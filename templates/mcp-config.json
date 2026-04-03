@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "codebase-memory-mcp": {
+      "type": "stdio",
+      "command": "${HOME}/.local/bin/codebase-memory-mcp",
+      "args": []
+    },
+    "roslyn": {
+      "type": "stdio",
+      "command": "${HOME}/.dotnet/tools/dotnet-roslyn-mcp",
+      "args": []
+    }
+  }
+}
