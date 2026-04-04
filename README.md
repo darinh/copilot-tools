@@ -38,6 +38,12 @@ operator --agent=anvil:anvil --yolo
 # Autonomous loop (restarts when agent signals)
 operator --loop --name myproject --agent=anvil:anvil
 
+# Restart later — auto-continues from where it left off
+operator --loop --name myproject --agent=anvil:anvil
+
+# Reset session numbering
+operator --loop --name myproject --fresh --agent=anvil:anvil
+
 # Multiple concurrent loops
 operator --loop --name frontend --agent=anvil:anvil
 operator --loop --name backend --agent=anvil:anvil

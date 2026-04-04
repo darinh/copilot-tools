@@ -74,6 +74,25 @@ operator --loop --name myproject --agent=anvil:anvil --model=claude-opus-4.6-1m
 
 Ctrl+C captures final metrics and shows an aggregate run summary.
 
+### Auto-Continue
+
+Named instances automatically resume where they left off when restarted. Session numbering and run summary scope carry over between operator restarts.
+
+State is stored in `~/.copilot/restart/{name}.state` and includes the session number and original run start time.
+
+```bash
+# First run — starts at session #1
+operator --loop --name myproject --agent=anvil:anvil
+
+# Stop with Ctrl+C, then restart later — continues from session #6
+operator --loop --name myproject --agent=anvil:anvil
+
+# Explicitly reset to start fresh
+operator --loop --name myproject --fresh --agent=anvil:anvil
+```
+
+Unnamed instances (no `--name`) are always ephemeral and don't persist state.
+
 ### Multi-Instance
 
 Multiple operator instances can run concurrently. Each gets its own tmux session and restart marker file.
@@ -119,6 +138,7 @@ The operator stores metrics in `~/.copilot/operator-metrics.db` (SQLite). Each s
 | `~/.copilot/operator.log` | Operator log file |
 | `~/.copilot/logs/process-*.log` | Copilot process logs (source data) |
 | `~/.copilot/restart/` | Per-instance restart marker files |
+| `~/.copilot/restart/*.state` | Auto-continue state (session number, run start time) |
 | `~/.copilot/operator-backups/` | Historical backups of operator.sh |
 
 ## Troubleshooting
