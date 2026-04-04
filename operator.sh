@@ -42,12 +42,14 @@ MAX_SESSIONS=1000
 INSTANCE_NAME=""
 TMUX_SESSION=""
 RESTART_MARKER=""
+STATE_FILE=""
 RUN_SCRIPT=""
 
 # Runtime state
 OPERATOR_RUN_STARTED=""
 CURRENT_SESSION_NUM=0
 IS_LOOP_MODE=false
+IS_FRESH=false
 COPILOT_PANE_PID=""
 
 # ── Logging ─────────────────────────────────────────────────────
@@ -80,8 +82,27 @@ derive_instance_paths() {
     INSTANCE_NAME="$name"
     TMUX_SESSION="$name"
     RESTART_MARKER="${RESTART_DIR}/${name}"
+    STATE_FILE="${RESTART_DIR}/${name}.state"
     RUN_SCRIPT="${HOME}/.copilot/operator-run-${name}.sh"
     mkdir -p "$RESTART_DIR"
+}
+
+save_instance_state() {
+    [[ -z "$STATE_FILE" ]] && return
+    printf 'SESSION_NUM=%d\nRUN_STARTED=%s\n' \
+        "$CURRENT_SESSION_NUM" "$OPERATOR_RUN_STARTED" > "$STATE_FILE"
+}
+
+load_instance_state() {
+    [[ -z "$STATE_FILE" || ! -f "$STATE_FILE" ]] && return 1
+    local line
+    while IFS='=' read -r key val; do
+        case "$key" in
+            SESSION_NUM)  CURRENT_SESSION_NUM="$val" ;;
+            RUN_STARTED)  OPERATOR_RUN_STARTED="$val" ;;
+        esac
+    done < "$STATE_FILE"
+    return 0
 }
 
 list_instances() {
@@ -410,6 +431,7 @@ cleanup() {
 
     if [[ "$IS_LOOP_MODE" == true ]] && (( CURRENT_SESSION_NUM > 0 )); then
         capture_and_store_metrics "$CURRENT_SESSION_NUM"
+        save_instance_state
         show_run_summary
     fi
 
@@ -426,17 +448,18 @@ show_help() {
 operator — Metrics-capturing wrapper for GitHub Copilot CLI
 
 USAGE
-    operator [--name NAME] [copilot-args...]          Single session (auto-attaches tmux)
-    operator --loop [--name NAME] [copilot-args...]   Autonomous loop mode
-    operator list                                      Show running instances
-    operator stop [NAME]                               Stop instance(s)
-    operator report [type]                             View usage reports
-    operator ingest [--force]                          Process all unprocessed copilot logs
-    operator help                                      Show this help
+    operator [--name NAME] [copilot-args...]                  Single session
+    operator --loop [--name NAME] [--fresh] [copilot-args...]  Loop mode
+    operator list                                              Show running instances
+    operator stop [NAME]                                       Stop instance(s)
+    operator report [type]                                     View usage reports
+    operator ingest [--force]                                  Process copilot logs
+    operator help                                              Show this help
 
 OPTIONS
     --name NAME     Set instance name (default: operator-copilot-{N}, auto-incremented)
     --loop          Enable autonomous loop mode
+    --fresh         Reset session numbering (ignore prior state)
 
 MODES
     Single session (default)
@@ -449,6 +472,9 @@ MODES
         Sends a preamble for autonomous operation. Restarts copilot
         when the agent touches the instance-specific restart marker.
         Ctrl+C captures metrics and shows an aggregate run summary.
+
+        Named instances auto-continue when restarted — session numbering
+        and run summary scope carry over. Use --fresh to reset.
 
 MULTI-INSTANCE
     Multiple operator instances can run concurrently. Each gets its own
@@ -695,7 +721,15 @@ run_loop_mode() {
     SCRIPT_PREAMBLE=$(build_preamble "$agent_name")
 
     init_metrics_db
-    OPERATOR_RUN_STARTED=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+    # Auto-continue: load prior state for named instances
+    local start_session=1
+    if [[ "$IS_FRESH" == false ]] && load_instance_state; then
+        start_session=$(( CURRENT_SESSION_NUM + 1 ))
+        log "Continuing from session #${start_session} (run started ${OPERATOR_RUN_STARTED})"
+    else
+        OPERATOR_RUN_STARTED=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    fi
 
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
         log "Instance '$INSTANCE_NAME' already exists. Attach with: tmux attach -t $TMUX_SESSION"
@@ -707,14 +741,16 @@ run_loop_mode() {
     log "Copilot CLI Operator starting (loop mode)"
     log "  Instance: $INSTANCE_NAME"
     log "  Agent: $agent_name"
+    log "  Starting session: #${start_session}"
     log "  Max sessions: $MAX_SESSIONS"
     log "  Poll interval: ${POLL_INTERVAL}s"
     log "  Restart signal: touch $RESTART_MARKER"
     log "  Attach: tmux attach -t $TMUX_SESSION"
     log "═══════════════════════════════════════════"
 
-    for session_num in $(seq 1 "$MAX_SESSIONS"); do
+    for session_num in $(seq "$start_session" "$MAX_SESSIONS"); do
         CURRENT_SESSION_NUM=$session_num
+        save_instance_state
 
         generate_run_script "${copilot_args[@]}"
         start_copilot_in_tmux "$session_num" on
@@ -726,6 +762,7 @@ run_loop_mode() {
             if ! is_copilot_running; then
                 log "Session #${session_num}: copilot exited"
                 capture_and_store_metrics "$session_num"
+                save_instance_state
                 show_run_summary
                 log "Operator shutting down"
                 rm -f "$RUN_SCRIPT" "$RESTART_MARKER"
@@ -741,6 +778,7 @@ run_loop_mode() {
 
         if [[ "$restart_requested" == true ]]; then
             restart_copilot "$session_num"
+            save_instance_state
 
             if (( session_num >= MAX_SESSIONS )); then
                 log "Max sessions ($MAX_SESSIONS) reached — stopping"
@@ -807,6 +845,10 @@ main() {
                 loop_mode=true
                 shift
                 ;;
+            --fresh)
+                IS_FRESH=true
+                shift
+                ;;
             --name)
                 if [[ $# -lt 2 || -z "${2:-}" ]]; then
                     echo "Error: --name requires a value" >&2
@@ -831,6 +873,10 @@ main() {
     fi
 
     derive_instance_paths "$instance_name"
+
+    if [[ "$IS_FRESH" == true ]]; then
+        rm -f "$STATE_FILE"
+    fi
 
     if [[ "$loop_mode" == true ]]; then
         run_loop_mode "${copilot_args[@]}"
