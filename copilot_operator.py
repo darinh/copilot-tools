@@ -215,7 +215,7 @@ def capture_and_store_metrics(session_num, copilot_pid=None):
             log(f"  Metrics: no copilot process log found (pid={copilot_pid or '?'})")
             return
         log(f"  Metrics: ingesting {logfile.name}...")
-        ingest_py = SCRIPT_DIR / 'operator-ingest.py'
+        ingest_py = SCRIPT_DIR / 'operator_ingest.py'
         r = subprocess.run(
             [sys.executable, str(ingest_py), str(logfile), str(METRICS_DB),
              '--session-num', str(session_num), '--work-dir', str(Path.cwd())],
@@ -234,7 +234,7 @@ def ingest_all_logs(force=False):
     if not COPILOT_LOG_DIR.exists():
         print("No log directory found.")
         return
-    ingest_py = SCRIPT_DIR / 'operator-ingest.py'
+    ingest_py = SCRIPT_DIR / 'operator_ingest.py'
     force_args = ['--force'] if force else []
     for logfile in sorted(COPILOT_LOG_DIR.glob('process-*.log')):
         total += 1
@@ -819,7 +819,7 @@ INGEST
 FILES
     ~/.copilot/operator-metrics.db      SQLite metrics database
     ~/.copilot/operator.log             Operator log file
-    operator-ingest.py                  Log parser (lives next to operator.py)
+    operator_ingest.py                  Log parser (lives next to copilot_operator.py)
     ~/.copilot/logs/process-*.log       Copilot process logs (source data)
     ~/.copilot/restart/                 Per-instance restart marker files
 

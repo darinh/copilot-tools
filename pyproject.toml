@@ -1,0 +1,25 @@
+[project]
+name = "copilot-tools"
+version = "0.1.0"
+description = "Tools, skills, and workflow conventions for GitHub Copilot CLI power users"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+
+[project.scripts]
+copilot-operator = "copilot_operator:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools]
+py-modules = ["copilot_operator", "operator_ingest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
