@@ -206,7 +206,7 @@ capture_and_store_metrics() {
         log "  Metrics: ingesting $(basename "$logfile")..."
 
         local result
-        result=$(python3 "${SCRIPT_DIR}/operator-ingest.py" \
+        result=$(python3 "${SCRIPT_DIR}/operator_ingest.py" \
             "$logfile" "$METRICS_DB" \
             --session-num "$session_num" \
             --work-dir "$(pwd)" 2>&1)
@@ -230,7 +230,7 @@ ingest_all_logs() {
         (( total++ )) || true
 
         local result rc
-        result=$(python3 "${SCRIPT_DIR}/operator-ingest.py" \
+        result=$(python3 "${SCRIPT_DIR}/operator_ingest.py" \
             "$logfile" "$METRICS_DB" $force_flag 2>&1) && rc=0 || rc=$?
 
         if [[ "$result" == SKIP* ]]; then
@@ -512,7 +512,7 @@ INGEST
 FILES
     ~/.copilot/operator-metrics.db      SQLite metrics database
     ~/.copilot/operator.log             Operator log file
-    operator-ingest.py                  Log parser (lives next to operator.sh)
+    operator_ingest.py                  Log parser (lives next to operator.sh)
     ~/.copilot/logs/process-*.log       Copilot process logs (source data)
     ~/.copilot/restart/                 Per-instance restart marker files
     ~/.copilot/operator-backups/        Backups of operator.sh
