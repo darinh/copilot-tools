@@ -2,20 +2,28 @@
 
 The operator is a metrics-capturing wrapper for GitHub Copilot CLI. It wraps `copilot` to capture usage metrics (premium requests, API time, session time, per-model breakdown) into a SQLite database. It supports single-session mode (default) and autonomous loop mode with automatic restarts.
 
+**Cross-platform**: Works on Linux, macOS, and Windows. Uses tmux on Unix and [psmux](https://github.com/psmux/psmux) on Windows.
+
 ## Prerequisites
 
-- `tmux` — session management
-- `sqlite3` — metrics database
-- `python3` — log parsing
-- `copilot` — GitHub Copilot CLI
+| Tool | Linux/macOS | Windows |
+|------|------------|---------|
+| Terminal multiplexer | `tmux` | [`psmux`](https://github.com/psmux/psmux) — `winget install psmux` |
+| Python | `python3` (3.8+) | `python` (3.8+) |
+| Copilot CLI | `copilot` | `copilot` |
+
+> **Note**: The `sqlite3` CLI is no longer required — the Python operator uses the built-in `sqlite3` module.
 
 ## Installation
 
 ```bash
-# From the copilot-tools repo
-./setup.sh
+# Cross-platform (recommended) — registers `copilot-operator` command
+pip install -e /path/to/copilot-tools
 
-# Or manually
+# Or run directly
+python copilot_operator.py help
+
+# Legacy (Linux/macOS only)
 ln -sf /path/to/copilot-tools/operator.sh ~/.local/bin/operator
 ```
 
@@ -128,7 +136,7 @@ The operator stores metrics in `~/.copilot/operator-metrics.db` (SQLite). Each s
 
 ### Log Parser
 
-`operator-ingest.py` parses copilot process logs (`~/.copilot/logs/process-*.log`) to extract metrics. It's called automatically during session transitions and can be run manually via `operator ingest`.
+`operator_ingest.py` parses copilot process logs (`~/.copilot/logs/process-*.log`) to extract metrics. It's called automatically during session transitions and can be run manually via `copilot-operator ingest`.
 
 ## Files
 
@@ -139,7 +147,28 @@ The operator stores metrics in `~/.copilot/operator-metrics.db` (SQLite). Each s
 | `~/.copilot/logs/process-*.log` | Copilot process logs (source data) |
 | `~/.copilot/restart/` | Per-instance restart marker files |
 | `~/.copilot/restart/*.state` | Auto-continue state (session number, run start time) |
-| `~/.copilot/operator-backups/` | Historical backups of operator.sh |
+
+## Cross-Platform Notes
+
+### Windows (psmux)
+
+[psmux](https://github.com/psmux/psmux) is a native Windows terminal multiplexer that implements the tmux command API. It ships `psmux`, `pmux`, and `tmux` binaries — the operator auto-detects whichever is available.
+
+Install: `winget install psmux` (or `cargo install psmux`, `scoop install psmux`, `choco install psmux`)
+
+All operator commands work identically on Windows:
+```powershell
+copilot-operator --loop --name myproject --agent=anvil:anvil
+copilot-operator list
+copilot-operator stop myproject
+copilot-operator report costs
+```
+
+### Path Conventions
+
+All platforms use `~/.copilot/` as the configuration directory:
+- Linux/macOS: `~/.copilot/` → `/home/user/.copilot/`
+- Windows: `~/.copilot/` → `C:\Users\user\.copilot\`
 
 ## Troubleshooting
 

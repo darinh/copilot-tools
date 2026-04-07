@@ -1,56 +1,78 @@
 # copilot-tools
 
-Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Built by the team at Microsoft for autonomous and interactive AI-assisted development.
+Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Built for autonomous and interactive AI-assisted development.
+
+**Cross-platform**: Works on Linux, macOS, and Windows (via [psmux](https://github.com/psmux/psmux)).
 
 ## What's Inside
 
 | Component | Description |
 |-----------|-------------|
-| [`operator.sh`](docs/operator.md) | Copilot CLI wrapper with metrics capture, autonomous loop mode, and multi-instance support |
-| [`operator-ingest.py`](operator-ingest.py) | Log parser for copilot process logs |
+| [`copilot_operator.py`](docs/operator.md) | Cross-platform Copilot CLI wrapper with metrics capture, autonomous loop mode, and multi-instance support |
+| [`operator_ingest.py`](operator_ingest.py) | Log parser for copilot process logs |
 | [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | MCP skill routing C#→Roslyn, TypeScript→codebase-memory-mcp |
 | [`templates/`](templates/) | Configuration templates for copilot-instructions, MCP servers, and per-project setup |
 | [`docs/`](docs/) | Documentation for operator and skills |
-| [`setup.sh`](setup.sh) | Automated environment setup script |
+| [`setup_tools.py`](setup_tools.py) | Cross-platform environment setup script |
+| [`operator.sh`](operator.sh) | Legacy bash wrapper (Linux/macOS only) |
 
 ## Quick Start
 
+### Linux / macOS
+
 ```bash
-git clone <this-repo> ~/projects/copilot-tools
+git clone https://github.com/darinh/copilot-tools ~/projects/copilot-tools
 cd ~/projects/copilot-tools
-chmod +x setup.sh operator.sh
-./setup.sh
+python3 setup_tools.py
 ```
 
-The setup script will:
-1. Check prerequisites (`tmux`, `sqlite3`, `python3`, `copilot`)
-2. Symlink `operator` into `~/.local/bin/`
-3. Install the [Anvil](https://github.com/burkeholland/anvil) agent plugin
-4. Check/install MCP servers (codebase-memory-mcp, dotnet-roslyn-mcp)
-5. Install configuration templates to `~/.copilot/`
+### Windows
+
+```powershell
+# Install psmux (native tmux for Windows)
+winget install psmux
+
+git clone https://github.com/darinh/copilot-tools $HOME\projects\copilot-tools
+cd $HOME\projects\copilot-tools
+python setup_tools.py
+```
+
+### Prerequisites
+
+| Tool | Linux/macOS | Windows |
+|------|------------|---------|
+| Terminal multiplexer | `tmux` | [`psmux`](https://github.com/psmux/psmux) (`winget install psmux`) |
+| Python | `python3` (3.8+) | `python` (3.8+) |
+| Git | `git` | `git` |
+| Copilot CLI | `copilot` | `copilot` |
+
+The setup script checks for all prerequisites and guides installation.
 
 ## Usage
 
 ```bash
 # Interactive session with Anvil agent
-operator --agent=anvil:anvil --yolo
+copilot-operator --agent=anvil:anvil --yolo
 
 # Autonomous loop (restarts when agent signals)
-operator --loop --name myproject --agent=anvil:anvil
+copilot-operator --loop --name myproject --agent=anvil:anvil
 
 # Restart later — auto-continues from where it left off
-operator --loop --name myproject --agent=anvil:anvil
+copilot-operator --loop --name myproject --agent=anvil:anvil
 
 # Reset session numbering
-operator --loop --name myproject --fresh --agent=anvil:anvil
+copilot-operator --loop --name myproject --fresh --agent=anvil:anvil
 
 # Multiple concurrent loops
-operator --loop --name frontend --agent=anvil:anvil
-operator --loop --name backend --agent=anvil:anvil
-operator list
+copilot-operator --loop --name frontend --agent=anvil:anvil
+copilot-operator --loop --name backend --agent=anvil:anvil
+copilot-operator list
 
 # Usage reports
-operator report costs
+copilot-operator report costs
+
+# Or run directly without pip install:
+python copilot_operator.py --agent=anvil:anvil --yolo
 ```
 
 See [Operator Documentation](docs/operator.md) for full details.
@@ -92,9 +114,12 @@ Configure in `~/.copilot/mcp-config.json` — see [`templates/mcp-config.json`](
 
 ```
 copilot-tools/
-├── operator.sh              # Copilot CLI wrapper
-├── operator-ingest.py       # Log parser
-├── setup.sh                 # Environment setup
+├── copilot_operator.py      # Cross-platform operator (Python)
+├── operator_ingest.py       # Log parser (Python, cross-platform)
+├── operator.sh              # Legacy bash operator (Linux/macOS)
+├── setup_tools.py           # Cross-platform setup (Python)
+├── setup.sh                 # Legacy bash setup (Linux/macOS)
+├── pyproject.toml           # Python package config
 ├── skills/
 │   └── code-intelligence/
 │       └── SKILL.md          # Roslyn + codebase-memory routing
@@ -102,6 +127,13 @@ copilot-tools/
 │   ├── copilot-instructions.md    # Workflow conventions
 │   ├── mcp-config.json            # MCP server config
 │   └── project-instructions.md    # Per-project template
+├── tests/
+│   ├── conftest.py           # Shared test fixtures
+│   ├── test_ingest.py        # Ingest tests (57 tests)
+│   └── test_operator.py      # Operator tests
+├── .github/
+│   └── workflows/
+│       └── ci.yml            # CI: ubuntu + windows, Python 3.10 + 3.12
 └── docs/
     ├── operator.md           # Operator documentation
     └── skills.md             # Skills reference
