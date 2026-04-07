@@ -10,18 +10,29 @@ Usage:
 
 Exit codes: 0=success/skip, 1=error, 2=no shutdown event
 """
-import re, sys, subprocess, os, argparse, json
+import re, sys, subprocess, os, argparse, json, sqlite3
+from pathlib import Path
 from datetime import datetime, timezone
 
 
-def run_cmd(cmd, timeout=30):
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    return r.stdout, r.returncode
-
-
-def run_sqlite(db_path, sql):
-    out, _ = run_cmd(['sqlite3', db_path, sql])
-    return out.strip()
+def run_sqlite(db_path, sql, fetch=True):
+    """Execute SQL against a SQLite database using Python's sqlite3 module."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+        # Handle multi-statement SQL by splitting on semicolons
+        statements = [s.strip() for s in sql.split(';') if s.strip()]
+        result = ''
+        for stmt in statements:
+            cursor.execute(stmt)
+            if fetch and cursor.description:
+                rows = cursor.fetchall()
+                if rows:
+                    result = str(rows[-1][0]) if len(rows[-1]) == 1 else str(rows[-1])
+        conn.commit()
+        return result
+    finally:
+        conn.close()
 
 
 def sql_esc(s):
@@ -35,30 +46,102 @@ def fmt_tokens(n):
     return str(n)
 
 
-def extract_shutdown_event(logfile):
-    """Use grep to pull session_shutdown properties and metrics."""
-    out, rc = run_cmd(['grep', '-B', '1', '-A', '150', '"kind": "session_shutdown"', logfile], timeout=60)
-    if rc != 0 or not out:
-        return None
+def read_first_line(filepath):
+    """Read the first line of a file."""
+    with open(filepath, 'r', errors='replace') as f:
+        return f.readline()
 
-    # Find the complete JSON object (need ~97 lines for the full event)
-    start = out.find('{')
-    if start < 0:
-        return None
-    depth = 0
-    for i in range(start, len(out)):
-        if out[i] == '{': depth += 1
-        elif out[i] == '}':
-            depth -= 1
-            if depth == 0:
-                raw = out[start:i+1]
-                # Fix trailing commas before closing braces (common in log format)
-                raw = re.sub(r',(\s*[}\]])', r'\1', raw)
-                try:
-                    return json.loads(raw)
-                except json.JSONDecodeError:
-                    return None
-    return None
+
+def read_last_line(filepath):
+    """Read the last non-empty line of a file efficiently."""
+    with open(filepath, 'rb') as f:
+        # Seek to end
+        f.seek(0, 2)
+        size = f.tell()
+        if size == 0:
+            return ''
+        # Read backwards to find last newline
+        pos = size - 1
+        while pos > 0:
+            f.seek(pos)
+            ch = f.read(1)
+            if ch == b'\n' and pos < size - 1:
+                return f.read().decode('utf-8', errors='replace').strip()
+            pos -= 1
+        # File has no newline — return entire content
+        f.seek(0)
+        return f.read().decode('utf-8', errors='replace').strip()
+
+
+def read_head_bytes(filepath, num_bytes):
+    """Read the first N bytes of a file."""
+    with open(filepath, 'r', errors='replace') as f:
+        return f.read(num_bytes)
+
+
+def extract_shutdown_event(logfile):
+    """Find and parse the session_shutdown JSON event from a log file.
+
+    The log contains many false positives where 'session_shutdown' appears
+    inside quoted string values (e.g., the agent discussing this script).
+    The real telemetry event is near the end of the file, preceded by a log
+    line like '[INFO] [Telemetry] cli.telemetry:' with JSON on the next line.
+    We search from the end to find it quickly and avoid false positives.
+    """
+    with open(logfile, 'r', errors='replace') as f:
+        content = f.read()
+
+    # Search from the end — the real shutdown event is always near EOF
+    marker = '"kind": "session_shutdown"'
+    search_from = len(content)
+    while True:
+        idx = content.rfind(marker, 0, search_from)
+        if idx < 0:
+            return None
+
+        # Check if this occurrence is inside a JSON string value.
+        # If the line containing the marker also contains "content": or starts
+        # with a quote that suggests it's inside a string value, skip it.
+        line_start = content.rfind('\n', 0, idx)
+        line = content[line_start+1:idx+len(marker)+5] if line_start >= 0 else content[:idx+len(marker)+5]
+
+        # Heuristic: real event has "kind" as a top-level key with leading whitespace
+        # False positives are inside escaped strings or "content" fields
+        stripped_line = line.lstrip()
+        if stripped_line.startswith('"kind"'):
+            # This looks like a real JSON field — walk back to find opening brace
+            start = idx
+            depth = 0
+            while start > 0:
+                start -= 1
+                if content[start] == '}':
+                    depth += 1
+                elif content[start] == '{':
+                    if depth == 0:
+                        break
+                    depth -= 1
+
+            if content[start] == '{':
+                # Walk forward to find matching close
+                depth = 0
+                for i in range(start, len(content)):
+                    if content[i] == '{':
+                        depth += 1
+                    elif content[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            raw = content[start:i+1]
+                            raw = re.sub(r',(\s*[}\]])', r'\1', raw)
+                            try:
+                                event = json.loads(raw)
+                                # Verify it's really a shutdown event with metrics
+                                if event.get('kind') == 'session_shutdown' and 'metrics' in event:
+                                    return event
+                            except json.JSONDecodeError:
+                                pass
+                            break
+
+        search_from = idx
 
 
 def extract_premium_from_usage(logfile):
@@ -70,33 +153,35 @@ def extract_premium_from_usage(logfile):
 
     Returns: {model_name: {'cost': float, 'calls': int}, ...}, total_cost
     """
-    out, rc = run_cmd(['grep', '-A', '20', '"kind": "assistant_usage"', logfile], timeout=60)
-    if rc != 0 or not out:
-        return {}, 0
+    with open(logfile, 'r', errors='replace') as f:
+        content = f.read()
 
     models = {}
     total = 0.0
-    lines = out.split('\n')
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if '"model":' in line:
-            model = line.split(':', 1)[1].strip().strip('",')
-            # Skip garbage model names from malformed log entries
+
+    # Find all assistant_usage events and extract model + cost
+    for match in re.finditer(r'"kind":\s*"assistant_usage"', content):
+        # Look in the surrounding context (back to previous '{', forward ~500 chars)
+        search_start = content.rfind('{', max(0, match.start() - 2000), match.start())
+        if search_start < 0:
+            continue
+        search_end = min(len(content), match.end() + 2000)
+        block = content[search_start:search_end]
+
+        model_match = re.search(r'"model":\s*"([^"]+)"', block)
+        cost_match = re.search(r'"cost":\s*([0-9.]+)', block)
+
+        if model_match and cost_match:
+            model = model_match.group(1)
+            # Skip garbage model names
             if not model or ' ' in model or ')' in model or len(model) > 40:
-                i += 1
                 continue
-            for j in range(i+1, min(i+20, len(lines))):
-                cline = lines[j].strip()
-                if cline.startswith('"cost":'):
-                    cost = float(cline.split(':', 1)[1].strip().rstrip(','))
-                    if model not in models:
-                        models[model] = {'cost': 0.0, 'calls': 0}
-                    models[model]['cost'] += cost
-                    models[model]['calls'] += 1
-                    total += cost
-                    break
-        i += 1
+            cost = float(cost_match.group(1))
+            if model not in models:
+                models[model] = {'cost': 0.0, 'calls': 0}
+            models[model]['cost'] += cost
+            models[model]['calls'] += 1
+            total += cost
 
     return models, round(total)
 
@@ -110,10 +195,10 @@ def main():
     parser.add_argument('--force', action='store_true')
     args = parser.parse_args()
 
-    logfile = os.path.abspath(args.logfile)
-    log_basename = os.path.basename(logfile)
+    logfile = str(Path(args.logfile).resolve())
+    log_basename = Path(logfile).name
 
-    if not os.path.isfile(logfile):
+    if not Path(logfile).is_file():
         print(f"ERROR: {logfile} not found", file=sys.stderr)
         sys.exit(1)
 
@@ -124,7 +209,7 @@ def main():
 
     if not args.force:
         existing = run_sqlite(args.db_path,
-            f"SELECT log_file_mtime FROM sessions WHERE log_file = '{sql_esc(log_basename)}';")
+            f"SELECT log_file_mtime FROM sessions WHERE log_file = '{sql_esc(log_basename)}'")
         if existing:
             if existing.strip() == file_mtime:
                 print(f"SKIP {log_basename} (already processed, mtime unchanged)")
@@ -137,7 +222,7 @@ def main():
 
     if not event:
         # UPSERT a no_op record so we don't re-scan this file
-        first_line, _ = run_cmd(['head', '-1', logfile])
+        first_line = read_first_line(logfile)
         ts = first_line.strip()[:24] if first_line.strip() else now
         if not ts.endswith('Z'):
             ts += 'Z'
@@ -146,7 +231,8 @@ def main():
             f"VALUES (0, '{sql_esc(log_basename)}', '{sql_esc(file_mtime)}', 1, '{sql_esc(ts)}', '{sql_esc(ts)}') "
             f"ON CONFLICT(log_file) DO UPDATE SET "
             f"log_file_mtime = '{sql_esc(file_mtime)}', no_op = 1, "
-            f"started_at = '{sql_esc(ts)}', ended_at = '{sql_esc(ts)}';")
+            f"started_at = '{sql_esc(ts)}', ended_at = '{sql_esc(ts)}'",
+            fetch=False)
         print(f"SKIP {log_basename} (no shutdown event)")
         sys.exit(2)
 
@@ -166,9 +252,9 @@ def main():
     api_time_s = int(api_duration_ms / 1000)
     session_time_s = int(session_duration_ms / 1000)
 
-    # Timestamps from head/tail
-    first_line, _ = run_cmd(['head', '-1', logfile])
-    last_line, _ = run_cmd(['tail', '-1', logfile])
+    # Timestamps from first/last lines
+    first_line = read_first_line(logfile)
+    last_line = read_last_line(logfile)
 
     def extract_ts(line):
         line = line.strip()
@@ -183,7 +269,7 @@ def main():
     # Work dir from arg or log
     work_dir = args.work_dir
     if not work_dir:
-        header, _ = run_cmd(['head', '-c', '50000', logfile])
+        header = read_head_bytes(logfile, 50000)
         m = re.search(r'"cwd":\s*"([^"]+)"', header)
         if m:
             work_dir = m.group(1)
@@ -195,7 +281,7 @@ def main():
                                capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
                 git_branch = r.stdout.strip()
-        except:
+        except Exception:
             pass
 
     # Extract per-model data from shutdown properties (token counts)
@@ -241,43 +327,37 @@ def main():
                              f"(Est. {mc} Premium requests)")
 
     # UPSERT session (log_file UNIQUE constraint drives ON CONFLICT)
-    session_id = run_sqlite(args.db_path, f"""
-        INSERT INTO sessions (session_num, log_file, log_file_mtime, started_at, ended_at, work_dir, git_branch,
-                              premium_requests, api_time_seconds, session_time_seconds,
-                              lines_added, lines_removed, raw_metrics)
-        VALUES ({args.session_num}, '{sql_esc(log_basename)}', '{sql_esc(file_mtime)}',
-                '{sql_esc(start_time)}', '{sql_esc(end_time)}',
-                '{sql_esc(work_dir)}', '{sql_esc(git_branch)}',
-                {total_premium}, {api_time_s}, {session_time_s},
-                {lines_added}, {lines_removed}, '{sql_esc(chr(10).join(raw_lines))}')
-        ON CONFLICT(log_file) DO UPDATE SET
-            log_file_mtime = '{sql_esc(file_mtime)}',
-            no_op = 0,
-            started_at = '{sql_esc(start_time)}',
-            ended_at = '{sql_esc(end_time)}',
-            work_dir = '{sql_esc(work_dir)}',
-            git_branch = '{sql_esc(git_branch)}',
-            premium_requests = {total_premium},
-            api_time_seconds = {api_time_s},
-            session_time_seconds = {session_time_s},
-            lines_added = {lines_added},
-            lines_removed = {lines_removed},
-            raw_metrics = '{sql_esc(chr(10).join(raw_lines))}';
-        SELECT id FROM sessions WHERE log_file = '{sql_esc(log_basename)}';
-    """)
+    raw_metrics = '\n'.join(raw_lines)
+    run_sqlite(args.db_path,
+        f"INSERT INTO sessions (session_num, log_file, log_file_mtime, started_at, ended_at, work_dir, git_branch, "
+        f"premium_requests, api_time_seconds, session_time_seconds, lines_added, lines_removed, raw_metrics) "
+        f"VALUES ({args.session_num}, '{sql_esc(log_basename)}', '{sql_esc(file_mtime)}', "
+        f"'{sql_esc(start_time)}', '{sql_esc(end_time)}', '{sql_esc(work_dir)}', '{sql_esc(git_branch)}', "
+        f"{total_premium}, {api_time_s}, {session_time_s}, {lines_added}, {lines_removed}, "
+        f"'{sql_esc(raw_metrics)}') "
+        f"ON CONFLICT(log_file) DO UPDATE SET "
+        f"log_file_mtime = '{sql_esc(file_mtime)}', no_op = 0, "
+        f"started_at = '{sql_esc(start_time)}', ended_at = '{sql_esc(end_time)}', "
+        f"work_dir = '{sql_esc(work_dir)}', git_branch = '{sql_esc(git_branch)}', "
+        f"premium_requests = {total_premium}, api_time_seconds = {api_time_s}, "
+        f"session_time_seconds = {session_time_s}, lines_added = {lines_added}, "
+        f"lines_removed = {lines_removed}, raw_metrics = '{sql_esc(raw_metrics)}'",
+        fetch=False)
+
+    session_id = run_sqlite(args.db_path,
+        f"SELECT id FROM sessions WHERE log_file = '{sql_esc(log_basename)}'")
 
     # Clear old model_usage rows (idempotent for new inserts, necessary for reprocessing)
-    run_sqlite(args.db_path, f"DELETE FROM model_usage WHERE session_id = {session_id};")
+    run_sqlite(args.db_path, f"DELETE FROM model_usage WHERE session_id = {session_id}", fetch=False)
 
     # Insert per-model usage
     for name, md in models.items():
         mc = int(md.get('request_cost', 0))
-        run_sqlite(args.db_path, f"""
-            INSERT INTO model_usage (session_id, model_name, tokens_in, tokens_out, tokens_cached, premium_requests)
-            VALUES ({session_id}, '{sql_esc(name)}', '{fmt_tokens(md.get("input_tokens", 0))}',
-                    '{fmt_tokens(md.get("output_tokens", 0))}',
-                    '{fmt_tokens(md.get("cache_read_tokens", 0))}', {mc});
-        """)
+        run_sqlite(args.db_path,
+            f"INSERT INTO model_usage (session_id, model_name, tokens_in, tokens_out, tokens_cached, premium_requests) "
+            f"VALUES ({session_id}, '{sql_esc(name)}', '{fmt_tokens(md.get('input_tokens', 0))}', "
+            f"'{fmt_tokens(md.get('output_tokens', 0))}', '{fmt_tokens(md.get('cache_read_tokens', 0))}', {mc})",
+            fetch=False)
 
     print(f"OK {log_basename}: {total_premium} premium, {api_time_s}s api, +{lines_added} -{lines_removed}")
     for name in sorted(models, key=lambda n: -int(models[n].get('request_cost', 0))):
