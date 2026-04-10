@@ -900,9 +900,11 @@ main() {
             ;;
         join)
             join_instance "${2:-}"
+            exit 0
             ;;
         reload)
             reload_instance "${2:-}"
+            exit 0
             ;;
         help|-h|--help|-\?)
             show_help
