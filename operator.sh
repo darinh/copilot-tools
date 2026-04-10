@@ -663,7 +663,7 @@ restart_copilot() {
 
 # ── Single Session Mode ────────────────────────────────────────
 run_single_session() {
-    local copilot_args=("$@")
+    local copilot_args=("--autopilot" "$@")
 
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
         echo "Error: instance '$INSTANCE_NAME' already exists." >&2
