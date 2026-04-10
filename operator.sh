@@ -421,7 +421,7 @@ extract_agent_from_args() {
 
 build_preamble() {
     local agent_name="$1"
-    printf '%s' "You are running under an automated operator wrapper that a human set up. Key facts: (1) You have blanket human approval for ALL decisions — tool calls, file edits, git operations, architectural choices. Do not ask for direction or confirmation. Make your best judgment call and proceed. If you are genuinely uncertain between approaches that have very different consequences, state your reasoning and pick one. (2) Session restart: when context gets heavy or a task is complete with next steps, first write your session handoff file, then run this bash command: touch ${RESTART_MARKER} — the operator watches for this file and will restart copilot CLI and deliver this same preamble. (3) On startup: always check for a session handoff file to resume work. (4) You are the @${agent_name} agent with --yolo permissions (all tools/files/URLs auto-approved). (5) Operator instance: ${INSTANCE_NAME}. Now: check for your session handoff and get to work."
+    printf '%s' "You are running under an automated operator wrapper that a human set up. Key facts: (1) You have blanket human approval for ALL decisions — tool calls, file edits, git operations, architectural choices. Do not ask for direction or confirmation. Make your best judgment call and proceed. If you are genuinely uncertain between approaches that have very different consequences, state your reasoning and pick one. (2) Session restart: when context gets heavy or a task is complete with next steps, use the handoff command: handoff --instance ${INSTANCE_NAME} --status \"what you completed\" --next \"what to do next\" --context \"key decisions and gotchas\" — this atomically writes the handoff file and triggers the restart. (3) On startup: always check for a session handoff file to resume work. (4) You are the @${agent_name} agent with --yolo permissions (all tools/files/URLs auto-approved). (5) Operator instance: ${INSTANCE_NAME}. Now: check for your session handoff and get to work."
 }
 
 # ── Commands ────────────────────────────────────────────────────
@@ -450,6 +450,9 @@ operator — Metrics-capturing wrapper for GitHub Copilot CLI
 USAGE
     operator [--name NAME] [copilot-args...]                  Single session
     operator --loop [--name NAME] [--fresh] [copilot-args...]  Loop mode
+    operator NAME                                              Join a running instance
+    operator join [NAME]                                       Join (explicit form)
+    operator reload NAME                                       Hot-reload run script
     operator list                                              Show running instances
     operator stop [NAME]                                       Stop instance(s)
     operator report [type]                                     View usage reports
@@ -498,6 +501,9 @@ EXAMPLES
     operator --agent=anvil:anvil --yolo
     operator --loop --agent=anvil:anvil --model=claude-opus-4.6-1m
     operator --loop --name myproject --agent=anvil:anvil
+    operator myproject                    # quick join
+    operator join myproject               # explicit join
+    operator reload myproject             # hot-reload run script
     operator report costs
     operator ingest
     operator ingest --force
@@ -799,6 +805,82 @@ run_loop_mode() {
 }
 
 # ── Main ────────────────────────────────────────────────────────
+RESERVED_WORDS="stop list report ingest help join reload"
+
+join_instance() {
+    local target="${1:-}"
+    if [[ -z "$target" ]]; then
+        list_instances
+        exit 0
+    fi
+    local full_name="$target"
+    if ! [[ "$target" =~ ^operator-copilot- ]]; then
+        full_name="operator-copilot-${target}"
+    fi
+    if tmux has-session -t "$full_name" 2>/dev/null; then
+        exec tmux attach -t "$full_name"
+    elif tmux has-session -t "$target" 2>/dev/null; then
+        exec tmux attach -t "$target"
+    else
+        echo "No instance '$target' found." >&2
+        echo
+        list_instances
+        exit 1
+    fi
+}
+
+reload_instance() {
+    local target="${1:-}"
+    if [[ -z "$target" ]]; then
+        echo "Usage: operator reload NAME" >&2
+        echo "Re-generates the run script for an instance using the current operator.sh." >&2
+        exit 1
+    fi
+    local full_name="$target"
+    if ! [[ "$target" =~ ^operator-copilot- ]]; then
+        full_name="operator-copilot-${target}"
+    fi
+    derive_instance_paths "$full_name"
+    if [[ ! -f "$RUN_SCRIPT" ]]; then
+        die "No run script found for '$full_name' at $RUN_SCRIPT"
+    fi
+    # Extract the current copilot command from the existing run script (line starting with exec)
+    local exec_line
+    exec_line=$(grep '^exec copilot' "$RUN_SCRIPT" 2>/dev/null || echo "")
+    if [[ -z "$exec_line" ]]; then
+        die "Cannot parse run script: $RUN_SCRIPT"
+    fi
+    # Rebuild the preamble with current operator.sh logic
+    local agent_name
+    agent_name=$(sed -n 's/.*--agent[= ]\([^ ]*\).*/\1/p' "$RUN_SCRIPT" | head -1)
+    agent_name="${agent_name:-anvil:anvil}"
+    SCRIPT_PREAMBLE=$(build_preamble "$agent_name")
+    # Extract copilot args from exec line (strip 'exec copilot ')
+    local args_str="${exec_line#exec copilot }"
+    # Remove the old -i "$PREAMBLE" from args
+    args_str=$(echo "$args_str" | sed 's/ -i "\$PREAMBLE"$//')
+    # Rebuild the run script
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'PREAMBLE=%q\n' "$SCRIPT_PREAMBLE"
+        printf '%s' "exec copilot ${args_str}"
+        printf ' -i "$PREAMBLE"\n'
+    } > "$RUN_SCRIPT"
+    chmod +x "$RUN_SCRIPT"
+    log "Reloaded run script for $full_name"
+    echo "✅ Run script updated: $RUN_SCRIPT"
+    echo "   Changes take effect on next copilot restart."
+}
+
+is_reserved_word() {
+    local word="$1"
+    local w
+    for w in $RESERVED_WORDS; do
+        [[ "$w" == "$word" ]] && return 0
+    done
+    return 1
+}
+
 main() {
     case "${1:-}" in
         stop)
@@ -816,11 +898,26 @@ main() {
             ingest_all_logs "${2:-}"
             exit 0
             ;;
+        join)
+            join_instance "${2:-}"
+            ;;
+        reload)
+            reload_instance "${2:-}"
+            ;;
         help|-h|--help|-\?)
             show_help
             exit 0
             ;;
     esac
+
+    # Positional shortcut: operator foo → join operator-copilot-foo
+    # Only if first arg is a bare word (not --flag, not a reserved subcommand)
+    if [[ $# -eq 1 && "${1:-}" != --* && -n "${1:-}" ]] && ! is_reserved_word "${1:-}"; then
+        local candidate="operator-copilot-$1"
+        if tmux has-session -t "$candidate" 2>/dev/null; then
+            exec tmux attach -t "$candidate"
+        fi
+    fi
 
     if ! command -v tmux &>/dev/null; then
         echo "Error: tmux is required but not found." >&2

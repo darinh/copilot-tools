@@ -67,10 +67,22 @@ When the user greets you (e.g., "hey", "hello", "hi"), **immediately**:
 3. **Log the session**: Insert a row into the `session_log` table in the session database (see Session History below).
 
 ### On Session End (automatic)
-Write `~/.copilot/projects/{guid}/next-session.md` when any of these are true:
+Use the `handoff` command when any of these are true:
 - You've completed a large task and there are known next steps.
-- You sense the context window is getting large (long conversation, many tool calls). Don't wait to be asked — proactively write the file and tell the user: *"Context is getting heavy. I've written the handoff — start a new session and I'll pick up where we left off."*
+- You sense the context window is getting large (long conversation, many tool calls). Don't wait to be asked — proactively write the handoff and tell the user: *"Context is getting heavy. I've written the handoff — starting a new session."*
 - The user says they're ending the session.
+
+```bash
+handoff --instance <operator-instance-name> \
+  --status "What was completed (commits, branches, files)" \
+  --next "Prioritized next steps" \
+  --context "Key decisions, gotchas" \
+  --prompt "Ready-to-execute prompt for next session"
+```
+
+The `handoff` command atomically writes the handoff file AND triggers the operator restart. **Never write the handoff file manually** — always use the command.
+
+If the `handoff` command is not available (e.g., not on PATH), fall back to writing `~/.copilot/projects/{guid}/next-session.md` manually and then running `touch ~/.copilot/restart/{instance-name}`.
 
 ### Handoff File Format
 ```markdown

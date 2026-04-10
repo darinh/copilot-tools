@@ -94,6 +94,21 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$LOCAL_BIN"; then
     warn "~/.local/bin is not on your PATH. Add to your shell profile:"
     echo "       export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
+
+# Handoff script symlink
+if [[ -L "${LOCAL_BIN}/handoff" ]]; then
+    current_target=$(readlink -f "${LOCAL_BIN}/handoff")
+    expected_target=$(readlink -f "${SCRIPT_DIR}/handoff.sh")
+    if [[ "$current_target" == "$expected_target" ]]; then
+        info "handoff symlink already correct"
+    else
+        ln -sf "${SCRIPT_DIR}/handoff.sh" "${LOCAL_BIN}/handoff"
+        info "Updated handoff symlink → ${SCRIPT_DIR}/handoff.sh"
+    fi
+else
+    ln -sf "${SCRIPT_DIR}/handoff.sh" "${LOCAL_BIN}/handoff"
+    info "Created handoff symlink → ${SCRIPT_DIR}/handoff.sh"
+fi
 echo ""
 
 # ── Step 4: Anvil plugin ──────────────────────────────────────
