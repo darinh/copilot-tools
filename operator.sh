@@ -65,6 +65,16 @@ die() { echo "Error: $*" >&2; exit 1; }
 
 # ── Instance Management ────────────────────────────────────────
 
+# Sanitize a name for use as a tmux session name.
+# tmux silently replaces '.' and ':' with '_', which causes all
+# subsequent -t lookups to fail. We replace them with '-' upfront.
+sanitize_session_name() {
+    local name="$1"
+    name="${name//./-}"
+    name="${name//:/-}"
+    echo "$name"
+}
+
 derive_instance_paths() {
     local name="$1"
     INSTANCE_NAME="$name"
@@ -135,12 +145,12 @@ handle_existing_session() {
         [Yy]|[Yy][Ee][Ss])
             log "Stopping existing session '$TMUX_SESSION' at user request"
             tmux kill-session -t "$TMUX_SESSION"
-            rm -f "${RESTART_DIR}/${TMUX_SESSION}" "${RESTART_DIR}/${TMUX_SESSION}.state"
+            rm -f "${RESTART_DIR}/${TMUX_SESSION}" "${RESTART_DIR}/${TMUX_SESSION}.state" "${RESTART_DIR}/${TMUX_SESSION}.managed"
             sleep 1
             ;;
         *)
             echo "Aborted." >&2
-            exit 0
+            exit 1
             ;;
     esac
 }
@@ -550,6 +560,7 @@ HELP
 
 stop_operator() {
     local target="${1:-}"
+    [[ -n "$target" ]] && target="$(sanitize_session_name "$target")"
     log "Stop requested${target:+ for $target}"
 
     if [[ -n "$target" ]]; then
@@ -565,12 +576,14 @@ stop_operator() {
         fi
     else
         local count=0
-        # Find all operator-managed sessions via .managed markers
+        # Find all operator-managed sessions via .managed and .state markers
         local -A managed_sessions
-        for f in "${RESTART_DIR}"/*.managed; do
+        for f in "${RESTART_DIR}"/*.managed "${RESTART_DIR}"/*.state; do
             [[ -e "$f" ]] || continue
             local base
-            base=$(basename "$f" .managed)
+            base=$(basename "$f")
+            base="${base%.managed}"
+            base="${base%.state}"
             managed_sessions["$base"]=1
         done
         while IFS= read -r name; do
@@ -823,6 +836,7 @@ join_instance() {
         list_instances
         exit 0
     fi
+    target="$(sanitize_session_name "$target")"
     if tmux has-session -t "$target" 2>/dev/null; then
         exec tmux attach -t "$target"
     else
@@ -840,6 +854,7 @@ reload_instance() {
         echo "Re-generates the run script for an instance using the current operator.sh." >&2
         exit 1
     fi
+    target="$(sanitize_session_name "$target")"
     derive_instance_paths "$target"
     if [[ ! -f "$RUN_SCRIPT" ]]; then
         die "No run script found for '$target' at $RUN_SCRIPT"
@@ -971,6 +986,8 @@ main() {
             die "--name is required when running from the filesystem root"
         fi
     fi
+
+    instance_name="$(sanitize_session_name "$instance_name")"
 
     derive_instance_paths "$instance_name"
 
