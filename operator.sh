@@ -75,10 +75,6 @@ next_instance_number() {
 
 derive_instance_paths() {
     local name="$1"
-    # Always prefix with operator-copilot- if not already
-    if ! [[ "$name" =~ ^operator-copilot- ]]; then
-        name="operator-copilot-${name}"
-    fi
     INSTANCE_NAME="$name"
     TMUX_SESSION="$name"
     RESTART_MARKER="${RESTART_DIR}/${name}"
@@ -109,10 +105,20 @@ list_instances() {
     echo "═══ Running Operator Instances ═══"
     echo
     local found=false
+    # Collect names of sessions managed by operator (have a restart marker or state file)
+    local -A managed_sessions
+    for f in "${RESTART_DIR}"/*.state "${RESTART_DIR}"/*.managed "${RESTART_DIR}"/operator-copilot-*; do
+        [[ -e "$f" ]] || continue
+        local base
+        base=$(basename "$f")
+        base="${base%.state}"
+        base="${base%.managed}"
+        managed_sessions["$base"]=1
+    done
     while IFS= read -r line; do
         local name
         name=$(echo "$line" | cut -d: -f1)
-        if [[ "$name" =~ ^operator-copilot- ]] || [[ "$name" == "copilot-operator" ]]; then
+        if [[ "$name" =~ ^operator-copilot- ]] || [[ "$name" == "copilot-operator" ]] || [[ -n "${managed_sessions[$name]+x}" ]]; then
             echo "  $line"
             found=true
         fi
@@ -123,6 +129,28 @@ list_instances() {
     echo
     echo "Attach: tmux attach -t <name>"
     echo "Stop:   $0 stop <name>"
+}
+
+handle_existing_session() {
+    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        return 0
+    fi
+    echo "Session '$TMUX_SESSION' is already running." >&2
+    printf "Stop it and start a new one? [y/N] " >&2
+    local answer=""
+    read -r answer < /dev/tty 2>/dev/null || answer=""
+    case "$answer" in
+        [Yy]|[Yy][Ee][Ss])
+            log "Stopping existing session '$TMUX_SESSION' at user request"
+            tmux kill-session -t "$TMUX_SESSION"
+            rm -f "${RESTART_DIR}/${TMUX_SESSION}" "${RESTART_DIR}/${TMUX_SESSION}.state"
+            sleep 1
+            ;;
+        *)
+            echo "Aborted." >&2
+            exit 0
+            ;;
+    esac
 }
 
 # ── Metrics Database ────────────────────────────────────────────
@@ -439,7 +467,7 @@ cleanup() {
         tmux kill-session -t "$TMUX_SESSION"
         log "Session ended"
     fi
-    rm -f "$RUN_SCRIPT" "$RESTART_MARKER"
+    rm -f "$RUN_SCRIPT" "$RESTART_MARKER" "${RESTART_DIR}/${TMUX_SESSION}.managed"
     exit 0
 }
 
@@ -543,7 +571,7 @@ stop_operator() {
         for name in "$full_name" "$target"; do
             if tmux has-session -t "$name" 2>/dev/null; then
                 tmux kill-session -t "$name"
-                rm -f "${RESTART_DIR}/${name}"
+                rm -f "${RESTART_DIR}/${name}" "${RESTART_DIR}/${name}.state" "${RESTART_DIR}/${name}.managed"
                 log "Stopped: $name"
                 found=true
                 break
@@ -560,7 +588,7 @@ stop_operator() {
         while IFS= read -r name; do
             if [[ "$name" =~ ^operator-copilot- ]] || [[ "$name" == "copilot-operator" ]]; then
                 tmux kill-session -t "$name"
-                rm -f "${RESTART_DIR}/${name}"
+                rm -f "${RESTART_DIR}/${name}" "${RESTART_DIR}/${name}.state" "${RESTART_DIR}/${name}.managed"
                 log "Stopped: $name"
                 (( count++ )) || true
             fi
@@ -620,6 +648,9 @@ start_copilot_in_tmux() {
     sleep 3
 
     log "  Session #${session_num} running (pid=$COPILOT_PANE_PID) — attach with: tmux attach -t $TMUX_SESSION"
+
+    # Mark this session as operator-managed so list_instances can find it
+    touch "${RESTART_DIR}/${TMUX_SESSION}.managed"
 }
 
 check_for_restart_signal() {
@@ -671,12 +702,7 @@ restart_copilot() {
 run_single_session() {
     local copilot_args=("--autopilot" "$@")
 
-    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-        echo "Error: instance '$INSTANCE_NAME' already exists." >&2
-        echo "  Attach: tmux attach -t $TMUX_SESSION" >&2
-        echo "  Stop:   operator stop $INSTANCE_NAME" >&2
-        exit 1
-    fi
+    handle_existing_session
 
     init_metrics_db
     OPERATOR_RUN_STARTED=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -700,7 +726,7 @@ run_single_session() {
         show_run_summary
     fi
 
-    rm -f "$RUN_SCRIPT"
+    rm -f "$RUN_SCRIPT" "${RESTART_DIR}/${TMUX_SESSION}.managed"
 }
 
 # ── Loop Mode ──────────────────────────────────────────────────
@@ -737,11 +763,7 @@ run_loop_mode() {
         OPERATOR_RUN_STARTED=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     fi
 
-    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-        log "Instance '$INSTANCE_NAME' already exists. Attach with: tmux attach -t $TMUX_SESSION"
-        log "To stop: $0 stop $INSTANCE_NAME"
-        exit 1
-    fi
+    handle_existing_session
 
     log "═══════════════════════════════════════════"
     log "Copilot CLI Operator starting (loop mode)"
@@ -771,7 +793,7 @@ run_loop_mode() {
                 save_instance_state
                 show_run_summary
                 log "Operator shutting down"
-                rm -f "$RUN_SCRIPT" "$RESTART_MARKER"
+                rm -f "$RUN_SCRIPT" "$RESTART_MARKER" "${RESTART_DIR}/${TMUX_SESSION}.managed"
                 exit 0
             fi
 
@@ -800,7 +822,7 @@ run_loop_mode() {
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
         tmux kill-session -t "$TMUX_SESSION"
     fi
-    rm -f "$RUN_SCRIPT" "$RESTART_MARKER"
+    rm -f "$RUN_SCRIPT" "$RESTART_MARKER" "${RESTART_DIR}/${TMUX_SESSION}.managed"
     log "Operator shut down"
 }
 
