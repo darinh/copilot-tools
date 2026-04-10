@@ -61,17 +61,9 @@ log() {
     echo "$msg" >&2
 }
 
+die() { echo "Error: $*" >&2; exit 1; }
+
 # ── Instance Management ────────────────────────────────────────
-next_instance_number() {
-    local max=0
-    while IFS= read -r name; do
-        if [[ "$name" =~ ^operator-copilot-([0-9]+)$ ]]; then
-            local n="${BASH_REMATCH[1]}"
-            (( n > max )) && max=$n
-        fi
-    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
-    echo $(( max + 1 ))
-}
 
 derive_instance_paths() {
     local name="$1"
@@ -105,9 +97,9 @@ list_instances() {
     echo "═══ Running Operator Instances ═══"
     echo
     local found=false
-    # Collect names of sessions managed by operator (have a restart marker or state file)
+    # Collect names of sessions managed by operator (have a .managed or .state marker)
     local -A managed_sessions
-    for f in "${RESTART_DIR}"/*.state "${RESTART_DIR}"/*.managed "${RESTART_DIR}"/operator-copilot-*; do
+    for f in "${RESTART_DIR}"/*.state "${RESTART_DIR}"/*.managed; do
         [[ -e "$f" ]] || continue
         local base
         base=$(basename "$f")
@@ -118,7 +110,7 @@ list_instances() {
     while IFS= read -r line; do
         local name
         name=$(echo "$line" | cut -d: -f1)
-        if [[ "$name" =~ ^operator-copilot- ]] || [[ "$name" == "copilot-operator" ]] || [[ -n "${managed_sessions[$name]+x}" ]]; then
+        if [[ -n "${managed_sessions[$name]+x}" ]]; then
             echo "  $line"
             found=true
         fi
@@ -488,7 +480,7 @@ USAGE
     operator help                                              Show this help
 
 OPTIONS
-    --name NAME     Set instance name (default: operator-copilot-{N}, auto-incremented)
+    --name NAME     Set instance name (default: current directory name)
     --loop          Enable autonomous loop mode
     --fresh         Reset session numbering (ignore prior state)
 
@@ -510,7 +502,7 @@ MODES
 MULTI-INSTANCE
     Multiple operator instances can run concurrently. Each gets its own
     tmux session and restart marker file. Use --name to assign a specific
-    name, or let the operator auto-assign operator-copilot-1, -2, etc.
+    name, or let the operator use the current directory name by default.
 
     operator --loop --name matrix --agent anvil:anvil
     operator --loop --name academy --agent anvil:anvil
@@ -561,23 +553,11 @@ stop_operator() {
     log "Stop requested${target:+ for $target}"
 
     if [[ -n "$target" ]]; then
-        # Prefix with operator-copilot- if user provided a short name
-        local full_name="$target"
-        if ! [[ "$target" =~ ^operator-copilot- ]]; then
-            full_name="operator-copilot-${target}"
-        fi
-        # Try both the full name and the original target
-        local found=false
-        for name in "$full_name" "$target"; do
-            if tmux has-session -t "$name" 2>/dev/null; then
-                tmux kill-session -t "$name"
-                rm -f "${RESTART_DIR}/${name}" "${RESTART_DIR}/${name}.state" "${RESTART_DIR}/${name}.managed"
-                log "Stopped: $name"
-                found=true
-                break
-            fi
-        done
-        if [[ "$found" == false ]]; then
+        if tmux has-session -t "$target" 2>/dev/null; then
+            tmux kill-session -t "$target"
+            rm -f "${RESTART_DIR}/${target}" "${RESTART_DIR}/${target}.state" "${RESTART_DIR}/${target}.managed"
+            log "Stopped: $target"
+        else
             echo "No instance '$target' found." >&2
             echo
             list_instances
@@ -585,7 +565,7 @@ stop_operator() {
         fi
     else
         local count=0
-        # Collect managed custom-named sessions
+        # Find all operator-managed sessions via .managed markers
         local -A managed_sessions
         for f in "${RESTART_DIR}"/*.managed; do
             [[ -e "$f" ]] || continue
@@ -594,7 +574,7 @@ stop_operator() {
             managed_sessions["$base"]=1
         done
         while IFS= read -r name; do
-            if [[ "$name" =~ ^operator-copilot- ]] || [[ "$name" == "copilot-operator" ]] || [[ -n "${managed_sessions[$name]+x}" ]]; then
+            if [[ -n "${managed_sessions[$name]+x}" ]]; then
                 tmux kill-session -t "$name"
                 rm -f "${RESTART_DIR}/${name}" "${RESTART_DIR}/${name}.state" "${RESTART_DIR}/${name}.managed"
                 log "Stopped: $name"
@@ -843,13 +823,7 @@ join_instance() {
         list_instances
         exit 0
     fi
-    local full_name="$target"
-    if ! [[ "$target" =~ ^operator-copilot- ]]; then
-        full_name="operator-copilot-${target}"
-    fi
-    if tmux has-session -t "$full_name" 2>/dev/null; then
-        exec tmux attach -t "$full_name"
-    elif tmux has-session -t "$target" 2>/dev/null; then
+    if tmux has-session -t "$target" 2>/dev/null; then
         exec tmux attach -t "$target"
     else
         echo "No instance '$target' found." >&2
@@ -866,13 +840,9 @@ reload_instance() {
         echo "Re-generates the run script for an instance using the current operator.sh." >&2
         exit 1
     fi
-    local full_name="$target"
-    if ! [[ "$target" =~ ^operator-copilot- ]]; then
-        full_name="operator-copilot-${target}"
-    fi
-    derive_instance_paths "$full_name"
+    derive_instance_paths "$target"
     if [[ ! -f "$RUN_SCRIPT" ]]; then
-        die "No run script found for '$full_name' at $RUN_SCRIPT"
+        die "No run script found for '$target' at $RUN_SCRIPT"
     fi
     # Extract the current copilot command from the existing run script (line starting with exec)
     local exec_line
@@ -897,7 +867,7 @@ reload_instance() {
         printf ' -i "$PREAMBLE"\n'
     } > "$RUN_SCRIPT"
     chmod +x "$RUN_SCRIPT"
-    log "Reloaded run script for $full_name"
+    log "Reloaded run script for $target"
     echo "✅ Run script updated: $RUN_SCRIPT"
     echo "   Changes take effect on next copilot restart."
 }
@@ -942,13 +912,9 @@ main() {
             ;;
     esac
 
-    # Positional shortcut: operator foo → join running instance
-    # Try operator-copilot-foo first (auto-named), then foo as-is (custom-named)
+    # Positional shortcut: operator foo → join running instance named "foo"
     if [[ $# -eq 1 && "${1:-}" != --* && -n "${1:-}" ]] && ! is_reserved_word "${1:-}"; then
-        local candidate="operator-copilot-$1"
-        if tmux has-session -t "$candidate" 2>/dev/null; then
-            exec tmux attach -t "$candidate"
-        elif tmux has-session -t "$1" 2>/dev/null; then
+        if tmux has-session -t "$1" 2>/dev/null; then
             exec tmux attach -t "$1"
         fi
     fi
@@ -1000,7 +966,10 @@ main() {
     done
 
     if [[ -z "$instance_name" ]]; then
-        instance_name="operator-copilot-$(next_instance_number)"
+        instance_name="$(basename "$(pwd)")"
+        if [[ -z "$instance_name" || "$instance_name" == "/" ]]; then
+            die "--name is required when running from the filesystem root"
+        fi
     fi
 
     derive_instance_paths "$instance_name"

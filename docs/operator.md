@@ -97,8 +97,8 @@ Unnamed instances (no `--name`) are always ephemeral and don't persist state.
 
 Multiple operator instances can run concurrently. Each gets its own tmux session and restart marker file.
 
-- `--name NAME` sets the instance name (always prefixed with `operator-copilot-`)
-- Without `--name`, auto-assigns `operator-copilot-1`, `operator-copilot-2`, etc.
+- `--name NAME` sets the instance name
+- Without `--name`, defaults to the current directory name (e.g., `~/projects/my-project` → `my-project`)
 
 ```bash
 # Start two independent loops
@@ -144,7 +144,7 @@ The operator stores metrics in `~/.copilot/operator-metrics.db` (SQLite). Each s
 ## Troubleshooting
 
 **"No instance found" when stopping**
-The `stop` command looks for tmux sessions named `operator-copilot-*`. If you started a session before multi-instance support, it may be named `copilot-operator` (legacy). `operator stop` handles both patterns.
+The `stop` command finds operator-managed sessions via `.managed` marker files in `~/.copilot/restart/`. If a session was started before this tracking was added, `operator stop` won't find it — use `tmux kill-session -t <name>` directly.
 
 **Metrics not captured**
 The operator finds copilot's log by matching the pane PID to `process-*-{pid}.log`. If copilot was restarted outside the operator, the PID won't match. Run `operator ingest` to process any unprocessed log files.
@@ -153,4 +153,4 @@ The operator finds copilot's log by matching the pane PID to `process-*-{pid}.lo
 This is normal if no operator sessions are active. Start one with `operator --loop --name myproject`.
 
 **Can't attach to a session**
-Find the session name with `operator list`, then: `tmux attach -t operator-copilot-myproject`
+Find the session name with `operator list`, then: `tmux attach -t myproject`
