@@ -585,8 +585,16 @@ stop_operator() {
         fi
     else
         local count=0
+        # Collect managed custom-named sessions
+        local -A managed_sessions
+        for f in "${RESTART_DIR}"/*.managed; do
+            [[ -e "$f" ]] || continue
+            local base
+            base=$(basename "$f" .managed)
+            managed_sessions["$base"]=1
+        done
         while IFS= read -r name; do
-            if [[ "$name" =~ ^operator-copilot- ]] || [[ "$name" == "copilot-operator" ]]; then
+            if [[ "$name" =~ ^operator-copilot- ]] || [[ "$name" == "copilot-operator" ]] || [[ -n "${managed_sessions[$name]+x}" ]]; then
                 tmux kill-session -t "$name"
                 rm -f "${RESTART_DIR}/${name}" "${RESTART_DIR}/${name}.state" "${RESTART_DIR}/${name}.managed"
                 log "Stopped: $name"
@@ -934,12 +942,14 @@ main() {
             ;;
     esac
 
-    # Positional shortcut: operator foo → join operator-copilot-foo
-    # Only if first arg is a bare word (not --flag, not a reserved subcommand)
+    # Positional shortcut: operator foo → join running instance
+    # Try operator-copilot-foo first (auto-named), then foo as-is (custom-named)
     if [[ $# -eq 1 && "${1:-}" != --* && -n "${1:-}" ]] && ! is_reserved_word "${1:-}"; then
         local candidate="operator-copilot-$1"
         if tmux has-session -t "$candidate" 2>/dev/null; then
             exec tmux attach -t "$candidate"
+        elif tmux has-session -t "$1" 2>/dev/null; then
+            exec tmux attach -t "$1"
         fi
     fi
 

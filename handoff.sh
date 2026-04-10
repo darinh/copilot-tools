@@ -55,9 +55,20 @@ resolve_instance() {
     local normalized
     normalized=$(cd "$project_root" 2>/dev/null && pwd) || return 1
 
+    # Collect operator-managed session names from markers
+    local -A managed_sessions
+    for f in "${RESTART_DIR}"/*.state "${RESTART_DIR}"/*.managed; do
+        [[ -e "$f" ]] || continue
+        local base
+        base=$(basename "$f")
+        base="${base%.state}"
+        base="${base%.managed}"
+        managed_sessions["$base"]=1
+    done
+
     local matches=()
     while IFS= read -r session_name; do
-        if [[ "$session_name" =~ ^operator-copilot- ]]; then
+        if [[ "$session_name" =~ ^operator-copilot- ]] || [[ -n "${managed_sessions[$session_name]+x}" ]]; then
             # Check if tmux session's cwd matches our project root
             local session_cwd
             session_cwd=$(tmux display-message -t "$session_name" -p '#{pane_current_path}' 2>/dev/null || echo "")
@@ -174,9 +185,15 @@ if [[ -z "$instance" ]]; then
     instance=$(resolve_instance "$project_root") || die "Cannot infer instance. Use --instance NAME"
 fi
 
-# Normalize instance name (add prefix if needed)
-if ! [[ "$instance" =~ ^operator-copilot- ]]; then
-    instance="operator-copilot-${instance}"
+# Normalize instance name — try as-is first, then prefixed for backward compat
+if tmux has-session -t "$instance" 2>/dev/null; then
+    : # name matches a running session as-is
+elif ! [[ "$instance" =~ ^operator-copilot- ]]; then
+    prefixed="operator-copilot-${instance}"
+    if tmux has-session -t "$prefixed" 2>/dev/null; then
+        instance="$prefixed"
+    fi
+    # If neither exists, keep as-is — the restart marker is name-based
 fi
 
 # Warn if instance isn't a running tmux session (non-fatal)
