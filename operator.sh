@@ -75,6 +75,15 @@ sanitize_session_name() {
     echo "$name"
 }
 
+# Set the terminal tab/window title via OSC 0. Windows Terminal honors this
+# from WSL. Only emits when stdout is a TTY so it doesn't pollute logs/pipes.
+# tmux default config has set-titles off, so this persists through tmux attach.
+set_tab_title() {
+    if [[ -t 1 ]]; then
+        printf '\033]0;%s\007' "$1"
+    fi
+}
+
 derive_instance_paths() {
     local name="$1"
     INSTANCE_NAME="$name"
@@ -701,7 +710,7 @@ restart_copilot() {
 
 # ── Single Session Mode ────────────────────────────────────────
 run_single_session() {
-    local copilot_args=("--autopilot" "$@")
+    local copilot_args=("--autopilot" "--effort" "high" "$@")
 
     handle_existing_session
 
@@ -714,6 +723,7 @@ run_single_session() {
     generate_run_script "${copilot_args[@]}"
     start_copilot_in_tmux 1 off
 
+    set_tab_title "operator - $INSTANCE_NAME"
     tmux attach -t "$TMUX_SESSION" 2>/dev/null || true
 
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
@@ -737,7 +747,7 @@ run_loop_mode() {
 
     trap cleanup SIGINT SIGTERM
 
-    local copilot_args=("--yolo" "--autopilot" "--no-ask-user")
+    local copilot_args=("--yolo" "--autopilot" "--no-ask-user" "--effort" "high")
 
     local agent_name
     agent_name=$(extract_agent_from_args "${user_args[@]}")
@@ -776,6 +786,8 @@ run_loop_mode() {
     log "  Restart signal: touch $RESTART_MARKER"
     log "  Attach: tmux attach -t $TMUX_SESSION"
     log "═══════════════════════════════════════════"
+
+    set_tab_title "operator - $INSTANCE_NAME"
 
     for session_num in $(seq "$start_session" "$MAX_SESSIONS"); do
         CURRENT_SESSION_NUM=$session_num
@@ -838,6 +850,7 @@ join_instance() {
     fi
     target="$(sanitize_session_name "$target")"
     if tmux has-session -t "$target" 2>/dev/null; then
+        set_tab_title "terminal - $target"
         exec tmux attach -t "$target"
     else
         echo "No instance '$target' found." >&2
@@ -874,6 +887,10 @@ reload_instance() {
     local args_str="${exec_line#exec copilot }"
     # Remove the old -i "$PREAMBLE" from args
     args_str=$(echo "$args_str" | sed 's/ -i "\$PREAMBLE"$//')
+    # Ensure --effort high is present
+    if [[ "$args_str" != *"--effort"* ]]; then
+        args_str="--effort high ${args_str}"
+    fi
     # Rebuild the run script
     {
         printf '#!/usr/bin/env bash\n'
@@ -930,6 +947,7 @@ main() {
     # Positional shortcut: operator foo → join running instance named "foo"
     if [[ $# -eq 1 && "${1:-}" != --* && -n "${1:-}" ]] && ! is_reserved_word "${1:-}"; then
         if tmux has-session -t "$1" 2>/dev/null; then
+            set_tab_title "terminal - $1"
             exec tmux attach -t "$1"
         fi
     fi
