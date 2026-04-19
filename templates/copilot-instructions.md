@@ -43,7 +43,7 @@ When setting up a new project, the user selects which conventions to enable:
 |---------|-------------|---------|
 | **Session Handoff** | `next-session.md` for cross-session continuity | ON |
 | **Session History** | SQL `session_log` table for audit trail | ON |
-| **Spec-Driven Development** | `specs/` directory as source of truth, mandatory spec change proposals | OFF |
+| **Spec-Driven Development** | Spec as source of truth, mandatory spec change proposals. Location: in-repo (`docs/spec/`) or project dir (`specs/`). | OFF |
 | **Branching Strategy** | develop → feature branches, conventional commits | ON |
 
 The generated `copilot-instructions.md` includes only the enabled sections.
@@ -135,6 +135,73 @@ CREATE TABLE IF NOT EXISTS session_log (
 **On session start**: `INSERT INTO session_log (branch, task_summary) VALUES ('{branch}', '{what you are working on}');`
 
 **On session end**: `UPDATE session_log SET ended_at = CURRENT_TIMESTAMP, commits = '{shas}', files_changed = '{files}', tests_before = N, tests_after = M, learnings = '{notes}', status = 'completed' WHERE id = {id};`
+
+---
+
+## Field Notes (Agent Journal)
+
+Cross-project working journal of insights about building, instructing, and collaborating with AI agents. Lives in its own repo (not per-project): `~/projects/agent-field-notes/`.
+
+```
+journal/    Chronological entries, one conversation per file.
+            Format: YYYY-MM-DD-slug.md
+essays/     Synthesized principles across multiple journal entries.
+            _pending.md tracks topics awaiting more evidence.
+```
+
+These notes are **about working with AI**, not about any one project's code. Topics include: model selection, agent orchestration, prompt engineering, failure modes, human-AI workflow philosophy, tooling discoveries.
+
+### When to write a journal entry (proactively, without being asked)
+
+Write a `journal/YYYY-MM-DD-slug.md` entry when something in conversation or work surfaces a transferable insight about how to work with AI:
+
+- Diagnosis of why an agent went sideways, and the principle behind it
+- Division-of-labor insight (cheap vs strong models, when to launch subagents)
+- Prompt-engineering tells — framings that change model behavior usefully
+- Failure modes the user might forget (especially wrong-but-plausible ones)
+- A verification gap a reviewer caught that your own checks missed
+- A user remark that reframes how the agent should operate
+
+**Conversation-driven, not task-driven.** Write because something was said or noticed that wouldn't be obvious to a future reader who wasn't in the room.
+
+### When NOT to write one
+
+- Routine task summaries → session history, not field notes
+- Project-specific code conventions → project `copilot-instructions.md` or `AGENTS.md`
+- Single-data-point claims with no story → wait for a second instance, then write the entry that ties them together
+
+### Format
+
+```markdown
+# YYYY-MM-DD — {short imperative or question}
+
+**Context**: What conversation/task surfaced this. Be specific.
+
+## What I said (the gist)
+The reasoning, expressed crisply.
+
+## What he replied / what we noticed
+The human's reaction, especially if it shifted the frame. Quote actual exchanges when they matter.
+
+## What I learned
+Numbered transferable principles.
+
+## What we changed (or are about to)
+Concrete artifact / instruction change / `_pending.md` entry.
+
+## Quote worth keeping
+Optional sentence that captures the principle.
+```
+
+### Rules
+
+- **Volunteer them** — don't wait to be asked.
+- **Write in the conversation, not after.** Memory rewrites things.
+- **Quote actual exchanges.** Don't smooth them.
+- **A principle without a story is a slogan.** Always include the story.
+- **Don't edit old entries to be right** — write a follow-up. Wrongness is data.
+- **Add unsynthesized themes to `essays/_pending.md`** when a conversation hints at a bigger pattern.
+- **Commit them.** This is a real repo.
 
 ---
 
