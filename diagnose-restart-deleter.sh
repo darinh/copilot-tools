@@ -8,32 +8,31 @@
 #
 # Why this script exists:
 #   inotifywait shows WHAT was deleted but not WHO deleted it.
-#   The Linux audit subsystem (auditd) records the offending PID,
-#   comm, and exe. This script wires up a temporary audit watch,
-#   waits for the next deletion, captures the culprit, then cleans up.
+#   On WSL2 the kernel audit subsystem isn't available, so we use
+#   fanotify (via the `fatrace` tool) which works on WSL2 and reports
+#   the offending PID and comm for every filesystem event.
 #
 # Usage:
 #   sudo ./diagnose-restart-deleter.sh           # waits indefinitely
 #   sudo ./diagnose-restart-deleter.sh --once    # exit after first capture
 #
-# Requires: sudo, auditctl, ausearch (apt-get install auditd)
+# Requires: sudo, fatrace (apt-get install fatrace)
 # ═══════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 if [[ "$(id -u)" -ne 0 ]]; then
-    echo "This script must run as root (auditctl requires CAP_AUDIT_CONTROL)." >&2
+    echo "This script must run as root (fatrace needs CAP_SYS_ADMIN)." >&2
     echo "Re-run: sudo $0 $*" >&2
     exit 1
 fi
 
-if ! command -v auditctl >/dev/null 2>&1; then
-    echo "auditctl not installed. Install with: sudo apt-get install -y auditd" >&2
+if ! command -v fatrace >/dev/null 2>&1; then
+    echo "fatrace not installed. Install with: sudo apt-get install -y fatrace" >&2
     exit 1
 fi
 
-# Resolve the real user's home (we're running as root via sudo)
+# Resolve the real user's home (we're running as root via sudo).
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo "$USER")}"
-# Validate REAL_USER to a safe charset before letting it flow into paths/chown
 if ! [[ "$REAL_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
     echo "Refusing to run: SUDO_USER value '$REAL_USER' is not a safe username." >&2
     exit 1
@@ -45,12 +44,11 @@ if [[ -z "$REAL_HOME" || ! -d "$REAL_HOME" ]]; then
 fi
 RESTART_DIR="${REAL_HOME}/.copilot/restart"
 RESTART_PARENT="${REAL_HOME}/.copilot"
-KEY="copilot_restart_kill_$$"
 ONCE=false
 [[ "${1:-}" == "--once" ]] && ONCE=true
 
-# Refuse to operate if either path is a symlink — a malicious symlink could
-# point chown / mkdir at arbitrary system locations.
+# Refuse to operate if either path is a symlink — a malicious symlink
+# could redirect chown / mkdir at arbitrary system locations.
 for _p in "$RESTART_PARENT" "$RESTART_DIR"; do
     if [[ -L "$_p" ]]; then
         echo "Refusing to run: $_p is a symlink. Resolve it first." >&2
@@ -58,72 +56,112 @@ for _p in "$RESTART_PARENT" "$RESTART_DIR"; do
     fi
 done
 
-# Confirm the parent is owned by REAL_USER before touching anything inside it.
+# Confirm the parent is owned by REAL_USER before touching anything inside.
 PARENT_OWNER=$(stat -c '%U' "$RESTART_PARENT" 2>/dev/null || echo "")
 if [[ "$PARENT_OWNER" != "$REAL_USER" ]]; then
     echo "Refusing to run: $RESTART_PARENT is owned by '$PARENT_OWNER', expected '$REAL_USER'." >&2
     exit 1
 fi
 
-# Create the dir if missing, then chown without following symlinks.
 mkdir -p "$RESTART_DIR"
 chown -h "$REAL_USER:$REAL_USER" "$RESTART_DIR"
 
+LOG_FILE="$(mktemp -t fatrace-restart.XXXXXX.log)"
+chown "$REAL_USER:$REAL_USER" "$LOG_FILE"
+FATRACE_PID=""
+
 cleanup() {
+    if [[ -n "$FATRACE_PID" ]] && kill -0 "$FATRACE_PID" 2>/dev/null; then
+        kill "$FATRACE_PID" 2>/dev/null || true
+        wait "$FATRACE_PID" 2>/dev/null || true
+    fi
     echo
-    echo "Removing audit watches…"
-    auditctl -d -w "$RESTART_DIR"  -p w -k "$KEY" 2>/dev/null || true
-    auditctl -d -w "$RESTART_PARENT" -p w -k "$KEY" 2>/dev/null || true
+    echo "Full fatrace log retained at: $LOG_FILE"
 }
 trap cleanup EXIT INT TERM
 
-echo "Watching $RESTART_DIR (key=$KEY)"
-auditctl -w "$RESTART_DIR"  -p w -k "$KEY"
-auditctl -w "$RESTART_PARENT" -p w -k "$KEY"
+echo "Watching $RESTART_DIR via fatrace"
+echo "Log file: $LOG_FILE"
 
-LAST_TS_FILE="$(mktemp)"
-date '+%H:%M:%S' > "$LAST_TS_FILE"
+# fatrace -c keeps comm names short; -t adds timestamps.
+# It can't filter by path, so we capture everything and grep.
+fatrace -t -c >"$LOG_FILE" 2>&1 &
+FATRACE_PID=$!
 
+# Give fatrace a moment to set up its fanotify mark.
+sleep 1
+if ! kill -0 "$FATRACE_PID" 2>/dev/null; then
+    echo "fatrace died immediately. Output:" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+fi
+
+echo
 echo "Waiting for the next vanish event…"
 echo "  (Trigger one by running 'operator --loop' in another window and answering 'y',"
-echo "   or just wait — your live operators restart roughly every few minutes.)"
+echo "   or just wait — your live operators restart on their own.)"
 echo
+
+REPORT_AND_RECREATE() {
+    echo "════════════════════════════════════════════════════════════════"
+    echo "VANISH DETECTED at $(date)"
+    echo "════════════════════════════════════════════════════════════════"
+    # Let fatrace flush.
+    sleep 1
+    echo
+    echo "── fatrace events touching .copilot/restart (last 50) ──"
+    grep -E '\.copilot(/restart)?(/|$| )' "$LOG_FILE" 2>/dev/null \
+        | tail -50 || echo "(nothing matched yet — see full log)"
+    echo
+    echo "── Delete events specifically (D = delete) ──"
+    # fatrace D events look like: 'comm(pid): D /full/path'
+    grep -E '\): D[+ ]' "$LOG_FILE" 2>/dev/null \
+        | grep -E '\.copilot(/restart)?' \
+        | tail -20 || echo "(no delete events captured — try a longer wait)"
+    echo
+    echo "── Resolving exe paths for PIDs seen above ──"
+    # Pull unique PIDs from the matching lines and resolve /proc/<pid>/exe
+    # while we still can (some may have exited).
+    pids=$(grep -E '\): [CDOWR][+ ]' "$LOG_FILE" 2>/dev/null \
+        | grep -E '\.copilot(/restart)?' \
+        | sed -nE 's/.*\(([0-9]+)\):.*/\1/p' \
+        | sort -u | tail -20)
+    if [[ -n "$pids" ]]; then
+        for pid in $pids; do
+            exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo "(gone)")
+            comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "(gone)")
+            cmdline=$(tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null || echo "(gone)")
+            ppid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo "?")
+            echo "  pid=$pid ppid=$ppid comm=$comm"
+            echo "    exe=$exe"
+            echo "    cmd=$cmdline"
+        done
+    else
+        echo "(no PIDs to resolve)"
+    fi
+    echo
+    echo "── Process tree right now ──"
+    ps -ef --forest 2>/dev/null | grep -E "copilot|operator|tmux|node|bash" | head -40
+    echo "════════════════════════════════════════════════════════════════"
+
+    # Re-validate paths/ownership before recreating.
+    if [[ -L "$RESTART_PARENT" || -L "$RESTART_DIR" ]]; then
+        echo "ABORT: path became a symlink during watch — not recreating." >&2
+        exit 1
+    fi
+    _parent_owner_now=$(stat -c '%U' "$RESTART_PARENT" 2>/dev/null || echo "")
+    if [[ "$_parent_owner_now" != "$REAL_USER" ]]; then
+        echo "ABORT: $RESTART_PARENT ownership changed to '$_parent_owner_now' — not recreating." >&2
+        exit 1
+    fi
+    mkdir -p "$RESTART_DIR"
+    chown -h "$REAL_USER:$REAL_USER" "$RESTART_DIR"
+}
 
 while true; do
     sleep 2
     if [[ ! -d "$RESTART_DIR" ]]; then
-        echo "════════════════════════════════════════════════════════════════"
-        echo "VANISH DETECTED at $(date)"
-        echo "════════════════════════════════════════════════════════════════"
-        # Give audit a moment to flush
-        sleep 1
-        echo
-        echo "── Audit records (last 30 seconds) ──"
-        ausearch -k "$KEY" --start recent -i 2>/dev/null | tail -200 || true
-        echo
-        echo "── Specifically: rmdir / unlink / rename syscalls on the dir ──"
-        ausearch -k "$KEY" --start recent -i 2>/dev/null \
-            | grep -E "syscall=(rmdir|unlink|unlinkat|rename|renameat)" -B1 -A4 || true
-        echo
-        echo "── Process tree at this moment ──"
-        ps -ef --forest 2>/dev/null | grep -E "copilot|operator|tmux|node|bash" | head -40
-        echo "════════════════════════════════════════════════════════════════"
-        # Recreate so subsequent operators don't get hosed.
-        # Re-validate BOTH path components are not symlinks and that the
-        # parent is still owned by REAL_USER before touching anything. A
-        # symlink swap during the wait loop could otherwise misdirect
-        # mkdir / chown as root.
-        if [[ -L "$RESTART_PARENT" || -L "$RESTART_DIR" ]]; then
-            echo "ABORT: path became a symlink during watch — not recreating." >&2
-            exit 1
-        fi
-        _parent_owner_now=$(stat -c '%U' "$RESTART_PARENT" 2>/dev/null || echo "")
-        if [[ "$_parent_owner_now" != "$REAL_USER" ]]; then
-            echo "ABORT: $RESTART_PARENT ownership changed to '$_parent_owner_now' — not recreating." >&2
-            exit 1
-        fi
-        mkdir -p "$RESTART_DIR"
-        chown -h "$REAL_USER:$REAL_USER" "$RESTART_DIR"
+        REPORT_AND_RECREATE
         if [[ "$ONCE" == true ]]; then
             echo "Captured. Exiting."
             exit 0
