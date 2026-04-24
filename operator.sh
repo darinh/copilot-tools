@@ -646,6 +646,32 @@ start_copilot_in_tmux() {
 
     rm -f "$RESTART_MARKER"
 
+    # Snapshot the names of all sibling .managed markers BEFORE we launch
+    # copilot. If the upcoming launch causes the wholesale dir-vanish (see
+    # comment at recovery block below), this lets us restore exactly the
+    # markers that existed — no more, no less. This is more reliable than
+    # inferring liveness from leftover operator-run-*.sh files (which
+    # `operator stop` does not delete).
+    #
+    # Known tradeoff: markers created by OTHER operators during our ~3s
+    # launch window are not in this snapshot. If such a marker is lost to
+    # the vanish, that operator's next natural file-write (within seconds)
+    # will restore it. We deliberately do NOT fall back to bare
+    # `tmux list-sessions` to populate the snapshot — any tmux session with
+    # a colliding name would get a bogus .managed marker written.
+    local -a PRE_LAUNCH_MARKERS=()
+    if [[ -d "$RESTART_DIR" ]]; then
+        local _f
+        for _f in "$RESTART_DIR"/*.managed; do
+            [[ -e "$_f" ]] || continue
+            local _base
+            _base=$(basename "$_f")
+            _base="${_base%.managed}"
+            [[ "$_base" == "$TMUX_SESSION" ]] && continue
+            PRE_LAUNCH_MARKERS+=("$_base")
+        done
+    fi
+
     tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 
     tmux new-session -d -s "$TMUX_SESSION" -c "$(pwd)" "$RUN_SCRIPT"
@@ -659,7 +685,47 @@ start_copilot_in_tmux() {
 
     log "  Session #${session_num} running (pid=$COPILOT_PANE_PID) — attach with: tmux attach -t $TMUX_SESSION"
 
-    # Mark this session as operator-managed so list_instances can find it
+    # Mark this session as operator-managed so list_instances can find it.
+    #
+    # Known issue: $RESTART_DIR is wholesale-deleted (rmdir) within ~3s of
+    # launching a fresh copilot in tmux. Confirmed via inotify trace
+    # (DELETE_SELF on the dir, preceded by DELETE on every remaining child).
+    # The deleter is NOT operator.sh, handoff.sh, or copilot-context-watchdog
+    # (statically verified — no rm -rf / rmdir of $RESTART_DIR in any of them).
+    # Strong correlation with copilot startup itself or one of its plugins/hooks
+    # — needs auditctl/strace (sudo) to pin the offending PID.
+    #
+    # Defensive recovery: recreate the dir AND restore the .managed markers
+    # we snapshotted BEFORE launch (PRE_LAUNCH_MARKERS), so `operator list`
+    # and any pending handoffs survive the deletion. Without this, all OTHER
+    # live operators silently disappear from `operator list` until they each
+    # restart.
+    #
+    # Each restored marker is also cross-checked against a live tmux session
+    # — if the named session is no longer running, we don't restore (it was
+    # legitimately stopped during our launch window).
+    if [[ ! -d "$RESTART_DIR" ]]; then
+        log "WARN: $RESTART_DIR vanished between startup and session launch — recreating + restoring ${#PRE_LAUNCH_MARKERS[@]} sibling marker(s)."
+        log "  To capture the culprit on the next vanish (requires sudo), run:"
+        log "     ${SCRIPT_DIR:-/home/darin/projects/copilot-tools}/diagnose-restart-deleter.sh"
+        mkdir -p "$RESTART_DIR"
+        if (( ${#PRE_LAUNCH_MARKERS[@]} > 0 )); then
+            local -A _live_sessions=()
+            local _s
+            while IFS= read -r _s; do
+                [[ -n "$_s" ]] && _live_sessions["$_s"]=1
+            done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+            local _name
+            for _name in "${PRE_LAUNCH_MARKERS[@]}"; do
+                if [[ -n "${_live_sessions[$_name]+x}" ]]; then
+                    touch "${RESTART_DIR}/${_name}.managed"
+                    log "  Restored marker for live instance: $_name"
+                else
+                    log "  Skipped marker for $_name (tmux session no longer exists)"
+                fi
+            done
+        fi
+    fi
     touch "${RESTART_DIR}/${TMUX_SESSION}.managed"
 }
 
