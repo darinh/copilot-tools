@@ -104,47 +104,55 @@ echo "  (Trigger one by running 'operator --loop' in another window and answerin
 echo "   or just wait — your live operators restart on their own.)"
 echo
 
+REPORT_FILE="${REAL_HOME}/.copilot/diagnose-restart-report.log"
+
 REPORT_AND_RECREATE() {
-    echo "════════════════════════════════════════════════════════════════"
-    echo "VANISH DETECTED at $(date)"
-    echo "════════════════════════════════════════════════════════════════"
-    # Let fatrace flush.
-    sleep 1
-    echo
-    echo "── fatrace events touching .copilot/restart (last 50) ──"
-    grep -E '\.copilot(/restart)?(/|$| )' "$LOG_FILE" 2>/dev/null \
-        | tail -50 || echo "(nothing matched yet — see full log)"
-    echo
-    echo "── Delete events specifically (D = delete) ──"
-    # fatrace D events look like: 'comm(pid): D /full/path'
-    grep -E '\): D[+ ]' "$LOG_FILE" 2>/dev/null \
-        | grep -E '\.copilot(/restart)?' \
-        | tail -20 || echo "(no delete events captured — try a longer wait)"
-    echo
-    echo "── Resolving exe paths for PIDs seen above ──"
-    # Pull unique PIDs from the matching lines and resolve /proc/<pid>/exe
-    # while we still can (some may have exited).
-    pids=$(grep -E '\): [CDOWR][+ ]' "$LOG_FILE" 2>/dev/null \
-        | grep -E '\.copilot(/restart)?' \
-        | sed -nE 's/.*\(([0-9]+)\):.*/\1/p' \
-        | sort -u | tail -20)
-    if [[ -n "$pids" ]]; then
-        for pid in $pids; do
-            exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo "(gone)")
-            comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "(gone)")
-            cmdline=$(tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null || echo "(gone)")
-            ppid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo "?")
-            echo "  pid=$pid ppid=$ppid comm=$comm"
-            echo "    exe=$exe"
-            echo "    cmd=$cmdline"
-        done
-    else
-        echo "(no PIDs to resolve)"
-    fi
-    echo
-    echo "── Process tree right now ──"
-    ps -ef --forest 2>/dev/null | grep -E "copilot|operator|tmux|node|bash" | head -40
-    echo "════════════════════════════════════════════════════════════════"
+    # Tee everything below to BOTH stdout and a user-readable report file
+    # so the agent / future-you can read it without needing sudo.
+    {
+        echo "════════════════════════════════════════════════════════════════"
+        echo "VANISH DETECTED at $(date)"
+        echo "════════════════════════════════════════════════════════════════"
+        # Let fatrace flush.
+        sleep 1
+        echo
+        echo "── fatrace events touching .copilot/restart (last 50) ──"
+        grep -E '\.copilot(/restart)?(/|$| )' "$LOG_FILE" 2>/dev/null \
+            | tail -50 || echo "(nothing matched yet — see full log)"
+        echo
+        echo "── Delete events specifically (D = delete) ──"
+        # fatrace D events look like: 'comm(pid): D /full/path'
+        grep -E '\): D[+ ]' "$LOG_FILE" 2>/dev/null \
+            | grep -E '\.copilot(/restart)?' \
+            | tail -20 || echo "(no delete events captured — try a longer wait)"
+        echo
+        echo "── Resolving exe paths for PIDs seen above ──"
+        # Pull unique PIDs from the matching lines and resolve /proc/<pid>/exe
+        # while we still can (some may have exited).
+        pids=$(grep -E '\): [CDOWR][+ ]' "$LOG_FILE" 2>/dev/null \
+            | grep -E '\.copilot(/restart)?' \
+            | sed -nE 's/.*\(([0-9]+)\):.*/\1/p' \
+            | sort -u | tail -20)
+        if [[ -n "$pids" ]]; then
+            for pid in $pids; do
+                exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo "(gone)")
+                comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "(gone)")
+                cmdline=$(tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null || echo "(gone)")
+                ppid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo "?")
+                echo "  pid=$pid ppid=$ppid comm=$comm"
+                echo "    exe=$exe"
+                echo "    cmd=$cmdline"
+            done
+        else
+            echo "(no PIDs to resolve)"
+        fi
+        echo
+        echo "── Process tree right now ──"
+        ps -ef --forest 2>/dev/null | grep -E "copilot|operator|tmux|node|bash" | head -40
+        echo "════════════════════════════════════════════════════════════════"
+    } | tee -a "$REPORT_FILE"
+    chown "$REAL_USER:$REAL_USER" "$REPORT_FILE" 2>/dev/null || true
+    chmod 644 "$REPORT_FILE" 2>/dev/null || true
 
     # Re-validate paths/ownership before recreating.
     if [[ -L "$RESTART_PARENT" || -L "$RESTART_DIR" ]]; then
