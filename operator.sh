@@ -779,23 +779,22 @@ start_copilot_in_tmux() {
 
     # Mark this session as operator-managed so list_instances can find it.
     #
-    # Historical note: prior to moving RESTART_DIR out of ~/.copilot, the copilot
-    # CLI itself would wholesale-delete ~/.copilot/restart on every startup
-    # (confirmed via fatrace — copilot's MainThread does open/readdir/unlink/rmdir
-    # within ~3s of launch). The path move eliminates that collision. The
-    # snapshot/restore code below remains as belt-and-suspenders in case any
-    # future tool also decides to nuke our restart dir.
-    # snapshotted BEFORE launch (PRE_LAUNCH_MARKERS), so `operator list`
-    # and any pending handoffs survive the deletion. Without this, all OTHER
-    # live operators silently disappear from `operator list` until they each
-    # restart.
+    # Historical note: prior to moving RESTART_DIR out of ~/.copilot, the
+    # copilot CLI itself would wholesale-delete ~/.copilot/restart on every
+    # startup (confirmed via fatrace — copilot's MainThread does
+    # open/readdir/unlink/rmdir within ~3s of launch). The path move
+    # eliminates that collision and the snapshot/restore below should now
+    # be a no-op in practice.
     #
-    # Each restored marker is also cross-checked against a live tmux session
-    # — if the named session is no longer running, we don't restore (it was
-    # legitimately stopped during our launch window).
+    # Belt-and-suspenders: if anything ever DOES nuke RESTART_DIR mid-launch
+    # (a future tool, a misbehaving cleanup script, etc.), we restore the
+    # .managed markers we snapshotted BEFORE launch (PRE_LAUNCH_MARKERS) so
+    # `operator list` and pending handoffs survive. Each restored marker is
+    # cross-checked against a live tmux session — if the named session is no
+    # longer running, we don't restore it (it was legitimately stopped
+    # during our launch window).
     if [[ ! -d "$RESTART_DIR" ]]; then
-        log "WARN: $RESTART_DIR vanished between startup and session launch — recreating + restoring ${#PRE_LAUNCH_MARKERS[@]} sibling marker(s)."
-        log "  To capture the culprit on the next vanish (requires sudo), run:"
+        log "WARN: $RESTART_DIR vanished between startup and session launch — unexpected after the ~/.operator/ move. Recreating + restoring ${#PRE_LAUNCH_MARKERS[@]} sibling marker(s). If this fires repeatedly, run:"
         log "     ${SCRIPT_DIR:-/home/darin/projects/copilot-tools}/diagnose-restart-deleter.sh"
         mkdir -p "$RESTART_DIR"
         if (( ${#PRE_LAUNCH_MARKERS[@]} > 0 )); then
