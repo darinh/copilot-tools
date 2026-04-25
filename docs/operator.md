@@ -78,7 +78,7 @@ Ctrl+C captures final metrics and shows an aggregate run summary.
 
 Named instances automatically resume where they left off when restarted. Session numbering and run summary scope carry over between operator restarts.
 
-State is stored in `~/.copilot/restart/{name}.state` and includes the session number and original run start time.
+State is stored in `~/.operator/restart/{name}.state` and includes the session number and original run start time.
 
 ```bash
 # First run — starts at session #1
@@ -117,7 +117,7 @@ operator stop
 
 ## Metrics
 
-The operator stores metrics in `~/.copilot/operator-metrics.db` (SQLite). Each session records:
+The operator stores metrics in `~/.operator/metrics.db` (SQLite). Each session records:
 
 - Premium requests consumed
 - API time (seconds)
@@ -134,17 +134,21 @@ The operator stores metrics in `~/.copilot/operator-metrics.db` (SQLite). Each s
 
 | Path | Description |
 |------|-------------|
-| `~/.copilot/operator-metrics.db` | SQLite metrics database |
-| `~/.copilot/operator.log` | Operator log file |
+| `~/.operator/` | Operator state directory (override with `COPILOT_OPERATOR_HOME`) |
+| `~/.operator/metrics.db` | SQLite metrics database |
+| `~/.operator/operator.log` | Operator log file |
+| `~/.operator/restart/` | Per-instance restart marker files |
+| `~/.operator/restart/*.state` | Auto-continue state (session number, run start time) |
+| `~/.operator/run-<instance>.sh` | Per-instance launch script |
+| `~/.operator/backups/` | Historical backups of operator.sh |
 | `~/.copilot/logs/process-*.log` | Copilot process logs (source data) |
-| `~/.copilot/restart/` | Per-instance restart marker files |
-| `~/.copilot/restart/*.state` | Auto-continue state (session number, run start time) |
-| `~/.copilot/operator-backups/` | Historical backups of operator.sh |
+
+> **Note**: Operator state used to live under `~/.copilot/`, but the copilot CLI itself wholesale-deletes `~/.copilot/restart/` on every startup (confirmed via fatrace). State was moved to `~/.operator/` to eliminate the collision. On first run, `operator.sh` automatically migrates any legacy state from `~/.copilot/` into `~/.operator/`.
 
 ## Troubleshooting
 
 **"No instance found" when stopping**
-The `stop` command finds operator-managed sessions via `.managed` marker files in `~/.copilot/restart/`. If a session was started before this tracking was added, `operator stop` won't find it — use `tmux kill-session -t <name>` directly.
+The `stop` command finds operator-managed sessions via `.managed` marker files in `~/.operator/restart/`. If a session was started before this tracking was added, `operator stop` won't find it — use `tmux kill-session -t <name>` directly.
 
 **Metrics not captured**
 The operator finds copilot's log by matching the pane PID to `process-*-{pid}.log`. If copilot was restarted outside the operator, the PID won't match. Run `operator ingest` to process any unprocessed log files.

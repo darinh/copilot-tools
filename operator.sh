@@ -31,10 +31,25 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 # ── Constants ───────────────────────────────────────────────────
-RESTART_DIR="${HOME}/.copilot/restart"
-LOG_FILE="${HOME}/.copilot/operator.log"
-METRICS_DB="${HOME}/.copilot/operator-metrics.db"
+# All operator state lives in ~/.operator/ (NOT ~/.copilot/).
+# The copilot CLI itself wholesale-deletes ~/.copilot/restart/ on every
+# startup (confirmed via fatrace: copilot's MainThread does
+# open/readdir/unlink/rmdir of that path within ~3s of launch). To avoid
+# the name collision, and to keep operator state cleanly separated from
+# copilot's own state, everything operator-related now lives outside
+# ~/.copilot.
+OPERATOR_HOME="${COPILOT_OPERATOR_HOME:-${HOME}/.operator}"
+RESTART_DIR="${OPERATOR_HOME}/restart"
+LOG_FILE="${OPERATOR_HOME}/operator.log"
+METRICS_DB="${OPERATOR_HOME}/metrics.db"
 COPILOT_LOG_DIR="${HOME}/.copilot/logs"
+
+# Legacy paths (for one-time migration). Anything found here on startup gets
+# moved into the new locations under $OPERATOR_HOME.
+LEGACY_RESTART_DIR="${HOME}/.copilot/restart"
+LEGACY_LOG_FILE="${HOME}/.copilot/operator.log"
+LEGACY_METRICS_DB="${HOME}/.copilot/operator-metrics.db"
+LEGACY_BACKUPS_DIR="${HOME}/.copilot/operator-backups"
 POLL_INTERVAL=10
 MAX_SESSIONS=1000
 
@@ -53,7 +68,7 @@ IS_FRESH=false
 COPILOT_PANE_PID=""
 
 # ── Logging ─────────────────────────────────────────────────────
-mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$OPERATOR_HOME" "$(dirname "$LOG_FILE")"
 
 log() {
     local msg="[operator $(date '+%Y-%m-%d %H:%M:%S')] $*"
@@ -90,8 +105,82 @@ derive_instance_paths() {
     TMUX_SESSION="$name"
     RESTART_MARKER="${RESTART_DIR}/${name}"
     STATE_FILE="${RESTART_DIR}/${name}.state"
-    RUN_SCRIPT="${HOME}/.copilot/operator-run-${name}.sh"
+    RUN_SCRIPT="${OPERATOR_HOME}/run-${name}.sh"
     mkdir -p "$RESTART_DIR"
+}
+
+# One-time migration: move operator state out of ~/.copilot/ (where it
+# collides with the copilot CLI) into ~/.operator/. Safe to call repeatedly
+# — only acts on legacy paths that still exist. The legacy ~/.copilot/restart
+# directory itself gets nuked by copilot on its next startup, so we don't
+# bother to rmdir it.
+migrate_legacy_state() {
+    local moved=0 f base
+
+    # Ensure target directories exist before we try to mv into them.
+    mkdir -p "$RESTART_DIR" "$OPERATOR_HOME"
+
+    # 1. Restart markers / state files
+    if [[ -d "$LEGACY_RESTART_DIR" && "$LEGACY_RESTART_DIR" != "$RESTART_DIR" ]]; then
+        shopt -s nullglob
+        for f in "$LEGACY_RESTART_DIR"/*.state "$LEGACY_RESTART_DIR"/*.managed "$LEGACY_RESTART_DIR"/*; do
+            [[ -e "$f" ]] || continue
+            base="$(basename "$f")"
+            if [[ ! -e "${RESTART_DIR}/${base}" ]]; then
+                mv "$f" "${RESTART_DIR}/${base}" 2>/dev/null && (( moved++ )) || true
+            fi
+        done
+        shopt -u nullglob
+    fi
+
+    # 2. Per-instance run scripts (~/.copilot/operator-run-*.sh -> ~/.operator/run-*.sh)
+    shopt -s nullglob
+    for f in "${HOME}/.copilot/operator-run-"*.sh; do
+        [[ -e "$f" ]] || continue
+        base="$(basename "$f")"
+        base="${base#operator-run-}"
+        if [[ ! -e "${OPERATOR_HOME}/run-${base}" ]]; then
+            mv "$f" "${OPERATOR_HOME}/run-${base}" 2>/dev/null && (( moved++ )) || true
+        fi
+    done
+    shopt -u nullglob
+
+    # 3. Metrics DB
+    if [[ -f "$LEGACY_METRICS_DB" && ! -e "$METRICS_DB" ]]; then
+        mv "$LEGACY_METRICS_DB" "$METRICS_DB" 2>/dev/null && (( moved++ )) || true
+    fi
+
+    # 4. Operator log
+    if [[ -f "$LEGACY_LOG_FILE" && ! -e "$LOG_FILE" ]]; then
+        mv "$LEGACY_LOG_FILE" "$LOG_FILE" 2>/dev/null && (( moved++ )) || true
+    fi
+
+    # 5. Backups dir
+    if [[ -d "$LEGACY_BACKUPS_DIR" && ! -e "${OPERATOR_HOME}/backups" ]]; then
+        mv "$LEGACY_BACKUPS_DIR" "${OPERATOR_HOME}/backups" 2>/dev/null && (( moved++ )) || true
+    fi
+
+    if (( moved > 0 )); then
+        log "Migrated $moved legacy operator artifact(s) from ~/.copilot/ to $OPERATOR_HOME"
+    fi
+
+    # Auto-heal: any live tmux session that has a matching run-<name>.sh
+    # script but no .managed marker (because the bug destroyed it earlier)
+    # gets its marker recreated. Only restores markers we know are operator-
+    # owned (run script must exist).
+    if command -v tmux >/dev/null 2>&1; then
+        local healed=0 sess
+        while IFS= read -r sess; do
+            [[ -z "$sess" ]] && continue
+            if [[ -f "${OPERATOR_HOME}/run-${sess}.sh" && ! -e "${RESTART_DIR}/${sess}.managed" ]]; then
+                touch "${RESTART_DIR}/${sess}.managed"
+                (( healed++ )) || true
+            fi
+        done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+        if (( healed > 0 )); then
+            log "Auto-healed $healed .managed marker(s) for live tmux session(s)"
+        fi
+    fi
 }
 
 save_instance_state() {
@@ -555,12 +644,15 @@ INGEST
     --force     Reprocess ALL log files, updating existing records.
 
 FILES
-    ~/.copilot/operator-metrics.db      SQLite metrics database
-    ~/.copilot/operator.log             Operator log file
+    ~/.operator/                        Operator state directory (override
+                                        with COPILOT_OPERATOR_HOME env var)
+    ~/.operator/metrics.db              SQLite metrics database
+    ~/.operator/operator.log            Operator log file
+    ~/.operator/restart/                Per-instance restart marker files
+    ~/.operator/run-<instance>.sh       Per-instance launch script
+    ~/.operator/backups/                Backups of operator.sh
     operator-ingest.py                  Log parser (lives next to operator.sh)
     ~/.copilot/logs/process-*.log       Copilot process logs (source data)
-    ~/.copilot/restart/                 Per-instance restart marker files
-    ~/.copilot/operator-backups/        Backups of operator.sh
 
 DEPENDENCIES
     tmux, sqlite3, python3, copilot
@@ -687,16 +779,13 @@ start_copilot_in_tmux() {
 
     # Mark this session as operator-managed so list_instances can find it.
     #
-    # Known issue: $RESTART_DIR is wholesale-deleted (rmdir) within ~3s of
-    # launching a fresh copilot in tmux. Confirmed via inotify trace
-    # (DELETE_SELF on the dir, preceded by DELETE on every remaining child).
-    # The deleter is NOT operator.sh, handoff.sh, or copilot-context-watchdog
-    # (statically verified — no rm -rf / rmdir of $RESTART_DIR in any of them).
-    # Strong correlation with copilot startup itself or one of its plugins/hooks
-    # — needs auditctl/strace (sudo) to pin the offending PID.
-    #
-    # Defensive recovery: recreate the dir AND restore the .managed markers
-    # we snapshotted BEFORE launch (PRE_LAUNCH_MARKERS), so `operator list`
+    # Historical note: prior to moving RESTART_DIR out of ~/.copilot, the copilot
+    # CLI itself would wholesale-delete ~/.copilot/restart on every startup
+    # (confirmed via fatrace — copilot's MainThread does open/readdir/unlink/rmdir
+    # within ~3s of launch). The path move eliminates that collision. The
+    # snapshot/restore code below remains as belt-and-suspenders in case any
+    # future tool also decides to nuke our restart dir.
+    # snapshotted BEFORE launch (PRE_LAUNCH_MARKERS), so `operator list`
     # and any pending handoffs survive the deletion. Without this, all OTHER
     # live operators silently disappear from `operator list` until they each
     # restart.
@@ -980,6 +1069,7 @@ is_reserved_word() {
 }
 
 main() {
+    migrate_legacy_state
     case "${1:-}" in
         stop)
             stop_operator "${2:-}"

@@ -82,7 +82,7 @@ handoff --instance <operator-instance-name> \
 
 The `handoff` command atomically writes the handoff file AND triggers the operator restart. **Never write the handoff file manually** — always use the command.
 
-If the `handoff` command is not available (e.g., not on PATH), fall back to writing `~/.copilot/projects/{guid}/next-session.md` manually and then running `touch ~/.copilot/restart/{instance-name}`.
+If the `handoff` command is not available (e.g., not on PATH), fall back to writing `~/.copilot/projects/{guid}/next-session.md` manually and then running `touch ~/.operator/restart/{instance-name}`.
 
 ### Handoff File Format
 ```markdown

@@ -2,11 +2,18 @@
 # ═══════════════════════════════════════════════════════════════════
 # diagnose-restart-deleter.sh
 #
-# Captures the PID, executable, and command line of whatever process
-# wholesale-deletes ~/.copilot/restart. Use this when operator.sh's
-# WARN line "$RESTART_DIR vanished" is firing.
+# Captures the PID, executable, and command line of any process that
+# wholesale-deletes the operator's restart marker directory. Use this when
+# operator.sh's WARN line "$RESTART_DIR vanished" is firing.
 #
-# Why this script exists:
+# History:
+#   The original deleter was the copilot CLI binary itself. It clears
+#   ~/.copilot/restart/ on every startup as part of its own state cleanup.
+#   Operator state has since been moved to ~/.operator/ to avoid the
+#   collision. This script remains useful in case any future tool
+#   accidentally clobbers the new path too.
+#
+# Why fatrace:
 #   inotifywait shows WHAT was deleted but not WHO deleted it.
 #   On WSL2 the kernel audit subsystem isn't available, so we use
 #   fanotify (via the `fatrace` tool) which works on WSL2 and reports
@@ -42,8 +49,8 @@ if [[ -z "$REAL_HOME" || ! -d "$REAL_HOME" ]]; then
     echo "Could not resolve a real home directory for $REAL_USER." >&2
     exit 1
 fi
-RESTART_DIR="${REAL_HOME}/.copilot/restart"
-RESTART_PARENT="${REAL_HOME}/.copilot"
+RESTART_DIR="${REAL_HOME}/.operator/restart"
+RESTART_PARENT="${REAL_HOME}/.operator"
 ONCE=false
 [[ "${1:-}" == "--once" ]] && ONCE=true
 
@@ -104,7 +111,7 @@ echo "  (Trigger one by running 'operator --loop' in another window and answerin
 echo "   or just wait — your live operators restart on their own.)"
 echo
 
-REPORT_FILE="${REAL_HOME}/.copilot/diagnose-restart-report.log"
+REPORT_FILE="${REAL_HOME}/.operator/diagnose-restart-report.log"
 
 REPORT_AND_RECREATE() {
     # Tee everything below to BOTH stdout and a user-readable report file
@@ -116,21 +123,21 @@ REPORT_AND_RECREATE() {
         # Let fatrace flush.
         sleep 1
         echo
-        echo "── fatrace events touching .copilot/restart (last 50) ──"
-        grep -E '\.copilot(/restart)?(/|$| )' "$LOG_FILE" 2>/dev/null \
+        echo "── fatrace events touching .operator/restart (last 50) ──"
+        grep -E '\.operator(/restart)?(/|$| )' "$LOG_FILE" 2>/dev/null \
             | tail -50 || echo "(nothing matched yet — see full log)"
         echo
         echo "── Delete events specifically (D = delete) ──"
         # fatrace D events look like: 'comm(pid): D /full/path'
         grep -E '\): D[+ ]' "$LOG_FILE" 2>/dev/null \
-            | grep -E '\.copilot(/restart)?' \
+            | grep -E '\.operator(/restart)?' \
             | tail -20 || echo "(no delete events captured — try a longer wait)"
         echo
         echo "── Resolving exe paths for PIDs seen above ──"
         # Pull unique PIDs from the matching lines and resolve /proc/<pid>/exe
         # while we still can (some may have exited).
         pids=$(grep -E '\): [CDOWR][+ ]' "$LOG_FILE" 2>/dev/null \
-            | grep -E '\.copilot(/restart)?' \
+            | grep -E '\.operator(/restart)?' \
             | sed -nE 's/.*\(([0-9]+)\):.*/\1/p' \
             | sort -u | tail -20)
         if [[ -n "$pids" ]]; then

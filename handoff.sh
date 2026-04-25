@@ -16,7 +16,7 @@
 set -euo pipefail
 
 CATALOG="${HOME}/.copilot/projects/catalog.csv"
-RESTART_DIR="${HOME}/.copilot/restart"
+RESTART_DIR="${COPILOT_OPERATOR_HOME:-${HOME}/.operator}/restart"
 
 # ── Helpers ─────────────────────────────────────────────────────
 die() { echo "Error: $*" >&2; exit 1; }
@@ -119,7 +119,7 @@ operator sessions whose working directory matches the project root.
 WHAT IT DOES
     1. Resolves project GUID from ~/.copilot/projects/catalog.csv
     2. Writes ~/.copilot/projects/{guid}/next-session.md
-    3. Touches ~/.copilot/restart/{instance} to trigger operator restart
+    3. Touches ~/.operator/restart/{instance} to trigger operator restart
 HELP
 }
 
@@ -227,6 +227,17 @@ mkdir -p "$project_dir" "$RESTART_DIR"
 
 # ── Touch Restart Marker ───────────────────────────────────────
 touch "$restart_marker"
+
+# Transitional: also touch the legacy path so operator instances that are
+# still running pre-migration code (watching ~/.copilot/restart/) get the
+# restart signal. Safe to keep — even after all operators are restarted,
+# the legacy touch is a no-op (copilot CLI wipes that dir on its next
+# startup anyway). Remove once you're confident no legacy operators remain.
+LEGACY_RESTART_DIR="${HOME}/.copilot/restart"
+if [[ "$LEGACY_RESTART_DIR" != "$RESTART_DIR" ]]; then
+    mkdir -p "$LEGACY_RESTART_DIR" 2>/dev/null || true
+    touch "${LEGACY_RESTART_DIR}/${instance}" 2>/dev/null || true
+fi
 
 echo "✅ Handoff written: $handoff_file"
 echo "✅ Restart signal: $restart_marker"

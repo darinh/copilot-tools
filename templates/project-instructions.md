@@ -26,7 +26,7 @@ Handoff file: `~/.copilot/projects/{guid}/next-session.md`
 When a session is complete or getting heavy (large context window), you MUST:
 1. Write `next-session.md` with full handoff context
 2. Present your final output to the user (summary of what was delivered, evidence bundles, etc.) — **everything you want recorded in the session log must be output BEFORE step 3**
-3. As your **absolute last action**, run the restart touch command from your operator preamble (e.g., `touch ~/.copilot/restart/{instance-name}`) — the operator kills the process immediately after detecting this file, so any output after the touch is lost
+3. As your **absolute last action**, run the restart touch command from your operator preamble (e.g., `touch ~/.operator/restart/{instance-name}`) — the operator kills the process immediately after detecting this file, so any output after the touch is lost
 4. **DO NOT output anything after the touch.** No summary, no farewell, no tool calls. The touch is the final thing you do.
 5. **DO NOT FORGET STEP 3.** The handoff file is useless without the restart trigger.
 6. This applies to EVERY session end — whether task-complete or context-heavy.
