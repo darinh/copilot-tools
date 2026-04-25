@@ -125,6 +125,37 @@ else
 fi
 echo ""
 
+
+
+# ── Step 4b: Runtime Extensions ──────────────────────────────
+echo "Installing runtime extensions..."
+EXTENSIONS_DIR="${COPILOT_DIR}/extensions"
+mkdir -p "$EXTENSIONS_DIR"
+if [[ -d "${SCRIPT_DIR}/extensions" ]]; then
+    shopt -s nullglob
+    for ext_dir in "${SCRIPT_DIR}/extensions/"*/; do
+        ext_name=$(basename "$ext_dir")
+        target="${EXTENSIONS_DIR}/${ext_name}"
+        src="${ext_dir%/}"
+        if [[ -L "$target" ]]; then
+            if [[ "$(readlink -f "$target")" == "$(readlink -f "$src")" ]]; then
+                info "Extension '$ext_name' symlink already correct"
+                continue
+            fi
+            rm "$target"
+        elif [[ -e "$target" ]]; then
+            warn "Extension '$ext_name' exists at $target as a real directory — skipping (remove it to symlink)"
+            continue
+        fi
+        ln -s "$src" "$target"
+        info "Linked extension '$ext_name' → $src"
+    done
+    shopt -u nullglob
+else
+    warn "No extensions/ directory found in copilot-tools — skipping"
+fi
+echo ""
+
 # ── Step 5: MCP Servers ──────────────────────────────────────
 echo "Checking MCP servers..."
 

@@ -9,6 +9,7 @@ Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Buil
 | [`operator.sh`](docs/operator.md) | Copilot CLI wrapper with metrics capture, autonomous loop mode, and multi-instance support |
 | [`operator-ingest.py`](operator-ingest.py) | Log parser for copilot process logs |
 | [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | MCP skill routing C#→Roslyn, TypeScript→codebase-memory-mcp |
+| [`extensions/`](extensions/README.md) | Copilot CLI runtime extensions: open-in-vs-code, lint-on-edit, security-shield, test-enforcer, architecture-enforcer, copy-to-clipboard-tool |
 | [`templates/`](templates/) | Configuration templates for copilot-instructions, MCP servers, and per-project setup |
 | [`docs/`](docs/) | Documentation for operator and skills |
 | [`setup.sh`](setup.sh) | Automated environment setup script |
@@ -26,8 +27,9 @@ The setup script will:
 1. Check prerequisites (`tmux`, `sqlite3`, `python3`, `copilot`)
 2. Symlink `operator` into `~/.local/bin/`
 3. Install the [Anvil](https://github.com/burkeholland/anvil) agent plugin
-4. Check/install MCP servers (codebase-memory-mcp, dotnet-roslyn-mcp)
-5. Install configuration templates to `~/.copilot/`
+4. Symlink runtime extensions (`extensions/`) into `~/.copilot/extensions/`
+5. Check/install MCP servers (codebase-memory-mcp, dotnet-roslyn-mcp)
+6. Install configuration templates to `~/.copilot/`
 
 ## Usage
 
