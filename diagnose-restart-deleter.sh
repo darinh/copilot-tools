@@ -67,7 +67,9 @@ mkdir -p "$RESTART_DIR"
 chown -h "$REAL_USER:$REAL_USER" "$RESTART_DIR"
 
 LOG_FILE="$(mktemp -t fatrace-restart.XXXXXX.log)"
-chown "$REAL_USER:$REAL_USER" "$LOG_FILE"
+# Intentionally NOT chowning the log to REAL_USER — on WSL2 that caused
+# the subsequent root-side redirect to fail with EACCES. The file stays
+# root-owned; we'll print the path at the end so the user can sudo-cat it.
 FATRACE_PID=""
 
 cleanup() {
