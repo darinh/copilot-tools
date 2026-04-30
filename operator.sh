@@ -66,6 +66,8 @@ CURRENT_SESSION_NUM=0
 IS_LOOP_MODE=false
 IS_FRESH=false
 COPILOT_PANE_PID=""
+CURRENT_COPILOT_SESSION_ID=""
+COPILOT_LAUNCH_STARTED_MS=""
 
 # ── Logging ─────────────────────────────────────────────────────
 mkdir -p "$OPERATOR_HOME" "$(dirname "$LOG_FILE")"
@@ -185,8 +187,12 @@ migrate_legacy_state() {
 
 save_instance_state() {
     [[ -z "$STATE_FILE" ]] && return
-    printf 'SESSION_NUM=%d\nRUN_STARTED=%s\n' \
-        "$CURRENT_SESSION_NUM" "$OPERATOR_RUN_STARTED" > "$STATE_FILE"
+    {
+        printf 'SESSION_NUM=%d\nRUN_STARTED=%s\n' "$CURRENT_SESSION_NUM" "$OPERATOR_RUN_STARTED"
+        if [[ -n "$CURRENT_COPILOT_SESSION_ID" ]]; then
+            printf 'COPILOT_SESSION_ID=%s\n' "$CURRENT_COPILOT_SESSION_ID"
+        fi
+    } > "$STATE_FILE"
 }
 
 load_instance_state() {
@@ -196,6 +202,7 @@ load_instance_state() {
         case "$key" in
             SESSION_NUM)  CURRENT_SESSION_NUM="$val" ;;
             RUN_STARTED)  OPERATOR_RUN_STARTED="$val" ;;
+            COPILOT_SESSION_ID) CURRENT_COPILOT_SESSION_ID="$val" ;;
         esac
     done < "$STATE_FILE"
     return 0
@@ -314,6 +321,79 @@ find_copilot_log() {
     fi
     # Fallback: most recently modified log file
     ls -t "${COPILOT_LOG_DIR}"/process-*.log 2>/dev/null | head -1
+}
+
+is_uuid() {
+    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+extract_copilot_session_id_from_log() {
+    local logfile="$1"
+    [[ -n "$logfile" && -f "$logfile" ]] || return 1
+
+    local session_id
+    session_id=$(grep -Eo '"session_id"[[:space:]]*:[[:space:]]*"[0-9a-fA-F-]{36}"' "$logfile" 2>/dev/null \
+        | head -1 \
+        | sed -E 's/.*"([0-9a-fA-F-]{36})".*/\1/' || true)
+    if is_uuid "$session_id"; then
+        echo "$session_id"
+        return 0
+    fi
+
+    session_id=$(grep -Eo 'Workspace initialized: [0-9a-fA-F-]{36}' "$logfile" 2>/dev/null \
+        | head -1 \
+        | awk '{print $3}' || true)
+    if is_uuid "$session_id"; then
+        echo "$session_id"
+        return 0
+    fi
+
+    return 1
+}
+
+find_copilot_log_for_current_launch() {
+    [[ -n "$COPILOT_PANE_PID" && -n "$COPILOT_LAUNCH_STARTED_MS" ]] || return 1
+
+    local logfile base started_ms newest="" newest_ms=0
+    shopt -s nullglob
+    for logfile in "${COPILOT_LOG_DIR}"/process-*-"${COPILOT_PANE_PID}".log; do
+        base=$(basename "$logfile")
+        started_ms="${base#process-}"
+        started_ms="${started_ms%-${COPILOT_PANE_PID}.log}"
+        if [[ "$started_ms" =~ ^[0-9]+$ ]] && (( started_ms >= COPILOT_LAUNCH_STARTED_MS && started_ms > newest_ms )); then
+            newest="$logfile"
+            newest_ms="$started_ms"
+        fi
+    done
+    shopt -u nullglob
+
+    [[ -n "$newest" ]] || return 1
+    echo "$newest"
+}
+
+remember_current_copilot_session_id() {
+    local timeout="${1:-15}"
+    local elapsed=0 logfile session_id
+
+    if [[ -z "$COPILOT_PANE_PID" ]]; then
+        log "  Warning: cannot determine Copilot CLI session id without a pane pid"
+        return 1
+    fi
+
+    while (( elapsed < timeout )); do
+        logfile=$(find_copilot_log_for_current_launch || true)
+        if session_id=$(extract_copilot_session_id_from_log "$logfile"); then
+            CURRENT_COPILOT_SESSION_ID="$session_id"
+            save_instance_state
+            log "  Copilot CLI session id: $CURRENT_COPILOT_SESSION_ID"
+            return 0
+        fi
+        sleep 1
+        (( elapsed++ )) || true
+    done
+
+    log "  Warning: could not determine Copilot CLI session id (pid=${COPILOT_PANE_PID:-?})"
+    return 1
 }
 
 capture_and_store_metrics() {
@@ -547,6 +627,22 @@ extract_agent_from_args() {
     echo "anvil:anvil"
 }
 
+args_have_explicit_session() {
+    local prev=""
+    for arg in "$@"; do
+        case "$arg" in
+            --continue|--resume|--resume=*|--connect|--connect=*)
+                return 0
+                ;;
+        esac
+        if [[ "$prev" == "--resume" || "$prev" == "--connect" ]]; then
+            return 0
+        fi
+        prev="$arg"
+    done
+    return 1
+}
+
 build_preamble() {
     local agent_name="$1"
     printf '%s' "You are running under an automated operator wrapper that a human set up. Key facts: (1) You have blanket human approval for ALL decisions — tool calls, file edits, git operations, architectural choices. Do not ask for direction or confirmation. Make your best judgment call and proceed. If you are genuinely uncertain between approaches that have very different consequences, state your reasoning and pick one. (2) Session restart: when context gets heavy or a task is complete with next steps, use the handoff command: handoff --instance ${INSTANCE_NAME} --status \"what you completed\" --next \"what to do next\" --context \"key decisions and gotchas\" — this atomically writes the handoff file and triggers the restart. (3) On startup: always check for a session handoff file to resume work. (4) You are the @${agent_name} agent with --yolo permissions (all tools/files/URLs auto-approved). (5) Operator instance: ${INSTANCE_NAME}. Now: check for your session handoff and get to work."
@@ -604,8 +700,10 @@ MODES
         when the agent touches the instance-specific restart marker.
         Ctrl+C captures metrics and shows an aggregate run summary.
 
-        Named instances auto-continue when restarted — session numbering
-        and run summary scope carry over. Use --fresh to reset.
+        Named instances auto-continue when restarted — session numbering,
+        run summary scope, and the last Copilot CLI session ID carry over.
+        If WSL crashes or Windows reboots, restarting the same loop resumes
+        that CLI session with --resume=<session-id>. Use --fresh to reset.
 
 MULTI-INSTANCE
     Multiple operator instances can run concurrently. Each gets its own
@@ -766,6 +864,7 @@ start_copilot_in_tmux() {
 
     tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 
+    COPILOT_LAUNCH_STARTED_MS=$(date +%s%3N)
     tmux new-session -d -s "$TMUX_SESSION" -c "$(pwd)" "$RUN_SCRIPT"
     tmux set-option -t "$TMUX_SESSION" remain-on-exit "$remain_on_exit"
 
@@ -776,6 +875,9 @@ start_copilot_in_tmux() {
     sleep 3
 
     log "  Session #${session_num} running (pid=$COPILOT_PANE_PID) — attach with: tmux attach -t $TMUX_SESSION"
+    if [[ "$IS_LOOP_MODE" == true ]]; then
+        remember_current_copilot_session_id 15 || true
+    fi
 
     # Mark this session as operator-managed so list_instances can find it.
     #
@@ -921,9 +1023,16 @@ run_loop_mode() {
 
     # Auto-continue: load prior state for named instances
     local start_session=1
+    local resume_session_id=""
     if [[ "$IS_FRESH" == false ]] && load_instance_state; then
         start_session=$(( CURRENT_SESSION_NUM + 1 ))
         log "Continuing from session #${start_session} (run started ${OPERATOR_RUN_STARTED})"
+        if is_uuid "$CURRENT_COPILOT_SESSION_ID"; then
+            resume_session_id="$CURRENT_COPILOT_SESSION_ID"
+            log "  Will resume Copilot CLI session after operator restart: $resume_session_id"
+        else
+            CURRENT_COPILOT_SESSION_ID=""
+        fi
     else
         OPERATOR_RUN_STARTED=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     fi
@@ -947,7 +1056,17 @@ run_loop_mode() {
         CURRENT_SESSION_NUM=$session_num
         save_instance_state
 
-        generate_run_script "${copilot_args[@]}"
+        local launch_args=("${copilot_args[@]}")
+        if [[ -n "$resume_session_id" ]]; then
+            if args_have_explicit_session "${launch_args[@]}"; then
+                log "  Skipping automatic --resume; user args already choose a session"
+            else
+                launch_args+=("--resume=$resume_session_id")
+            fi
+            resume_session_id=""
+        fi
+
+        generate_run_script "${launch_args[@]}"
         start_copilot_in_tmux "$session_num" on
 
         local restart_requested=false
@@ -973,6 +1092,7 @@ run_loop_mode() {
 
         if [[ "$restart_requested" == true ]]; then
             restart_copilot "$session_num"
+            CURRENT_COPILOT_SESSION_ID=""
             save_instance_state
 
             if (( session_num >= MAX_SESSIONS )); then

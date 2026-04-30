@@ -76,9 +76,9 @@ Ctrl+C captures final metrics and shows an aggregate run summary.
 
 ### Auto-Continue
 
-Named instances automatically resume where they left off when restarted. Session numbering and run summary scope carry over between operator restarts.
+Named instances automatically resume where they left off when restarted. Session numbering, run summary scope, and the active Copilot CLI session ID carry over between operator restarts.
 
-State is stored in `~/.operator/restart/{name}.state` and includes the session number and original run start time.
+State is stored in `~/.operator/restart/{name}.state` and includes the session number, original run start time, and most recently observed Copilot CLI session ID. After a WSL crash or Windows reboot, starting the same named loop again injects `--resume=<session-id>` once so Copilot rejoins the prior CLI session instead of creating a disconnected one.
 
 ```bash
 # First run — starts at session #1
@@ -92,6 +92,8 @@ operator --loop --name myproject --fresh --agent=anvil:anvil
 ```
 
 Unnamed instances (no `--name`) are always ephemeral and don't persist state.
+
+Intentional operator handoffs still start a fresh Copilot CLI session and rely on the handoff file for context. The saved CLI session ID is only reused when the operator process itself is restarted.
 
 ### Multi-Instance
 
@@ -138,7 +140,7 @@ The operator stores metrics in `~/.operator/metrics.db` (SQLite). Each session r
 | `~/.operator/metrics.db` | SQLite metrics database |
 | `~/.operator/operator.log` | Operator log file |
 | `~/.operator/restart/` | Per-instance restart marker files |
-| `~/.operator/restart/*.state` | Auto-continue state (session number, run start time) |
+| `~/.operator/restart/*.state` | Auto-continue state (session number, run start time, Copilot CLI session ID) |
 | `~/.operator/run-<instance>.sh` | Per-instance launch script |
 | `~/.operator/backups/` | Historical backups of operator.sh |
 | `~/.copilot/logs/process-*.log` | Copilot process logs (source data) |
