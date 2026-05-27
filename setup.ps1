@@ -81,7 +81,22 @@ function Install-Template($src, $dest, $label, [scriptblock]$BeforeWrite) {
     if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
 
     $manifest = Load-Manifest
-    $srcHash = Get-FileSha256 $src
+
+    # Compute what we WOULD write (post-BeforeWrite) and hash THAT, not the raw source.
+    # If we just hashed $src, BeforeWrite-mutated templates would never match the
+    # written file and we'd prompt on every re-run.
+    $srcRaw = Get-Content -Raw $src
+    $effective = if ($BeforeWrite) { & $BeforeWrite $srcRaw } else { $srcRaw }
+    $tmp = [System.IO.Path]::GetTempFileName()
+    try {
+        # Write to a temp file with the SAME encoding we'll use for the real write
+        # so the hash matches byte-for-byte.
+        $effective | Out-File -Encoding utf8 -NoNewline $tmp
+        $effectiveHash = (Get-FileHash -Algorithm SHA256 -Path $tmp).Hash.ToLower()
+    } finally {
+        Remove-Item -Force $tmp -ErrorAction SilentlyContinue
+    }
+
     $destHash = Get-FileSha256 $dest
     $shippedHash = $null
     if ($manifest.PSObject.Properties.Match($dest).Count -gt 0) {
@@ -91,7 +106,7 @@ function Install-Template($src, $dest, $label, [scriptblock]$BeforeWrite) {
     $action = $null
     if (-not (Test-Path $dest)) {
         $action = 'install'
-    } elseif ($srcHash -and $destHash -eq $srcHash) {
+    } elseif ($destHash -eq $effectiveHash) {
         $action = 'skip-uptodate'
     } elseif ($shippedHash -and $destHash -eq $shippedHash) {
         $action = 'auto-upgrade'
@@ -101,21 +116,18 @@ function Install-Template($src, $dest, $label, [scriptblock]$BeforeWrite) {
 
     switch ($action) {
         'install' {
-            $contents = if ($BeforeWrite) { & $BeforeWrite (Get-Content -Raw $src) } else { Get-Content -Raw $src }
-            $contents | Out-File -Encoding utf8 -NoNewline $dest
+            $effective | Out-File -Encoding utf8 -NoNewline $dest
             Info "Installed $label"
         }
         'skip-uptodate' { }
         'auto-upgrade' {
-            $contents = if ($BeforeWrite) { & $BeforeWrite (Get-Content -Raw $src) } else { Get-Content -Raw $src }
-            $contents | Out-File -Encoding utf8 -NoNewline $dest
+            $effective | Out-File -Encoding utf8 -NoNewline $dest
             Info "Auto-upgraded $label (no local edits detected)"
         }
         'prompt' {
             if (Ask "$label has local edits AND a newer version ships. Overwrite (current saved as .bak)?") {
                 Copy-Item -Force -Path $dest -Destination "$dest.bak"
-                $contents = if ($BeforeWrite) { & $BeforeWrite (Get-Content -Raw $src) } else { Get-Content -Raw $src }
-                $contents | Out-File -Encoding utf8 -NoNewline $dest
+                $effective | Out-File -Encoding utf8 -NoNewline $dest
                 Info "Updated $label (previous saved to $dest.bak)"
             } else {
                 Warn "Skipped $label (kept your version)"
@@ -123,10 +135,10 @@ function Install-Template($src, $dest, $label, [scriptblock]$BeforeWrite) {
         }
     }
 
-    if ($srcHash) {
-        $manifest | Add-Member -NotePropertyName $dest -NotePropertyValue $srcHash -Force
-        Save-Manifest $manifest
-    }
+    # Always record the effective hash so the next run knows "this is what we
+    # shipped" and can auto-upgrade if the user hasn't edited it.
+    $manifest | Add-Member -NotePropertyName $dest -NotePropertyValue $effectiveHash -Force
+    Save-Manifest $manifest
 }
 
 # Install one extension subdir under %USERPROFILE%\.copilot\extensions\.
@@ -376,11 +388,13 @@ Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1. Open a NEW terminal so the updated PATH takes effect."
 if ($hasWsl) {
-    Write-Host "  2. Try: operator help    (runs `wsl operator help` under the hood)"
+    Write-Host "  2. Try: operator help    (runs 'wsl operator help' under the hood)"
     Write-Host "  3. Start a loop: operator --loop --name myproject --agent=anvil:anvil"
+    Write-Host "  4. Review %USERPROFILE%\.copilot\copilot-instructions.md and customize"
+    Write-Host "  5. To upgrade later: .\upgrade.ps1"
 } else {
     Write-Host "  2. Install WSL: wsl --install   then re-run .\setup.ps1"
+    Write-Host "  3. Review %USERPROFILE%\.copilot\copilot-instructions.md and customize"
+    Write-Host "  4. To upgrade later: .\upgrade.ps1"
 }
-Write-Host "  4. Review %USERPROFILE%\.copilot\copilot-instructions.md and customize"
-Write-Host "  5. To upgrade later: .\upgrade.ps1"
 Write-Host ""
