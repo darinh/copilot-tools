@@ -61,15 +61,23 @@ copy_template() {
     mkdir -p "$(dirname "$TEMPLATE_MANIFEST")"
     touch "$TEMPLATE_MANIFEST"
 
-    local src_hash dest_hash shipped_hash
+    # Hash the EFFECTIVE output (what we'd actually write to disk), not the
+    # raw source. setup.sh has no BeforeWrite mutation today, so effective ==
+    # source for now, but mirroring setup.ps1's logic means adding a Linux-
+    # specific header later (or any future mutator) won't silently break the
+    # auto-upgrade check by causing dest_hash to never match shipped_hash.
+    local src_hash dest_hash shipped_hash effective_hash
     src_hash=$(file_sha256 "$src")
     dest_hash=$(file_sha256 "$dest")
     shipped_hash=$(awk -v k="$dest" -F'  ' '$2==k {print $1; exit}' "$TEMPLATE_MANIFEST")
+    # Today the effective output IS the source byte-for-byte. If a mutator is
+    # ever added, hash the post-mutation bytes here instead.
+    effective_hash="$src_hash"
 
     if [[ ! -f "$dest" ]]; then
         cp "$src" "$dest"
         info "Installed $label"
-    elif [[ -n "$src_hash" && "$dest_hash" == "$src_hash" ]]; then
+    elif [[ -n "$effective_hash" && "$dest_hash" == "$effective_hash" ]]; then
         : # already up to date — silent
     elif [[ -n "$shipped_hash" && "$dest_hash" == "$shipped_hash" ]]; then
         cp "$src" "$dest"
@@ -84,23 +92,40 @@ copy_template() {
         fi
     fi
 
-    # Record the hash of what we just shipped (or would have shipped) so
-    # future runs can tell "unmodified" apart from "user-edited."
-    if [[ -n "$src_hash" ]]; then
+    # Record the effective hash so future runs can tell "unmodified" from
+    # "user-edited" even when the source file changes between releases.
+    if [[ -n "$effective_hash" ]]; then
         local tmp
         tmp=$(mktemp "${TEMPLATE_MANIFEST}.XXXXXX")
         awk -v k="$dest" '$2!=k' "$TEMPLATE_MANIFEST" > "$tmp" 2>/dev/null || true
-        echo "${src_hash}  ${dest}" >> "$tmp"
+        echo "${effective_hash}  ${dest}" >> "$tmp"
         mv "$tmp" "$TEMPLATE_MANIFEST"
     fi
 }
 
 # Returns 0 if $SCRIPT_DIR lives on a Windows mount (DrvFs / 9P), 1 otherwise.
-# Detected by walking up to a /mnt/<drive>/ prefix. We use this to decide
-# whether to symlink-into-PATH (safe on Linux fs) or to drop a wrapper script
-# (works around DrvFs not honoring +x reliably and avoids fragile cross-fs
-# symlinks).
+# Primary check: filesystem type via stat (works regardless of automount root,
+# so users who set [automount] root = / in /etc/wsl.conf are still detected).
+# Fallback: regex match on the default /mnt/<drive>/ prefix for systems where
+# stat -f is unavailable. We use this to decide whether to symlink-into-PATH
+# (safe on Linux fs) or to drop a wrapper script (works around DrvFs not
+# honoring +x reliably and avoids fragile cross-fs symlinks).
 script_dir_on_windows_mount() {
+    local fstype
+    if command -v stat >/dev/null 2>&1; then
+        # GNU stat: -f -c %T prints filesystem type ("drvfs", "9p", "ext2/ext3", etc.)
+        # BSD stat / BusyBox: misinterprets these flags or returns a hex magic
+        # number. We classify only what we recognize; anything else falls through
+        # to the regex check below, so unfamiliar stat output never regresses
+        # Alpine/BSD users on default /mnt/<drive>/ paths.
+        fstype=$(stat -f -c %T "$SCRIPT_DIR" 2>/dev/null)
+        case "$fstype" in
+            drvfs|9p|cifs|smb*|ntfs|exfat|vfat|msdos) return 0 ;;
+            ext2*|ext3*|ext4*|btrfs|xfs|zfs|tmpfs|overlay*|reiserfs|f2fs) return 1 ;;
+            *) ;;  # unknown / empty / non-GNU stat output — try the regex.
+        esac
+    fi
+    # Stat unavailable or didn't return a known type — fall back to the path prefix.
     [[ "$SCRIPT_DIR" =~ ^/mnt/[a-z]/ ]]
 }
 

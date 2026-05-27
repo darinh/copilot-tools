@@ -78,32 +78,55 @@ _mig_catalog_conflicts() {
 
 # Merge legacy catalog rows into the new catalog. Skips rows whose path is
 # already present in the new catalog (regardless of GUID — those are handled
-# by the conflict check above which gates the whole migration).
+# by the conflict check above which gates the whole migration). Also skips
+# rows whose GUID is listed in $_MIG_FAILED_GUIDS — the legacy directory for
+# that GUID failed to move, so we must NOT advertise it in the new catalog;
+# handoff.sh's per-lookup legacy fallback will still find the stranded state.
 _mig_merge_catalogs() {
     [[ -f "$LEGACY_CATALOG" ]] || return 0
     mkdir -p "$NEW_PROJECTS_DIR"
     touch "$NEW_CATALOG"
-    local appended=0 path id
+    local appended=0 skipped_failed=0 path id
+    : "${_MIG_FAILED_GUIDS:=$'\n'}"
     while IFS=',' read -r path id; do
         path="${path#\"}"; path="${path%\"}"
         id="${id#\"}"; id="${id%\"}"
         [[ -n "$path" && -n "$id" ]] || continue
+        # Skip rows whose dir-move failed (still recoverable via legacy fallback).
+        if [[ "$_MIG_FAILED_GUIDS" == *$'\n'"${id}"$'\n'* ]]; then
+            (( skipped_failed++ )) || true
+            continue
+        fi
         if ! awk -F',' -v p="\"$path\"" '$1==p {found=1} END{exit !found}' "$NEW_CATALOG" 2>/dev/null; then
             echo "\"$path\",$id" >> "$NEW_CATALOG"
             (( appended++ )) || true
         fi
     done < "$LEGACY_CATALOG"
-    (( appended > 0 )) && _mig_info "Merged $appended catalog row(s) into $NEW_CATALOG"
+    (( appended > 0 ))       && _mig_info "Merged $appended catalog row(s) into $NEW_CATALOG"
+    (( skipped_failed > 0 )) && _mig_warn "Held back $skipped_failed catalog row(s) tied to failed-move project dirs; legacy fallback will resolve them."
     return 0
 }
 
 # Move GUID-shaped project subdirs from legacy → new, skipping any that
 # already exist at the destination. Warns about non-GUID entries it leaves
-# behind.
+# behind. Returns 0 on full success, 2 if any move FAILED (so the caller
+# knows not to nuke the legacy catalog).
+#
+# Populates two globals consumed by _mig_merge_catalogs:
+#   _MIG_SAFE_GUIDS   — GUIDs whose dir is safely at the new location
+#                       (moved or already there). Their catalog rows are
+#                       safe to merge.
+#   _MIG_FAILED_GUIDS — GUIDs whose legacy dir FAILED to move. Their
+#                       catalog rows must NOT be merged — otherwise the
+#                       new catalog would point handoff.sh at a missing
+#                       directory and the legacy fallback in handoff.sh
+#                       could never find the stranded state.
 _mig_move_projects() {
+    _MIG_SAFE_GUIDS=$'\n'
+    _MIG_FAILED_GUIDS=$'\n'
     [[ -d "$LEGACY_PROJECTS_DIR" ]] || return 0
     mkdir -p "$NEW_PROJECTS_DIR"
-    local moved=0 skipped=0 unknown=0 base
+    local moved=0 skipped=0 unknown=0 failed=0 base
     shopt -s nullglob dotglob
     for entry in "$LEGACY_PROJECTS_DIR"/*; do
         [[ -e "$entry" ]] || continue
@@ -113,8 +136,16 @@ _mig_move_projects() {
         if [[ -d "$entry" && "$base" =~ $_GUID_RE ]]; then
             if [[ -e "${NEW_PROJECTS_DIR}/${base}" ]]; then
                 (( skipped++ )) || true
+                _MIG_SAFE_GUIDS+="${base}"$'\n'
             else
-                mv "$entry" "${NEW_PROJECTS_DIR}/${base}" 2>/dev/null && (( moved++ )) || true
+                if mv "$entry" "${NEW_PROJECTS_DIR}/${base}" 2>/dev/null; then
+                    (( moved++ )) || true
+                    _MIG_SAFE_GUIDS+="${base}"$'\n'
+                else
+                    _mig_err "Failed to move project dir: $entry → ${NEW_PROJECTS_DIR}/${base}"
+                    (( failed++ )) || true
+                    _MIG_FAILED_GUIDS+="${base}"$'\n'
+                fi
             fi
         else
             _mig_warn "Leaving non-project entry in legacy dir: $entry"
@@ -124,6 +155,8 @@ _mig_move_projects() {
     shopt -u nullglob dotglob
     (( moved > 0 ))   && _mig_info "Moved $moved project dir(s) to $NEW_PROJECTS_DIR"
     (( skipped > 0 )) && _mig_info "Skipped $skipped project dir(s) (target already present)"
+    (( failed > 0 ))  && _mig_err  "FAILED to move $failed project dir(s); legacy catalog will NOT be removed."
+    (( failed > 0 )) && return 2
     return 0
 }
 
@@ -180,12 +213,24 @@ migrate_operator_state() {
         return 1
     fi
 
-    # Do the work.
-    _mig_merge_catalogs
+    # Do the work. Order matters: move project dirs FIRST so we know which
+    # GUIDs are safely at the destination, then merge catalog rows that
+    # correspond to safe (or catalog-only) GUIDs. If any move fails, the
+    # catalog merger skips those rows AND we keep the legacy catalog so
+    # handoff.sh's per-lookup legacy fallback can resolve the stranded state.
     _mig_move_projects
+    local move_rc=$?
+    _mig_merge_catalogs
 
-    # Remove the legacy catalog only after a successful merge (it's been
-    # absorbed). Leave the empty parent dir alone in case the Copilot CLI
+    if (( move_rc != 0 )); then
+        _mig_warn "Migration completed with partial failures. Legacy catalog kept at: $LEGACY_CATALOG"
+        _mig_warn "Re-run after resolving the underlying issue (permissions, disk space, etc.)."
+        [[ -n "${lock_fd:-}" ]] && exec {lock_fd}>&- || true
+        return $move_rc
+    fi
+
+    # Remove the legacy catalog only after a successful merge AND successful
+    # project moves. Leave the empty parent dir alone in case the Copilot CLI
     # itself ever uses it.
     if [[ -f "$LEGACY_CATALOG" ]]; then
         rm -f "$LEGACY_CATALOG" && _mig_info "Removed merged legacy catalog: $LEGACY_CATALOG"
