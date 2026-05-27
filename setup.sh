@@ -4,12 +4,17 @@
 # Copilot CLI power-user toolkit.
 #
 # Usage: ./setup.sh
+#
+# Idempotent: safe to re-run after a `git pull`. Use `./upgrade.sh`
+# for a one-step pull-and-resync.
 # ═══════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COPILOT_DIR="${HOME}/.copilot"
+OPERATOR_HOME="${COPILOT_OPERATOR_HOME:-${HOME}/.operator}"
 LOCAL_BIN="${HOME}/.local/bin"
+TEMPLATE_MANIFEST="${OPERATOR_HOME}/.template-manifest"
 
 # ── Helpers ─────────────────────────────────────────────────────
 info()  { echo "  ✅ $*"; }
@@ -27,19 +32,107 @@ check_cmd() {
     fi
 }
 
+# Hash a file with whichever sha256 tool is available. Echoes the hex digest
+# or an empty string if the file doesn't exist / nothing is installed.
+file_sha256() {
+    local f="$1"
+    [[ -f "$f" ]] || return 0
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$f" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$f" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$f" | awk '{print $NF}'
+    else
+        echo ""
+    fi
+}
+
+# Smart template install. Tracks the hash of the version we last shipped in
+# $TEMPLATE_MANIFEST. On re-run:
+#   • Destination missing  → install fresh.
+#   • Dest matches shipped → no-op silent (user hasn't customized).
+#   • Dest matches NEW src → no-op silent (already up to date).
+#   • Dest != shipped AND != new src → user has local edits, prompt.
+#   • Dest == shipped AND != new src → auto-upgrade (unmodified user).
 copy_template() {
     local src="$1" dest="$2" label="$3"
-    if [[ -f "$dest" ]]; then
-        if ask "$label already exists at $dest. Overwrite?"; then
-            cp "$src" "$dest"
-            info "Updated $label"
-        else
-            warn "Skipped $label (kept existing)"
-        fi
-    else
+    mkdir -p "$(dirname "$dest")"
+    mkdir -p "$(dirname "$TEMPLATE_MANIFEST")"
+    touch "$TEMPLATE_MANIFEST"
+
+    local src_hash dest_hash shipped_hash
+    src_hash=$(file_sha256 "$src")
+    dest_hash=$(file_sha256 "$dest")
+    shipped_hash=$(awk -v k="$dest" -F'  ' '$2==k {print $1; exit}' "$TEMPLATE_MANIFEST")
+
+    if [[ ! -f "$dest" ]]; then
         cp "$src" "$dest"
         info "Installed $label"
+    elif [[ -n "$src_hash" && "$dest_hash" == "$src_hash" ]]; then
+        : # already up to date — silent
+    elif [[ -n "$shipped_hash" && "$dest_hash" == "$shipped_hash" ]]; then
+        cp "$src" "$dest"
+        info "Auto-upgraded $label (no local edits detected)"
+    else
+        if ask "$label has local edits AND a newer version ships. Overwrite (current saved as .bak)?"; then
+            cp "$dest" "${dest}.bak"
+            cp "$src" "$dest"
+            info "Updated $label (previous saved to ${dest}.bak)"
+        else
+            warn "Skipped $label (kept your version)"
+        fi
     fi
+
+    # Record the hash of what we just shipped (or would have shipped) so
+    # future runs can tell "unmodified" apart from "user-edited."
+    if [[ -n "$src_hash" ]]; then
+        local tmp
+        tmp=$(mktemp "${TEMPLATE_MANIFEST}.XXXXXX")
+        awk -v k="$dest" '$2!=k' "$TEMPLATE_MANIFEST" > "$tmp" 2>/dev/null || true
+        echo "${src_hash}  ${dest}" >> "$tmp"
+        mv "$tmp" "$TEMPLATE_MANIFEST"
+    fi
+}
+
+# Returns 0 if $SCRIPT_DIR lives on a Windows mount (DrvFs / 9P), 1 otherwise.
+# Detected by walking up to a /mnt/<drive>/ prefix. We use this to decide
+# whether to symlink-into-PATH (safe on Linux fs) or to drop a wrapper script
+# (works around DrvFs not honoring +x reliably and avoids fragile cross-fs
+# symlinks).
+script_dir_on_windows_mount() {
+    [[ "$SCRIPT_DIR" =~ ^/mnt/[a-z]/ ]]
+}
+
+# Install one bin entry. On a normal Linux fs: symlink. On a /mnt/c-style WSL
+# DrvFs mount: write a tiny wrapper script that execs bash with the absolute
+# path. The wrapper avoids DrvFs executable-bit quirks and survives Windows-
+# side `git pull` operations that may strip the +x bit on the linked target.
+install_bin_entry() {
+    local name="$1" target_script="$2"
+    local link="${LOCAL_BIN}/${name}"
+
+    if script_dir_on_windows_mount; then
+        cat > "$link" <<WRAPPER
+#!/usr/bin/env bash
+exec bash "${target_script}" "\$@"
+WRAPPER
+        chmod +x "$link"
+        info "Installed wrapper ${name} → ${target_script} (NTFS-safe)"
+        return 0
+    fi
+
+    if [[ -L "$link" ]]; then
+        local current expected
+        current=$(readlink -f "$link")
+        expected=$(readlink -f "$target_script")
+        if [[ "$current" == "$expected" ]]; then
+            info "${name} symlink already correct"
+            return 0
+        fi
+    fi
+    ln -sf "$target_script" "$link"
+    info "Installed ${name} symlink → ${target_script}"
 }
 
 echo ""
@@ -67,47 +160,40 @@ echo ""
 # ── Step 2: Directory scaffolding ──────────────────────────────
 echo "Setting up directories..."
 mkdir -p "$LOCAL_BIN"
-mkdir -p "${COPILOT_DIR}/restart"
-mkdir -p "${COPILOT_DIR}/projects"
-mkdir -p "${COPILOT_DIR}/logs"
-info "Created ~/.copilot/ directories"
+mkdir -p "$OPERATOR_HOME"
+mkdir -p "${OPERATOR_HOME}/restart"
+mkdir -p "${OPERATOR_HOME}/projects"
+# ~/.copilot/extensions and ~/.copilot/logs are CLI-owned paths; create the
+# extensions one because we install into it, but leave logs alone (the CLI
+# creates it on first run).
+mkdir -p "${COPILOT_DIR}/extensions"
+info "Created ~/.operator/ + ~/.copilot/extensions/ directories"
 echo ""
 
-# ── Step 3: Operator symlink ──────────────────────────────────
-echo "Installing operator..."
-if [[ -L "${LOCAL_BIN}/operator" ]]; then
-    current_target=$(readlink -f "${LOCAL_BIN}/operator")
-    expected_target=$(readlink -f "${SCRIPT_DIR}/operator.sh")
-    if [[ "$current_target" == "$expected_target" ]]; then
-        info "operator symlink already correct"
-    else
-        ln -sf "${SCRIPT_DIR}/operator.sh" "${LOCAL_BIN}/operator"
-        info "Updated operator symlink → ${SCRIPT_DIR}/operator.sh"
+# ── Step 2b: Migrate legacy operator state ────────────────────
+# Move anything that lived under ~/.copilot/projects/ (legacy location) into
+# ~/.operator/projects/. Refuses gracefully if operator instances are still
+# running so handoffs in flight aren't lost.
+if [[ -f "${SCRIPT_DIR}/lib/migrate-operator-state.sh" ]]; then
+    echo "Checking for legacy operator state to migrate..."
+    # shellcheck disable=SC1091
+    source "${SCRIPT_DIR}/lib/migrate-operator-state.sh"
+    if ! migrate_operator_state; then
+        err "Legacy state migration was refused or partially failed. Resolve the messages above and re-run."
+        exit 1
     fi
-else
-    ln -sf "${SCRIPT_DIR}/operator.sh" "${LOCAL_BIN}/operator"
-    info "Created operator symlink → ${SCRIPT_DIR}/operator.sh"
+    echo ""
 fi
+
+# ── Step 3: Operator + handoff into PATH ──────────────────────
+echo "Installing operator + handoff into ${LOCAL_BIN}..."
+install_bin_entry operator "${SCRIPT_DIR}/operator.sh"
+install_bin_entry handoff  "${SCRIPT_DIR}/handoff.sh"
 
 # Ensure ~/.local/bin is on PATH
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$LOCAL_BIN"; then
     warn "~/.local/bin is not on your PATH. Add to your shell profile:"
     echo "       export PATH=\"\$HOME/.local/bin:\$PATH\""
-fi
-
-# Handoff script symlink
-if [[ -L "${LOCAL_BIN}/handoff" ]]; then
-    current_target=$(readlink -f "${LOCAL_BIN}/handoff")
-    expected_target=$(readlink -f "${SCRIPT_DIR}/handoff.sh")
-    if [[ "$current_target" == "$expected_target" ]]; then
-        info "handoff symlink already correct"
-    else
-        ln -sf "${SCRIPT_DIR}/handoff.sh" "${LOCAL_BIN}/handoff"
-        info "Updated handoff symlink → ${SCRIPT_DIR}/handoff.sh"
-    fi
-else
-    ln -sf "${SCRIPT_DIR}/handoff.sh" "${LOCAL_BIN}/handoff"
-    info "Created handoff symlink → ${SCRIPT_DIR}/handoff.sh"
 fi
 echo ""
 
