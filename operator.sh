@@ -897,7 +897,7 @@ start_copilot_in_tmux() {
     # during our launch window).
     if [[ ! -d "$RESTART_DIR" ]]; then
         log "WARN: $RESTART_DIR vanished between startup and session launch — unexpected after the ~/.operator/ move. Recreating + restoring ${#PRE_LAUNCH_MARKERS[@]} sibling marker(s). If this fires repeatedly, run:"
-        log "     ${SCRIPT_DIR:-/home/darin/projects/copilot-tools}/diagnose-restart-deleter.sh"
+        log "     ${SCRIPT_DIR}/diagnose-restart-deleter.sh"
         mkdir -p "$RESTART_DIR"
         if (( ${#PRE_LAUNCH_MARKERS[@]} > 0 )); then
             local -A _live_sessions=()
