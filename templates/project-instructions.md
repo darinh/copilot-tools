@@ -20,7 +20,7 @@
 
 Enabled. See `~/.copilot/copilot-instructions.md` for protocol.
 
-Handoff file: `~/.copilot/projects/{guid}/next-session.md`
+Handoff file: `~/.operator/projects/{guid}/next-session.md`
 
 ### Operator Restart Protocol
 When a session is complete or getting heavy (large context window), you MUST:

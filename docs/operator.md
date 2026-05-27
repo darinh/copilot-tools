@@ -2,18 +2,25 @@
 
 The operator is a metrics-capturing wrapper for GitHub Copilot CLI. It wraps `copilot` to capture usage metrics (premium requests, API time, session time, per-model breakdown) into a SQLite database. It supports single-session mode (default) and autonomous loop mode with automatic restarts.
 
+> **Windows note**: `operator.sh` is bash + tmux only and runs **inside WSL** on Windows. `setup.ps1` drops an `operator.cmd` shim into `%USERPROFILE%\.local\bin\` (on PATH) that forwards arguments to `wsl operator`, so the commands below work verbatim from PowerShell, cmd.exe, or VS Code's integrated terminal once setup has run.
+
 ## Prerequisites
 
 - `tmux` — session management
 - `sqlite3` — metrics database
 - `python3` — log parsing
 - `copilot` — GitHub Copilot CLI
+- (Windows only) WSL with one of the above distros installed
 
 ## Installation
 
 ```bash
-# From the copilot-tools repo
+# Linux / macOS / WSL — from the copilot-tools repo
 ./setup.sh
+
+# Windows (PowerShell) — installs cross-platform pieces natively and
+# shells into WSL to set up the bash side
+.\setup.ps1
 
 # Or manually
 ln -sf /path/to/copilot-tools/operator.sh ~/.local/bin/operator

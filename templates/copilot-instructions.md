@@ -6,11 +6,11 @@ These conventions apply to all projects I work on. They complement any agent-spe
 
 ## Project Configuration System
 
-Each project can have a persistent configuration stored outside the repo at `~/.copilot/projects/`.
+Each project can have a persistent configuration stored outside the repo at `~/.operator/projects/`.
 
 ### Catalog
 
-`~/.copilot/projects/catalog.csv` maps project root paths to GUIDs:
+`~/.operator/projects/catalog.csv` maps project root paths to GUIDs:
 
 ```csv
 "/home/user/projects/my-app",a1b2c3d4-e5f6-7890-abcd-ef1234567890
@@ -19,7 +19,7 @@ Each project can have a persistent configuration stored outside the repo at `~/.
 
 ### Per-Project Directory
 
-`~/.copilot/projects/{guid}/` contains:
+`~/.operator/projects/{guid}/` contains:
 - `copilot-instructions.md` — project-specific conventions and feature flags
 - `next-session.md` — session handoff file (ephemeral, read-once)
 - `specs/` — living specifications (if spec-driven development is enabled)
@@ -28,8 +28,8 @@ Each project can have a persistent configuration stored outside the repo at `~/.
 ### On Session Start — Project Lookup
 
 1. Determine the current project root (git root or cwd).
-2. Read `~/.copilot/projects/catalog.csv` and look for a matching path.
-3. **If found**: Read `~/.copilot/projects/{guid}/copilot-instructions.md` and follow its conventions. Check for `next-session.md` handoff.
+2. Read `~/.operator/projects/catalog.csv` and look for a matching path.
+3. **If found**: Read `~/.operator/projects/{guid}/copilot-instructions.md` and follow its conventions. Check for `next-session.md` handoff.
 4. **If not found**: Ask the user:
    - "This project isn't in the catalog yet. Would you like to set it up?"
    - Choices: "Enable all features" / "Select features" / "Skip for now"
@@ -54,13 +54,13 @@ The generated `copilot-instructions.md` includes only the enabled sections.
 
 *Enabled by feature flag: `session-handoff`*
 
-Agents use `~/.copilot/projects/{guid}/next-session.md` for continuity across sessions.
+Agents use `~/.operator/projects/{guid}/next-session.md` for continuity across sessions.
 
 ### On Session Start
 When the user greets you (e.g., "hey", "hello", "hi"), **immediately**:
 
 1. **Check for unmerged work**: Run `git branch --no-merged` against the integration branch (usually `develop` or `main`). If any feature branches have unmerged commits, tell the user: *"Found unmerged work on branch X (N commits). Want to continue that, merge it, or start fresh?"*
-2. **Read handoff**: Check if `~/.copilot/projects/{guid}/next-session.md` exists. If it does:
+2. **Read handoff**: Check if `~/.operator/projects/{guid}/next-session.md` exists. If it does:
    - Read it and use it as your starting context.
    - Tell the user what was left in progress and what you're picking up.
    - Delete the file after reading it (it's a one-time handoff, not permanent docs).
@@ -82,7 +82,7 @@ handoff --instance <operator-instance-name> \
 
 The `handoff` command atomically writes the handoff file AND triggers the operator restart. **Never write the handoff file manually** — always use the command.
 
-If the `handoff` command is not available (e.g., not on PATH), fall back to writing `~/.copilot/projects/{guid}/next-session.md` manually and then running `touch ~/.operator/restart/{instance-name}`.
+If the `handoff` command is not available (e.g., not on PATH), fall back to writing `~/.operator/projects/{guid}/next-session.md` manually and then running `touch ~/.operator/restart/{instance-name}`.
 
 ### Handoff File Format
 ```markdown
@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS session_log (
 
 ## Field Notes (Agent Journal)
 
-Cross-project working journal of insights about building, instructing, and collaborating with AI agents. Lives in its own repo (not per-project): `~/projects/agent-field-notes/`.
+Cross-project working journal of insights about building, instructing, and collaborating with AI agents. Lives in its own repo (not per-project) — for example, `${AGENT_FIELD_NOTES_DIR:-~/projects/agent-field-notes/}`. Adjust the path or skip this section if you don't keep one.
 
 ```
 journal/    Chronological entries, one conversation per file.
@@ -209,7 +209,7 @@ Optional sentence that captures the principle.
 
 *Enabled by feature flag: `spec-driven`*
 
-If enabled, the project's `specs/` directory (at `~/.copilot/projects/{guid}/specs/` or in-repo — whichever is configured) is the single source of truth.
+If enabled, the project's `specs/` directory (at `~/.operator/projects/{guid}/specs/` or in-repo — whichever is configured) is the single source of truth.
 
 ### Plans ARE Spec Change Proposals
 
