@@ -10,100 +10,43 @@
 #          [--in-progress "..."] [--context "..."] [--prompt "..."]
 #          [--project-root DIR]
 #
-# The project GUID is resolved from ~/.operator/projects/catalog.csv
-# using --project-root or the current working directory. The legacy
-# ~/.copilot/projects/catalog.csv is consulted as a fallback for users
-# mid-migration and the matching project gets moved into ~/.operator/.
+# The project GUID is resolved from ~/.copilot/projects/catalog.csv
+# using --project-root or the current working directory.
 # ═══════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# Operator state lives under ~/.operator/ (kept out of ~/.copilot/, which
-# the Copilot CLI itself manages). Override with COPILOT_OPERATOR_HOME.
-OPERATOR_HOME="${COPILOT_OPERATOR_HOME:-${HOME}/.operator}"
-CATALOG="${OPERATOR_HOME}/projects/catalog.csv"
-PROJECTS_DIR="${OPERATOR_HOME}/projects"
-RESTART_DIR="${OPERATOR_HOME}/restart"
-
-# Legacy paths (read-only fallback for users mid-migration). New writes always
-# go to the locations above. On a legacy hit we opportunistically migrate just
-# that one project so the migration completes incrementally without a big-bang
-# move.
-LEGACY_CATALOG="${HOME}/.copilot/projects/catalog.csv"
-LEGACY_PROJECTS_DIR="${HOME}/.copilot/projects"
+CATALOG="${HOME}/.copilot/projects/catalog.csv"
+RESTART_DIR="${COPILOT_OPERATOR_HOME:-${HOME}/.operator}/restart"
 
 # ── Helpers ─────────────────────────────────────────────────────
 die() { echo "Error: $*" >&2; exit 1; }
-warn() { echo "Warning: $*" >&2; }
-
-# Match a project root path against a catalog file. Echoes the matching GUID
-# on success, empty string on miss.
-lookup_in_catalog() {
-    local catalog="$1" normalized="$2"
-    [[ -f "$catalog" ]] || return 0
-    local path id guid=""
-    while IFS=',' read -r path id; do
-        path="${path#\"}"; path="${path%\"}"
-        id="${id#\"}"; id="${id%\"}"
-        if [[ "$path" == "$normalized" ]]; then
-            guid="$id"; break
-        fi
-    done < "$catalog"
-    echo "$guid"
-}
-
-# Opportunistically migrate one project's state from the legacy ~/.copilot/projects/
-# location into ~/.operator/projects/. Used when handoff finds the project in the
-# legacy catalog only — avoids leaving handoff broken for users who haven't run
-# `upgrade` yet. Safe to call repeatedly: each move skips if the target exists.
-migrate_one_project() {
-    local guid="$1" path="$2"
-    mkdir -p "$PROJECTS_DIR"
-
-    # Move the per-project directory if it exists in legacy but not new.
-    local legacy_dir="${LEGACY_PROJECTS_DIR}/${guid}"
-    local new_dir="${PROJECTS_DIR}/${guid}"
-    if [[ -d "$legacy_dir" && ! -e "$new_dir" ]]; then
-        mv "$legacy_dir" "$new_dir" 2>/dev/null || return 1
-    fi
-
-    # Append the catalog row to the new catalog if not already there.
-    if [[ -f "$CATALOG" ]]; then
-        if ! grep -Fq "\"$path\",$guid" "$CATALOG" 2>/dev/null && \
-           ! grep -Fq "\"$path\",\"$guid\"" "$CATALOG" 2>/dev/null; then
-            echo "\"$path\",$guid" >> "$CATALOG"
-        fi
-    else
-        echo "\"$path\",$guid" > "$CATALOG"
-    fi
-
-    warn "Migrated project entry for '$path' from ~/.copilot/projects/ to ${PROJECTS_DIR}/. Run ./upgrade.sh in copilot-tools to migrate everything else."
-}
 
 resolve_guid() {
     local project_root="$1"
+    [[ -f "$CATALOG" ]] || die "Catalog not found: $CATALOG"
+
+    # Normalize the path for matching
     local normalized
     normalized=$(cd "$project_root" 2>/dev/null && pwd) || die "Directory not found: $project_root"
 
-    # 1. Try the canonical catalog first.
     local guid=""
-    guid=$(lookup_in_catalog "$CATALOG" "$normalized")
-    if [[ -n "$guid" ]]; then
-        echo "$guid"; return 0
-    fi
-
-    # 2. Fall back to the legacy catalog. On hit, migrate just that one project
-    #    so subsequent lookups go through the canonical path.
-    if [[ -f "$LEGACY_CATALOG" ]]; then
-        guid=$(lookup_in_catalog "$LEGACY_CATALOG" "$normalized")
-        if [[ -n "$guid" ]]; then
-            migrate_one_project "$guid" "$normalized" || true
-            echo "$guid"; return 0
+    while IFS=',' read -r path id; do
+        # Strip surrounding quotes
+        path="${path#\"}"
+        path="${path%\"}"
+        id="${id#\"}"
+        id="${id%\"}"
+        if [[ "$path" == "$normalized" ]]; then
+            guid="$id"
+            break
         fi
-    fi
+    done < "$CATALOG"
 
-    die "No catalog entry for: $normalized
+    [[ -n "$guid" ]] || die "No catalog entry for: $normalized
 Add it with:
   echo '\"$normalized\",<guid>' >> $CATALOG"
+
+    echo "$guid"
 }
 
 resolve_instance() {
@@ -174,9 +117,8 @@ If --instance is omitted, handoff tries to infer it from running
 operator sessions whose working directory matches the project root.
 
 WHAT IT DOES
-    1. Resolves project GUID from ~/.operator/projects/catalog.csv (with
-       one-time fallback read of legacy ~/.copilot/projects/catalog.csv).
-    2. Writes ~/.operator/projects/{guid}/next-session.md atomically.
+    1. Resolves project GUID from ~/.copilot/projects/catalog.csv
+    2. Writes ~/.copilot/projects/{guid}/next-session.md
     3. Touches ~/.operator/restart/{instance} to trigger operator restart
 HELP
 }
@@ -250,18 +192,13 @@ fi
 
 # ── Resolve GUID ────────────────────────────────────────────────
 guid=$(resolve_guid "$project_root")
-project_dir="${PROJECTS_DIR}/${guid}"
+project_dir="${HOME}/.copilot/projects/${guid}"
 handoff_file="${project_dir}/next-session.md"
 restart_marker="${RESTART_DIR}/${instance}"
 
 mkdir -p "$project_dir" "$RESTART_DIR"
 
-# ── Write Handoff (atomic) ─────────────────────────────────────
-# Write to a tmpfile in the same directory, then atomic rename. This guarantees
-# the next-session.md reader (the operator preamble) never sees a half-written
-# file — a real concern when the agent's last action is `touch <restart>` which
-# triggers an immediate operator restart.
-tmpfile=$(mktemp "${project_dir}/.next-session.XXXXXX.md")
+# ── Write Handoff ───────────────────────────────────────────────
 {
     echo "# Session Handoff"
     echo ""
@@ -286,8 +223,7 @@ tmpfile=$(mktemp "${project_dir}/.next-session.XXXXXX.md")
         echo "$prompt"
         echo ""
     fi
-} > "$tmpfile"
-mv "$tmpfile" "$handoff_file"
+} > "$handoff_file"
 
 # ── Touch Restart Marker ───────────────────────────────────────
 touch "$restart_marker"

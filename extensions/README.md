@@ -28,13 +28,13 @@ Drop a `.copilot-architecture.json` at any project root:
 {
   "rules": [
     {
-      "from": "src/MyApp\\.Domain/",
-      "cannotImport": "MyApp\\.(Infrastructure|Api)",
+      "from": "src/Matrix\\.Domain/",
+      "cannotImport": "Matrix\\.(Infrastructure|Operator|Api)",
       "reason": "Domain has zero project references."
     },
     {
-      "from": "src/MyApp\\.Infrastructure/",
-      "cannotImport": "MyApp\\.Api",
+      "from": "src/Matrix\\.Infrastructure/",
+      "cannotImport": "Matrix\\.(Operator|Api)",
       "reason": "Infrastructure depends only on Domain."
     },
     {
@@ -50,12 +50,8 @@ Without a config file the extension is a no-op — safe to install globally.
 
 ## Install
 
-Run the setup script from the repo root:
-
-- Linux / WSL / macOS: `./setup.sh` symlinks each subdirectory here into `~/.copilot/extensions/`.
-- Windows (PowerShell): `./setup.ps1` installs each subdirectory as a directory junction (or symlink/copy fallback) under `%USERPROFILE%\.copilot\extensions\`. If WSL is also installed, the bash setup runs inside WSL too, so both environments see the same extensions.
-
-Re-run setup after a `git pull` to pick up new extensions, or use `./upgrade.sh` / `./upgrade.ps1` to do both in one step.
+`setup.sh` symlinks each subdirectory here into `~/.copilot/extensions/`.
+Run it after a `git pull` to pick up new extensions.
 
 ## Authoring
 
