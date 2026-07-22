@@ -237,7 +237,7 @@ When multiple AI agents collaborate on these tasks:
 3. Each agent operates in an isolated git worktree.
 4. Each agent MUST atomically claim one ready task (using a `BEGIN IMMEDIATE` transaction) before beginning work.
 5. A task is ready only if its dependencies are `done` and it is unclaimed.
-6. When a task is finished, the agent MUST update both the SQL database and this `tasks.md` file.
+6. When a task is finished, the worker agent MUST update the SQL database and report completion. ONLY the coordinator serially updates this `tasks.md` file to prevent filesystem race conditions.
 
 ---
 

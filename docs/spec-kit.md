@@ -47,6 +47,6 @@ When working with parallel agents, spec-kit utilizes the session SQLite database
 2. **Identity**: Each agent is assigned a unique stable ID.
 3. **Claiming**: Agents atomically claim one ready task at a time using a `BEGIN IMMEDIATE` transaction.
 4. **Dependency Awareness**: A task is only ready if all its dependencies are `done` and it remains unclaimed. If a preferred task is blocked by an in-progress dependency, agents look for other ready work instead of idling.
-5. **Updating**: Upon completion, the agent updates both the SQLite status and the `tasks.md` file.
+5. **Updating**: Upon completion, the worker agent updates the SQLite status and reports completion. To prevent filesystem race conditions, ONLY the coordinator serially updates the `tasks.md` checkboxes (in single-agent mode, the lone agent handles both).
 
 Tasks marked `[P]` in `tasks.md` are eligible for parallel execution, but actual ownership is governed entirely by the SQL database claims to guarantee safe coordination. Tasks that modify the same file must be run sequentially even if marked `[P]`.

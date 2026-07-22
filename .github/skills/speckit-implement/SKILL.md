@@ -157,7 +157,7 @@ You **MUST** consider the user input before proceeding (if not empty).
    - **Identity & Ownership**: If multiple agents are collaborating, each agent MUST use a unique stable agent ID and claim exactly one todo before changing files.
    - **Atomic Claiming**: Claiming MUST be atomic using a short `BEGIN IMMEDIATE` transaction in the shared SQL database. Execute an `INSERT OR IGNORE INTO todo_claims` followed by a guarded `UPDATE todos SET status = 'in_progress'` that verifies the claim. It ONLY succeeds for a pending, unclaimed todo whose dependencies are all `done`.
    - **Dependency Handling**: Provide exact ready-work SQL excluding claimed or dependency-blocked todos (e.g., using `NOT EXISTS (SELECT 1 FROM todo_claims)` and `NOT EXISTS (SELECT 1 FROM todo_deps ... WHERE status != 'done')`). If preferred work depends on an in-progress item, leave it pending and claim another ready todo. Do not mark dependency waits as blocked.
-   - **Status Coherence**: Task completion, real blockers, or releasing MUST update status and claim coherently within a transaction (e.g., updating the status and deleting the claim record). Task completion MUST update BOTH SQL todos and `tasks.md`.
+   - **Status Coherence**: Task completion, real blockers, or releasing MUST update status and claim coherently within a transaction (e.g., updating the status and deleting the claim record). In single-agent mode, the agent MUST update both SQL todos and `tasks.md`. In parallel mode, worker agents MUST update SQL and report completion; ONLY the coordinator serially reconciles `tasks.md` checkboxes to prevent filesystem race conditions.
    - **Stale Claims**: Only a coordinator may recover a stale claim after confirming the agent stopped.
 
 8. Implementation execution rules:
@@ -173,7 +173,7 @@ You **MUST** consider the user input before proceeding (if not empty).
    - For parallel tasks [P], continue with successful tasks, report failed ones
    - Provide clear error messages with context for debugging
    - Suggest next steps if implementation cannot proceed
-   - **IMPORTANT** For completed tasks, make sure to mark the task off as [X] in the tasks file.
+   - **IMPORTANT** In single-agent mode (or if you are the coordinator), make sure to mark completed tasks as [X] in the tasks file. In parallel mode, workers report completion and the coordinator updates the file.
 
 10. Completion validation:
    - Verify all required tasks are completed

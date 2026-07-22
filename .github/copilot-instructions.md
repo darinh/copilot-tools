@@ -25,3 +25,4 @@
 - Completion/real blocker/release must update status and claim coherently within a transaction (e.g., `UPDATE todos SET status = 'done'` and `DELETE FROM todo_claims`).
 - Work in an isolated git worktree. Tasks that modify the same file are
   sequential even when they are otherwise marked parallel (`[P]` means eligible, not assigned).
+- In parallel mode, worker agents update SQL status and report completion, but ONLY the coordinator serially reconciles `tasks.md` checkboxes. Single agents update both SQL and `tasks.md` directly.

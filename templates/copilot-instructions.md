@@ -289,6 +289,8 @@ When multiple agents collaborate on a feature, coordinate via a shared SQLite da
 
 7. **Task Granularity**: `[P]` means eligible for parallel execution, not assigned. Same-file work is sequential. Work in isolated worktrees.
 
+8. **Task Artifact Reconciliation**: In parallel mode, worker agents update SQL status and report completion, but ONLY the coordinator serially updates `tasks.md` checkboxes to prevent filesystem conflicts. Single agents update both.
+
 ---
 
 ## Branching Strategy
