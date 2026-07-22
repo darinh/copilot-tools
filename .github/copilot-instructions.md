@@ -23,6 +23,8 @@
 - If preferred work depends on an in-progress todo, leave it pending and select
   another ready todo instead of waiting. Do not mark dependency waits as blocked.
 - Completion/real blocker/release must update status only when the same agent owns the claim, then delete the claim coherently within a transaction.
+- Refresh `heartbeat_at` during long-running work; only the coordinator may
+  recover a stale claim after confirming its owner stopped.
 - Work in an isolated git worktree. Tasks that modify the same file are
   sequential even when they are otherwise marked parallel (`[P]` means eligible, not assigned).
 - In parallel mode, worker agents update SQL status and report completion, but ONLY the coordinator serially reconciles `tasks.md` checkboxes. Single agents update both SQL and `tasks.md` directly.

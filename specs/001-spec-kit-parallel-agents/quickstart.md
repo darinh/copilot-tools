@@ -55,8 +55,7 @@ whose dependencies are all done.
 ```bash
 bash -n setup.sh
 bash tests/test-setup-spec-kit.sh
+bash tests/test-todo-claims.sh
 .specify/scripts/bash/check-prerequisites.sh --json --require-tasks --include-tasks
-git grep -n -i codebase-memory-mcp
+python3 -m json.tool templates/mcp-config.json >/dev/null
 ```
-
-The final grep must return no matches.

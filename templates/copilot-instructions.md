@@ -33,7 +33,7 @@ Each project can have a persistent configuration stored outside the repo at `~/.
    - "This project isn't in the catalog yet. Would you like to set it up?"
    - Choices: "Enable all features" / "Select features" / "Skip for now"
    - If enabling: generate a GUID, create the directory, write `copilot-instructions.md` with selected features, add entry to `catalog.csv`.
-   - **If spec-driven is selected and `.specify/` is missing**, instruct the agent to initialize with `specify init --here --force --integration copilot --integration-options="--skills" --script sh`.
+   - **If spec-driven is selected and `.specify/` is missing**, run `specify init --here --force --integration copilot --integration-options="--skills" --script sh`.
 
 ### Feature Selection
 
@@ -213,19 +213,19 @@ Optional sentence that captures the principle.
 If enabled, the project uses **GitHub spec-kit** as the authoritative workflow. Specifications live in-repo under `.specify/` and `specs/`.
 
 ### Workflow
-1. **Specify**: Define observable behavior in `specs/[id]/spec.md`.
-2. **Clarify**: Resolve ambiguities in `spec.md` before proceeding.
-3. **Plan**: Write the technical approach in `plan.md`.
-4. **Tasks**: Break down execution into `tasks.md`.
-5. **Implement**: Execute tasks, keeping specs factual. Update `spec.md`, `plan.md`, and `tasks.md` with delivered behavior.
-6. **Analyze**: Review deliverables for accuracy and constraints.
+1. **Constitution** (`/speckit-constitution`): Establish project governance.
+2. **Specify** (`/speckit-specify`): Define observable behavior in `specs/[id]/spec.md`.
+3. **Clarify** (`/speckit-clarify`): Resolve ambiguities before proceeding.
+4. **Plan** (`/speckit-plan`): Write the technical approach in `plan.md`.
+5. **Tasks** (`/speckit-tasks`): Break execution into `tasks.md`.
+6. **Implement** (`/speckit-implement`): Execute tasks and keep artifacts factual.
+7. **Analyze** (`/speckit-analyze`): Review deliverables for accuracy and constraints.
 
 ### Validation Checklist
 
 When reviewing completed work:
 - [ ] Every code change is reflected in the specification artifacts.
 - [ ] Every spec claim references actual code (file paths, function names, types)
-- [ ] The changelog has an entry for the change
 - [ ] No aspirational claims — spec describes what IS, not what SHOULD BE
 
 ### Discovery Workflow
@@ -261,7 +261,9 @@ When multiple agents collaborate on a feature, coordinate via a shared SQLite da
          SELECT 1 FROM todo_deps td
          JOIN todos dep ON td.depends_on = dep.id
          WHERE td.todo_id = t.id AND dep.status != 'done'
-     );
+     )
+   ORDER BY t.created_at
+   LIMIT 1;
    ```
 
 4. **Atomic Claiming**: Claiming must be atomic in a short `BEGIN IMMEDIATE` transaction and only succeed for a pending, unclaimed todo whose dependencies are all `done`:
@@ -276,24 +278,41 @@ When multiple agents collaborate on a feature, coordinate via a shared SQLite da
            JOIN todos dep ON td.depends_on = dep.id
            WHERE td.todo_id = t.id AND dep.status != 'done'
        );
-   UPDATE todos SET status = 'in_progress'
-     WHERE id = '{todo_id}' AND status = 'pending'
-       AND EXISTS (SELECT 1 FROM todo_claims WHERE todo_id = '{todo_id}' AND agent_id = '{agent_id}');
+   UPDATE todos
+   SET status = 'in_progress', updated_at = datetime('now')
+   WHERE id = '{todo_id}' AND status = 'pending'
+     AND EXISTS (
+         SELECT 1 FROM todo_claims
+         WHERE todo_id = '{todo_id}' AND agent_id = '{agent_id}'
+     );
    COMMIT;
    ```
    Check `changes()` (or verify status) to ensure the claim succeeded before starting work.
 
 5. **Dependency Awareness**: If preferred work depends on an in-progress item, leave it pending and claim another ready todo. Do not mark dependency waits as blocked.
 
-6. **Releasing**: Completion, real blockers, or releasing must update status only when the same agent owns the claim, then delete the claim:
+6. **Releasing**: Completion or a genuine blocker must update status only when the same agent owns the claim, then delete the claim:
    ```sql
    BEGIN IMMEDIATE;
-   UPDATE todos SET status = 'done'
-     WHERE id = '{todo_id}'
-       AND EXISTS (SELECT 1 FROM todo_claims WHERE todo_id = '{todo_id}' AND agent_id = '{agent_id}');
-   DELETE FROM todo_claims WHERE todo_id = '{todo_id}' AND agent_id = '{agent_id}';
+   UPDATE todos
+   SET status = '{done_or_blocked}', updated_at = datetime('now')
+   WHERE id = '{todo_id}' AND status = 'in_progress'
+     AND EXISTS (
+         SELECT 1 FROM todo_claims
+         WHERE todo_id = '{todo_id}' AND agent_id = '{agent_id}'
+     );
+   DELETE FROM todo_claims
+   WHERE todo_id = '{todo_id}' AND agent_id = '{agent_id}'
+     AND EXISTS (
+         SELECT 1 FROM todos
+         WHERE id = '{todo_id}' AND status = '{done_or_blocked}'
+     );
    COMMIT;
    ```
+   Substitute either `done` or `blocked` consistently. Dependency waits stay
+   `pending` and unclaimed. To return unfinished work, the coordinator sets it
+   back to `pending` and deletes the claim in the same transaction. Refresh
+   `heartbeat_at` during long-running work.
    Only a coordinator may recover a stale claim after confirming the agent stopped.
 
 7. **Task Granularity**: `[P]` means eligible for parallel execution, not assigned. Same-file work is sequential. Work in isolated worktrees.

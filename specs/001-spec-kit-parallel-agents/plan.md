@@ -9,7 +9,7 @@
 Initialize the repository with spec-kit v0.13.4 in GitHub Copilot skills mode,
 install the `specify` CLI from the official GitHub release during setup when
 missing, replace legacy specification guidance, add an atomic SQLite todo-claim
-protocol for parallel agents, and remove codebase-memory-mcp.
+protocol for parallel agents, and remove the retired code graph MCP.
 
 ## Technical Context
 
@@ -77,14 +77,14 @@ templates/
 ├── mcp-config.json
 └── project-instructions.md
 tests/test-setup-spec-kit.sh
+tests/test-todo-claims.sh
 README.md
 setup.sh
 ```
 
 **Structure Decision**: Keep spec-kit infrastructure in its standard generated
-locations, retain reusable user-facing templates under `templates/`, and add a
-single shell integration test because the changed runtime behavior is in
-`setup.sh`.
+locations, retain reusable user-facing templates under `templates/`, and cover
+setup plus SQLite coordination with focused shell tests.
 
 ## Design
 

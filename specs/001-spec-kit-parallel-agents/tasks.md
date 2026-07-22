@@ -3,7 +3,7 @@
 **Input**: Design documents from `specs/001-spec-kit-parallel-agents/`
 
 **Tests**: Setup installation, SQLite claim behavior, spec-kit prerequisites, and
-repository-wide MCP reference removal are required by the feature specification.
+retired MCP removal are required by the feature specification.
 
 ## Phase 1: Spec-kit Foundation
 
@@ -13,26 +13,26 @@ repository-wide MCP reference removal are required by the feature specification.
 
 ## Phase 2: Setup and Toolchain
 
-- [ ] T004 [P] [US1] Add conditional pinned spec-kit installation to `setup.sh`
-- [ ] T005 [P] [US1] Add isolated setup coverage in `tests/test-setup-spec-kit.sh`
-- [ ] T006 [P] [US4] Remove codebase-memory-mcp from `templates/mcp-config.json`, `skills/code-intelligence/SKILL.md`, `docs/skills.md`, and `README.md`
+- [X] T004 [P] [US1] Add conditional pinned spec-kit installation to `setup.sh`
+- [X] T005 [P] [US1] Add isolated setup coverage in `tests/test-setup-spec-kit.sh`
+- [X] T006 [P] [US4] Remove the retired MCP from `templates/mcp-config.json`, `skills/code-intelligence/SKILL.md`, `docs/skills.md`, and `README.md`
 
 ## Phase 3: Specification Workflow
 
-- [ ] T007 [US2] Replace legacy spec-writing rules in `templates/copilot-instructions.md`
-- [ ] T008 [P] [US2] Enable spec-kit in `templates/project-instructions.md`
-- [ ] T009 [P] [US2] Document spec-kit setup and commands in `docs/spec-kit.md` and `README.md`
+- [X] T007 [US2] Replace legacy spec-writing rules in `templates/copilot-instructions.md`
+- [X] T008 [P] [US2] Enable spec-kit in `templates/project-instructions.md`
+- [X] T009 [P] [US2] Document spec-kit setup and commands in `docs/spec-kit.md` and `README.md`
 
 ## Phase 4: Parallel Agent Coordination
 
-- [ ] T010 [US3] Add atomic todo claim and ready-work SQL guidance to `templates/copilot-instructions.md`
-- [ ] T011 [P] [US3] Add repository coordination rules to `.github/copilot-instructions.md`
-- [ ] T012 [US3] Add claim-before-work behavior to `.github/skills/speckit-implement/SKILL.md`
-- [ ] T013 [P] [US3] Clarify parallel eligibility and ownership in `.specify/templates/tasks-template.md`
+- [X] T010 [US3] Add atomic todo claim and ready-work SQL guidance to `templates/copilot-instructions.md`
+- [X] T011 [P] [US3] Add repository coordination rules to `.github/copilot-instructions.md`
+- [X] T012 [US3] Add claim-before-work behavior to `.github/skills/speckit-implement/SKILL.md`
+- [X] T013 [P] [US3] Clarify parallel eligibility and ownership in `.specify/templates/tasks-template.md`
 
 ## Phase 5: Validation and Review
 
-- [ ] T014 Run shell, setup, SQLite, spec-kit, JSON, and repository search checks
+- [X] T014 Run shell, setup, SQLite, spec-kit, JSON, and repository search checks
 - [ ] T015 Run isolated multi-model adversarial reviews and resolve all consensus findings
 - [ ] T016 Update `specs/001-spec-kit-parallel-agents/spec.md` and this task list to reflect delivered behavior
 

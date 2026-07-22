@@ -10,7 +10,7 @@ tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 db="${tmp_dir}/todos.db"
 
-sqlite3 "$db" <<'SQL'
+sqlite3 "$db" >/dev/null <<'SQL'
 PRAGMA journal_mode = WAL;
 
 CREATE TABLE todos (

@@ -115,11 +115,18 @@ STUB
 # run_setup — execute setup.sh in the isolated environment, return its exit code.
 # Use a minimal PATH so real ~/.local/bin (and any pre-installed specify) is excluded.
 run_setup() {
-    local fake_home="$1" stub_bin="$2"
+    local fake_home="$1" stub_bin="$2" spec_kit_version="${3:-}"
     local actual_exit=0
-    HOME="$fake_home" \
-    PATH="${stub_bin}:${fake_home}/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    bash "$SETUP_SH" </dev/null >"${fake_home}/setup.out" 2>&1 || actual_exit=$?
+    if [[ -n "$spec_kit_version" ]]; then
+        SPEC_KIT_VERSION="$spec_kit_version" \
+        HOME="$fake_home" \
+        PATH="${stub_bin}:${fake_home}/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        bash "$SETUP_SH" </dev/null >"${fake_home}/setup.out" 2>&1 || actual_exit=$?
+    else
+        HOME="$fake_home" \
+        PATH="${stub_bin}:${fake_home}/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        bash "$SETUP_SH" </dev/null >"${fake_home}/setup.out" 2>&1 || actual_exit=$?
+    fi
     echo "$actual_exit"
 }
 
@@ -299,6 +306,24 @@ if [[ -x "${t4_home}/.local/bin/specify" ]]; then
     pass "T4: specify callable after bootstrap install"
 else
     fail "T4: specify not callable after bootstrap install"
+fi
+
+echo ""
+
+# ── Test 5: version override ─────────────────────────────────
+# Expect: SPEC_KIT_VERSION controls the pinned GitHub tag.
+echo "Test 5: SPEC_KIT_VERSION overrides the default pin"
+t5_base="$(mktemp -d)"
+CLEANUP_DIRS+=("$t5_base")
+
+build_env "$t5_base" "absent" "present"
+t5_exit=$(run_setup "${t5_base}/home" "${t5_base}/stub-bin" "v9.9.9")
+assert_eq "T5: setup exits 0" "$t5_exit" "0"
+
+if grep -q "spec-kit.git@v9.9.9" "${t5_base}/calls.log" 2>/dev/null; then
+    pass "T5: configured spec-kit version used in uv call"
+else
+    fail "T5: configured spec-kit version not found in uv call log"
 fi
 
 echo ""

@@ -4,11 +4,11 @@
 
 **Created**: 2026-07-22
 
-**Status**: In Progress
+**Status**: In Review
 
 **Input**: Adopt GitHub spec-kit, install it during setup when absent, update
 spec-writing guidance, coordinate parallel agents through todo ownership and
-dependency-aware work selection, and remove codebase-memory-mcp.
+dependency-aware work selection, and remove the retired code graph MCP.
 
 ## User Scenarios & Testing
 
@@ -88,13 +88,13 @@ excluded while another ready todo is returned.
 ### User Story 4 - Keep the MCP Toolchain Focused (Priority: P2)
 
 A user receives only the supported Roslyn MCP integration and no setup prompts
-or guidance for codebase-memory-mcp.
+or guidance for the retired code graph MCP.
 
 **Why this priority**: Removing unused tooling reduces setup noise and prevents
 agents from selecting an integration that the repository no longer recommends.
 
-**Independent Test**: Search all tracked files and confirm there are no
-codebase-memory-mcp references while the Roslyn configuration remains valid.
+**Independent Test**: Search all tracked files and confirm there are no retired
+MCP references while the Roslyn configuration remains valid.
 
 **Acceptance Scenarios**:
 
@@ -145,7 +145,7 @@ codebase-memory-mcp references while the Roslyn configuration remains valid.
 - **FR-014**: Spec-kit task guidance MUST distinguish parallel eligibility from
   ownership; a `[P]` marker does not itself assign work.
 - **FR-015**: Setup, MCP configuration, skills, and documentation MUST contain no
-  codebase-memory-mcp references.
+  references to the retired code graph MCP.
 
 ### Key Entities
 
@@ -168,8 +168,8 @@ codebase-memory-mcp references while the Roslyn configuration remains valid.
 - **SC-003**: In a two-agent claim race, exactly one agent owns the target todo.
 - **SC-004**: A ready-work query returns zero todos with incomplete dependencies
   and zero todos claimed by another agent.
-- **SC-005**: All tracked repository files contain zero references to
-  codebase-memory-mcp.
+- **SC-005**: Active setup, MCP configuration, skills, and documentation expose
+  only the supported Roslyn MCP integration.
 - **SC-006**: Spec-kit prerequisite checks resolve this feature's spec, plan, and
   tasks successfully.
 

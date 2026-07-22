@@ -1,6 +1,6 @@
 ---
 name: code-intelligence
-description: Use when exploring codebase structure, finding callers or references, understanding dependencies, or assessing blast radius. Prefer this over grep, glob, or file reads for structural questions. Use before planning or implementing any Medium or Large task.
+description: Use for C# structural questions such as callers, references, implementations, dependencies, and change blast radius. For other languages, use the environment's built-in code intelligence, LSP, or search tools.
 allowed-tools: mcp__roslyn__find_references, mcp__roslyn__find_implementations, mcp__roslyn__find_callers, mcp__roslyn__get_symbol_info, mcp__roslyn__search_symbols
 ---
 
@@ -28,7 +28,7 @@ built-in tools can answer it faster.
 
 ## Common Workflows
 
-**Before planning a Medium/Large task:**
+**Before planning a Medium/Large C# task:**
 1. `roslyn:find_references` on the C# symbol(s) you plan to change — blast radius
 2. `roslyn:find_implementations` if changing a C# interface
 3. Include results in the plan before implementing

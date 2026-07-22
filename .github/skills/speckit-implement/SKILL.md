@@ -154,10 +154,11 @@ You **MUST** consider the user input before proceeding (if not empty).
    - **Validation checkpoints**: Verify each phase completion before proceeding
 
 7. Parallel Todo Coordination:
+   - **Initialization**: Before dispatching workers, the coordinator MUST create the shared `todo_claims` table defined by the repository instructions and mirror `tasks.md` into `todos` and `todo_deps`.
    - **Identity & Ownership**: If multiple agents are collaborating, each agent MUST use a unique stable agent ID and claim exactly one todo before changing files.
-   - **Atomic Claiming**: Claiming MUST be atomic using a short `BEGIN IMMEDIATE` transaction in the shared SQL database. Execute an `INSERT OR IGNORE INTO todo_claims` followed by a guarded `UPDATE todos SET status = 'in_progress'` that verifies the claim. It ONLY succeeds for a pending, unclaimed todo whose dependencies are all `done`.
+   - **Atomic Claiming**: Claiming MUST use the exact short `BEGIN IMMEDIATE` transaction from the repository instructions: conditional `INSERT OR IGNORE ... SELECT`, then a guarded `UPDATE todos SET status = 'in_progress'`. It ONLY succeeds for a pending, unclaimed todo whose dependencies are all `done`.
    - **Dependency Handling**: Provide exact ready-work SQL excluding claimed or dependency-blocked todos (e.g., using `NOT EXISTS (SELECT 1 FROM todo_claims)` and `NOT EXISTS (SELECT 1 FROM todo_deps ... WHERE status != 'done')`). If preferred work depends on an in-progress item, leave it pending and claim another ready todo. Do not mark dependency waits as blocked.
-   - **Status Coherence**: Completion, real blockers, or releasing MUST update status only when the same agent owns the claim, then delete the claim coherently within a transaction. In single-agent mode, the agent MUST update both SQL todos and `tasks.md`. In parallel mode, worker agents MUST update SQL and report completion; ONLY the coordinator serially reconciles `tasks.md` checkboxes to prevent filesystem race conditions.
+   - **Status Coherence**: Completion, real blockers, or releasing MUST update status only when the same agent owns the claim, then delete the claim coherently within a transaction. Refresh `heartbeat_at` during long work. In single-agent mode, the agent MUST update both SQL todos and `tasks.md`. In parallel mode, worker agents MUST update SQL and report completion; ONLY the coordinator serially reconciles `tasks.md` checkboxes to prevent filesystem race conditions.
    - **Stale Claims**: Only a coordinator may recover a stale claim after confirming the agent stopped.
 
 8. Implementation execution rules:

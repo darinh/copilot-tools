@@ -4,7 +4,8 @@ The `copilot-tools` repository leverages **Spec Kit** to drive Specification-Dri
 
 ## Installation & Setup
 
-When the `spec-driven` feature is enabled for a project and the `.specify/` directory is missing, agents will initialize spec-kit automatically.
+When the `spec-driven` feature is enabled for a project and `.specify/` is
+missing, agents initialize Spec Kit automatically.
 
 You can also initialize it manually:
 
@@ -12,11 +13,14 @@ You can also initialize it manually:
 specify init --here --force --integration copilot --integration-options="--skills" --script sh
 ```
 
-During the `copilot-tools` setup script execution, if `specify` is not found, the official `specify-cli` is installed automatically to ensure the environment is ready.
+During `copilot-tools` setup, the official `specify-cli` is installed from the
+pinned GitHub release when `specify` is absent. A fresh bootstrap requires
+Python 3.11+ and `curl`; setup installs `uv` when needed. Override the release
+pin with `SPEC_KIT_VERSION=vX.Y.Z ./setup.sh`.
 
 ## Standard Paths
 
-Spec-kit uses the following standard paths in your repository:
+Spec Kit uses the following standard paths in your repository:
 
 - `.specify/` — Contains templates, scripts, and the `memory/constitution.md` which dictates agent governance.
 - `specs/` — The directory where your feature specifications, plans, and tasks reside.
@@ -28,6 +32,7 @@ Spec-kit uses the following standard paths in your repository:
 
 Use the Copilot CLI skills (or equivalent slash commands if configured) to drive the workflow:
 
+- `/speckit-constitution` — Establish or update project governance.
 - `/speckit-specify` — Scaffold or update a specification based on requirements.
 - `/speckit-clarify` — Resolve ambiguities in the spec.
 - `/speckit-plan` — Generate a technical implementation plan.
@@ -37,7 +42,8 @@ Use the Copilot CLI skills (or equivalent slash commands if configured) to drive
 
 ## Upgrades
 
-Upgrading Spec Kit is idempotent. The setup script will skip installation if `specify` is already installed. If you need to force an upgrade to the latest pinned version, you can use the official CLI check:
+The setup script intentionally leaves an existing installation unchanged. Use
+the official self-management commands to check or upgrade it:
 
 ```bash
 specify self check
