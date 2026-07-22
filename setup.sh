@@ -10,6 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COPILOT_DIR="${HOME}/.copilot"
 LOCAL_BIN="${HOME}/.local/bin"
+SPEC_KIT_VERSION="${SPEC_KIT_VERSION:-v0.13.4}"
 
 # ── Helpers ─────────────────────────────────────────────────────
 info()  { echo "  ✅ $*"; }
@@ -159,13 +160,6 @@ echo ""
 # ── Step 5: MCP Servers ──────────────────────────────────────
 echo "Checking MCP servers..."
 
-# codebase-memory-mcp
-if check_cmd codebase-memory-mcp; then
-    info "codebase-memory-mcp ready"
-else
-    warn "codebase-memory-mcp not found. Install the Go binary from your team's distribution."
-fi
-
 # dotnet-roslyn-mcp
 if command -v dotnet-roslyn-mcp &>/dev/null || command -v dotnet &>/dev/null && dotnet tool list -g 2>/dev/null | grep -q "roslyn-mcp"; then
     info "dotnet-roslyn-mcp ready"
@@ -177,6 +171,55 @@ else
     else
         warn "dotnet CLI not found — cannot install roslyn-mcp. Install .NET SDK first."
     fi
+fi
+echo ""
+
+# ── Step 5b: Spec-kit CLI ─────────────────────────────────────
+echo "Checking spec-kit (specify)..."
+if command -v specify &>/dev/null; then
+    info "specify already installed: $(specify --version 2>&1 | head -1)"
+else
+    # Require Python >= 3.11
+    python_ver=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
+    python_major=$(echo "$python_ver" | cut -d. -f1)
+    python_minor=$(echo "$python_ver" | cut -d. -f2)
+    if [[ "$python_major" -lt 3 ]] || { [[ "$python_major" -eq 3 ]] && [[ "$python_minor" -lt 11 ]]; }; then
+        err "spec-kit requires Python >= 3.11 (found ${python_ver}). Upgrade Python and re-run."
+        exit 1
+    fi
+    info "Python ${python_ver} OK"
+
+    # Bootstrap uv via Astral's official installer when absent
+    if ! command -v uv &>/dev/null; then
+        info "uv not found — bootstrapping via Astral installer..."
+        if ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
+            err "Failed to download or run the Astral uv installer."
+            exit 1
+        fi
+        export PATH="${HOME}/.local/bin:${PATH}"
+        if ! command -v uv &>/dev/null; then
+            err "uv installer ran but 'uv' is still not on PATH. Add ~/.local/bin to PATH and re-run."
+            exit 1
+        fi
+        info "uv bootstrapped"
+    else
+        info "uv found: $(command -v uv)"
+        export PATH="${HOME}/.local/bin:${PATH}"
+    fi
+
+    # Install specify-cli from the pinned GitHub tag
+    info "Installing specify-cli ${SPEC_KIT_VERSION} via uv..."
+    if ! uv tool install specify-cli --from "git+https://github.com/github/spec-kit.git@${SPEC_KIT_VERSION}"; then
+        err "uv tool install failed for specify-cli ${SPEC_KIT_VERSION}."
+        exit 1
+    fi
+
+    # Verify specify is callable
+    if ! command -v specify &>/dev/null; then
+        err "'specify' is not callable after installation. Ensure ~/.local/bin is on PATH and re-run."
+        exit 1
+    fi
+    info "specify installed: $(specify --version 2>&1 | head -1)"
 fi
 echo ""
 
