@@ -33,8 +33,8 @@ retired MCP removal are required by the feature specification.
 ## Phase 5: Validation and Review
 
 - [X] T014 Run shell, setup, SQLite, spec-kit, JSON, and repository search checks
-- [ ] T015 Run isolated multi-model adversarial reviews and resolve all consensus findings
-- [ ] T016 Update `specs/001-spec-kit-parallel-agents/spec.md` and this task list to reflect delivered behavior
+- [X] T015 Run isolated multi-model adversarial reviews and resolve all consensus findings
+- [X] T016 Update `specs/001-spec-kit-parallel-agents/spec.md` and this task list to reflect delivered behavior
 
 ## Dependencies & Execution Order
 
