@@ -34,6 +34,7 @@ Each project can have a persistent configuration stored outside the repo at `~/.
    - "This project isn't in the catalog yet. Would you like to set it up?"
    - Choices: "Enable all features" / "Select features" / "Skip for now"
    - If enabling: generate a GUID, create the directory, write `copilot-instructions.md` with selected features, add entry to `catalog.csv`.
+   - **If spec-driven is selected and `.specify/` is missing**, instruct the agent to initialize with `specify init --here --force --integration copilot --integration-options="--skills" --script sh`.
 
 ### Feature Selection
 
@@ -43,7 +44,8 @@ When setting up a new project, the user selects which conventions to enable:
 |---------|-------------|---------|
 | **Session Handoff** | `next-session.md` for cross-session continuity | ON |
 | **Session History** | SQL `session_log` table for audit trail | ON |
-| **Spec-Driven Development** | Spec as source of truth, mandatory spec change proposals. Location: in-repo (`docs/spec/`) or project dir (`specs/`). | OFF |
+| **Spec-Driven Development** | Spec as source of truth. Uses GitHub spec-kit. Location: `.specify/` and `specs/`. | ON |
+| **Parallel Agents** | SQL-coordinated parallel task execution via `todo_claims`. | ON |
 | **Branching Strategy** | develop → feature branches, conventional commits | ON |
 
 The generated `copilot-instructions.md` includes only the enabled sections.
@@ -209,31 +211,51 @@ Optional sentence that captures the principle.
 
 *Enabled by feature flag: `spec-driven`*
 
-If enabled, the project's `specs/` directory (at `~/.copilot/projects/{guid}/specs/` or in-repo — whichever is configured) is the single source of truth.
+If enabled, the project uses **GitHub spec-kit** as the authoritative workflow. Specifications live in-repo under `.specify/` and `specs/`.
 
-### Plans ARE Spec Change Proposals
-
-Every implementation plan must include a **Spec Change Proposal** section:
-
-```
-## Spec Change Proposal
-- **Sections affected**: [spec section numbers and names]
-- **Change type**: NEW_CAPABILITY | MODIFICATION | BUG_FIX_CODE | BUG_FIX_SPEC
-- **Proposed changes**: [what the spec will say after implementation]
-- **Verification**: [how to confirm spec accuracy against delivered code]
-```
+### Workflow
+1. **Specify**: Define observable behavior in `specs/[id]/spec.md`.
+2. **Clarify**: Resolve ambiguities in `spec.md` before proceeding.
+3. **Plan**: Write the technical approach in `plan.md`.
+4. **Tasks**: Break down execution into `tasks.md`.
+5. **Implement**: Execute tasks, keeping specs factual. Update `spec.md`, `plan.md`, and `tasks.md` with delivered behavior.
+6. **Analyze**: Review deliverables for accuracy and constraints.
 
 ### Validation Checklist
 
 When reviewing completed work:
-- [ ] Every code change has a corresponding spec update
+- [ ] Every code change is reflected in the specification artifacts.
 - [ ] Every spec claim references actual code (file paths, function names, types)
 - [ ] The changelog has an entry for the change
 - [ ] No aspirational claims — spec describes what IS, not what SHOULD BE
 
 ### Discovery Workflow
-- **Read specs first** — specs have complete API contracts, DB schemas, behavior rules.
-- **Read code only when implementing** — or when the spec says "Planned" or has known gaps.
+- **Read constitution** (`.specify/memory/constitution.md`) and specs first.
+- **Read code only when implementing** — or when the spec has known gaps.
+
+---
+
+## Parallel Agents
+
+*Enabled by feature flag: `parallel-agents`*
+
+When multiple agents collaborate on a feature, coordinate via a shared SQLite database:
+
+1. **Initialization**: The coordinator must create the tracking table:
+   ```sql
+   CREATE TABLE IF NOT EXISTS todo_claims (
+       todo_id TEXT PRIMARY KEY,
+       agent_id TEXT NOT NULL UNIQUE,
+       claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+       heartbeat_at TEXT NOT NULL DEFAULT (datetime('now'))
+   );
+   ```
+2. **Identity & Ownership**: Every agent has a unique stable agent ID and claims exactly one todo before changing files.
+3. **Atomic Claiming**: Claiming must be atomic in a short `BEGIN IMMEDIATE` transaction and only succeed for a pending, unclaimed todo whose dependencies are all `done`.
+4. **Ready Work**: Provide exact ready-work SQL excluding claimed or dependency-blocked todos.
+5. **Dependency Awareness**: If preferred work depends on an in-progress item, leave it pending and claim another ready todo. Do not mark dependency waits as blocked.
+6. **Releasing**: Completion, real blockers, or releasing must update status and claim coherently. Only a coordinator may recover a stale claim after confirming the agent stopped.
+7. **Task Granularity**: `[P]` means eligible for parallel execution, not assigned. Same-file work is sequential. Work in isolated worktrees.
 
 ---
 

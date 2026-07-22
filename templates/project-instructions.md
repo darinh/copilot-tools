@@ -11,7 +11,8 @@
 |---------|--------|
 | Session Handoff | ✅ ON |
 | Session History | ✅ ON |
-| Spec-Driven Development | ❌ OFF |
+| Spec-Driven Development | ✅ ON |
+| Parallel Agents | ✅ ON |
 | Branching Strategy | ✅ ON |
 
 ---

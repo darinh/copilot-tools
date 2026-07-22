@@ -153,14 +153,21 @@ You **MUST** consider the user input before proceeding (if not empty).
    - **File-based coordination**: Tasks affecting the same files must run sequentially
    - **Validation checkpoints**: Verify each phase completion before proceeding
 
-7. Implementation execution rules:
+7. Parallel Todo Coordination:
+   - **Identity & Ownership**: If multiple agents are collaborating, each agent MUST use a unique stable agent ID and claim exactly one todo before changing files.
+   - **Atomic Claiming**: Claiming MUST be atomic using a short `BEGIN IMMEDIATE` transaction in the shared SQL database. It ONLY succeeds for a pending, unclaimed todo whose dependencies are all `done`.
+   - **Dependency Handling**: Provide exact ready-work SQL excluding claimed/dependency-blocked todos. If preferred work depends on an in-progress item, leave it pending and claim another ready todo. Do not mark dependency waits as blocked.
+   - **Status Coherence**: Task completion, real blockers, or releasing MUST update status and claim coherently. Task completion MUST update BOTH SQL todos and `tasks.md`.
+   - **Stale Claims**: Only a coordinator may recover a stale claim after confirming the agent stopped.
+
+8. Implementation execution rules:
    - **Setup first**: Initialize project structure, dependencies, configuration
    - **Tests before code**: If you need to write tests for contracts, entities, and integration scenarios
    - **Core development**: Implement models, services, CLI commands, endpoints
    - **Integration work**: Database connections, middleware, logging, external services
    - **Polish and validation**: Unit tests, performance optimization, documentation
 
-8. Progress tracking and error handling:
+9. Progress tracking and error handling:
    - Report progress after each completed task
    - Halt execution if any non-parallel task fails
    - For parallel tasks [P], continue with successful tasks, report failed ones
@@ -168,7 +175,7 @@ You **MUST** consider the user input before proceeding (if not empty).
    - Suggest next steps if implementation cannot proceed
    - **IMPORTANT** For completed tasks, make sure to mark the task off as [X] in the tasks file.
 
-9. Completion validation:
+10. Completion validation:
    - Verify all required tasks are completed
    - Check that implemented features match the original specification
    - Validate that tests pass and coverage meets requirements

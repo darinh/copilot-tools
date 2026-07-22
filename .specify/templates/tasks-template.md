@@ -228,16 +228,16 @@ Task: "Create [Entity2] model in src/models/[entity2].py"
 4. Add User Story 3 → Test independently → Deploy/Demo
 5. Each story adds value without breaking previous stories
 
-### Parallel Team Strategy
+### Parallel Agent Strategy
 
-With multiple developers:
+When multiple AI agents collaborate on these tasks:
 
-1. Team completes Setup + Foundational together
-2. Once Foundational is done:
-   - Developer A: User Story 1
-   - Developer B: User Story 2
-   - Developer C: User Story 3
-3. Stories complete and integrate independently
+1. The coordinator creates the shared `todo_claims` table in the session SQL database.
+2. The task list MUST be mirrored to the `todos` and `todo_deps` SQL tables.
+3. Each agent operates in an isolated git worktree.
+4. Each agent MUST atomically claim one ready task (using a `BEGIN IMMEDIATE` transaction) before beginning work.
+5. A task is ready only if its dependencies are `done` and it is unclaimed.
+6. When a task is finished, the agent MUST update both the SQL database and this `tasks.md` file.
 
 ---
 

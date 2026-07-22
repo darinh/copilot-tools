@@ -8,10 +8,10 @@ Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Buil
 |-----------|-------------|
 | [`operator.sh`](docs/operator.md) | Copilot CLI wrapper with metrics capture, autonomous loop mode, and multi-instance support |
 | [`operator-ingest.py`](operator-ingest.py) | Log parser for copilot process logs |
-| [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | MCP skill routing C#→Roslyn, TypeScript→codebase-memory-mcp |
+| [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | MCP skill routing C#→Roslyn |
 | [`extensions/`](extensions/README.md) | Copilot CLI runtime extensions: open-in-vs-code, lint-on-edit, security-shield, test-enforcer, architecture-enforcer, copy-to-clipboard-tool |
 | [`templates/`](templates/) | Configuration templates for copilot-instructions, MCP servers, and per-project setup |
-| [`docs/`](docs/) | Documentation for operator and skills |
+| [`docs/`](docs/) | Documentation for operator, skills, and spec-kit |
 | [`setup.sh`](setup.sh) | Automated environment setup script |
 
 ## Quick Start
@@ -28,7 +28,7 @@ The setup script will:
 2. Symlink `operator` into `~/.local/bin/`
 3. Install the [Anvil](https://github.com/burkeholland/anvil) agent plugin
 4. Symlink runtime extensions (`extensions/`) into `~/.copilot/extensions/`
-5. Check/install MCP servers (codebase-memory-mcp, dotnet-roslyn-mcp)
+5. Check/install MCP servers (dotnet-roslyn-mcp)
 6. Install configuration templates to `~/.copilot/`
 
 ## Usage
@@ -83,11 +83,10 @@ Copy to `~/.copilot/copilot-instructions.md` and customize for your workflow.
 
 ## MCP Servers
 
-Two MCP servers provide structural code intelligence:
+An optional MCP server provides structural code intelligence:
 
 | Server | Language | Install |
 |--------|----------|---------|
-| **codebase-memory-mcp** | TypeScript/JS, git analysis | Go binary (see team distribution) |
 | **dotnet-roslyn-mcp** | C# | `dotnet tool install -g dotnet-roslyn-mcp` |
 
 Configure in `~/.copilot/mcp-config.json` — see [`templates/mcp-config.json`](templates/mcp-config.json).
@@ -101,12 +100,13 @@ copilot-tools/
 ├── setup.sh                 # Environment setup
 ├── skills/
 │   └── code-intelligence/
-│       └── SKILL.md          # Roslyn + codebase-memory routing
+│       └── SKILL.md          # Roslyn routing
 ├── templates/
 │   ├── copilot-instructions.md    # Workflow conventions
 │   ├── mcp-config.json            # MCP server config
 │   └── project-instructions.md    # Per-project template
 └── docs/
     ├── operator.md           # Operator documentation
-    └── skills.md             # Skills reference
+    ├── skills.md             # Skills reference
+    └── spec-kit.md           # GitHub spec-kit documentation
 ```
