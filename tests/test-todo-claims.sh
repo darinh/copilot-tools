@@ -36,11 +36,13 @@ CREATE TABLE todo_claims (
 INSERT INTO todos (id, title, status) VALUES
     ('foundation', 'Foundation', 'in_progress'),
     ('dependent', 'Dependent work', 'pending'),
+    ('orphaned', 'Work with a missing prerequisite', 'pending'),
     ('ready', 'Ready work', 'pending'),
     ('also-ready', 'Other ready work', 'pending');
 
-INSERT INTO todo_deps (todo_id, depends_on)
-VALUES ('dependent', 'foundation');
+INSERT INTO todo_deps (todo_id, depends_on) VALUES
+    ('dependent', 'foundation'),
+    ('orphaned', 'missing-prerequisite');
 SQL
 
 claim_todo() {
@@ -62,10 +64,10 @@ WHERE t.id = '${todo_id}'
   AND NOT EXISTS (
       SELECT 1
       FROM todo_deps AS dependency
-      JOIN todos AS prerequisite
+      LEFT JOIN todos AS prerequisite
         ON prerequisite.id = dependency.depends_on
       WHERE dependency.todo_id = t.id
-        AND prerequisite.status != 'done'
+        AND (prerequisite.id IS NULL OR prerequisite.status != 'done')
   );
 
 UPDATE todos
@@ -127,10 +129,10 @@ WHERE t.status = 'pending'
   AND NOT EXISTS (
       SELECT 1
       FROM todo_deps AS dependency
-      JOIN todos AS prerequisite
+      LEFT JOIN todos AS prerequisite
         ON prerequisite.id = dependency.depends_on
       WHERE dependency.todo_id = t.id
-        AND prerequisite.status != 'done'
+        AND (prerequisite.id IS NULL OR prerequisite.status != 'done')
   )
 ORDER BY t.id;
 SQL
@@ -157,6 +159,13 @@ claim_todo ready "$loser"
 actual_owner=$(sqlite3 "$db" "SELECT agent_id FROM todo_claims WHERE todo_id = 'ready';")
 [[ "$actual_owner" == "$winner" ]] || {
     echo "a losing agent replaced the active owner" >&2
+    exit 1
+}
+
+claim_todo orphaned agent-c
+orphan_claims=$(sqlite3 "$db" "SELECT COUNT(*) FROM todo_claims WHERE todo_id = 'orphaned';")
+[[ "$orphan_claims" == "0" ]] || {
+    echo "todo with a missing prerequisite was claimable" >&2
     exit 1
 }
 

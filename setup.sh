@@ -11,6 +11,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COPILOT_DIR="${HOME}/.copilot"
 LOCAL_BIN="${HOME}/.local/bin"
 SPEC_KIT_VERSION="${SPEC_KIT_VERSION:-v0.13.4}"
+ORIGINAL_PATH="$PATH"
+
+if ! echo "$PATH" | tr ':' '\n' | grep -qx "$LOCAL_BIN"; then
+    export PATH="${LOCAL_BIN}:${PATH}"
+fi
 
 # ── Helpers ─────────────────────────────────────────────────────
 info()  { echo "  ✅ $*"; }
@@ -91,7 +96,7 @@ else
 fi
 
 # Ensure ~/.local/bin is on PATH
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$LOCAL_BIN"; then
+if ! echo "$ORIGINAL_PATH" | tr ':' '\n' | grep -qx "$LOCAL_BIN"; then
     warn "~/.local/bin is not on your PATH. Add to your shell profile:"
     echo "       export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
@@ -177,7 +182,12 @@ echo ""
 # ── Step 5b: Spec-kit CLI ─────────────────────────────────────
 echo "Checking spec-kit (specify)..."
 if command -v specify &>/dev/null; then
-    info "specify already installed: $(specify --version 2>&1 | head -1)"
+    if ! specify_version=$(specify --version 2>&1); then
+        err "specify was found at $(command -v specify) but failed its version check."
+        err "Repair or remove the broken command, then re-run setup."
+        exit 1
+    fi
+    info "specify already installed: ${specify_version%%$'\n'*}"
 else
     # Require Python >= 3.11
     python_ver=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
@@ -204,7 +214,6 @@ else
             exit 1
         fi
         rm -f "$uv_installer"
-        export PATH="${HOME}/.local/bin:${PATH}"
         if ! command -v uv &>/dev/null; then
             err "uv installer ran but 'uv' is still not on PATH. Add ~/.local/bin to PATH and re-run."
             exit 1
@@ -212,7 +221,6 @@ else
         info "uv bootstrapped"
     else
         info "uv found: $(command -v uv)"
-        export PATH="${HOME}/.local/bin:${PATH}"
     fi
 
     # Install specify-cli from the pinned GitHub tag
@@ -227,7 +235,11 @@ else
         err "'specify' is not callable after installation. Ensure ~/.local/bin is on PATH and re-run."
         exit 1
     fi
-    info "specify installed: $(specify --version 2>&1 | head -1)"
+    if ! specify_version=$(specify --version 2>&1); then
+        err "specify was installed but failed its version check."
+        exit 1
+    fi
+    info "specify installed: ${specify_version%%$'\n'*}"
 fi
 echo ""
 

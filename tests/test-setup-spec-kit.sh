@@ -37,7 +37,7 @@ assert_eq() {
 # build_env — populate an isolated HOME and stub-bin directory.
 #
 # $1  base dir (must already exist)
-# $2  specify mode: "absent" | "present"
+# $2  specify mode: "absent" | "present" | "broken"
 # $3  uv mode:     "present" (records calls, creates specify on install)
 #                  "broken"  (records calls, does NOT create specify)
 build_env() {
@@ -76,12 +76,19 @@ STUB
 
     # ── specify stub ─────────────────────────────────────────
     if [[ "$specify_mode" == "present" ]]; then
-        cat > "${stub_bin}/specify" <<'STUB'
+        cat > "${fake_home}/.local/bin/specify" <<'STUB'
 #!/usr/bin/env bash
 echo "specify 0.13.4"
 exit 0
 STUB
-        chmod +x "${stub_bin}/specify"
+        chmod +x "${fake_home}/.local/bin/specify"
+    elif [[ "$specify_mode" == "broken" ]]; then
+        cat > "${fake_home}/.local/bin/specify" <<'STUB'
+#!/usr/bin/env bash
+echo "broken specify" >&2
+exit 1
+STUB
+        chmod +x "${fake_home}/.local/bin/specify"
     fi
 
     # ── uv stub ──────────────────────────────────────────────
@@ -120,11 +127,11 @@ run_setup() {
     if [[ -n "$spec_kit_version" ]]; then
         SPEC_KIT_VERSION="$spec_kit_version" \
         HOME="$fake_home" \
-        PATH="${stub_bin}:${fake_home}/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        PATH="${stub_bin}:/usr/local/bin:/usr/bin:/bin" \
         bash "$SETUP_SH" </dev/null >"${fake_home}/setup.out" 2>&1 || actual_exit=$?
     else
         HOME="$fake_home" \
-        PATH="${stub_bin}:${fake_home}/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        PATH="${stub_bin}:/usr/local/bin:/usr/bin:/bin" \
         bash "$SETUP_SH" </dev/null >"${fake_home}/setup.out" 2>&1 || actual_exit=$?
     fi
     echo "$actual_exit"
@@ -324,6 +331,32 @@ if grep -q "spec-kit.git@v9.9.9" "${t5_base}/calls.log" 2>/dev/null; then
     pass "T5: configured spec-kit version used in uv call"
 else
     fail "T5: configured spec-kit version not found in uv call log"
+fi
+
+echo ""
+
+# ── Test 6: broken existing specify ──────────────────────────
+# Expect: setup fails explicitly and does not try to reinstall over the shim.
+echo "Test 6: broken existing specify → explicit failure"
+t6_base="$(mktemp -d)"
+CLEANUP_DIRS+=("$t6_base")
+
+build_env "$t6_base" "broken" "present"
+t6_exit=$(run_setup "${t6_base}/home" "${t6_base}/stub-bin")
+
+if [[ "$t6_exit" -ne 0 ]]; then
+    pass "T6: setup exits non-zero for broken existing specify"
+else
+    fail "T6: setup accepted a broken existing specify"
+fi
+
+t6_calls=$(grep -c "uv tool install" "${t6_base}/calls.log" 2>/dev/null || true)
+assert_eq "T6: setup does not reinstall over broken specify" "${t6_calls:-0}" "0"
+
+if grep -q "failed its version check" "${t6_base}/home/setup.out" 2>/dev/null; then
+    pass "T6: failure explains the broken specify command"
+else
+    fail "T6: broken specify failure was not actionable"
 fi
 
 echo ""

@@ -259,8 +259,9 @@ When multiple agents collaborate on a feature, coordinate via a shared SQLite da
      AND NOT EXISTS (SELECT 1 FROM todo_claims c WHERE c.todo_id = t.id)
      AND NOT EXISTS (
          SELECT 1 FROM todo_deps td
-         JOIN todos dep ON td.depends_on = dep.id
-         WHERE td.todo_id = t.id AND dep.status != 'done'
+         LEFT JOIN todos dep ON td.depends_on = dep.id
+         WHERE td.todo_id = t.id
+           AND (dep.id IS NULL OR dep.status != 'done')
      )
    ORDER BY t.created_at
    LIMIT 1;
@@ -275,8 +276,9 @@ When multiple agents collaborate on a feature, coordinate via a shared SQLite da
        AND NOT EXISTS (SELECT 1 FROM todo_claims c WHERE c.todo_id = t.id)
        AND NOT EXISTS (
            SELECT 1 FROM todo_deps td
-           JOIN todos dep ON td.depends_on = dep.id
-           WHERE td.todo_id = t.id AND dep.status != 'done'
+           LEFT JOIN todos dep ON td.depends_on = dep.id
+           WHERE td.todo_id = t.id
+             AND (dep.id IS NULL OR dep.status != 'done')
        );
    UPDATE todos
    SET status = 'in_progress', updated_at = datetime('now')

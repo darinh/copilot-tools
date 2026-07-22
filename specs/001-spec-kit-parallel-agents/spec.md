@@ -110,6 +110,7 @@ MCP references while the Roslyn configuration remains valid.
 - Neither `uv` nor `specify` is installed before setup.
 - The network or upstream installer fails partway through setup.
 - A todo has multiple prerequisites and only some are complete.
+- A todo dependency points to a missing prerequisite row.
 - Every pending todo is dependency-blocked or already claimed.
 - An agent owns a todo but discovers a genuine external blocker.
 - Two nominally parallel tasks modify the same file.

@@ -96,7 +96,16 @@ You **MUST** consider the user input before proceeding (if not empty).
    - **IF EXISTS**: Read .specify/memory/constitution.md for governance constraints
    - **IF EXISTS**: Read quickstart.md for integration scenarios
 
-4. **Project Setup Verification**:
+4. **Parallel Todo Coordination**:
+   - **Claim Before Writes**: A parallel worker MUST successfully claim one ready todo before creating, editing, or verifying files. If a claim fails, select another ready todo or stop without modifying the worktree.
+   - **Initialization**: Before dispatching workers, the coordinator MUST create the shared `todo_claims` table defined by the repository instructions and mirror `tasks.md` into `todos` and `todo_deps`.
+   - **Identity & Ownership**: If multiple agents are collaborating, each agent MUST use a unique stable agent ID and claim exactly one todo before changing files.
+   - **Atomic Claiming**: Claiming MUST use the exact short `BEGIN IMMEDIATE` transaction from the repository instructions: conditional `INSERT OR IGNORE ... SELECT`, then a guarded `UPDATE todos SET status = 'in_progress'`. It ONLY succeeds for a pending, unclaimed todo whose dependencies exist and are all `done`.
+   - **Dependency Handling**: Use the exact ready-work SQL from the repository instructions, including missing-prerequisite handling. If preferred work depends on an in-progress item, leave it pending and claim another ready todo. Do not mark dependency waits as blocked.
+   - **Status Coherence**: Completion, real blockers, or releasing MUST update status only when the same agent owns the claim, then delete the claim coherently within a transaction. Refresh `heartbeat_at` during long work. In single-agent mode, the agent MUST update both SQL todos and `tasks.md`. In parallel mode, worker agents MUST update SQL and report completion; ONLY the coordinator serially reconciles `tasks.md` checkboxes to prevent filesystem race conditions.
+   - **Stale Claims**: Only a coordinator may recover a stale claim after confirming the agent stopped.
+
+5. **Project Setup Verification**:
    - **REQUIRED**: Create/verify ignore files based on actual project setup:
 
    **Detection & Creation Logic**:
@@ -140,26 +149,18 @@ You **MUST** consider the user input before proceeding (if not empty).
    - **Terraform**: `.terraform/`, `*.tfstate*`, `*.tfvars`, `.terraform.lock.hcl`
    - **Kubernetes/k8s**: `*.secret.yaml`, `secrets/`, `.kube/`, `kubeconfig*`, `*.key`, `*.crt`
 
-5. Parse tasks.md structure and extract:
+6. Parse tasks.md structure and extract:
    - **Task phases**: Setup, Tests, Core, Integration, Polish
    - **Task dependencies**: Sequential vs parallel execution rules
    - **Task details**: ID, description, file paths, parallel markers [P]
    - **Execution flow**: Order and dependency requirements
 
-6. Execute implementation following the task plan:
+7. Execute implementation following the task plan:
    - **Phase-by-phase execution**: Complete each phase before moving to the next
    - **Respect dependencies**: Run sequential tasks in order, parallel tasks [P] can run together
    - **Follow TDD approach**: Execute test tasks before their corresponding implementation tasks
    - **File-based coordination**: Tasks affecting the same files must run sequentially
    - **Validation checkpoints**: Verify each phase completion before proceeding
-
-7. Parallel Todo Coordination:
-   - **Initialization**: Before dispatching workers, the coordinator MUST create the shared `todo_claims` table defined by the repository instructions and mirror `tasks.md` into `todos` and `todo_deps`.
-   - **Identity & Ownership**: If multiple agents are collaborating, each agent MUST use a unique stable agent ID and claim exactly one todo before changing files.
-   - **Atomic Claiming**: Claiming MUST use the exact short `BEGIN IMMEDIATE` transaction from the repository instructions: conditional `INSERT OR IGNORE ... SELECT`, then a guarded `UPDATE todos SET status = 'in_progress'`. It ONLY succeeds for a pending, unclaimed todo whose dependencies are all `done`.
-   - **Dependency Handling**: Provide exact ready-work SQL excluding claimed or dependency-blocked todos (e.g., using `NOT EXISTS (SELECT 1 FROM todo_claims)` and `NOT EXISTS (SELECT 1 FROM todo_deps ... WHERE status != 'done')`). If preferred work depends on an in-progress item, leave it pending and claim another ready todo. Do not mark dependency waits as blocked.
-   - **Status Coherence**: Completion, real blockers, or releasing MUST update status only when the same agent owns the claim, then delete the claim coherently within a transaction. Refresh `heartbeat_at` during long work. In single-agent mode, the agent MUST update both SQL todos and `tasks.md`. In parallel mode, worker agents MUST update SQL and report completion; ONLY the coordinator serially reconciles `tasks.md` checkboxes to prevent filesystem race conditions.
-   - **Stale Claims**: Only a coordinator may recover a stale claim after confirming the agent stopped.
 
 8. Implementation execution rules:
    - **Setup first**: Initialize project structure, dependencies, configuration

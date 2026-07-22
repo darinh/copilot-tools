@@ -56,8 +56,9 @@ than one model, and high-confidence findings MUST be resolved before merge.
 2. Mirror executable tasks into the session todo database when multiple agents
    participate.
 3. Initialize shared todo-claim coordination before dispatching agents.
-4. Claim one ready todo atomically, implement it in an isolated worktree, and
-   mark both the SQL todo and matching `tasks.md` item complete.
+4. Claim one ready todo atomically and implement it in an isolated worktree.
+   Mark the SQL todo complete; in single-agent mode also update `tasks.md`, while
+   parallel workers report completion for the coordinator to reconcile there.
 5. Validate the smallest surface that proves the requirement, then run
    adversarial review before integration.
 
@@ -67,4 +68,4 @@ This constitution supersedes conflicting workflow guidance in repository
 templates. Amendments require a documented spec change, migration notes for
 affected templates or generated artifacts, and an updated version below.
 
-**Version**: 1.0.0 | **Ratified**: 2026-07-22 | **Last Amended**: 2026-07-22
+**Version**: 1.0.1 | **Ratified**: 2026-07-22 | **Last Amended**: 2026-07-22
