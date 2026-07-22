@@ -204,6 +204,105 @@ else
     fail "T3: expected error message about specify not found in output"
 fi
 
+# ── Test 4: both specify and uv absent → bootstrap uv via curl → install specify ──
+# Expect: curl called once; exactly one 'uv tool install' with pinned version;
+#         specify callable; setup exits 0. No real network calls.
+echo "Test 4: no specify, no uv → bootstrap uv via curl → install specify"
+t4_base="$(mktemp -d)"
+CLEANUP_DIRS+=("$t4_base")
+
+t4_home="${t4_base}/home"
+t4_stub="${t4_base}/stub-bin"
+t4_curl_log="${t4_base}/curl-calls.log"
+mkdir -p "$t4_stub" "${t4_home}/.local/bin"
+touch "$t4_curl_log"
+
+# Standard prereq stubs (same minimal set as build_env)
+for _cmd in tmux sqlite3 git; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${t4_stub}/${_cmd}"
+    chmod +x "${t4_stub}/${_cmd}"
+done
+cat > "${t4_stub}/python3" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+    -c) echo "3.11" ;;
+    --version) echo "Python 3.11.0" ;;
+esac
+exit 0
+STUB
+chmod +x "${t4_stub}/python3"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${t4_stub}/copilot"
+chmod +x "${t4_stub}/copilot"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${t4_stub}/dotnet-roslyn-mcp"
+chmod +x "${t4_stub}/dotnet-roslyn-mcp"
+
+# uv stub: records calls; on 'tool install' creates a specify stub.
+# Written to a shared file; the fake installer will copy it into ~/.local/bin.
+cat > "${t4_base}/uv-stub.sh" <<'UVSTUB'
+#!/usr/bin/env bash
+echo "uv $*" >> "${HOME}/.local/uv-calls.log"
+if [[ "${1:-}" == "tool" && "${2:-}" == "install" ]]; then
+    mkdir -p "${HOME}/.local/bin"
+    printf '#!/usr/bin/env bash\necho "specify 0.13.4"\nexit 0\n' \
+        > "${HOME}/.local/bin/specify"
+    chmod +x "${HOME}/.local/bin/specify"
+fi
+exit 0
+UVSTUB
+chmod +x "${t4_base}/uv-stub.sh"
+
+# Fake installer: places uv-stub.sh at ~/.local/bin/uv when executed by sh.
+# ${t4_base} is expanded at write time (known path); ${HOME} expands at run time.
+cat > "${t4_base}/fake-installer.sh" <<INSTALLER
+#!/usr/bin/env bash
+mkdir -p "\${HOME}/.local/bin"
+cp "${t4_base}/uv-stub.sh" "\${HOME}/.local/bin/uv"
+chmod +x "\${HOME}/.local/bin/uv"
+INSTALLER
+chmod +x "${t4_base}/fake-installer.sh"
+
+# curl stub: records the call and copies the fake installer to the -o target.
+cat > "${t4_stub}/curl" <<CURLSTUB
+#!/usr/bin/env bash
+echo "curl \$*" >> "${t4_curl_log}"
+prev=""
+for arg in "\$@"; do
+    if [[ "\$prev" == "-o" ]]; then
+        cp "${t4_base}/fake-installer.sh" "\$arg"
+        break
+    fi
+    prev="\$arg"
+done
+exit 0
+CURLSTUB
+chmod +x "${t4_stub}/curl"
+
+t4_exit=$(run_setup "$t4_home" "$t4_stub")
+assert_eq "T4: setup exits 0" "$t4_exit" "0"
+
+if grep -q "curl" "$t4_curl_log" 2>/dev/null; then
+    pass "T4: curl called to download uv installer"
+else
+    fail "T4: curl not called"
+fi
+
+t4_uv_calls=$(grep -c "uv tool install" "${t4_home}/.local/uv-calls.log" 2>/dev/null || true)
+assert_eq "T4: uv tool install called exactly once after bootstrap" "${t4_uv_calls:-0}" "1"
+
+if grep -q "v0.13.4" "${t4_home}/.local/uv-calls.log" 2>/dev/null; then
+    pass "T4: pinned version v0.13.4 used after bootstrap"
+else
+    fail "T4: pinned version v0.13.4 not found in uv call log"
+fi
+
+if [[ -x "${t4_home}/.local/bin/specify" ]]; then
+    pass "T4: specify callable after bootstrap install"
+else
+    fail "T4: specify not callable after bootstrap install"
+fi
+
+echo ""
+
 # ── Summary ───────────────────────────────────────────────────
 echo ""
 echo "═══ Results: ${PASS} passed, ${FAIL} failed ═══"

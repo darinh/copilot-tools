@@ -192,10 +192,18 @@ else
     # Bootstrap uv via Astral's official installer when absent
     if ! command -v uv &>/dev/null; then
         info "uv not found — bootstrapping via Astral installer..."
-        if ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
-            err "Failed to download or run the Astral uv installer."
+        uv_installer=$(mktemp)
+        if ! curl -LsSf https://astral.sh/uv/install.sh -o "$uv_installer"; then
+            rm -f "$uv_installer"
+            err "Failed to download the Astral uv installer."
             exit 1
         fi
+        if ! sh "$uv_installer"; then
+            rm -f "$uv_installer"
+            err "Astral uv installer exited with an error."
+            exit 1
+        fi
+        rm -f "$uv_installer"
         export PATH="${HOME}/.local/bin:${PATH}"
         if ! command -v uv &>/dev/null; then
             err "uv installer ran but 'uv' is still not on PATH. Add ~/.local/bin to PATH and re-run."
