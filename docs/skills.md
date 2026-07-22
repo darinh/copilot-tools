@@ -9,11 +9,8 @@ Skills extend Copilot CLI agents with specialized capabilities. They're markdown
 **Location**: `skills/code-intelligence/SKILL.md`
 **Install**: Copy into your project's `.github/skills/` directory
 
-Routes structural code questions to the right MCP server:
-- **Roslyn** (dotnet-roslyn-mcp) for C# — callers, references, implementations, symbol info
-- **codebase-memory-mcp** for TypeScript/JS, git coupling, architecture overview, change detection
-
-Key rule: never use `codebase-memory-mcp` for C# cross-file resolution — tree-sitter can't handle it. Always use Roslyn for C#.
+Use Roslyn for C# structural questions. For other languages, use the built-in
+code intelligence, LSP, or search tools in your environment.
 
 ```bash
 cp -r copilot-tools/skills/code-intelligence your-project/.github/skills/
@@ -61,17 +58,6 @@ Key features:
 
 Skills often depend on MCP (Model Context Protocol) servers for tooling access.
 
-### codebase-memory-mcp
-
-Knowledge graph built from your codebase via tree-sitter parsing. Provides:
-- `search_graph` — find symbols by name/pattern
-- `trace_call_path` — callers and callees (TypeScript/JS)
-- `get_architecture` — project structure overview
-- `detect_changes` — map git diffs to affected symbols
-- `query_graph` — custom Cypher queries
-
-**Install**: Get the Go binary from your team's distribution, place in `~/.local/bin/`
-
 ### dotnet-roslyn-mcp
 
 C# code intelligence powered by the Roslyn compiler. Provides:
@@ -85,4 +71,4 @@ C# code intelligence powered by the Roslyn compiler. Provides:
 
 ### Configuration
 
-Both servers are configured in `~/.copilot/mcp-config.json`. See `templates/mcp-config.json` for the template.
+Roslyn is configured in `~/.copilot/mcp-config.json`. See `templates/mcp-config.json` for the template.
