@@ -29,7 +29,8 @@ The setup script will:
 3. Install the [Anvil](https://github.com/burkeholland/anvil) agent plugin
 4. Symlink runtime extensions (`extensions/`) into `~/.copilot/extensions/`
 5. Check/install MCP servers (dotnet-roslyn-mcp)
-6. Install configuration templates to `~/.copilot/`
+6. Conditionally install the Spec Kit CLI if not already present
+7. Install configuration templates to `~/.copilot/`
 
 ## Usage
 
@@ -76,7 +77,8 @@ The `templates/copilot-instructions.md` file establishes conventions for:
 - **Project Configuration System** — per-project settings stored in `~/.copilot/projects/`
 - **Session Handoff** — cross-session continuity via `next-session.md` files
 - **Session History** — SQL-based audit trail of work across sessions
-- **Spec-Driven Development** — specs as the single source of truth (opt-in)
+- **Spec-Driven Development** — specs as the single source of truth (enabled by default)
+- **Parallel Agents** — SQL-coordinated parallel task execution via `todo_claims`
 - **Branching Strategy** — develop → feature branches with conventional commits
 
 Copy to `~/.copilot/copilot-instructions.md` and customize for your workflow.

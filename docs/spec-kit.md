@@ -1,6 +1,6 @@
-# GitHub Spec-Kit
+# Spec Kit
 
-The `copilot-tools` repository leverages **GitHub spec-kit** to drive Specification-Driven Development.
+The `copilot-tools` repository leverages **Spec Kit** to drive Specification-Driven Development.
 
 ## Installation & Setup
 
@@ -37,7 +37,12 @@ Use the Copilot CLI skills (or equivalent slash commands if configured) to drive
 
 ## Upgrades
 
-Upgrading spec-kit is idempotent. The setup script will skip installation if `specify` is already installed. If you need to force an upgrade to the latest pinned version, you can re-run the `setup.sh` script or use the `specify upgrade` command provided by the CLI.
+Upgrading Spec Kit is idempotent. The setup script will skip installation if `specify` is already installed. If you need to force an upgrade to the latest pinned version, you can use the official CLI check:
+
+```bash
+specify self check
+specify self upgrade --tag v0.13.4
+```
 
 ## Parallel Workflow
 
