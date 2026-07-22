@@ -155,9 +155,9 @@ You **MUST** consider the user input before proceeding (if not empty).
 
 7. Parallel Todo Coordination:
    - **Identity & Ownership**: If multiple agents are collaborating, each agent MUST use a unique stable agent ID and claim exactly one todo before changing files.
-   - **Atomic Claiming**: Claiming MUST be atomic using a short `BEGIN IMMEDIATE` transaction in the shared SQL database. It ONLY succeeds for a pending, unclaimed todo whose dependencies are all `done`.
-   - **Dependency Handling**: Provide exact ready-work SQL excluding claimed/dependency-blocked todos. If preferred work depends on an in-progress item, leave it pending and claim another ready todo. Do not mark dependency waits as blocked.
-   - **Status Coherence**: Task completion, real blockers, or releasing MUST update status and claim coherently. Task completion MUST update BOTH SQL todos and `tasks.md`.
+   - **Atomic Claiming**: Claiming MUST be atomic using a short `BEGIN IMMEDIATE` transaction in the shared SQL database. Execute an `INSERT OR IGNORE INTO todo_claims` followed by a guarded `UPDATE todos SET status = 'in_progress'` that verifies the claim. It ONLY succeeds for a pending, unclaimed todo whose dependencies are all `done`.
+   - **Dependency Handling**: Provide exact ready-work SQL excluding claimed or dependency-blocked todos (e.g., using `NOT EXISTS (SELECT 1 FROM todo_claims)` and `NOT EXISTS (SELECT 1 FROM todo_deps ... WHERE status != 'done')`). If preferred work depends on an in-progress item, leave it pending and claim another ready todo. Do not mark dependency waits as blocked.
+   - **Status Coherence**: Task completion, real blockers, or releasing MUST update status and claim coherently within a transaction (e.g., updating the status and deleting the claim record). Task completion MUST update BOTH SQL todos and `tasks.md`.
    - **Stale Claims**: Only a coordinator may recover a stale claim after confirming the agent stopped.
 
 8. Implementation execution rules:

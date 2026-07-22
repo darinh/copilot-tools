@@ -15,12 +15,13 @@
   parallel agents:
   `CREATE TABLE IF NOT EXISTS todo_claims (todo_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL UNIQUE, claimed_at TEXT NOT NULL DEFAULT (datetime('now')), heartbeat_at TEXT NOT NULL DEFAULT (datetime('now')));`
 - Use a unique stable agent ID and atomically claim one ready todo before
-  changing files. Claiming must be atomic in a short `BEGIN IMMEDIATE` transaction.
+  changing files. Claiming must be atomic in a short `BEGIN IMMEDIATE` transaction using `INSERT OR IGNORE INTO todo_claims` followed by a guarded `UPDATE todos SET status = 'in_progress'` that verifies the claim succeeded.
 - Never work on a todo claimed by another agent and never steal a claim without
   coordinator confirmation that its owner has stopped.
-- A todo is ready only when it is pending, unclaimed, and every dependency is `done`. Provide exact ready-work SQL excluding claimed/dependency-blocked todos.
+- A todo is ready only when it is pending, unclaimed, and every dependency is `done`. Provide exact ready-work SQL excluding claimed or dependency-blocked todos:
+  `SELECT t.* FROM todos t WHERE t.status = 'pending' AND NOT EXISTS (SELECT 1 FROM todo_claims c WHERE c.todo_id = t.id) AND NOT EXISTS (SELECT 1 FROM todo_deps td JOIN todos dep ON td.depends_on = dep.id WHERE td.todo_id = t.id AND dep.status != 'done');`
 - If preferred work depends on an in-progress todo, leave it pending and select
   another ready todo instead of waiting. Do not mark dependency waits as blocked.
-- Completion/real blocker/release must update status and claim coherently.
+- Completion/real blocker/release must update status and claim coherently within a transaction (e.g., `UPDATE todos SET status = 'done'` and `DELETE FROM todo_claims`).
 - Work in an isolated git worktree. Tasks that modify the same file are
   sequential even when they are otherwise marked parallel (`[P]` means eligible, not assigned).

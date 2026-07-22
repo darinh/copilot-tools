@@ -239,7 +239,7 @@ When reviewing completed work:
 
 *Enabled by feature flag: `parallel-agents`*
 
-When multiple agents collaborate on a feature, coordinate via a shared SQLite database:
+When multiple agents collaborate on a feature, coordinate via a shared SQLite database. The protocol relies on atomic `BEGIN IMMEDIATE` transactions to prevent race conditions.
 
 1. **Initialization**: The coordinator must create the tracking table:
    ```sql
@@ -250,11 +250,43 @@ When multiple agents collaborate on a feature, coordinate via a shared SQLite da
        heartbeat_at TEXT NOT NULL DEFAULT (datetime('now'))
    );
    ```
+
 2. **Identity & Ownership**: Every agent has a unique stable agent ID and claims exactly one todo before changing files.
-3. **Atomic Claiming**: Claiming must be atomic in a short `BEGIN IMMEDIATE` transaction and only succeed for a pending, unclaimed todo whose dependencies are all `done`.
-4. **Ready Work**: Provide exact ready-work SQL excluding claimed or dependency-blocked todos.
+
+3. **Ready Work**: Provide exact ready-work SQL excluding claimed or dependency-blocked todos:
+   ```sql
+   SELECT t.* FROM todos t
+   WHERE t.status = 'pending'
+     AND NOT EXISTS (SELECT 1 FROM todo_claims c WHERE c.todo_id = t.id)
+     AND NOT EXISTS (
+         SELECT 1 FROM todo_deps td
+         JOIN todos dep ON td.depends_on = dep.id
+         WHERE td.todo_id = t.id AND dep.status != 'done'
+     );
+   ```
+
+4. **Atomic Claiming**: Claiming must be atomic in a short `BEGIN IMMEDIATE` transaction and only succeed for a pending, unclaimed todo whose dependencies are all `done`:
+   ```sql
+   BEGIN IMMEDIATE;
+   INSERT OR IGNORE INTO todo_claims (todo_id, agent_id) VALUES ('{todo_id}', '{agent_id}');
+   UPDATE todos SET status = 'in_progress' 
+     WHERE id = '{todo_id}' 
+     AND EXISTS (SELECT 1 FROM todo_claims WHERE todo_id = '{todo_id}' AND agent_id = '{agent_id}');
+   COMMIT;
+   ```
+   Check `changes()` (or verify status) to ensure the claim succeeded before starting work.
+
 5. **Dependency Awareness**: If preferred work depends on an in-progress item, leave it pending and claim another ready todo. Do not mark dependency waits as blocked.
-6. **Releasing**: Completion, real blockers, or releasing must update status and claim coherently. Only a coordinator may recover a stale claim after confirming the agent stopped.
+
+6. **Releasing**: Completion, real blockers, or releasing must update status and claim coherently:
+   ```sql
+   BEGIN IMMEDIATE;
+   UPDATE todos SET status = 'done' WHERE id = '{todo_id}';
+   DELETE FROM todo_claims WHERE todo_id = '{todo_id}' AND agent_id = '{agent_id}';
+   COMMIT;
+   ```
+   Only a coordinator may recover a stale claim after confirming the agent stopped.
+
 7. **Task Granularity**: `[P]` means eligible for parallel execution, not assigned. Same-file work is sequential. Work in isolated worktrees.
 
 ---
