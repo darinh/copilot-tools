@@ -327,11 +327,20 @@ def extract_ai_credit_usage(text: str) -> dict:
         "models": {},
         "calls": 0,
     }
+    seen_ids: set[str] = set()
 
     for obj in _iter_parsed_objects(text):
         usage = obj.get("copilot_usage")
         if not isinstance(usage, dict):
             continue
+        # Responses carry a unique id. Dedupe on it so a body echoed twice in
+        # the log — a retry, or the same payload logged at two levels — cannot
+        # inflate reported usage.
+        response_id = obj.get("id")
+        if isinstance(response_id, str) and response_id:
+            if response_id in seen_ids:
+                continue
+            seen_ids.add(response_id)
         nano = usage.get("total_nano_aiu")
         if not isinstance(nano, (int, float)):
             nano = 0

@@ -20,6 +20,9 @@ REAL_NANO_AIU = 20_242_875_000
 REAL_CREDITS = 20.242875
 
 
+_RESPONSE_SEQ = iter(range(1, 1_000_000))
+
+
 def usage_response(
     model: str = "claude-opus-5",
     nano_aiu: int = REAL_NANO_AIU,
@@ -27,10 +30,15 @@ def usage_response(
     cache_read: int = 0,
     cache_write: int = 32371,
     output_tokens: int = 4,
+    response_id: str | None = None,
 ) -> str:
-    """A chat-completion response body shaped like the real CLI logs."""
+    """A chat-completion response body shaped like the real CLI logs.
+
+    Each call gets a distinct id by default, matching the real CLI. Pass
+    ``response_id`` explicitly to simulate a duplicated body.
+    """
     body = {
-        "id": "msg_test",
+        "id": response_id or f"msg_{next(_RESPONSE_SEQ)}",
         "object": "chat.completion",
         "model": model,
         "usage": {
@@ -100,12 +108,40 @@ def test_sums_across_multiple_api_calls():
     assert operator_ingest.credits_from_nano(usage["nano_aiu"]) == pytest.approx(3.5)
 
 
+def test_duplicate_response_body_is_not_double_counted():
+    """The same payload echoed twice must not inflate reported usage."""
+    body = usage_response(nano_aiu=1_000_000_000, response_id="msg_dup")
+    usage = operator_ingest.extract_ai_credit_usage(body + body)
+    assert usage["nano_aiu"] == 1_000_000_000
+    assert usage["calls"] == 1
+
+
 def test_attributes_usage_per_model():
     text = (usage_response(model="claude-opus-5", nano_aiu=2_000_000_000)
             + usage_response(model="gpt-5.4", nano_aiu=1_000_000_000))
     usage = operator_ingest.extract_ai_credit_usage(text)
     assert usage["models"]["claude-opus-5"]["nano_aiu"] == 2_000_000_000
     assert usage["models"]["gpt-5.4"]["nano_aiu"] == 1_000_000_000
+
+
+def test_legacy_cost_appears_in_periodic_columns(tmp_path, monkeypatch, capsys):
+    """A legacy premium-billed session dated today must show in today's cost,
+    not only in the all-time column — otherwise the report claims $0.00 for
+    real spend and the printed footnote is false."""
+    db = tmp_path / "m.db"
+    monkeypatch.setattr(op, "METRICS_DB", db)
+    operator_ingest.init_db(db)
+    with operator_ingest.connect(db) as c:
+        c.execute(
+            "INSERT INTO sessions (session_num, log_file, no_op, started_at,"
+            " ended_at, nano_aiu, premium_requests)"
+            " VALUES (1,'legacy.log',0,datetime('now'),datetime('now'),0,10)"
+        )
+    with operator_ingest.connect(db) as c:
+        today = "date(ended_at,'localtime')=date('now','localtime')"
+        usd = c.execute(
+            f"SELECT {op._usd(today)} FROM sessions WHERE no_op=0").fetchone()[0]
+    assert usd == pytest.approx(0.40), "10 premium requests at $0.04 = $0.40"
 
 
 def test_log_without_usage_yields_zero():

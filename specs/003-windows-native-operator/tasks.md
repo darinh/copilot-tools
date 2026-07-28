@@ -64,7 +64,7 @@
 
 ## Verification
 
-- [x] 186 tests pass, including 8 against a real psmux session on Windows
+- [x] 188 tests pass, including 8 against a real psmux session on Windows
 - [x] `verify_cross_platform.py` passes 36/36 on Windows and on Linux
 - [x] `bash -n` clean on all shell scripts
 - [x] `git diff main -- operator.sh handoff.sh operator-ingest.py` empty (no Linux regression)

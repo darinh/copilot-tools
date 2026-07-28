@@ -322,17 +322,25 @@ def _credits(expr: str = "nano_aiu") -> str:
     return f"COALESCE(SUM({expr}),0) / {_NANO}.0"
 
 
-def _usd(expr: str = "nano_aiu") -> str:
-    """Dollars from AI credits, falling back to legacy premium requests.
+def _legacy_usd_term(predicate: str = "1") -> str:
+    """Dollars from legacy premium requests, for rows with no AI credits."""
+    return (
+        f"COALESCE(SUM(CASE WHEN ({predicate}) AND COALESCE(nano_aiu,0) = 0 "
+        f"THEN premium_requests ELSE 0 END),0) * {_LEGACY_USD}"
+    )
 
-    Rows predating the 2026-06-01 billing change have no nano_aiu, so their
-    cost is still derived from premium requests. Mixing the two in one sum
-    keeps historical totals meaningful.
+
+def _usd(predicate: str = "1") -> str:
+    """Dollars over an optional window, combining both billing models.
+
+    Rows predating the 2026-06-01 change have no ``nano_aiu``, so their cost is
+    still derived from premium requests. The same window must apply to both
+    terms — costing credits within a period but legacy usage only all-time
+    would report $0.00 for a legacy user's real spend.
     """
     return (
-        f"(COALESCE(SUM({expr}),0) / {_NANO}.0) * {_USD} + "
-        f"COALESCE(SUM(CASE WHEN COALESCE({expr},0) = 0 "
-        f"THEN premium_requests ELSE 0 END),0) * {_LEGACY_USD}"
+        f"(COALESCE(SUM(CASE WHEN ({predicate}) THEN nano_aiu ELSE 0 END),0) "
+        f"/ {_NANO}.0) * {_USD} + {_legacy_usd_term(predicate)}"
     )
 
 
@@ -391,21 +399,21 @@ def report_metrics(subcmd: str = "summary") -> int:
             ORDER BY SUM(nano_aiu) DESC
         """, (home,))
     elif subcmd == "costs":
+        today = "date(ended_at,'localtime')=date('now','localtime')"
+        week = "ended_at >= datetime('now','-7 days')"
+        month = "strftime('%Y-%m', ended_at)=strftime('%Y-%m','now')"
         print("═══ Cost Estimates ═══\n")
         rows, headers = _query(f"""
             SELECT
-              printf('%.1f', COALESCE(SUM(CASE WHEN date(ended_at,'localtime')=date('now','localtime')
+              printf('%.1f', COALESCE(SUM(CASE WHEN {today}
                                 THEN nano_aiu ELSE 0 END),0) / {_NANO}.0) AS today_cr,
-              printf('$%.2f', COALESCE(SUM(CASE WHEN date(ended_at,'localtime')=date('now','localtime')
-                                THEN nano_aiu ELSE 0 END),0) / {_NANO}.0 * {_USD}) AS today_cost,
-              printf('%.1f', COALESCE(SUM(CASE WHEN ended_at >= datetime('now','-7 days')
+              printf('$%.2f', {_usd(today)}) AS today_cost,
+              printf('%.1f', COALESCE(SUM(CASE WHEN {week}
                                 THEN nano_aiu ELSE 0 END),0) / {_NANO}.0) AS week_cr,
-              printf('$%.2f', COALESCE(SUM(CASE WHEN ended_at >= datetime('now','-7 days')
-                                THEN nano_aiu ELSE 0 END),0) / {_NANO}.0 * {_USD}) AS week_cost,
-              printf('%.1f', COALESCE(SUM(CASE WHEN strftime('%Y-%m', ended_at)=strftime('%Y-%m','now')
+              printf('$%.2f', {_usd(week)}) AS week_cost,
+              printf('%.1f', COALESCE(SUM(CASE WHEN {month}
                                 THEN nano_aiu ELSE 0 END),0) / {_NANO}.0) AS month_cr,
-              printf('$%.2f', COALESCE(SUM(CASE WHEN strftime('%Y-%m', ended_at)=strftime('%Y-%m','now')
-                                THEN nano_aiu ELSE 0 END),0) / {_NANO}.0 * {_USD}) AS month_cost,
+              printf('$%.2f', {_usd(month)}) AS month_cost,
               printf('%.1f', {_credits()}) AS all_cr,
               printf('$%.2f', {_usd()}) AS all_cost
             FROM sessions WHERE no_op = 0
