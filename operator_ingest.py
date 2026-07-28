@@ -30,6 +30,26 @@ from pathlib import Path
 
 BUSY_TIMEOUT = 15.0
 
+# Billing constants.
+#
+# GitHub replaced premium requests with AI credits on 2026-06-01. Usage is
+# metered on token consumption and reported by the CLI as "nano AIU" —
+# billionths of an AI credit.
+#
+#   credits = total_nano_aiu / NANO_AIU_PER_CREDIT
+#   dollars = credits * USD_PER_CREDIT
+#
+# Verified against a live session: 20,242,875,000 nano AIU was displayed by the
+# CLI as "AI Credits 20.2".
+NANO_AIU_PER_CREDIT = 1_000_000_000
+USD_PER_CREDIT = 0.01
+
+# Legacy request-based billing, still in force for annual plans that have not
+# yet expired. Retained so old logs and legacy accounts still report correctly.
+USD_PER_PREMIUM_REQUEST = 0.04
+
+TOKEN_TYPES = ("input", "cache_read", "cache_write", "output")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,6 +62,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     work_dir TEXT,
     git_branch TEXT,
     premium_requests INTEGER,
+    nano_aiu INTEGER NOT NULL DEFAULT 0,
+    tokens_input INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+    tokens_output INTEGER NOT NULL DEFAULT 0,
     api_time_seconds INTEGER,
     session_time_seconds INTEGER,
     lines_added INTEGER,
@@ -55,9 +80,34 @@ CREATE TABLE IF NOT EXISTS model_usage (
     tokens_in TEXT,
     tokens_out TEXT,
     tokens_cached TEXT,
-    premium_requests INTEGER
+    premium_requests INTEGER,
+    nano_aiu INTEGER NOT NULL DEFAULT 0
 );
 """
+
+# Columns added after the original schema shipped. Existing databases are
+# migrated in place so a user's history survives the billing change.
+_ADDED_COLUMNS = {
+    "sessions": {
+        "log_file_mtime": "TEXT",
+        "nano_aiu": "INTEGER NOT NULL DEFAULT 0",
+        "tokens_input": "INTEGER NOT NULL DEFAULT 0",
+        "tokens_cache_read": "INTEGER NOT NULL DEFAULT 0",
+        "tokens_cache_write": "INTEGER NOT NULL DEFAULT 0",
+        "tokens_output": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "model_usage": {
+        "nano_aiu": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
+
+
+def credits_from_nano(nano_aiu) -> float:
+    return (nano_aiu or 0) / NANO_AIU_PER_CREDIT
+
+
+def usd_from_nano(nano_aiu) -> float:
+    return credits_from_nano(nano_aiu) * USD_PER_CREDIT
 
 
 # ── database ────────────────────────────────────────────────────
@@ -93,19 +143,23 @@ def connect(db_path):
 def init_db(db_path) -> None:
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
-        if "log_file_mtime" not in cols:
-            try:
-                conn.execute("ALTER TABLE sessions ADD COLUMN log_file_mtime TEXT")
-            except sqlite3.OperationalError as exc:
-                # Two operators can upgrade the same older database at once and
-                # both observe the column as missing. Losing that race is fine
-                # as long as the column now exists.
-                if "duplicate column" not in str(exc).lower():
-                    raise
-                cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
-                if "log_file_mtime" not in cols:
-                    raise
+        for table, columns in _ADDED_COLUMNS.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns.items():
+                if name in existing:
+                    continue
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                except sqlite3.OperationalError as exc:
+                    # Two operators can upgrade the same database at once and
+                    # both observe a column as missing. Losing that race is
+                    # fine as long as the column now exists.
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+                    recheck = {r["name"] for r in
+                               conn.execute(f"PRAGMA table_info({table})")}
+                    if name not in recheck:
+                        raise
 
 
 # ── helpers ─────────────────────────────────────────────────────
@@ -242,6 +296,78 @@ def extract_shutdown_event(text: str) -> dict | None:
     return None
 
 
+def extract_ai_credit_usage(text: str) -> dict:
+    """Aggregate AI credit and token usage from Copilot API response bodies.
+
+    Since 2026-06-01 usage is metered in AI credits rather than premium
+    requests. Each chat-completion response the CLI logs carries a
+    ``copilot_usage`` object::
+
+        "copilot_usage": {
+          "token_details": [
+            {"batch_size": 1000000, "cost_per_batch": 500000000000,
+             "token_count": 2, "token_type": "input"}, ...
+          ],
+          "total_nano_aiu": 20242875000
+        }
+
+    ``total_nano_aiu`` is billionths of an AI credit and is authoritative — the
+    per-type costs are reported alongside it for attribution, not for the
+    caller to recompute.
+
+    Returns totals plus a per-model breakdown. The response body's ``model``
+    field supplies the model name when present.
+
+    Note: these bodies are only written when Copilot runs at debug log level.
+    At the default level the process log contains no usage data at all.
+    """
+    totals = {
+        "nano_aiu": 0,
+        "tokens": {t: 0 for t in TOKEN_TYPES},
+        "models": {},
+        "calls": 0,
+    }
+
+    for obj in _iter_parsed_objects(text):
+        usage = obj.get("copilot_usage")
+        if not isinstance(usage, dict):
+            continue
+        nano = usage.get("total_nano_aiu")
+        if not isinstance(nano, (int, float)):
+            nano = 0
+        model = obj.get("model") if isinstance(obj.get("model"), str) else "unknown"
+
+        entry = totals["models"].setdefault(
+            model, {"nano_aiu": 0, "calls": 0,
+                    "tokens": {t: 0 for t in TOKEN_TYPES}}
+        )
+        totals["nano_aiu"] += int(nano)
+        entry["nano_aiu"] += int(nano)
+        totals["calls"] += 1
+        entry["calls"] += 1
+
+        details = usage.get("token_details")
+        if isinstance(details, list):
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                ttype = detail.get("token_type")
+                count = detail.get("token_count")
+                if ttype in TOKEN_TYPES and isinstance(count, (int, float)):
+                    totals["tokens"][ttype] += int(count)
+                    entry["tokens"][ttype] += int(count)
+
+    return totals
+
+
+def _iter_parsed_objects(text: str):
+    """Yield every top-level JSON object in the text that parses to a dict."""
+    for _, raw in _iter_json_objects(text):
+        parsed = _parse_object(raw)
+        if parsed is not None:
+            yield parsed
+
+
 def extract_premium_from_usage(text: str) -> tuple[dict, int]:
     """Sum assistant_usage cost fields per model.
 
@@ -320,8 +446,13 @@ def ingest_file(
         first_line = lines[0] if lines else ""
         last_line = lines[-1] if lines else ""
         event = extract_shutdown_event(text)
+        credit_usage = extract_ai_credit_usage(text)
 
-        if not event:
+        # A log is worth recording if it carries either the legacy shutdown
+        # summary or AI credit usage. Current Copilot versions no longer write
+        # a shutdown payload to the process log, so requiring one would discard
+        # every modern session.
+        if not event and credit_usage["calls"] == 0:
             ts = _extract_ts(first_line) or _now()
             conn.execute(
                 """
@@ -337,13 +468,17 @@ def ingest_file(
                 (basename, mtime, ts, ts),
             )
             conn.commit()
-            return f"SKIP {basename} (no shutdown event)"
+            return f"SKIP {basename} (no usage data)"
 
+        event = event or {}
         props = event.get("properties", {}) or {}
         metrics = event.get("metrics", {}) or {}
 
         usage_models, usage_premium = extract_premium_from_usage(text)
         total_premium = usage_premium or metrics.get("total_premium_requests", 0) or 0
+
+        nano_aiu = credit_usage["nano_aiu"]
+        tokens = credit_usage["tokens"]
 
         api_time_s = int((metrics.get("total_api_duration_ms", 0) or 0) / 1000)
         session_time_s = int((metrics.get("session_duration_ms", 0) or 0) / 1000)
@@ -374,11 +509,28 @@ def ingest_file(
             entry = models.setdefault(name, {})
             entry["request_cost"] = str(round(data["cost"]))
             entry.setdefault("request_count", str(data["calls"]))
+        # Merge AI credit usage, which is the current billing signal.
+        for name, data in credit_usage["models"].items():
+            entry = models.setdefault(name, {})
+            entry["nano_aiu"] = data["nano_aiu"]
+            entry.setdefault("request_count", str(data["calls"]))
+            entry.setdefault("input_tokens", data["tokens"]["input"])
+            entry.setdefault("output_tokens", data["tokens"]["output"])
+            entry.setdefault("cache_read_tokens", data["tokens"]["cache_read"])
+            entry.setdefault("cache_write_tokens", data["tokens"]["cache_write"])
 
-        raw_lines = [
-            f"Total usage est: {total_premium} Premium requests",
-            f"API time spent: {api_time_s}s",
-        ]
+        if nano_aiu:
+            raw_lines = [
+                f"Total usage: {credits_from_nano(nano_aiu):.2f} AI credits "
+                f"(${usd_from_nano(nano_aiu):.2f})",
+                f"Tokens: {fmt_tokens(tokens['input'])} in, "
+                f"{fmt_tokens(tokens['output'])} out, "
+                f"{fmt_tokens(tokens['cache_read'])} cache read, "
+                f"{fmt_tokens(tokens['cache_write'])} cache write",
+            ]
+        else:
+            raw_lines = [f"Total usage est: {total_premium} Premium requests"]
+        raw_lines.append(f"API time spent: {api_time_s}s")
         if session_time_s >= 3600:
             h, rem = divmod(session_time_s, 3600)
             mn, sec = divmod(rem, 60)
@@ -389,23 +541,32 @@ def ingest_file(
         raw_lines.append(f"Total code changes: +{lines_added} -{lines_removed}")
         if models:
             raw_lines.append("Breakdown by AI model:")
-            for name in sorted(models, key=lambda n: -int(models[n].get("request_cost", 0) or 0)):
+            for name in sorted(
+                models,
+                key=lambda n: (-int(models[n].get("nano_aiu", 0) or 0),
+                               -int(models[n].get("request_cost", 0) or 0)),
+            ):
                 md = models[name]
+                cost = (f"{credits_from_nano(md['nano_aiu']):.2f} AI credits"
+                        if md.get("nano_aiu")
+                        else f"Est. {int(md.get('request_cost', 0) or 0)} Premium requests")
                 raw_lines.append(
                     f"  {name}  {fmt_tokens(md.get('input_tokens', 0))} in, "
                     f"{fmt_tokens(md.get('output_tokens', 0))} out, "
                     f"{fmt_tokens(md.get('cache_read_tokens', 0))} cached "
-                    f"(Est. {int(md.get('request_cost', 0) or 0)} Premium requests)"
+                    f"({cost})"
                 )
 
         conn.execute(
             """
             INSERT INTO sessions (session_num, log_file, log_file_mtime, no_op,
                                   started_at, ended_at, work_dir, git_branch,
-                                  premium_requests, api_time_seconds,
+                                  premium_requests, nano_aiu, tokens_input,
+                                  tokens_cache_read, tokens_cache_write,
+                                  tokens_output, api_time_seconds,
                                   session_time_seconds, lines_added, lines_removed,
                                   raw_metrics)
-            VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(log_file) DO UPDATE SET
                 session_num = excluded.session_num,
                 log_file_mtime = excluded.log_file_mtime,
@@ -415,6 +576,11 @@ def ingest_file(
                 work_dir = excluded.work_dir,
                 git_branch = excluded.git_branch,
                 premium_requests = excluded.premium_requests,
+                nano_aiu = excluded.nano_aiu,
+                tokens_input = excluded.tokens_input,
+                tokens_cache_read = excluded.tokens_cache_read,
+                tokens_cache_write = excluded.tokens_cache_write,
+                tokens_output = excluded.tokens_output,
                 api_time_seconds = excluded.api_time_seconds,
                 session_time_seconds = excluded.session_time_seconds,
                 lines_added = excluded.lines_added,
@@ -423,7 +589,9 @@ def ingest_file(
             """,
             (
                 session_num, basename, mtime, started_at, ended_at, work_dir, branch,
-                total_premium, api_time_s, session_time_s, lines_added, lines_removed,
+                total_premium, nano_aiu, tokens["input"], tokens["cache_read"],
+                tokens["cache_write"], tokens["output"],
+                api_time_s, session_time_s, lines_added, lines_removed,
                 "\n".join(raw_lines),
             ),
         )
@@ -437,8 +605,9 @@ def ingest_file(
             conn.execute(
                 """
                 INSERT INTO model_usage (session_id, model_name, tokens_in,
-                                         tokens_out, tokens_cached, premium_requests)
-                VALUES (?, ?, ?, ?, ?, ?)
+                                         tokens_out, tokens_cached,
+                                         premium_requests, nano_aiu)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -447,12 +616,18 @@ def ingest_file(
                     fmt_tokens(md.get("output_tokens", 0)),
                     fmt_tokens(md.get("cache_read_tokens", 0)),
                     int(md.get("request_cost", 0) or 0),
+                    int(md.get("nano_aiu", 0) or 0),
                 ),
             )
         conn.commit()
 
+    if nano_aiu:
+        summary = (f"{credits_from_nano(nano_aiu):.2f} AI credits "
+                   f"(${usd_from_nano(nano_aiu):.2f})")
+    else:
+        summary = f"{total_premium} premium"
     return (
-        f"OK {basename}: {total_premium} premium, {api_time_s}s api, "
+        f"OK {basename}: {summary}, {api_time_s}s api, "
         f"+{lines_added} -{lines_removed}"
     )
 

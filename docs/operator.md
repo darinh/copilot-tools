@@ -1,6 +1,6 @@
 # Operator
 
-The operator is a metrics-capturing wrapper for GitHub Copilot CLI. It wraps `copilot` to capture usage metrics (premium requests, API time, session time, per-model breakdown) into a SQLite database. It supports single-session mode (default) and autonomous loop mode with automatic restarts.
+The operator is a metrics-capturing wrapper for GitHub Copilot CLI. It wraps `copilot` to capture usage metrics (AI credits, tokens, API time, session time, per-model breakdown) into a SQLite database. It supports single-session mode (default) and autonomous loop mode with automatic restarts.
 
 ## Platform Support
 
@@ -93,11 +93,12 @@ operator stop project-a              # stop one instance
 operator stop                        # stop all instances
 
 # Reports
-operator report summary              # premium request totals
+operator report summary              # AI credit totals
 operator report sessions             # last 20 sessions with details
 operator report models               # usage breakdown by AI model
 operator report projects             # usage breakdown by project directory
 operator report costs                # cost estimates
+operator report tokens               # token counts by type
 
 # Ingest historical logs
 operator ingest                      # process unprocessed logs
@@ -203,7 +204,7 @@ operator forget NAME
 
 The operator stores metrics in `~/.operator/metrics.db` (SQLite). Each session records:
 
-- Premium requests consumed
+- AI credits consumed (and tokens by type)
 - API time (seconds)
 - Session wall-clock time
 - Lines added/removed
@@ -252,6 +253,34 @@ logs.
 | `COPILOT_OPERATOR_HOME` | Relocate the operator state directory |
 | `COPILOT_OPERATOR_MUX` | Force a specific multiplexer binary |
 | `COPILOT_LOG_DIR` | Point at a non-default Copilot log directory |
+| `COPILOT_OPERATOR_NO_DEBUG_LOG` | Don't add `--log-level debug`; disables usage capture |
+
+## Billing and AI credits
+
+GitHub replaced premium requests with **AI credits** on 2026-06-01. Usage is
+metered on token consumption — input, output, cache-read and cache-write
+tokens are each priced per model — and **1 AI credit = $0.01 USD**.
+
+The operator records, per session:
+
+- `nano_aiu` — billionths of an AI credit, as reported by Copilot
+- token counts split by type (`input`, `cache_read`, `cache_write`, `output`)
+- `premium_requests` — retained for legacy annual plans, which still bill that way
+
+`operator report costs` prices AI credits at $0.01 and falls back to
+$0.04/premium request for sessions recorded before the change, so historical
+totals stay meaningful.
+
+> **Why the operator forces debug logging.** Copilot reports usage in its
+> chat-completion response bodies (`copilot_usage.total_nano_aiu`), and those
+> bodies are only written at debug log level. At the default level the process
+> log contains no usage data at all — a session's metrics would silently be
+> empty. The operator therefore appends `--log-level debug` when launching
+> Copilot. This makes logs substantially larger; set
+> `COPILOT_OPERATOR_NO_DEBUG_LOG=1` to opt out and forgo usage capture.
+
+Copilot itself exposes usage interactively via `/usage`, `/statusline` and the
+exit summary, and `copilot help billing` documents the model.
 
 ## Troubleshooting
 

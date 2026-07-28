@@ -311,6 +311,31 @@ def _fmt_duration_sql(col: str) -> str:
     )
 
 
+# AI credits are stored as integer nano-AIU to avoid float drift. These
+# fragments convert on read. See operator_ingest for the billing constants.
+_NANO = operator_ingest.NANO_AIU_PER_CREDIT
+_USD = operator_ingest.USD_PER_CREDIT
+_LEGACY_USD = operator_ingest.USD_PER_PREMIUM_REQUEST
+
+
+def _credits(expr: str = "nano_aiu") -> str:
+    return f"COALESCE(SUM({expr}),0) / {_NANO}.0"
+
+
+def _usd(expr: str = "nano_aiu") -> str:
+    """Dollars from AI credits, falling back to legacy premium requests.
+
+    Rows predating the 2026-06-01 billing change have no nano_aiu, so their
+    cost is still derived from premium requests. Mixing the two in one sum
+    keeps historical totals meaningful.
+    """
+    return (
+        f"(COALESCE(SUM({expr}),0) / {_NANO}.0) * {_USD} + "
+        f"COALESCE(SUM(CASE WHEN COALESCE({expr},0) = 0 "
+        f"THEN premium_requests ELSE 0 END),0) * {_LEGACY_USD}"
+    )
+
+
 def report_metrics(subcmd: str = "summary") -> int:
     if not METRICS_DB.exists():
         print(f"No metrics database found at {METRICS_DB}")
@@ -320,13 +345,14 @@ def report_metrics(subcmd: str = "summary") -> int:
     home = str(HOME)
     if subcmd == "summary":
         print("═══ Usage Summary ═══\n")
-        rows, headers = _query("""
+        rows, headers = _query(f"""
             SELECT
-              COALESCE(SUM(CASE WHEN date(ended_at,'localtime')=date('now','localtime')
-                                THEN premium_requests ELSE 0 END),0) AS today,
-              COALESCE(SUM(CASE WHEN ended_at >= datetime('now','-7 days')
-                                THEN premium_requests ELSE 0 END),0) AS this_week,
-              COALESCE(SUM(premium_requests),0) AS all_time,
+              printf('%.1f', COALESCE(SUM(CASE WHEN date(ended_at,'localtime')=date('now','localtime')
+                                THEN nano_aiu ELSE 0 END),0) / {_NANO}.0) AS today_credits,
+              printf('%.1f', COALESCE(SUM(CASE WHEN ended_at >= datetime('now','-7 days')
+                                THEN nano_aiu ELSE 0 END),0) / {_NANO}.0) AS week_credits,
+              printf('%.1f', {_credits()}) AS all_time_credits,
+              COALESCE(SUM(premium_requests),0) AS legacy_premium,
               COUNT(*) AS sessions
             FROM sessions WHERE no_op = 0
         """)
@@ -334,7 +360,8 @@ def report_metrics(subcmd: str = "summary") -> int:
         print("═══ Recent Sessions ═══\n")
         rows, headers = _query(f"""
             SELECT session_num AS '#', substr(started_at,1,16) AS started,
-                   COALESCE(premium_requests,0) AS premium,
+                   printf('%.1f', COALESCE(nano_aiu,0) / {_NANO}.0) AS credits,
+                   COALESCE(premium_requests,0) AS legacy_pr,
                    COALESCE(api_time_seconds || 's','—') AS api_time,
                    COALESCE({_fmt_duration_sql('session_time_seconds')},'—') AS sess_time,
                    '+' || COALESCE(lines_added,0) || ' -' || COALESCE(lines_removed,0) AS changes,
@@ -344,55 +371,74 @@ def report_metrics(subcmd: str = "summary") -> int:
         """, (home,))
     elif subcmd == "models":
         print("═══ Per-Model Usage ═══\n")
-        rows, headers = _query("""
+        rows, headers = _query(f"""
             SELECT model_name AS model,
-                   COALESCE(SUM(premium_requests),0) AS total_premium,
+                   printf('%.1f', {_credits()}) AS credits,
+                   COALESCE(SUM(premium_requests),0) AS legacy_pr,
                    COUNT(*) AS appearances
-            FROM model_usage GROUP BY model_name ORDER BY total_premium DESC
+            FROM model_usage GROUP BY model_name
+            ORDER BY SUM(nano_aiu) DESC, SUM(premium_requests) DESC
         """)
     elif subcmd == "projects":
         print("═══ Per-Project Usage ═══\n")
-        rows, headers = _query("""
+        rows, headers = _query(f"""
             SELECT COALESCE(replace(work_dir, ?, '~'),'—') AS project,
-                   COALESCE(SUM(premium_requests),0) AS total_premium,
+                   printf('%.1f', {_credits()}) AS credits,
+                   printf('$%.2f', {_usd()}) AS est_cost,
                    COUNT(*) AS sessions,
                    COALESCE(SUM(api_time_seconds),0) || 's' AS total_api_time
-            FROM sessions WHERE no_op = 0 GROUP BY work_dir ORDER BY total_premium DESC
+            FROM sessions WHERE no_op = 0 GROUP BY work_dir
+            ORDER BY SUM(nano_aiu) DESC
         """, (home,))
     elif subcmd == "costs":
-        print("═══ Cost Estimates (Enterprise @ $0.04/premium request) ═══\n")
-        rows, headers = _query("""
+        print("═══ Cost Estimates ═══\n")
+        rows, headers = _query(f"""
             SELECT
-              COALESCE(SUM(CASE WHEN date(ended_at,'localtime')=date('now','localtime')
-                                THEN premium_requests ELSE 0 END),0) AS today_reqs,
+              printf('%.1f', COALESCE(SUM(CASE WHEN date(ended_at,'localtime')=date('now','localtime')
+                                THEN nano_aiu ELSE 0 END),0) / {_NANO}.0) AS today_cr,
               printf('$%.2f', COALESCE(SUM(CASE WHEN date(ended_at,'localtime')=date('now','localtime')
-                                THEN premium_requests ELSE 0 END),0)*0.04) AS today_cost,
-              COALESCE(SUM(CASE WHEN ended_at >= datetime('now','-7 days')
-                                THEN premium_requests ELSE 0 END),0) AS week_reqs,
+                                THEN nano_aiu ELSE 0 END),0) / {_NANO}.0 * {_USD}) AS today_cost,
+              printf('%.1f', COALESCE(SUM(CASE WHEN ended_at >= datetime('now','-7 days')
+                                THEN nano_aiu ELSE 0 END),0) / {_NANO}.0) AS week_cr,
               printf('$%.2f', COALESCE(SUM(CASE WHEN ended_at >= datetime('now','-7 days')
-                                THEN premium_requests ELSE 0 END),0)*0.04) AS week_cost,
-              COALESCE(SUM(CASE WHEN strftime('%Y-%m', ended_at)=strftime('%Y-%m','now')
-                                THEN premium_requests ELSE 0 END),0) AS month_reqs,
+                                THEN nano_aiu ELSE 0 END),0) / {_NANO}.0 * {_USD}) AS week_cost,
+              printf('%.1f', COALESCE(SUM(CASE WHEN strftime('%Y-%m', ended_at)=strftime('%Y-%m','now')
+                                THEN nano_aiu ELSE 0 END),0) / {_NANO}.0) AS month_cr,
               printf('$%.2f', COALESCE(SUM(CASE WHEN strftime('%Y-%m', ended_at)=strftime('%Y-%m','now')
-                                THEN premium_requests ELSE 0 END),0)*0.04) AS month_cost,
-              COALESCE(SUM(premium_requests),0) AS all_time_reqs,
-              printf('$%.2f', COALESCE(SUM(premium_requests),0)*0.04) AS all_time_cost
+                                THEN nano_aiu ELSE 0 END),0) / {_NANO}.0 * {_USD}) AS month_cost,
+              printf('%.1f', {_credits()}) AS all_cr,
+              printf('$%.2f', {_usd()}) AS all_cost
+            FROM sessions WHERE no_op = 0
+        """)
+    elif subcmd == "tokens":
+        print("═══ Token Usage ═══\n")
+        rows, headers = _query(f"""
+            SELECT COALESCE(SUM(tokens_input),0) AS input,
+                   COALESCE(SUM(tokens_output),0) AS output,
+                   COALESCE(SUM(tokens_cache_read),0) AS cache_read,
+                   COALESCE(SUM(tokens_cache_write),0) AS cache_write,
+                   COALESCE(SUM(tokens_input+tokens_output+tokens_cache_read+tokens_cache_write),0) AS total,
+                   printf('%.1f', {_credits()}) AS credits
             FROM sessions WHERE no_op = 0
         """)
     else:
-        print("Usage: operator report [summary|sessions|models|projects|costs]\n")
-        print("  summary   — Premium request totals (today, week, all time)")
+        print("Usage: operator report "
+              "[summary|sessions|models|projects|costs|tokens]\n")
+        print("  summary   — AI credit totals (today, week, all time)")
         print("  sessions  — Last 20 sessions with details")
         print("  models    — Usage breakdown by AI model")
         print("  projects  — Usage breakdown by project directory")
-        print("  costs     — Cost estimates at enterprise overage rates")
+        print("  costs     — Cost estimates in USD")
+        print("  tokens    — Token counts by type")
         return 1
 
     print(_table(rows, headers))
     if subcmd == "costs":
-        print("\nNote: Enterprise plan includes 1,000 premium requests/month.")
-        print("      Costs above assume overage pricing ($0.04/request).")
-        print("      Actual cost depends on your remaining monthly allowance.")
+        print(f"\nNote: billed in GitHub AI credits at ${_USD:.2f}/credit.")
+        print("      Each plan includes a monthly credit allowance; these")
+        print("      figures are gross usage, not net of that allowance.")
+        print(f"      Rows predating 2026-06-01 are costed at "
+              f"${_LEGACY_USD:.2f}/premium request.")
     return 0
 
 
@@ -402,21 +448,21 @@ def show_run_summary(run_started: str) -> None:
     print("\n═══ Operator Run Summary ═══\n")
     rows, headers = _query(f"""
         SELECT COUNT(*) AS sessions,
-               COALESCE(SUM(premium_requests),0) AS total_premium,
+               printf('%.1f', {_credits()}) AS credits,
+               printf('$%.2f', {_usd()}) AS est_cost,
                COALESCE(SUM(api_time_seconds),0) || 's' AS total_api_time,
                COALESCE({_fmt_duration_sql('SUM(session_time_seconds)')},'0s') AS total_sess_time,
-               '+' || COALESCE(SUM(lines_added),0) || ' -' || COALESCE(SUM(lines_removed),0) AS total_changes,
-               printf('$%.2f', COALESCE(SUM(premium_requests),0)*0.04) AS est_cost
+               '+' || COALESCE(SUM(lines_added),0) || ' -' || COALESCE(SUM(lines_removed),0) AS total_changes
         FROM sessions WHERE no_op = 0 AND ended_at >= ?
     """, (run_started,))
     print(_table(rows, headers))
-    rows, headers = _query("""
+    rows, headers = _query(f"""
         SELECT m.model_name AS model,
-               COALESCE(SUM(m.premium_requests),0) AS premium,
+               printf('%.1f', COALESCE(SUM(m.nano_aiu),0) / {_NANO}.0) AS credits,
                COUNT(*) AS uses
         FROM model_usage m JOIN sessions s ON m.session_id = s.id
         WHERE s.no_op = 0 AND s.ended_at >= ?
-        GROUP BY m.model_name ORDER BY premium DESC
+        GROUP BY m.model_name ORDER BY SUM(m.nano_aiu) DESC
     """, (run_started,))
     if rows:
         print()
@@ -475,6 +521,24 @@ def copilot_executable() -> str | None:
     return shutil.which("copilot")
 
 
+def _ensure_usage_logging(argv: list[str]) -> list[str]:
+    """Ensure Copilot logs the data the metrics pipeline depends on.
+
+    Since the move to AI credits, usage is reported in the chat-completion
+    response bodies (``copilot_usage.total_nano_aiu``), and those bodies are
+    only written at debug log level. At the default level the process log
+    contains no usage data at all, so metrics would silently be empty.
+
+    Set ``COPILOT_OPERATOR_NO_DEBUG_LOG=1`` to opt out — sessions will run with
+    smaller logs but will record no usage.
+    """
+    if os.environ.get("COPILOT_OPERATOR_NO_DEBUG_LOG"):
+        return argv
+    if any(a == "--log-level" or a.startswith("--log-level=") for a in argv):
+        return argv
+    return [*argv, "--log-level", "debug"]
+
+
 def start_session(instance: Instance, copilot_args: list[str], session_num: int,
                   remain_on_exit: bool, preamble: str = "") -> None:
     cwd = Path.cwd()
@@ -486,6 +550,7 @@ def start_session(instance: Instance, copilot_args: list[str], session_num: int,
     argv = [exe, *copilot_args]
     if preamble:
         argv += ["-i", preamble]
+    argv = _ensure_usage_logging(argv)
 
     instance.restart_marker.unlink(missing_ok=True)
     instance.exit_file.unlink(missing_ok=True)
@@ -995,11 +1060,22 @@ MODES
         resumed once with --resume. Use --fresh to reset.
 
 REPORTS
-    operator report summary       Premium request totals (today, week, all time)
+    operator report summary       AI credit totals (today, week, all time)
     operator report sessions      Last 20 sessions with details
     operator report models        Usage breakdown by AI model
     operator report projects      Usage breakdown by project directory
-    operator report costs         Cost estimates at $0.04/premium request
+    operator report costs         Cost estimates in USD
+    operator report tokens        Token counts by type
+
+BILLING
+    GitHub replaced premium requests with AI credits on 2026-06-01. Usage is
+    metered on token consumption; 1 AI credit = $0.01 USD. Legacy annual plans
+    still bill in premium requests, and both are reported.
+
+    Usage figures come from Copilot's chat-completion response bodies, which
+    are only written at debug log level. The operator therefore adds
+    --log-level debug when launching Copilot. Set COPILOT_OPERATOR_NO_DEBUG_LOG=1
+    to opt out; sessions will then produce smaller logs but record no usage.
 
 FILES
     ~/.operator/                        State directory (override with

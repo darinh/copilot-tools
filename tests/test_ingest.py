@@ -193,11 +193,11 @@ def test_model_usage_rows_replaced_not_duplicated(tmp_path, db_path):
     assert all(r["c"] == 1 for r in rows)
 
 
-def test_log_without_shutdown_event_recorded_as_noop(tmp_path, db_path):
+def test_log_without_any_usage_recorded_as_noop(tmp_path, db_path):
     log = tmp_path / "process-1700000000000-11.log"
     log.write_text("2026-07-27T10:00:00.000Z [info] nothing here\n", encoding="utf-8")
     result = operator_ingest.ingest_file(log, db_path)
-    assert "no shutdown event" in result
+    assert "no usage data" in result
     with operator_ingest.connect(db_path) as conn:
         assert conn.execute("SELECT no_op FROM sessions").fetchone()[0] == 1
 
