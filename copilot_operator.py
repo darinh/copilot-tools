@@ -795,7 +795,10 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
                     resume_id_used = resume_id
                 resume_id = ""
 
-            instance.save_state(session_num, run_started)
+            # Persist the pending resume id too: if the launch fails or the
+            # process dies here, the id must survive on disk rather than being
+            # cleared by a pre-launch write.
+            instance.save_state(session_num, run_started, resume_id_used)
             try:
                 start_session(instance, launch_args, session_num,
                               remain_on_exit=True, preamble=preamble)
@@ -856,7 +859,9 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
                 instance.save_state(session_num, run_started)
                 session_num += 1
                 log(f"Pausing before session #{session_num}...")
-                time.sleep(3)
+                _sleep(3)
+                if shutdown["requested"]:
+                    raise KeyboardInterrupt
     except KeyboardInterrupt:
         print(file=sys.stderr)
         log("Signal received — shutting down")

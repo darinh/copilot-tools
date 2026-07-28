@@ -43,6 +43,7 @@ from pathlib import Path
 
 SESSION_ID_TIMEOUT = 20
 LOG_PIN_TIMEOUT = 30
+TREE_SETTLE_SECONDS = 1.5
 
 
 def _log(state_dir: Path, instance: str, msg: str) -> None:
@@ -260,29 +261,39 @@ def run(spec_path: Path) -> int:
     # session id so the operator can resume it later.
     pinned: Path | None = None
     found_session = False
-    deadline = time.time() + LOG_PIN_TIMEOUT
+    started_at = time.time()
+    deadline = started_at + LOG_PIN_TIMEOUT
+    # Sample the tree eagerly for a moment even if the process exits at once:
+    # a shim may not have spawned the real binary by the first snapshot, and a
+    # pid that is never observed can never be attributed.
+    settle_until = started_at + TREE_SETTLE_SECONDS
+
     while True:
+        now = time.time()
         alive = proc.poll() is None
-        if alive:
+        if alive or now < settle_until:
             candidate_pids |= _process_tree(proc.pid)
+
         if pinned is None:
             pinned = _find_log(log_dir, candidate_pids, started_ms)
             if pinned is not None:
                 _log(state_dir, instance,
                      f"log pinned: {pinned.name} (pids={sorted(candidate_pids)})")
+
         if pinned is not None and not found_session:
             sid = _extract_session_id(pinned)
             if sid:
                 session_file.write_text(sid, encoding="utf-8")
                 _log(state_dir, instance, f"session id={sid}")
                 found_session = True
-        if not alive:
+
+        if not alive and now >= settle_until:
             break
-        if pinned is not None and (found_session or time.time() > deadline):
+        if found_session and pinned is not None:
             break
-        if time.time() > deadline:
+        if now > deadline:
             break
-        time.sleep(0.5)
+        time.sleep(0.25 if not alive else 0.5)
 
     if pinned is None:
         _log(state_dir, instance, "no log pinned during startup window")

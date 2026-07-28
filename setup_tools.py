@@ -130,8 +130,30 @@ def install_package(assume_yes: bool = False) -> bool:
     return True
 
 
-def _link_directory(src: Path, dest: Path) -> str:
-    """Link src -> dest, preferring a link and falling back to a copy."""
+def _dirs_match(a: Path, b: Path) -> bool:
+    """True when two directory trees have identical file names and contents."""
+    try:
+        a_files = {p.relative_to(a) for p in a.rglob("*") if p.is_file()}
+        b_files = {p.relative_to(b) for p in b.rglob("*") if p.is_file()}
+    except OSError:
+        return False
+    if a_files != b_files:
+        return False
+    for rel in a_files:
+        try:
+            if (a / rel).read_bytes() != (b / rel).read_bytes():
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _link_directory(src: Path, dest: Path, assume_yes: bool = False) -> str:
+    """Link src -> dest, preferring a link and falling back to a copy.
+
+    A real directory at ``dest`` may contain edits the user made in place, so it
+    is never removed without consent.
+    """
     if dest.is_symlink() or (IS_WINDOWS and dest.is_dir() and _is_junction(dest)):
         try:
             if Path(os.path.realpath(dest)) == src.resolve():
@@ -143,10 +165,14 @@ def _link_directory(src: Path, dest: Path) -> str:
         except OSError:
             shutil.rmtree(dest, ignore_errors=True)
     elif dest.exists():
-        # A real directory: refresh the copy rather than clobbering blindly.
+        if dest.is_dir() and _dirs_match(src, dest):
+            return "already up to date"
+        if not ask(f"{dest} exists and differs from the repository copy. Replace it?",
+                   assume_yes):
+            return "skipped (kept existing)"
         shutil.rmtree(dest, ignore_errors=True)
         shutil.copytree(src, dest)
-        return "copied (refreshed)"
+        return "replaced with a copy"
 
     if IS_WINDOWS:
         # Junctions need neither Developer Mode nor elevation.
@@ -170,7 +196,7 @@ def _is_junction(path: Path) -> bool:
         return False
 
 
-def install_extensions() -> None:
+def install_extensions(assume_yes: bool = False) -> None:
     print("\nInstalling runtime extensions...")
     src_root = REPO_ROOT / "extensions"
     if not src_root.is_dir():
@@ -180,7 +206,7 @@ def install_extensions() -> None:
     dest_root.mkdir(parents=True, exist_ok=True)
     for src in sorted(p for p in src_root.iterdir() if p.is_dir()):
         try:
-            result = _link_directory(src, dest_root / src.name)
+            result = _link_directory(src, dest_root / src.name, assume_yes)
             info(f"extension '{src.name}': {result}")
         except OSError as exc:
             warn(f"extension '{src.name}': {exc}")
@@ -242,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
         if not install_package(assume_yes=args.yes):
             return 1
 
-    install_extensions()
+    install_extensions(assume_yes=args.yes)
     install_templates(assume_yes=args.yes)
 
     print("\n\u2550\u2550\u2550 Setup Complete \u2550\u2550\u2550\n")
