@@ -7,16 +7,39 @@ The `copilot-tools` repository leverages **Spec Kit** to drive Specification-Dri
 When the `spec-driven` feature is enabled for a project and `.specify/` is
 missing, agents initialize Spec Kit automatically.
 
-You can also initialize it manually:
+You can also initialize it manually, selecting the script variant for your platform:
 
+**PowerShell (Windows)**
+```powershell
+specify init --here --force --integration copilot --integration-options="--skills" --script ps
+```
+
+**bash (Linux/macOS/WSL)**
 ```bash
 specify init --here --force --integration copilot --integration-options="--skills" --script sh
 ```
 
+The `--script` value determines whether the generated helper scripts under `.specify/scripts/` are
+PowerShell or POSIX shell. Choose the one that matches the platform you will run them on.
+
 During `copilot-tools` setup, the official `specify-cli` is installed from the
 pinned GitHub release when `specify` is absent. A fresh bootstrap requires
-Python 3.11+ and `curl`; setup installs `uv` when needed. Override the release
-pin with `SPEC_KIT_VERSION=vX.Y.Z ./setup.sh`.
+Python 3.11+; on Linux/macOS/WSL it also requires `curl`, and setup installs `uv`
+when needed. Override the release pin with the environment variable
+`SPEC_KIT_VERSION`:
+
+**PowerShell (Windows)**
+```powershell
+$env:SPEC_KIT_VERSION = 'vX.Y.Z'
+```
+
+**bash (Linux/macOS/WSL)**
+```bash
+SPEC_KIT_VERSION=vX.Y.Z ./setup.sh
+```
+
+Note that `setup.sh` itself is POSIX-only — see [Operator](operator.md#platform-support) for current
+platform support.
 
 ## Standard Paths
 

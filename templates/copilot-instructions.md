@@ -10,12 +10,16 @@ Each project can have a persistent configuration stored outside the repo at `~/.
 
 ### Catalog
 
-`~/.copilot/projects/catalog.csv` maps project root paths to GUIDs:
+`~/.copilot/projects/catalog.csv` maps project root paths to GUIDs. Paths are stored in the **native
+form of the platform that created the entry**:
 
 ```csv
-"/home/user/projects/my-app",a1b2c3d4-e5f6-7890-abcd-ef1234567890
-"/home/user/projects/other-project",f9e8d7c6-b5a4-3210-fedc-ba0987654321
+"C:\Users\dev\repos\my-app",a1b2c3d4-e5f6-7890-abcd-ef1234567890
+"/home/dev/projects/other-project",f9e8d7c6-b5a4-3210-fedc-ba0987654321
 ```
+
+When matching, normalize the current project root before comparing. On Windows compare
+case-insensitively; on Linux and macOS compare case-sensitively.
 
 ### Per-Project Directory
 
@@ -33,7 +37,18 @@ Each project can have a persistent configuration stored outside the repo at `~/.
    - "This project isn't in the catalog yet. Would you like to set it up?"
    - Choices: "Enable all features" / "Select features" / "Skip for now"
    - If enabling: generate a GUID, create the directory, write `copilot-instructions.md` with selected features, add entry to `catalog.csv`.
-   - **If spec-driven is selected and `.specify/` is missing**, run `specify init --here --force --integration copilot --integration-options="--skills" --script sh`.
+   - **If spec-driven is selected and `.specify/` is missing**, initialize spec-kit using the script
+     variant matching your platform — `ps` on Windows, `sh` on Linux/macOS/WSL:
+
+     **PowerShell (Windows)**
+     ```powershell
+     specify init --here --force --integration copilot --integration-options="--skills" --script ps
+     ```
+
+     **bash (Linux/macOS/WSL)**
+     ```bash
+     specify init --here --force --integration copilot --integration-options="--skills" --script sh
+     ```
 
 ### Feature Selection
 
@@ -73,17 +88,28 @@ Use the `handoff` command when any of these are true:
 - You sense the context window is getting large (long conversation, many tool calls). Don't wait to be asked — proactively write the handoff and tell the user: *"Context is getting heavy. I've written the handoff — starting a new session."*
 - The user says they're ending the session.
 
-```bash
-handoff --instance <operator-instance-name> \
-  --status "What was completed (commits, branches, files)" \
-  --next "Prioritized next steps" \
-  --context "Key decisions, gotchas" \
-  --prompt "Ready-to-execute prompt for next session"
+The `handoff` command takes the same arguments on every platform. Pass each value as a single quoted
+argument on one line — do not use shell line continuations, which differ between shells:
+
+```
+handoff --instance <operator-instance-name> --status "What was completed (commits, branches, files)" --next "Prioritized next steps" --context "Key decisions, gotchas" --prompt "Ready-to-execute prompt for next session"
 ```
 
 The `handoff` command atomically writes the handoff file AND triggers the operator restart. **Never write the handoff file manually** — always use the command.
 
-If the `handoff` command is not available (e.g., not on PATH), fall back to writing `~/.copilot/projects/{guid}/next-session.md` manually and then running `touch ~/.operator/restart/{instance-name}`.
+If the `handoff` command is not available (e.g., not on PATH), fall back to writing
+`~/.copilot/projects/{guid}/next-session.md` manually and then creating the restart marker file using
+the form for your platform:
+
+**PowerShell (Windows)**
+```powershell
+New-Item -ItemType File -Force ~/.operator/restart/{instance-name}
+```
+
+**bash (Linux/macOS/WSL)**
+```bash
+touch ~/.operator/restart/{instance-name}
+```
 
 ### Handoff File Format
 ```markdown
@@ -141,7 +167,9 @@ CREATE TABLE IF NOT EXISTS session_log (
 
 ## Field Notes (Agent Journal)
 
-Cross-project working journal of insights about building, instructing, and collaborating with AI agents. Lives in its own repo (not per-project): `~/projects/agent-field-notes/`.
+Cross-project working journal of insights about building, instructing, and collaborating with AI agents.
+Lives in its own repo (not per-project), alongside your other repositories — for example
+`C:\Users\dev\repos\agent-field-notes` on Windows or `~/projects/agent-field-notes` on Linux/macOS.
 
 ```
 journal/    Chronological entries, one conversation per file.

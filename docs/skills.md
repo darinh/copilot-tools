@@ -12,6 +12,12 @@ Skills extend Copilot CLI agents with specialized capabilities. They're markdown
 Use Roslyn for C# structural questions. For other languages, use the built-in
 code intelligence, LSP, or search tools in your environment.
 
+**PowerShell (Windows)**
+```powershell
+Copy-Item -Recurse copilot-tools\skills\code-intelligence your-project\.github\skills\
+```
+
+**bash (Linux/macOS/WSL)**
 ```bash
 cp -r copilot-tools/skills/code-intelligence your-project/.github/skills/
 ```

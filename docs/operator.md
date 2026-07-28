@@ -2,14 +2,24 @@
 
 The operator is a metrics-capturing wrapper for GitHub Copilot CLI. It wraps `copilot` to capture usage metrics (premium requests, API time, session time, per-model breakdown) into a SQLite database. It supports single-session mode (default) and autonomous loop mode with automatic restarts.
 
+## Platform Support
+
+The operator requires a POSIX shell and `tmux`, so it runs on **Linux, WSL, and macOS**. It does not yet
+run natively on Windows — see [`specs/003-windows-native-operator/`](../specs/003-windows-native-operator/).
+On Windows, run the operator inside WSL.
+
 ## Prerequisites
 
-- `tmux` — session management
-- `sqlite3` — metrics database
-- `python3` — log parsing
-- `copilot` — GitHub Copilot CLI
+| Tool | Purpose | Linux / WSL | macOS |
+|------|---------|-------------|-------|
+| `tmux` | Session management | `apt install tmux` | `brew install tmux` |
+| `sqlite3` | Metrics database | `apt install sqlite3` | preinstalled |
+| `python3` | Log parsing | `apt install python3` | preinstalled |
+| `copilot` | GitHub Copilot CLI | see GitHub docs | see GitHub docs |
 
 ## Installation
+
+**bash (Linux/macOS/WSL)**
 
 ```bash
 # From the copilot-tools repo
@@ -63,7 +73,7 @@ operator --agent=anvil:anvil --yolo
 
 Adds `--yolo --autopilot --no-ask-user` automatically. Sends a preamble that tells the agent:
 - It has blanket approval for all decisions
-- How to trigger a restart (touch a marker file)
+- How to trigger a restart (create a marker file)
 - To check for session handoff files on startup
 
 The operator polls for the restart marker. When detected, it captures metrics, restarts copilot, and delivers the same preamble.

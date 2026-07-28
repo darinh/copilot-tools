@@ -1,0 +1,205 @@
+# Data Model
+
+**Feature**: `003-windows-native-operator`
+
+Concrete representation of the entities in [spec.md](./spec.md). Formats are unchanged from the current
+bash implementation so that an existing `~/.operator/` directory stays readable — only the code that
+reads and writes them changes.
+
+## Path resolution
+
+All state lives under a single root, overridable by `COPILOT_OPERATOR_HOME`:
+
+| Symbol | Default (POSIX) | Default (Windows) |
+|---|---|---|
+| `OPERATOR_HOME` | `$HOME/.operator` | `%USERPROFILE%\.operator` |
+| `RESTART_DIR` | `$OPERATOR_HOME/restart` | `%OPERATOR_HOME%\restart` |
+| `METRICS_DB` | `$OPERATOR_HOME/metrics.db` | `%OPERATOR_HOME%\metrics.db` |
+| `LOG_FILE` | `$OPERATOR_HOME/operator.log` | `%OPERATOR_HOME%\operator.log` |
+| `BACKUPS_DIR` | `$OPERATOR_HOME/backups` | `%OPERATOR_HOME%\backups` |
+| `COPILOT_LOG_DIR` | `$HOME/.copilot/logs` | `%USERPROFILE%\.copilot\logs` |
+
+Resolution uses `pathlib.Path.home()`, which honors `USERPROFILE` on Windows. State is **not** shared
+with a WSL installation, which has its own `$HOME` (spec Assumptions).
+
+State must never live under `~/.copilot/`: the Copilot CLI wholesale-deletes `~/.copilot/restart/` on
+startup (FR-016).
+
+## Operator instance
+
+The central entity. Identified by a sanitized name; defaults to the current directory name.
+
+**Name rule**: `.` and `:` are replaced with `-` before any use. Required for correctness — psmux
+creates no session at all for a name containing `:` while reporting success
+([mux-backend.md](./contracts/mux-backend.md)).
+
+Files per instance `{name}`:
+
+| File | Meaning | Lifetime |
+|---|---|---|
+| `restart/{name}` | Restart signal | Created by agent/handoff, deleted by operator on observe |
+| `restart/{name}.state` | Persisted state | Survives operator restarts; deleted by `stop` |
+| `restart/{name}.managed` | Ownership marker | Created at launch; deleted at shutdown |
+| `restart/{name}.pid` | Copilot's real process ID | Written by the launch script; replaced each session |
+| `run-{name}.sh` / `run-{name}.ps1` | Generated launch script | Recreated per session; deleted at shutdown |
+
+An instance is **operator-managed** if `restart/{name}.managed` or `restart/{name}.state` exists.
+`list` and bare `stop` act only on managed instances (FR-006).
+
+## Instance state record
+
+`restart/{name}.state` — line-oriented `KEY=VALUE`, unchanged from bash:
+
+```
+SESSION_NUM=7
+RUN_STARTED=2026-07-27T14:03:11Z
+COPILOT_SESSION_ID=3f2a9c1e-...
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `SESSION_NUM` | int | Last started session number. Next run starts at `SESSION_NUM + 1`. |
+| `RUN_STARTED` | ISO-8601 UTC | Original run start, scoping the aggregate summary. |
+| `COPILOT_SESSION_ID` | UUID, optional | Last observed Copilot CLI session. Omitted when unknown. |
+
+**Rules**
+
+- Written only for named instances; unnamed instances are ephemeral.
+- `--fresh` ignores an existing record and restarts numbering at 1.
+- `COPILOT_SESSION_ID` is consumed **exactly once**: injected as `--resume=<id>` on the first session
+  after an operator restart, then cleared. It is suppressed when the user already passed a session
+  argument (FR-012).
+- Values are validated on load — a non-UUID `COPILOT_SESSION_ID` is discarded rather than passed to
+  Copilot.
+
+### State transitions
+
+```
+absent ──start named loop──▶ SESSION_NUM=1
+   ▲                              │
+   │                       restart signal
+   │                              ▼
+   └────── stop ──────  SESSION_NUM=n+1 (COPILOT_SESSION_ID cleared)
+
+SESSION_NUM=n ──operator restart──▶ resume at n+1 with --resume=<id> (once)
+SESSION_NUM=n ──--fresh──▶ SESSION_NUM=1
+```
+
+## Restart signal
+
+`restart/{name}` — an empty marker file; only existence matters. Created by `handoff` or directly by the
+agent; polled every 10s by loop mode; deleted by the operator when observed and before each launch.
+
+Cross-platform creation (FR-022):
+
+| Shell | Command |
+|---|---|
+| bash | `touch ~/.operator/restart/{name}` |
+| PowerShell | `New-Item -ItemType File -Force ~/.operator/restart/{name}` |
+
+## Ownership marker
+
+`restart/{name}.managed` — empty file created after a successful session launch, distinguishing operator
+sessions from unrelated sessions with the same name (FR-006).
+
+The bash implementation snapshots sibling markers before launch and restores them if `RESTART_DIR`
+vanishes mid-launch — defensive scaffolding from when state lived under `~/.copilot/`. Restoration is
+gated on the session still being live. This behavior is preserved.
+
+## Metrics database
+
+SQLite at `METRICS_DB`, accessed through Python's stdlib `sqlite3`. Schema is unchanged, so existing
+databases work without migration.
+
+### `sessions`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK AUTOINCREMENT | |
+| `session_num` | INTEGER NOT NULL | Loop session number; `0` for no-op records |
+| `log_file` | TEXT **UNIQUE** | Log basename. Drives idempotent upsert. |
+| `log_file_mtime` | TEXT | Skip-if-unchanged marker for ingest |
+| `no_op` | INTEGER NOT NULL DEFAULT 0 | `1` when the log had no shutdown event |
+| `started_at` / `ended_at` | TEXT NOT NULL | ISO-8601 UTC |
+| `work_dir`, `git_branch` | TEXT | |
+| `premium_requests`, `api_time_seconds`, `session_time_seconds` | INTEGER | |
+| `lines_added`, `lines_removed` | INTEGER | |
+| `raw_metrics` | TEXT | Rendered human-readable summary |
+
+### `model_usage`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK AUTOINCREMENT | |
+| `session_id` | INTEGER NOT NULL REFERENCES sessions(id) | |
+| `model_name` | TEXT NOT NULL | |
+| `tokens_in`, `tokens_out`, `tokens_cached` | TEXT | Pre-formatted (`1.2M`, `340k`) |
+| `premium_requests` | INTEGER | |
+
+Rows are deleted and reinserted per session on reprocessing.
+
+### Access rules
+
+- The `sqlite3` **binary** is no longer used. Stdlib `sqlite3` replaces it on every platform.
+- All statements use **parameter binding**, not string interpolation. The bash and current Python
+  implementations interpolate escaped strings; log-derived values (model names, work dirs) reach these
+  statements, so binding is required.
+- Concurrent instances share one database, so connections set a **busy timeout** and the ingest path is
+  idempotent via the `log_file` unique constraint (spec Edge Cases).
+
+## Project catalog entry
+
+`~/.copilot/projects/catalog.csv` — two columns, optionally quoted:
+
+```csv
+"C:\Users\dev\repos\my-app",a1b2c3d4-e5f6-7890-abcd-ef1234567890
+"/home/dev/repos/my-app",f9e8d7c6-b5a4-3210-fedc-ba0987654321
+```
+
+Lookup normalizes the project root and compares. On Windows the comparison is **case-insensitive** and
+separator-normalized; on POSIX it is case-sensitive. A catalog written on one platform stores that
+platform's paths; cross-platform sharing is out of scope.
+
+Resolving a GUID yields `~/.copilot/projects/{guid}/`, where `next-session.md` is written.
+
+## Handoff file
+
+`~/.copilot/projects/{guid}/next-session.md`, written with explicit UTF-8. Sections in fixed order;
+optional sections are omitted entirely rather than emitted empty:
+
+```markdown
+# Session Handoff
+
+## Status
+...
+## In Progress      (optional)
+## Next Steps
+...
+## Context          (optional)
+## Prompt           (optional)
+```
+
+Ephemeral: the next agent reads it once and deletes it.
+
+## Copilot process log
+
+`~/.copilot/logs/process-*.log`, read-only input owned by the Copilot CLI. Named
+`process-{startTimeMs}-{pid}.log`, where `{pid}` is **Copilot's own** process ID.
+
+### Attribution
+
+The PID used for matching comes from `restart/{name}.pid`, written by the launch script, **not** from
+the multiplexer's pane PID. On POSIX the two are identical because the run script `exec`s Copilot; on
+Windows they are not — the pane PID is the multiplexer's own shell, two levels above Copilot
+([research.md](./research.md) §R5.1).
+
+When the PID file is missing, the operator records **no** metrics for that session and logs a warning.
+It must not fall back to "most recently modified log", which silently misattributes one instance's usage
+to another when instances run concurrently.
+
+Files are opened with **explicit UTF-8 and lenient error handling** — the default encoding on Windows is
+locale-dependent and silently corrupts non-ASCII content, which then fails JSON parsing and discards the
+session's metrics entirely.
+
+The parser extracts the `session_shutdown` event for totals and sums `assistant_usage` cost fields for
+premium requests, because `session_shutdown.total_premium_requests` reports only the last call's cost.

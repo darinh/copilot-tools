@@ -14,7 +14,23 @@ Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Buil
 | [`docs/`](docs/) | Documentation for operator, skills, and spec-kit |
 | [`setup.sh`](setup.sh) | Automated environment setup script |
 
+## Platform Support
+
+| Component | Windows | Linux / WSL | macOS |
+|-----------|---------|-------------|-------|
+| Workflow conventions & templates | ✅ | ✅ | ✅ |
+| Spec Kit workflow | ✅ | ✅ | ✅ |
+| Runtime extensions | ✅ | ✅ | ✅ |
+| `operator.sh` / `handoff.sh` | ❌ not yet | ✅ | ✅ |
+| `setup.sh` | ❌ not yet | ✅ | ✅ |
+
+The operator currently requires a POSIX shell and `tmux`. Native Windows support is specified in
+[`specs/003-windows-native-operator/`](specs/003-windows-native-operator/) and is not yet implemented —
+on Windows, run the operator inside WSL.
+
 ## Quick Start
+
+**bash (Linux/macOS/WSL)**
 
 ```bash
 git clone <this-repo> ~/projects/copilot-tools
@@ -24,6 +40,7 @@ chmod +x setup.sh operator.sh
 ```
 
 The setup script will:
+
 1. Check prerequisites (`tmux`, `sqlite3`, `python3`, `copilot`)
 2. Symlink `operator` into `~/.local/bin/`
 3. Install the [Anvil](https://github.com/burkeholland/anvil) agent plugin
@@ -32,10 +49,28 @@ The setup script will:
 6. Conditionally install the Spec Kit CLI if not already present
 7. Install configuration templates to `~/.copilot/`
 
+**PowerShell (Windows)**
+
+`setup.sh` is POSIX-only, and the operator it installs does not run natively on Windows yet. Clone the
+repository and install the configuration templates directly — these are the parts that work on Windows
+today:
+
+```powershell
+git clone <this-repo> $HOME\repos\copilot-tools
+cd $HOME\repos\copilot-tools
+New-Item -ItemType Directory -Force $HOME\.copilot | Out-Null
+Copy-Item templates\copilot-instructions.md $HOME\.copilot\copilot-instructions.md
+Copy-Item templates\mcp-config.json $HOME\.copilot\mcp-config.json
+```
+
+To use the operator on Windows, run it inside WSL following the bash instructions above.
+
 See [Spec Kit Workflow](docs/spec-kit.md) for project initialization, commands,
 upgrades, and parallel-agent coordination.
 
 ## Usage
+
+> The `operator` command requires Linux, WSL, or macOS. See [Platform Support](#platform-support).
 
 ```bash
 # Interactive session with Anvil agent
