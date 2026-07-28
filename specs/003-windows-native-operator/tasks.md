@@ -33,29 +33,39 @@
 ## Phase 4: Tests
 
 - [x] **T011** `tests/test_mux.py` — naming, collisions, reserved names, probe order,
-      silent-failure detection, argv preservation (25 tests)
+      silent-failure detection, argv preservation
 - [x] **T012** `tests/test_ingest.py` — parsing, premium summing, idempotency, UTF-8,
-      SQL binding, concurrency settings (17 tests)
-- [x] **T013** `tests/test_runner.py` — log attribution, no-fallback guarantee, session-id
-      extraction, end-to-end supervision (13 tests)
+      SQL binding, concurrency settings, string-literal braces, field order
+- [x] **T013** `tests/test_runner.py` — log attribution, no-fallback guarantee, PID-reuse
+      bounds, session-id extraction, end-to-end supervision
 - [x] **T014** `tests/test_operator.py` — identity, state, ownership, args, preamble,
-      reports, dispatch, foreign-session isolation (42 tests)
-- [x] **T015** `tests/test_handoff.py` — rendering, catalog, path matching, warnings (19 tests)
+      reports, dispatch, foreign-session isolation, `pane_dead` liveness
+- [x] **T015** `tests/test_handoff.py` — rendering, catalog, path matching, warnings
 - [x] **T016** `tests/test_integration.py` — real multiplexer: create/query/kill, persistence,
-      spaces in paths, unsafe-name rejection, runner supervision, detach, concurrency (8 tests)
+      spaces in paths, unsafe-name rejection, runner supervision, detach, concurrency
+- [x] **T017** `tests/test_loop_resilience.py` — launch retry, bounded give-up, resume-id
+      preservation across a failed launch
+- [x] **T018** `tests/test_setup.py` — extension preservation without consent, consent-gated
+      replacement, identical-tree no-op, prerequisite hints
 
 ## Phase 5: Documentation and governance
 
-- [x] **T017** `README.md` — platform matrix, cross-platform quick start, repo structure
-- [x] **T018** `docs/operator.md` — platform support, prerequisites, architecture, files,
+- [x] **T019** `README.md` — platform matrix, cross-platform quick start, repo structure
+- [x] **T020** `docs/operator.md` — platform support, prerequisites, architecture, files,
       environment variables, troubleshooting
-- [x] **T019** Constitution amendment — Python as primary cross-platform language,
+- [x] **T021** Constitution amendment — Python as primary cross-platform language,
       platform verification requirement, version 1.1.0
-- [x] **T020** Spec artifacts updated to describe delivered behavior
+- [x] **T022** Spec artifacts updated to describe delivered behavior
+
+## Phase 6: Adversarial review
+
+- [x] **T023** Three review rounds across four models; every finding fixed with a
+      regression test. See the review table in [spec.md](./spec.md).
 
 ## Verification
 
-- [x] 124 tests pass, including 8 against a real psmux session on Windows
+- [x] 151 tests pass, including 8 against a real psmux session on Windows
+- [x] `verify_cross_platform.py` passes 36/36 on Windows and on Linux
 - [x] `bash -n` clean on all shell scripts
 - [x] `git diff main -- operator.sh handoff.sh operator-ingest.py` empty (no Linux regression)
 - [x] Manual Windows 11: loop mode, restart, resume after killed operator, reports,

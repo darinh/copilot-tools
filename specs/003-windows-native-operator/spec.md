@@ -156,7 +156,7 @@ adapter; this is documented rather than claimed otherwise.
 
 ## Verification
 
-- 124 automated tests pass, of which 8 drive a **real psmux session** on Windows.
+- 151 automated tests pass, of which 8 drive a **real psmux session** on Windows.
 - `verify_cross_platform.py` — a stdlib-only smoke test needing no pytest —
   passes **36/36 on both platforms**: Windows with psmux 3.3.7 and Linux with
   tmux 3.4, including full runner supervision and metrics capture on each.
@@ -168,6 +168,25 @@ adapter; this is documented rather than claimed otherwise.
 - End-to-end loop mode, restart, resume, reports, `list`/`stop`,
   foreign-session isolation and `handoff` were each exercised manually on
   Windows 11.
+
+## Review rounds
+
+Three adversarial review rounds ran across four models. Every finding was fixed
+and covered by a regression test; the notable ones:
+
+| Finding | Impact if unfixed |
+|---|---|
+| `is_copilot_running` ignored `pane_dead` | Autonomous loop could poll forever with no restart and no shutdown |
+| Brace counting ignored string literals | A `}` in any string value silently discarded a whole session's metrics |
+| `sqlite3` connections never closed | Handle leak in a long-running loop |
+| Premium cost lookahead crossed event boundaries | Inflated billing numbers |
+| Cost read by line proximity | A cost preceding its model silently reported zero |
+| `safe_instance_id` collided with digest-shaped names | Two instances sharing every state file |
+| `_find_log` unbounded upper window | A recycled PID could attribute a later run to this session |
+| Launch failure propagated out of the loop | An unattended loop died instead of retrying |
+| `_link_directory` rmtree'd real directories | **Destroyed user-edited extensions without consent** |
+| Pre-launch state write cleared the resume id | A failed launch lost the resume id from disk |
+| Process tree sampled once before a fast exit | A shim's child pid never observed, so its log was unattributable |
 
 ## Out of Scope
 
