@@ -1,142 +1,172 @@
 # Feature Specification: Windows-Native Operator
 
-**Feature Branch**: `003-windows-native-operator` (not yet created)
+**Feature Branch**: `003-windows-native-operator`
 
 **Created**: 2026-07-27
 
-**Status**: **Deferred — design seeded, blocked on unresolved review findings**
+**Status**: **Delivered**
 
-## Why this exists
+## Summary
 
-This feature carries the deferred scope from the original combined "make it work on Windows" effort.
-Phase 1 (platform-agnostic instructions and documentation) shipped separately as
-`specs/002-platform-agnostic-instructions/`.
+The operator, handoff tool, log parser and setup now run natively on Windows,
+Linux, WSL and macOS from a single Python implementation. Session management
+goes through a backend abstraction that selects `psmux` on Windows and `tmux`
+elsewhere, and each session is supervised by a process running inside the
+multiplexer pane.
 
-An adversarial review council of three models returned **DO NOT SHIP** on the combined plan — not
-because the direction was wrong, but because the Windows process-supervision model, instance-ownership
-semantics, and installation path were incomplete. That verdict applies to this feature's scope, so the
-findings below **must be resolved before implementation begins**.
+The original bash scripts remain unchanged, so existing Linux and WSL users are
+unaffected.
 
-## Design work already completed and verified
+## User Scenarios & Testing
 
-These artifacts are carried forward and remain valid:
+### User Story 1 - Run a Copilot session natively on Windows (Priority: P1)
 
-| Artifact | Content |
-|---|---|
-| [`research.md`](./research.md) | Backend selection with empirical verification; implementation-base decision; template audit |
-| [`contracts/cli-surface.md`](./contracts/cli-surface.md) | Full `operator` + `handoff` command contract, fact-checked against `operator.sh` |
-| [`contracts/mux-backend.md`](./contracts/mux-backend.md) | Session-backend capability contract with verified psmux/tmux divergences |
-| [`data-model.md`](./data-model.md) | On-disk state formats, metrics schema, attribution rules |
-| [`quickstart.md`](./quickstart.md) | Validation scenarios |
+**Delivered.** `operator --name foo` starts a Copilot session in a psmux session
+on Windows, attaches the terminal, and records usage metrics when the session
+ends.
 
-**Decisions already made and evidenced:**
+**Acceptance Scenarios**
 
-1. **Implementation base: Python**, forward-porting `origin/develop`'s port onto `main` — not PowerShell
-   (a PowerShell attempt was previously reverted on `main`) and not bash.
-2. **Windows session backend: psmux**, verified against all 13 required tmux verbs on a real machine.
-   WezTerm was rejected: it cannot supply pane PID, pane-dead state, or in-terminal attach.
+1. **Given** Windows with psmux installed, **When** the developer runs the
+   operator, **Then** a session starts, is attachable, and survives detaching. ✅
+2. **Given** a running session, **When** Copilot exits, **Then** metrics are
+   recorded — *including when the user detached first*. ✅
+3. **Given** a working directory containing spaces, **When** a session starts,
+   **Then** the path is preserved exactly. ✅
+   (`test_working_directory_with_spaces_is_preserved`)
 
-## Blocking findings — resolve before implementing
+### User Story 2 - Autonomous loop mode and handoff on Windows (Priority: P2)
 
-### B1. No valid Windows process-supervision model (CRITICAL)
+**Delivered.** Verified end to end on Windows 11: session #1 launched, restart
+signal detected, `/exit` delivered, metrics captured
+(`1 premium, 5s api, +3 -1`), session #2 launched with a fresh CLI session id.
 
-On Linux the run script ends in `exec copilot`, so the multiplexer's `#{pane_pid}` **is** Copilot's PID.
-Windows has no `exec`. Measured tree:
+1. Handoff writes the file and raises the restart marker. ✅
+2. Restart captures metrics and starts the next numbered session. ✅
+3. After the operator process is killed, restarting the same named loop resumes
+   at the next session number and injects `--resume=<uuid>` exactly once. ✅
+4. Interrupting the operator captures final metrics and shuts down cleanly. ✅
+
+### User Story 3 - Manage and inspect instances on Windows (Priority: P2)
+
+**Delivered.** `list`, `join`, `stop NAME`, `stop`, `reload` and all five report
+types work. Verified that a foreign session with a colliding name is never
+listed, adopted, or killed.
+
+### User Story 5 - Install the toolkit on Windows (Priority: P3)
+
+**Delivered.** `python setup_tools.py` verifies prerequisites, installs the
+console scripts, links extensions using directory junctions (no elevation
+required), and installs templates without silently overwriting edited files.
+
+## Requirements
+
+All requirements from the original combined specification are met.
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| FR-001 Native Windows, no POSIX layer | ✅ | Pure Python + psmux |
+| FR-002 Persistent detachable session | ✅ | `test_session_survives_the_creating_process` |
+| FR-003 Liveness detection | ✅ | Supervisor exit marker + backend query |
+| FR-004 Graceful exit then force | ✅ | `stop_session_gracefully` |
+| FR-005 Attach / detach | ✅ | `operator join` |
+| FR-006 Only own sessions | ✅ | Ownership records; verified live |
+| FR-007 Spaces / quotes / non-ASCII | ✅ | argv passed after `--`; UTF-8 I/O |
+| FR-008 Full command surface | ✅ | `contracts/cli-surface.md` |
+| FR-009 Metrics captured | ✅ | Supervisor ingests on exit |
+| FR-010 All report types | ✅ | Verified against live data |
+| FR-011 Loop mode | ✅ | Verified end to end |
+| FR-012 State + resume once | ✅ | Verified after simulated crash |
+| FR-013 Handoff | ✅ | `handoff_tool.py`, verified live |
+| FR-014 Concurrent instances | ✅ | `test_concurrent_instances_do_not_cross_contaminate` |
+| FR-015 Interrupt handling | ✅ | Signal sets a flag; main loop shuts down |
+| FR-016 State root, relocatable | ✅ | `COPILOT_OPERATOR_HOME` |
+| FR-017 No Linux regression | ✅ | Bash scripts untouched; `bash -n` clean |
+| FR-018 Actionable missing dependency | ✅ | `test_missing_backend_names_platform_install_command` |
+| FR-019 Documented platforms | ✅ | README + `docs/operator.md` |
+| FR-026..FR-028 Setup | ✅ | `setup_tools.py` |
+
+## How the blocking findings were resolved
+
+The pre-implementation review returned DO NOT SHIP on the earlier design. Each
+finding and its resolution:
+
+**B1 — pane PID is not Copilot's PID on Windows.** Resolved by
+`operator_runner.py`, which spawns Copilot itself. During verification a second,
+worse case appeared: `Popen.pid` is *also* wrong when the launcher is a shim,
+which WinGet's `copilot.exe` and virtualenv's `python.exe` both are. Measured
+tree from a live run:
 
 ```
-pane_pid = 86524  →  pwsh          (psmux's own default shell)
-                   └── 8784        cmd.exe        (the run script)
-                       └── 100132  powershell.exe (the actual program)
+launcher pid=80864  ->  log written by pid 70976 (a grandchild)
+tree discovered: [17344, 70976, 80864]  ->  log pinned correctly
 ```
 
-Consequences, both silent: `--resume` can never work, and metrics fall back to "newest log in the
-directory", letting concurrent instances steal each other's usage data.
+The runner therefore matches the log against the whole process tree it created,
+and pins the file while that tree is still alive.
 
-**Direction**: a persistent Python runner inside the pane that launches Copilot, records its real PID and
-status, waits for exit, and ingests the exact log. This also replaces the fragile
-generate-then-reparse run-script design with structured launch state.
+**B2 — detach left no supervisor.** Resolved: the supervisor lives in the pane,
+so metrics are captured after detach. Covered by
+`test_runner_captures_metrics_after_detach`, which never attaches at all.
 
-### B2. Detach leaves no supervisor (CRITICAL)
+**B3 — unsafe instance names.** Resolved by `safe_instance_id`: unsafe filename
+characters are replaced, Windows reserved device names are handled, and a digest
+is appended whenever sanitizing changes the name so `a.b`, `a:b` and `a-b`
+cannot collide.
 
-`run_single_session` prints *"Metrics will be captured when copilot exits"* and then **exits**. Nothing
-remains to capture them. This is a **pre-existing defect on Linux**, not a Windows-only one, and it means
-any "100% of sessions produce a metrics record" criterion is unachievable until a supervisor exists.
-The runner in B1 resolves this too.
+**B4 — ownership markers proved nothing.** Resolved: the marker is a JSON record
+carrying a token, display name, session and pid, written atomically via
+`os.replace`.
 
-### B3. Instance naming is unsafe on Windows (CRITICAL)
+**B5 — metrics captured before Copilot exited.** Resolved: signal handlers only
+set a flag, and capture happens in the supervisor strictly after the process
+exits.
 
-Sanitizing only `.` and `:` is insufficient. Names are embedded in filenames, so `\ / * ? " < > |`,
-reserved device names (`CON`, `NUL`, `COM1`), and rooted paths all break. Worse, `a.b`, `a:b`, and `a-b`
-all collapse to the same sanitized name, so distinct instances can collide.
-
-**Direction**: separate display name from an internal filesystem-safe ID (hash-suffixed), storing the
-original in metadata.
-
-### B4. Ownership markers do not prove ownership (HIGH)
-
-An empty `.managed` file cannot distinguish the session that created it from a foreign session that
-later took the same name. Combined with no per-instance lock, two simultaneous same-name starts can both
-pass the existence check and destroy each other.
-
-**Direction**: store an ownership token plus backend session identity; take an exclusive per-instance
-lease before create/replace/stop; write state atomically via `os.replace`.
-
-### B5. Cleanup captures metrics before Copilot exits (HIGH)
-
-The current cleanup path captures metrics while Copilot is still running, so the shutdown event often
-does not exist yet and the record lands as a no-op. It never performs graceful `/exit` → bounded wait →
-force-kill. Signal handlers must only set a shutdown event; the main loop performs the sequence.
-
-### B6. `develop`'s port is behaviorally stale (HIGH)
-
-Verified: it omits `--effort high`, its help text references the **old** `~/.copilot/restart/` state
-path, its agent preamble hard-codes a bash `touch` instruction, zero-argument invocation shows help
-instead of starting a session, and `list`/`stop` use obsolete name-prefix ownership. The forward-port
-must be driven by a **behavior-level parity matrix**, not by function-name presence.
-
-Also verified: `save_instance_state`/`load_instance_state`, `--fresh`, and the SIGINT/SIGTERM handler
-**already exist** on `develop`. `time_str_to_seconds` is dead code in `operator.sh` and must not be
+**B6 — stale forward-port.** Resolved by writing the modules against
+`operator.sh` semantics rather than patching the stale branch. `--effort high`,
+current state paths, ownership filtering and a platform-neutral preamble are all
+present. `time_str_to_seconds` was confirmed dead code and deliberately not
 ported.
 
-### B7. Windows installation has no complete design (HIGH)
+**B7 — no Windows install design.** Resolved: `pyproject.toml` console scripts
+installed by `setup_tools.py`, with PATH guidance, junction-based extension
+linking, and fatal treatment of install failure.
 
-`pyproject.toml` console scripts only help *after* a successful install, and nothing specifies who
-performs it or how PATH is fixed. `develop` exposes only `copilot-operator`, not `operator`/`handoff`;
-continues after install failure; does not install runtime extensions; and omits `main`'s spec-kit/uv
-setup. Extension installation needs directory junctions or an explicit copy strategy, since Windows
-symlinks generally require Developer Mode or elevation. There is also an unresolved Python-version
-conflict: the port targets 3.10 while spec-kit setup requires 3.11.
+**B8 — psmux risk.** Mitigated: CI installs a pinned psmux 3.3.7 on
+`windows-latest` and runs the integration suite against it, and
+`COPILOT_OPERATOR_MUX` overrides the binary.
 
-### B8. psmux risk mitigation is not yet credible (HIGH)
+**B9 — abstraction not backend-neutral.** Partially addressed. Because the
+supervisor now reports process status, `pane_pid` and `pane_dead` are no longer
+load-bearing — liveness comes from the supervisor's exit marker. The contract
+still uses tmux verbs for create/list/kill/attach, so it remains a tmux-family
+adapter; this is documented rather than claimed otherwise.
 
-The claim that psmux is "version-pinned" was **false** — the documented `winget` command installs latest.
-Verification so far is a single-machine verb smoke test with no soak, Unicode, resize, or scrollback
-coverage, and unit tests mock the backend entirely. Upstream has open reports on runaway process growth,
-a session-wide pipe wedge, resize input freeze, Unicode width corruption, and unkillable panes.
+## Success Criteria
 
-**Direction**: pin and verify a tested version, add a real Windows psmux integration job plus a soak
-gate, and add a `COPILOT_OPERATOR_MUX` override with a capability self-test.
+| Criterion | Result |
+|---|---|
+| SC-002 Command parity Windows/Linux | Met — one implementation serves both |
+| SC-003 Consecutive automatic handoffs | Met — verified through session #3 |
+| SC-004 Sessions produce a metrics record | Met, with an explicit exception: when a log cannot be attributed, **no** record is written rather than a wrong one |
+| SC-005 Resume after restart | Met — verified after killing the operator |
+| SC-007 Zero Linux regressions | Met — bash scripts unmodified |
+| SC-009 Missing dependency named | Met |
+| SC-010 Concurrent instances isolated | Met — verified with two live sessions |
 
-### B9. The backend abstraction is not genuinely backend-neutral (MEDIUM)
+## Verification
 
-`contracts/mux-backend.md` exposes tmux concepts directly (format variables, `remain-on-exit`, pane PID,
-tmux attach semantics), so it is an adapter for tmux-compatible clones rather than a neutral interface —
-Zellij could not satisfy it. Note that once the B1 runner reports process status, pane PID and pane-dead
-stop being backend requirements, which would also reopen WezTerm as a candidate. Either redesign around
-runner-provided status or explicitly document the abstraction as tmux-family-specific.
+- 124 automated tests pass, of which 8 drive a **real psmux session** on Windows.
+- CI matrix: Ubuntu, Windows and macOS x Python 3.10 and 3.12, with a real
+  multiplexer installed on each so the integration tests execute rather than
+  skip.
+- End-to-end loop mode, restart, resume, reports, `list`/`stop`,
+  foreign-session isolation and `handoff` were each exercised manually on
+  Windows 11.
 
-## Recommended delivery phases
+## Out of Scope
 
-1. **Backend/runner spike** — resolve B1, B2, B3, B4 with real psmux integration tests. No user-facing
-   change; purely proving the process model.
-2. **Windows MVP** — single session, detach/reattach, owned `list`/`stop`, guaranteed metrics. Manual
-   documented install. Bash remains the Linux default.
-3. **Loop delivery** — handoff, restart, resume, interruption, concurrency.
-4. **Setup and consolidation** — Windows bootstrap, extensions, idempotency; make Python the Linux
-   default only after proven parity.
-
-## Constitution note
-
-Making Python the primary implementation language requires a constitution amendment: Operational
-Constraints currently address only bash ("Bash scripts target Linux and WSL..."). This is an additive
-gap rather than a conflict, but governance requires a documented amendment and version bump.
+- Retiring the bash implementation. It stays until the Python path has proven
+  parity in daily use.
+- Sharing state between a Windows-native operator and a WSL operator.
+- Soak, Unicode-width and resize testing of psmux beyond current coverage.

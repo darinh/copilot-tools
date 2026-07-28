@@ -27,17 +27,32 @@ SC-009):
 
 | Operation | Backend invocation | Returns | Notes |
 |---|---|---|---|
-| `sanitize_name(name)` | none (pure) | `str` | Replaces `.` and `:` with `-`. MUST be applied before any other call. |
-| `new_session(name, cwd, program)` | `new-session -d -s NAME -c CWD PROGRAM` | `None`, raises on failure | MUST verify via `has_session` afterwards. |
+| `sanitize_name(name)` | none (pure) | `str` | Replaces characters unsafe in session names or filenames. |
+| `safe_instance_id(name)` | none (pure) | `str` | Adds a digest when sanitizing changes the name, or for Windows reserved device names, so distinct names cannot collide. |
+| `new_session(name, cwd, argv)` | `new-session -d -s NAME -c CWD -- ARGV...` | `None`, raises on failure | argv passed after `--` so quoting is never re-parsed. MUST verify via `has_session` afterwards. |
 | `has_session(name)` | `has-session -t NAME` | `bool` | Exit 0 = present. |
 | `kill_session(name)` | `kill-session -t NAME` | `bool` | Idempotent; absent session is not an error. |
 | `list_sessions()` | `list-sessions -F '#{session_name}'` | `list[str]` | Empty **output** = empty set. MUST NOT rely on exit status. |
-| `pane_pid(name)` | `display-message -t NAME -p '#{pane_pid}'` | `int \| None` | Used to locate the Copilot process log. |
-| `pane_dead(name)` | `display-message -t NAME -p '#{pane_dead}'` | `bool` | `1` = program exited. Meaningful only with remain-on-exit enabled. |
+| `pane_pid(name)` | `display-message -t NAME -p '#{pane_pid}'` | `int \| None` | Informational only — see below. |
+| `pane_dead(name)` | `display-message -t NAME -p '#{pane_dead}'` | `bool` | Informational only — see below. |
 | `set_remain_on_exit(name, on)` | `set-option -t NAME remain-on-exit on\|off` | `None` | |
 | `send_keys(name, text, enter=True)` | `send-keys -t NAME TEXT Enter` | `None` | Used to deliver `/exit`. |
 | `pane_current_path(name)` | `display-message -t NAME -p '#{pane_current_path}'` | `str \| None` | Used by handoff instance inference. |
-| `attach(name)` | `attach -t NAME` | never returns on success | Runs in the foreground, inheriting the console. |
+| `attach(name)` | `attach -t NAME` | exit code | Returns when the user detaches. |
+
+### `pane_pid` and `pane_dead` are not load-bearing
+
+Both are exposed for diagnostics but **must not** be used to identify the
+Copilot process or to decide whether a session's work has finished.
+
+`pane_pid` reports the pane's direct child. On POSIX the run script `exec`s
+Copilot so the two coincide; on Windows it is the multiplexer's own shell, with
+Copilot two or more levels below. Copilot's real PID comes from the supervisor
+(`operator_runner.py`), which spawned it.
+
+Liveness likewise comes from the supervisor's `{id}.exit` marker rather than
+`pane_dead`. This keeps correctness independent of backend-specific format
+variables — and means a backend lacking them entirely would still be usable.
 
 ## Invariants
 

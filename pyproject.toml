@@ -1,0 +1,42 @@
+[project]
+name = "copilot-tools"
+version = "1.0.0"
+description = "Tools, skills, and workflow conventions for GitHub Copilot CLI power users"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+]
+
+[project.scripts]
+operator = "copilot_operator:main"
+handoff = "handoff_tool:main"
+operator-ingest = "operator_ingest:main"
+operator-runner = "operator_runner:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "copilot_operator",
+    "operator_console",
+    "operator_ingest",
+    "operator_mux",
+    "operator_runner",
+    "handoff_tool",
+    "setup_tools",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

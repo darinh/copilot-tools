@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.10', '3.12']
+      fail-fast: false
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # The integration tests need a real multiplexer. They skip themselves
+      # when one is absent, so installing it here is what makes them run.
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
+      - name: Install psmux (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '3.3.7'
+          $url = "https://github.com/psmux/psmux/releases/download/v$version/psmux-v$version-windows-x64.zip"
+          $zip = "$env:RUNNER_TEMP\psmux.zip"
+          $dest = "$env:RUNNER_TEMP\psmux"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $exe = Get-ChildItem -Path $dest -Filter 'psmux.exe' -Recurse | Select-Object -First 1
+          Add-Content -Path $env:GITHUB_PATH -Value $exe.DirectoryName
+
+      - name: Verify multiplexer
+        run: python -c "from operator_mux import Mux; m=Mux(); print('backend:', m.binary, m.version())"
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+      - name: Verify console scripts
+        run: |
+          operator version
+          operator help
+
+  shellcheck:
+    name: Shell script syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n all shell scripts
+        run: |
+          status=0
+          while IFS= read -r -d '' f; do
+            bash -n "$f" || { echo "FAIL $f"; status=1; }
+          done < <(find . -name '*.sh' -not -path './.git/*' -print0)
+          exit $status

@@ -34,13 +34,23 @@ stays coherent.
 ### V. Verification Precedes Completion
 
 Changed shell scripts MUST pass syntax checks and behavior-specific tests.
-Generated spec-kit artifacts MUST pass their prerequisite checks. Significant
-deliverables MUST receive adversarial review from isolated agents using more
-than one model, and high-confidence findings MUST be resolved before merge.
+Python code MUST pass its test suite on every supported platform. Any component
+whose behavior differs by platform MUST be verified by executing it on that
+platform, not by reasoning about documentation. Generated spec-kit artifacts
+MUST pass their prerequisite checks. Significant deliverables MUST receive
+adversarial review from isolated agents using more than one model, and
+high-confidence findings MUST be resolved before merge.
 
 ## Operational Constraints
 
-- Bash scripts target Linux and WSL and MUST use strict error handling.
+- Python is the primary implementation language for cross-platform tooling. It
+  MUST target Windows, Linux, WSL, and macOS, MUST depend only on the standard
+  library at runtime, and MUST be verified on every supported platform in CI.
+- Bash scripts target Linux and WSL and MUST use strict error handling. Existing
+  bash entry points MUST NOT regress when a Python replacement is introduced;
+  they are retired only after the replacement has demonstrated parity.
+- Platform-divergent behavior MUST be isolated behind a single abstraction and
+  labelled explicitly wherever it reaches a user or an agent.
 - Repository changes occur on dedicated feature branches in isolated worktrees.
 - User configuration and credentials MUST never be committed or overwritten
   without explicit consent.
@@ -68,4 +78,4 @@ This constitution supersedes conflicting workflow guidance in repository
 templates. Amendments require a documented spec change, migration notes for
 affected templates or generated artifacts, and an updated version below.
 
-**Version**: 1.0.1 | **Ratified**: 2026-07-22 | **Last Amended**: 2026-07-22
+**Version**: 1.1.0 | **Ratified**: 2026-07-22 | **Last Amended**: 2026-07-27

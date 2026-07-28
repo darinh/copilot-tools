@@ -6,8 +6,12 @@ Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Buil
 
 | Component | Description |
 |-----------|-------------|
-| [`operator.sh`](docs/operator.md) | Copilot CLI wrapper with metrics capture, autonomous loop mode, and multi-instance support |
-| [`operator-ingest.py`](operator-ingest.py) | Log parser for copilot process logs |
+| [`copilot_operator.py`](docs/operator.md) | Cross-platform Copilot CLI wrapper with metrics capture, autonomous loop mode, and multi-instance support |
+| [`operator_runner.py`](docs/operator.md#architecture) | In-pane session supervisor: correct process attribution and metrics after detach |
+| [`operator_mux.py`](docs/operator.md#platform-support) | Session-backend abstraction (tmux / psmux) |
+| [`operator_ingest.py`](operator_ingest.py) | Pure-Python log parser for copilot process logs |
+| [`handoff_tool.py`](docs/operator.md) | Atomic session handoff for agents |
+| [`operator.sh`](operator.sh), [`handoff.sh`](handoff.sh), [`operator-ingest.py`](operator-ingest.py) | Original bash implementation, retained unchanged for existing Linux/WSL users |
 | [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | Roslyn-backed C# structural analysis |
 | [`extensions/`](extensions/README.md) | Copilot CLI runtime extensions: open-in-vs-code, lint-on-edit, security-shield, test-enforcer, architecture-enforcer, copy-to-clipboard-tool |
 | [`templates/`](templates/) | Configuration templates for copilot-instructions, MCP servers, and per-project setup |
@@ -21,56 +25,62 @@ Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Buil
 | Workflow conventions & templates | ✅ | ✅ | ✅ |
 | Spec Kit workflow | ✅ | ✅ | ✅ |
 | Runtime extensions | ✅ | ✅ | ✅ |
-| `operator.sh` / `handoff.sh` | ❌ not yet | ✅ | ✅ |
-| `setup.sh` | ❌ not yet | ✅ | ✅ |
+| `operator` / `handoff` (Python) | ✅ | ✅ | ✅ |
+| `operator.sh` / `handoff.sh` (bash, legacy) | ❌ | ✅ | ✅ |
 
-The operator currently requires a POSIX shell and `tmux`. Native Windows support is specified in
-[`specs/003-windows-native-operator/`](specs/003-windows-native-operator/) and is not yet implemented —
-on Windows, run the operator inside WSL.
+The Python implementation is the supported entry point on every platform. The
+original bash scripts are retained unchanged for existing Linux and WSL users
+and will be retired once the Python path has proven parity in daily use.
+
+Session management uses a terminal multiplexer: **psmux** on Windows, **tmux**
+elsewhere. See [Operator](docs/operator.md) for details.
 
 ## Quick Start
+
+**PowerShell (Windows)**
+
+```powershell
+winget install --id marlocarlo.psmux
+git clone <this-repo> $HOME\repos\copilot-tools
+cd $HOME\repos\copilot-tools
+python setup_tools.py
+```
 
 **bash (Linux/macOS/WSL)**
 
 ```bash
 git clone <this-repo> ~/projects/copilot-tools
 cd ~/projects/copilot-tools
+python3 setup_tools.py
+```
+
+`setup_tools.py` is cross-platform. It will:
+
+1. Check prerequisites (multiplexer, Python 3.10+, `copilot`, `git`)
+2. Install the `operator`, `handoff` and `operator-ingest` console scripts
+3. Link runtime extensions into `~/.copilot/extensions/`
+4. Install configuration templates to `~/.copilot/`
+
+`sqlite3` is **not** required — the toolkit uses Python's standard-library
+`sqlite3` module.
+
+<details>
+<summary>Legacy bash setup (Linux/WSL only)</summary>
+
+```bash
 chmod +x setup.sh operator.sh
 ./setup.sh
 ```
 
-The setup script will:
-
-1. Check prerequisites (`tmux`, `sqlite3`, `python3`, `copilot`)
-2. Symlink `operator` into `~/.local/bin/`
-3. Install the [Anvil](https://github.com/burkeholland/anvil) agent plugin
-4. Symlink runtime extensions (`extensions/`) into `~/.copilot/extensions/`
-5. Check/install MCP servers (dotnet-roslyn-mcp)
-6. Conditionally install the Spec Kit CLI if not already present
-7. Install configuration templates to `~/.copilot/`
-
-**PowerShell (Windows)**
-
-`setup.sh` is POSIX-only, and the operator it installs does not run natively on Windows yet. Clone the
-repository and install the configuration templates directly — these are the parts that work on Windows
-today:
-
-```powershell
-git clone <this-repo> $HOME\repos\copilot-tools
-cd $HOME\repos\copilot-tools
-New-Item -ItemType Directory -Force $HOME\.copilot | Out-Null
-Copy-Item templates\copilot-instructions.md $HOME\.copilot\copilot-instructions.md
-Copy-Item templates\mcp-config.json $HOME\.copilot\mcp-config.json
-```
-
-To use the operator on Windows, run it inside WSL following the bash instructions above.
+This installs the original bash `operator.sh`, symlinks it into
+`~/.local/bin`, and additionally installs the Anvil plugin, MCP servers and the
+Spec Kit CLI.
+</details>
 
 See [Spec Kit Workflow](docs/spec-kit.md) for project initialization, commands,
 upgrades, and parallel-agent coordination.
 
 ## Usage
-
-> The `operator` command requires Linux, WSL, or macOS. See [Platform Support](#platform-support).
 
 ```bash
 # Interactive session with Anvil agent
@@ -140,9 +150,18 @@ copilot-tools/
 │   └── skills/speckit-*/       # Copilot skills generated by Spec Kit
 ├── .specify/                   # Spec Kit templates, scripts, and constitution
 ├── specs/                      # Feature specifications, plans, and tasks
-├── operator.sh              # Copilot CLI wrapper
-├── operator-ingest.py       # Log parser
-├── setup.sh                 # Environment setup
+├── copilot_operator.py      # Operator CLI (all platforms)
+├── operator_runner.py       # In-pane session supervisor
+├── operator_mux.py          # Session-backend abstraction (tmux / psmux)
+├── operator_ingest.py       # Pure-Python log parser
+├── operator_console.py      # UTF-8 console output
+├── handoff_tool.py          # Session handoff
+├── setup_tools.py           # Cross-platform environment setup
+├── pyproject.toml           # Packaging and console scripts
+├── operator.sh              # Legacy bash wrapper (Linux/WSL)
+├── operator-ingest.py       # Legacy log parser, used by operator.sh
+├── handoff.sh               # Legacy bash handoff (Linux/WSL)
+├── setup.sh                 # Legacy bash setup (Linux/WSL)
 ├── skills/
 │   └── code-intelligence/
 │       └── SKILL.md          # Roslyn routing
@@ -150,7 +169,7 @@ copilot-tools/
 │   ├── copilot-instructions.md    # Workflow conventions
 │   ├── mcp-config.json            # MCP server config
 │   └── project-instructions.md    # Per-project template
-├── tests/                      # Setup and todo-coordination tests
+├── tests/                      # pytest suite + bash coordination tests
 └── docs/
     ├── operator.md           # Operator documentation
     ├── skills.md             # Skills reference
