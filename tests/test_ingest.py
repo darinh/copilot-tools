@@ -65,6 +65,72 @@ def test_cost_lookahead_does_not_cross_into_next_event():
     assert models["model-b"]["cost"] == 5.0
 
 
+def test_cost_before_model_is_still_counted():
+    """Field order within an event must not matter."""
+    text = (
+        '{"kind": "assistant_usage",\n'
+        '  "cost": 4.0,\n'
+        '  "model": "model-a"\n'
+        '}\n'
+        '{"kind": "assistant_usage",\n'
+        '  "cost": 3.0,\n'
+        '  "model": "model-b"\n'
+        '}\n'
+    )
+    models, total = operator_ingest.extract_premium_from_usage(text)
+    assert total == 7
+    assert models["model-a"]["cost"] == 4.0
+    assert models["model-b"]["cost"] == 3.0
+
+
+def test_shutdown_event_survives_braces_inside_strings():
+    """A '}' in a string value must not be read as structure; treating it as
+    one drops the event and silently discards the session's metrics."""
+    text = (
+        '2026 [telemetry] {\n'
+        '  "note": "a } brace { inside a string",\n'
+        '  "kind": "session_shutdown",\n'
+        '  "properties": {},\n'
+        '  "metrics": {"total_premium_requests": 9, "lines_added": 1, "lines_removed": 0}\n'
+        '}\n'
+    )
+    event = operator_ingest.extract_shutdown_event(text)
+    assert event is not None
+    assert event["metrics"]["lines_added"] == 1
+
+
+def test_shutdown_marker_inside_a_log_message_is_not_mistaken_for_the_event():
+    text = (
+        '2026 [info] {"msg": "waiting for the session_shutdown event"}\n'
+        '2026 [telemetry] {\n'
+        '  "kind": "session_shutdown",\n'
+        '  "properties": {},\n'
+        '  "metrics": {"total_premium_requests": 3, "lines_added": 2, "lines_removed": 1}\n'
+        '}\n'
+    )
+    event = operator_ingest.extract_shutdown_event(text)
+    assert event is not None
+    assert event["metrics"]["total_premium_requests"] == 3
+
+
+def test_truncated_log_returns_none_rather_than_raising():
+    text = '2026 [telemetry] {\n  "kind": "session_shutdown",\n  "metrics": {"lines_added": 1'
+    assert operator_ingest.extract_shutdown_event(text) is None
+
+
+def test_windows_path_with_brace_in_shutdown_event():
+    text = (
+        '{\n'
+        '  "kind": "session_shutdown",\n'
+        '  "properties": {"path": "C:/a{b/c"},\n'
+        '  "metrics": {"lines_added": 5, "lines_removed": 0}\n'
+        '}\n'
+    )
+    event = operator_ingest.extract_shutdown_event(text)
+    assert event is not None
+    assert event["metrics"]["lines_added"] == 5
+
+
 def test_multiple_usage_events_are_summed_not_double_counted():
     text = "".join(
         '{"kind": "assistant_usage",\n  "model": "m",\n  "cost": 2.0\n}\n'

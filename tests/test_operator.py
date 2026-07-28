@@ -254,6 +254,30 @@ def test_stop_all_ignores_foreign_sessions(monkeypatch):
     assert killed == [inst.id]
 
 
+def test_is_copilot_running_treats_dead_pane_as_stopped(monkeypatch):
+    """Loop mode sets remain-on-exit, so has_session stays true after the
+    program exits. Ignoring pane_dead lets the loop poll forever."""
+    inst = op.Instance("proj")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    monkeypatch.setattr(op.MUX, "pane_dead", lambda s: True)
+    assert op.is_copilot_running(inst) is False
+
+
+def test_is_copilot_running_true_while_alive(monkeypatch):
+    inst = op.Instance("proj")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    monkeypatch.setattr(op.MUX, "pane_dead", lambda s: False)
+    assert op.is_copilot_running(inst) is True
+
+
+def test_is_copilot_running_false_when_exit_marker_present(monkeypatch):
+    inst = op.Instance("proj")
+    inst.exit_file.write_text("0", encoding="utf-8")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    monkeypatch.setattr(op.MUX, "pane_dead", lambda s: False)
+    assert op.is_copilot_running(inst) is False
+
+
 def test_reload_without_name_errors(capsys):
     assert op.reload_instance(None) == 1
 

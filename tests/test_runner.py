@@ -40,6 +40,24 @@ def test_find_log_ignores_older_launches(tmp_path):
     assert operator_runner._find_log(logs, 4242, 1699999999999) == current
 
 
+def test_find_log_ignores_logs_far_after_launch(tmp_path):
+    """PID reuse: a much later Copilot run that happened to get the same PID
+    must not be attributed to this session."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "process-1800000000000-4242.log").write_text("much later", encoding="utf-8")
+    assert operator_runner._find_log(logs, {4242}, 1700000000000) is None
+
+
+def test_find_log_prefers_the_launch_closest_in_time(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    near = logs / "process-1700000001000-4242.log"
+    near.write_text("near", encoding="utf-8")
+    (logs / "process-1700000500000-4242.log").write_text("far", encoding="utf-8")
+    assert operator_runner._find_log(logs, {4242}, 1700000000000) == near
+
+
 def test_find_log_handles_missing_directory(tmp_path):
     assert operator_runner._find_log(tmp_path / "nope", 1, 0) is None
 

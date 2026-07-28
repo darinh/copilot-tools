@@ -134,44 +134,70 @@ def _extract_ts(line: str) -> str | None:
 
 
 # ── parsing ─────────────────────────────────────────────────────
-def extract_shutdown_event(text: str) -> dict | None:
-    """Return the session_shutdown telemetry event as a dict, if present."""
-    marker = text.find('"kind": "session_shutdown"')
-    if marker < 0:
-        marker = text.find('"kind":"session_shutdown"')
-    if marker < 0:
-        return None
+def _iter_json_objects(text: str):
+    """Yield ``(start, raw)`` for every top-level ``{...}`` block in the text.
 
-    # Walk backwards to the '{' that opens the object containing the marker.
+    A single string-aware pass. Hand-counting braces without tracking string and
+    escape state misreads a ``}`` inside a string literal as structure, which
+    makes the enclosing event unparseable and silently discards a session's
+    metrics.
+    """
     depth = 0
     start = -1
-    for i in range(marker, -1, -1):
-        ch = text[i]
-        if ch == "}":
-            depth += 1
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
         elif ch == "{":
             if depth == 0:
                 start = i
-                break
-            depth -= 1
-    if start < 0:
-        return None
-
-    # Forward-balance to the matching close brace.
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == "{":
             depth += 1
         elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                raw = text[start : i + 1]
-                raw = re.sub(r",(\s*[}\]])", r"\1", raw)
-                try:
-                    return json.loads(raw)
-                except json.JSONDecodeError:
-                    return None
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    yield start, text[start : i + 1]
+                    start = -1
+
+
+def _parse_object(raw: str) -> dict | None:
+    candidate = re.sub(r",(\s*[}\]])", r"\1", raw)
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _telemetry_events(text: str):
+    """Yield parsed top-level telemetry objects that carry a ``kind``."""
+    for _, raw in _iter_json_objects(text):
+        if '"kind"' not in raw:
+            continue
+        parsed = _parse_object(raw)
+        if parsed is not None and "kind" in parsed:
+            yield parsed
+
+
+def extract_shutdown_event(text: str) -> dict | None:
+    """Return the session_shutdown telemetry event as a dict, if present.
+
+    Matching is on the parsed ``kind`` field rather than a substring search, so
+    a log message that merely mentions ``session_shutdown`` is never mistaken
+    for the event itself.
+    """
+    for event in _telemetry_events(text):
+        if event.get("kind") == "session_shutdown":
+            return event
     return None
 
 
@@ -181,38 +207,26 @@ def extract_premium_from_usage(text: str) -> tuple[dict, int]:
     `session_shutdown.total_premium_requests` reports only the last call's cost
     rather than the sum, so the per-call `cost` values are authoritative.
 
-    The lookahead stops at the next telemetry event so a malformed record can
-    never borrow the following event's cost, which would misreport billing.
+    Fields are read from the parsed object, so key order does not matter and a
+    cost can never be borrowed from a neighbouring event.
     """
     models: dict[str, dict] = {}
     total = 0.0
-    lines = text.splitlines()
-    marker_lines = [
-        i for i, line in enumerate(lines)
-        if '"kind": "assistant_usage"' in line or '"kind":"assistant_usage"' in line
-    ]
-    for pos, idx in enumerate(marker_lines):
-        # Never scan past the start of the next usage event.
-        limit = marker_lines[pos + 1] if pos + 1 < len(marker_lines) else len(lines)
-        limit = min(limit, idx + 40, len(lines))
-        model = None
-        for j in range(idx, limit):
-            probe = lines[j].strip()
-            if model is None and '"model":' in probe:
-                candidate = probe.split(":", 1)[1].strip().strip('",')
-                if candidate and " " not in candidate and ")" not in candidate and len(candidate) <= 40:
-                    model = candidate
-                continue
-            if model is not None and probe.startswith('"cost":'):
-                try:
-                    cost = float(probe.split(":", 1)[1].strip().rstrip(","))
-                except ValueError:
-                    break
-                entry = models.setdefault(model, {"cost": 0.0, "calls": 0})
-                entry["cost"] += cost
-                entry["calls"] += 1
-                total += cost
-                break
+    for event in _telemetry_events(text):
+        if event.get("kind") != "assistant_usage":
+            continue
+        model = event.get("model")
+        cost = event.get("cost")
+        if not isinstance(model, str) or not model:
+            continue
+        try:
+            cost = float(cost)
+        except (TypeError, ValueError):
+            continue
+        entry = models.setdefault(model, {"cost": 0.0, "calls": 0})
+        entry["cost"] += cost
+        entry["calls"] += 1
+        total += cost
     return models, round(total)
 
 

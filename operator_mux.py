@@ -70,6 +70,9 @@ def sanitize_name(name: str) -> str:
     return cleaned
 
 
+_DIGEST_SUFFIX = re.compile(r"-[0-9a-f]{6}$")
+
+
 def safe_instance_id(name: str) -> str:
     """Map a display name to a collision-free, filesystem-safe instance id.
 
@@ -78,10 +81,14 @@ def safe_instance_id(name: str) -> str:
     silently destroy each other. When sanitizing changes the name, or produces
     a Windows reserved device name, a short digest of the ORIGINAL name is
     appended to keep distinct inputs distinct.
+
+    A name that already ends in something shaped like a digest is also
+    suffixed, otherwise a literal name such as ``a-b-69f664`` would collide
+    with the generated id for ``a.b``.
     """
     cleaned = sanitize_name(name)
     stem = cleaned.split(".", 1)[0].upper()
-    if cleaned != name or stem in _RESERVED:
+    if cleaned != name or stem in _RESERVED or _DIGEST_SUFFIX.search(cleaned):
         digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:6]
         cleaned = f"{cleaned}-{digest}"
     return cleaned

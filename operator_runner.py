@@ -156,16 +156,20 @@ def _process_tree(root_pid: int) -> set[int]:
 
 
 
-def _find_log(log_dir: Path, pids, started_ms: int) -> Path | None:
+def _find_log(log_dir: Path, pids, started_ms: int, window_ms: int = 600_000) -> Path | None:
     """Locate the Copilot process log for a set of candidate PIDs.
 
     Never falls back to "newest log in the directory": that is precisely what
     causes one instance to record another's usage when several run at once.
+
+    Bounded on both sides and resolved to the launch time rather than the
+    newest match, because the OS can recycle a PID and a later Copilot run
+    would otherwise be attributed to this session.
     """
     if isinstance(pids, int):
         pids = {pids}
     best: Path | None = None
-    best_ms = -1
+    best_delta = None
     for pid in pids:
         try:
             candidates = list(log_dir.glob(f"process-*-{pid}.log"))
@@ -178,8 +182,11 @@ def _find_log(log_dir: Path, pids, started_ms: int) -> Path | None:
             ms = int(stem)
             # Allow a small negative skew: the log may be stamped just before
             # the parent observes the spawn.
-            if ms >= started_ms - 5000 and ms > best_ms:
-                best, best_ms = path, ms
+            if ms < started_ms - 5000 or ms > started_ms + window_ms:
+                continue
+            delta = abs(ms - started_ms)
+            if best_delta is None or delta < best_delta:
+                best, best_delta = path, delta
     return best
 
 

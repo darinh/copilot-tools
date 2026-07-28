@@ -40,7 +40,10 @@ __version__ = "1.0.0"
 
 POLL_INTERVAL = 10
 MAX_SESSIONS = 1000
-EXIT_GRACE_SECONDS = 15
+MAX_LAUNCH_FAILURES = 5
+LAUNCH_BACKOFF_BASE = 5
+SESSION_ID_WAIT = 20
+EXIT_GRACE_SECONDS = 20
 RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload", "version"}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -68,6 +71,7 @@ COPILOT_LOG_DIR = Path(
 LEGACY_RESTART_DIR = HOME / ".copilot" / "restart"
 LEGACY_LOG_FILE = HOME / ".copilot" / "operator.log"
 LEGACY_METRICS_DB = HOME / ".copilot" / "operator-metrics.db"
+LEGACY_BACKUPS_DIR = HOME / ".copilot" / "operator-backups"
 
 MUX = Mux()
 
@@ -118,6 +122,12 @@ def migrate_legacy_state() -> None:
                 moved += 1
             except (OSError, shutil.Error):
                 pass
+    if LEGACY_BACKUPS_DIR.is_dir() and not BACKUPS_DIR.exists():
+        try:
+            shutil.move(str(LEGACY_BACKUPS_DIR), str(BACKUPS_DIR))
+            moved += 1
+        except (OSError, shutil.Error):
+            pass
     if moved:
         log(f"Migrated {moved} legacy state item(s) into {OPERATOR_HOME}")
 
@@ -485,9 +495,24 @@ def start_session(instance: Instance, copilot_args: list[str], session_num: int,
 
 
 def is_copilot_running(instance: Instance) -> bool:
+    """True while the session's Copilot process is still alive.
+
+    Three signals, because any one alone can lie:
+
+    * the runner's ``.exit`` marker is authoritative when present, but the
+      runner writes it last and may be killed before it does;
+    * ``has_session`` stays true after the program exits when
+      ``remain-on-exit`` is on, which loop mode sets;
+    * ``pane_dead`` catches exactly that case.
+
+    Omitting ``pane_dead`` lets loop mode poll forever when the runner dies
+    without writing its marker.
+    """
     if instance.exit_file.exists():
         return False
-    return MUX.has_session(instance.session)
+    if not MUX.has_session(instance.session):
+        return False
+    return not MUX.pane_dead(instance.session)
 
 
 def wait_for_exit(instance: Instance, timeout: int = EXIT_GRACE_SECONDS) -> bool:
@@ -757,6 +782,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
     set_tab_title(f"operator - {instance.display_name}")
 
     session_num = start_session_num
+    launch_failures = 0
+    resume_id_used = ""
     try:
         while session_num <= MAX_SESSIONS:
             launch_args = list(copilot_args)
@@ -765,19 +792,44 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
                     log("  Skipping automatic --resume; user args already choose a session")
                 else:
                     launch_args.append(f"--resume={resume_id}")
+                    resume_id_used = resume_id
                 resume_id = ""
 
             instance.save_state(session_num, run_started)
-            start_session(instance, launch_args, session_num,
-                          remain_on_exit=True, preamble=preamble)
+            try:
+                start_session(instance, launch_args, session_num,
+                              remain_on_exit=True, preamble=preamble)
+            except MuxError as exc:
+                # A launch failure must not kill an unattended loop. Back off
+                # and retry the same session number rather than exiting.
+                launch_failures += 1
+                log(f"  Launch failed ({exc}) — attempt {launch_failures}")
+                if launch_failures >= MAX_LAUNCH_FAILURES:
+                    log(f"  Giving up after {launch_failures} consecutive launch failures")
+                    raise
+                if resume_id_used:
+                    # Put the resume id back so a failed launch does not lose it.
+                    resume_id = resume_id_used
+                backoff = min(60, LAUNCH_BACKOFF_BASE * launch_failures)
+                log(f"  Retrying in {backoff}s...")
+                _sleep(backoff)
+                if shutdown["requested"]:
+                    raise KeyboardInterrupt
+                continue
+            launch_failures = 0
+            resume_id_used = ""
 
             # Record the CLI session id once the runner discovers it.
-            for _ in range(20):
+            for _ in range(SESSION_ID_WAIT):
                 sid = instance.read_session_id()
                 if sid:
                     instance.save_state(session_num, run_started, sid)
                     break
-                time.sleep(1)
+                if not is_copilot_running(instance):
+                    break
+                _sleep(1)
+                if shutdown["requested"]:
+                    raise KeyboardInterrupt
 
             restart_requested = False
             while True:

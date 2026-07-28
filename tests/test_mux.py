@@ -62,6 +62,13 @@ def test_safe_id_disambiguates_names_that_sanitize_alike():
     assert len(ids) == 3
 
 
+def test_safe_id_does_not_collide_with_a_literal_digest_name():
+    """A user naming an instance exactly like a generated id must not collide
+    with the instance that generated it."""
+    generated = safe_instance_id("a.b")
+    assert safe_instance_id(generated) != generated
+
+
 def test_safe_id_avoids_windows_reserved_device_names():
     for reserved in ("CON", "nul", "COM1", "LPT9"):
         assert safe_instance_id(reserved).lower() != reserved.lower()
