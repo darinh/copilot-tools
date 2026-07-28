@@ -119,10 +119,13 @@ databases work without migration.
 | `session_num` | INTEGER NOT NULL | Loop session number; `0` for no-op records |
 | `log_file` | TEXT **UNIQUE** | Log basename. Drives idempotent upsert. |
 | `log_file_mtime` | TEXT | Skip-if-unchanged marker for ingest |
-| `no_op` | INTEGER NOT NULL DEFAULT 0 | `1` when the log had no shutdown event |
+| `no_op` | INTEGER NOT NULL DEFAULT 0 | `1` when the log carried no usage data |
 | `started_at` / `ended_at` | TEXT NOT NULL | ISO-8601 UTC |
 | `work_dir`, `git_branch` | TEXT | |
-| `premium_requests`, `api_time_seconds`, `session_time_seconds` | INTEGER | |
+| `nano_aiu` | INTEGER NOT NULL DEFAULT 0 | **Billionths of an AI credit** — the current billing signal |
+| `tokens_input`, `tokens_cache_read`, `tokens_cache_write`, `tokens_output` | INTEGER NOT NULL DEFAULT 0 | Token counts by type |
+| `premium_requests` | INTEGER | Legacy request-based billing, retained for annual plans |
+| `api_time_seconds`, `session_time_seconds` | INTEGER | |
 | `lines_added`, `lines_removed` | INTEGER | |
 | `raw_metrics` | TEXT | Rendered human-readable summary |
 
@@ -134,7 +137,8 @@ databases work without migration.
 | `session_id` | INTEGER NOT NULL REFERENCES sessions(id) | |
 | `model_name` | TEXT NOT NULL | |
 | `tokens_in`, `tokens_out`, `tokens_cached` | TEXT | Pre-formatted (`1.2M`, `340k`) |
-| `premium_requests` | INTEGER | |
+| `nano_aiu` | INTEGER NOT NULL DEFAULT 0 | AI credits for this model, in billionths |
+| `premium_requests` | INTEGER | Legacy billing, retained |
 
 Rows are deleted and reinserted per session on reprocessing.
 
@@ -201,5 +205,30 @@ Files are opened with **explicit UTF-8 and lenient error handling** — the defa
 locale-dependent and silently corrupts non-ASCII content, which then fails JSON parsing and discards the
 session's metrics entirely.
 
-The parser extracts the `session_shutdown` event for totals and sums `assistant_usage` cost fields for
-premium requests, because `session_shutdown.total_premium_requests` reports only the last call's cost.
+### What the parser reads
+
+Since the 2026-06-01 billing change, usage is metered in **AI credits**. Each chat-completion response
+body carries:
+
+```json
+"copilot_usage": {
+  "token_details": [
+    {"batch_size": 1000000, "cost_per_batch": 500000000000,
+     "token_count": 2, "token_type": "input"}
+  ],
+  "total_nano_aiu": 20242875000
+}
+```
+
+`total_nano_aiu` is billionths of an AI credit and is authoritative; the parser sums it across every
+response in the session. `1 AI credit = $0.01 USD`.
+
+**These bodies are only written at debug log level.** At the default level the process log contains no
+usage data at all, so the operator appends `--log-level debug` when launching Copilot
+(`COPILOT_OPERATOR_NO_DEBUG_LOG=1` opts out).
+
+For legacy request-billed accounts the parser still reads the `session_shutdown` event and sums
+`assistant_usage` cost fields, because `session_shutdown.total_premium_requests` reports only the last
+call's cost. A log is recorded when it carries **either** signal; current Copilot versions no longer
+write a `session_shutdown` payload to the process log, so requiring one would discard every modern
+session.

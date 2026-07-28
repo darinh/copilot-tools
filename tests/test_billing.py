@@ -209,3 +209,68 @@ def test_debug_logging_can_be_opted_out(monkeypatch):
     monkeypatch.setenv("COPILOT_OPERATOR_NO_DEBUG_LOG", "1")
     argv = op._ensure_usage_logging(["copilot", "--yolo"])
     assert "--log-level" not in argv
+
+
+def test_equals_form_log_level_is_respected(monkeypatch):
+    monkeypatch.delenv("COPILOT_OPERATOR_NO_DEBUG_LOG", raising=False)
+    argv = op._ensure_usage_logging(["copilot", "--log-level=info"])
+    assert argv == ["copilot", "--log-level=info"]
+
+
+def test_injected_flag_goes_after_the_preamble(monkeypatch):
+    """The preamble is the value of -i. Appending must not land between -i and
+    its value, which would hand Copilot the wrong prompt."""
+    monkeypatch.delenv("COPILOT_OPERATOR_NO_DEBUG_LOG", raising=False)
+    argv = op._ensure_usage_logging(["copilot", "--yolo", "-i", "a long preamble"])
+    assert argv[argv.index("-i") + 1] == "a long preamble"
+    assert argv[-2:] == ["--log-level", "debug"]
+
+
+# ── cost SQL ────────────────────────────────────────────────────
+def _seed(db, rows):
+    operator_ingest.init_db(db)
+    with operator_ingest.connect(db) as c:
+        for name, nano, premium in rows:
+            c.execute(
+                "INSERT INTO sessions (session_num, log_file, no_op, started_at,"
+                " ended_at, nano_aiu, premium_requests) VALUES (1,?,0,?,?,?,?)",
+                (name, "2026-07-28T10:00:00Z", "2026-07-28T10:00:00Z", nano, premium),
+            )
+
+
+def test_mixed_legacy_and_credit_rows_cost_correctly(tmp_path, monkeypatch):
+    """History spans the billing change. A row carrying both signals must be
+    costed once, on credits — not counted under both schemes."""
+    db = tmp_path / "m.db"
+    monkeypatch.setattr(op, "METRICS_DB", db)
+    _seed(db, [
+        ("new.log", 20_000_000_000, 0),   # 20 credits -> $0.20
+        ("old.log", 0, 10),               # 10 premium -> $0.40
+        ("both.log", 5_000_000_000, 7),   # 5 credits  -> $0.05, premium ignored
+    ])
+    with operator_ingest.connect(db) as c:
+        credits = c.execute(
+            f"SELECT {op._credits()} FROM sessions WHERE no_op=0").fetchone()[0]
+        usd = c.execute(
+            f"SELECT {op._usd()} FROM sessions WHERE no_op=0").fetchone()[0]
+    assert credits == pytest.approx(25.0)
+    assert usd == pytest.approx(0.65)
+
+
+def test_large_credit_sums_stay_exact(tmp_path, monkeypatch):
+    """nano_aiu is ~2e10 per session; a long run must not lose precision."""
+    db = tmp_path / "m.db"
+    monkeypatch.setattr(op, "METRICS_DB", db)
+    _seed(db, [(f"s{i}.log", REAL_NANO_AIU, 0) for i in range(2000)])
+    with operator_ingest.connect(db) as c:
+        total = c.execute("SELECT SUM(nano_aiu) FROM sessions").fetchone()[0]
+    assert total == 2000 * REAL_NANO_AIU
+
+
+def test_every_report_renders_with_credit_data(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "m.db"
+    monkeypatch.setattr(op, "METRICS_DB", db)
+    _seed(db, [("a.log", REAL_NANO_AIU, 0), ("b.log", 0, 5)])
+    for kind in ("summary", "sessions", "models", "projects", "costs", "tokens"):
+        assert op.report_metrics(kind) == 0, f"{kind} report failed"
+        capsys.readouterr()

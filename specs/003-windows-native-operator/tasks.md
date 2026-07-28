@@ -64,7 +64,7 @@
 
 ## Verification
 
-- [x] 162 tests pass, including 8 against a real psmux session on Windows
+- [x] 182 tests pass, including 8 against a real psmux session on Windows
 - [x] `verify_cross_platform.py` passes 36/36 on Windows and on Linux
 - [x] `bash -n` clean on all shell scripts
 - [x] `git diff main -- operator.sh handoff.sh operator-ingest.py` empty (no Linux regression)
@@ -74,3 +74,14 @@
 - [x] **T024** Third review round: ownership semantics, backend honesty, parser resynchronization,
       case-only aliasing, schema-migration race, filesystem-root guard, retry checkpointing.
       Adds `operator forget` for stale state. 11 new regression tests.
+
+## Phase 7: AI credit billing
+
+- [x] **T025** Establish the new billing mechanics from a live Copilot session; record
+      `total_nano_aiu`, the 1 credit = $0.01 conversion, and the token-type breakdown
+- [x] **T026** `extract_ai_credit_usage` sums credits and tokens per session and per model
+- [x] **T027** Schema records credits and token counts; existing databases migrate in place
+- [x] **T028** Reports switch to AI credits, with legacy premium-request fallback; add `report tokens`
+- [x] **T029** Append `--log-level debug` at launch so usage data exists at all
+- [x] **T030** `tests/test_billing.py` — conversion against the real captured value, multi-call
+      summing, per-model attribution, migration preserving history, launch-flag behaviour

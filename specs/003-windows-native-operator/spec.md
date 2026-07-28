@@ -154,9 +154,36 @@ adapter; this is documented rather than claimed otherwise.
 | SC-009 Missing dependency named | Met |
 | SC-010 Concurrent instances isolated | Met — verified with two live sessions |
 
+## Billing model change (2026-06-01)
+
+GitHub replaced premium requests with **GitHub AI Credits**, metered on token consumption. This landed
+after the port and changed what the metrics pipeline must record.
+
+Established by capturing a **live Copilot session** rather than inferring from documentation:
+
+| Fact | Value |
+|---|---|
+| Telemetry field | `copilot_usage.total_nano_aiu` (billionths of an AI credit) |
+| Conversion | `credits = nano_aiu / 1e9`, `1 AI credit = $0.01 USD` |
+| Verification | 20,242,875,000 nano → 20.24 credits; CLI displayed `AI Credits 20.2` |
+| Token types | `input`, `cache_read`, `cache_write`, `output`, each priced per model |
+
+Three defects this exposed:
+
+1. **`$0.04/premium request` was obsolete.** Overage is now $0.01/credit.
+2. **`total_premium_requests` is absent** from current logs. Legacy annual plans still bill by request,
+   so both models are supported and reported.
+3. **No usage data is written at the default log level.** The process log for a real session was 429
+   bytes and contained nothing. The metrics pipeline was capturing *nothing* on current Copilot while
+   appearing to work. The operator now appends `--log-level debug`; `COPILOT_OPERATOR_NO_DEBUG_LOG=1`
+   opts out.
+
+Existing databases migrate in place, so usage history recorded before the change is preserved rather
+than discarded.
+
 ## Verification
 
-- 162 automated tests pass, of which 8 drive a **real psmux session** on Windows.
+- 182 automated tests pass, of which 8 drive a **real psmux session** on Windows.
 - `verify_cross_platform.py` — a stdlib-only smoke test needing no pytest —
   passes **36/36 on both platforms**: Windows with psmux 3.3.7 and Linux with
   tmux 3.4, including full runner supervision and metrics capture on each.

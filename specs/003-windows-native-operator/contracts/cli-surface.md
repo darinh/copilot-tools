@@ -43,13 +43,15 @@ and non-ASCII characters (FR-007).
 |---|---|
 | Single session | `--autopilot --effort high` |
 | Loop mode | `--yolo --autopilot --no-ask-user --effort high`, plus `--agent <name>` when absent, plus the autonomous preamble via `-i` |
+| Both | `--log-level debug`, unless the user set `--log-level` or `COPILOT_OPERATOR_NO_DEBUG_LOG=1`. Required because Copilot only writes usage data at debug level. |
 
 In loop mode with saved state, `--resume=<session-id>` is appended **exactly once**, and is suppressed
 when the user already specified a session argument (FR-012).
 
 ### Report types
 
-`summary` (default), `sessions`, `models`, `projects`, `costs`. Every type must render on Windows
+`summary` (default), `sessions`, `models`, `projects`, `costs`, `tokens`. Every type must render on
+Windows
 (FR-010).
 
 ### Exit codes
