@@ -183,7 +183,7 @@ than discarded.
 
 ## Verification
 
-- 182 automated tests pass, of which 8 drive a **real psmux session** on Windows.
+- 186 automated tests pass, of which 8 drive a **real psmux session** on Windows.
 - `verify_cross_platform.py` — a stdlib-only smoke test needing no pytest —
   passes **36/36 on both platforms**: Windows with psmux 3.3.7 and Linux with
   tmux 3.4, including full runner supervision and metrics capture on each.

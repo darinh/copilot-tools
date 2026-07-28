@@ -255,6 +255,7 @@ logs.
 | `COPILOT_LOG_DIR` | Point at a non-default Copilot log directory |
 | `COPILOT_OPERATOR_NO_DEBUG_LOG` | Don't add `--log-level debug`; disables usage capture |
 
+
 ## Billing and AI credits
 
 GitHub replaced premium requests with **AI credits** on 2026-06-01. Usage is
@@ -278,6 +279,20 @@ totals stay meaningful.
 > empty. The operator therefore appends `--log-level debug` when launching
 > Copilot. This makes logs substantially larger; set
 > `COPILOT_OPERATOR_NO_DEBUG_LOG=1` to opt out and forgo usage capture.
+
+### Managing log growth
+
+Debug logs are substantially larger and Copilot does not rotate them. Inspect
+and reclaim the space with:
+
+```
+operator logs                       # file count and total size
+operator logs --prune --days 30     # remove ingested logs older than 30 days
+```
+
+Pruning removes only logs that have **already been ingested**, so recorded
+usage is never lost. Run `operator ingest` first to capture anything
+outstanding; logs that are still unprocessed are kept and reported.
 
 Copilot itself exposes usage interactively via `/usage`, `/statusline` and the
 exit summary, and `copilot help billing` documents the model.

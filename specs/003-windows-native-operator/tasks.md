@@ -64,7 +64,7 @@
 
 ## Verification
 
-- [x] 182 tests pass, including 8 against a real psmux session on Windows
+- [x] 186 tests pass, including 8 against a real psmux session on Windows
 - [x] `verify_cross_platform.py` passes 36/36 on Windows and on Linux
 - [x] `bash -n` clean on all shell scripts
 - [x] `git diff main -- operator.sh handoff.sh operator-ingest.py` empty (no Linux regression)
@@ -85,3 +85,7 @@
 - [x] **T029** Append `--log-level debug` at launch so usage data exists at all
 - [x] **T030** `tests/test_billing.py` — conversion against the real captured value, multi-call
       summing, per-model attribution, migration preserving history, launch-flag behaviour
+
+- [x] **T031** `operator logs` inspects and prunes Copilot's process logs, since forcing debug
+      logging makes them grow and Copilot does not rotate them. Pruning only removes logs
+      already ingested, so usage is never lost.

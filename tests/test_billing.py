@@ -274,3 +274,63 @@ def test_every_report_renders_with_credit_data(tmp_path, monkeypatch, capsys):
     for kind in ("summary", "sessions", "models", "projects", "costs", "tokens"):
         assert op.report_metrics(kind) == 0, f"{kind} report failed"
         capsys.readouterr()
+
+
+# ── log management ──────────────────────────────────────────────
+def _make_logs(log_dir, names, age_days=0):
+    import os
+    import time
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    made = []
+    for name in names:
+        p = log_dir / name
+        p.write_text("x" * 1024, encoding="utf-8")
+        if age_days:
+            old = time.time() - age_days * 86400
+            os.utime(p, (old, old))
+        made.append(p)
+    return made
+
+
+def test_logs_reports_size_without_deleting(tmp_path, monkeypatch, capsys):
+    logs = tmp_path / "logs"
+    monkeypatch.setattr(op, "COPILOT_LOG_DIR", logs)
+    monkeypatch.setattr(op, "METRICS_DB", tmp_path / "m.db")
+    _make_logs(logs, ["process-1-1.log", "process-2-2.log"])
+    assert op.manage_logs([]) == 0
+    assert len(list(logs.glob("*.log"))) == 2, "reporting must not delete"
+    assert "files: 2" in capsys.readouterr().out
+
+
+def test_prune_keeps_logs_not_yet_ingested(tmp_path, monkeypatch, capsys):
+    """Logs are the only record of usage. Pruning one that was never ingested
+    would destroy data the user has not captured."""
+    logs = tmp_path / "logs"
+    db = tmp_path / "m.db"
+    monkeypatch.setattr(op, "COPILOT_LOG_DIR", logs)
+    monkeypatch.setattr(op, "METRICS_DB", db)
+    _make_logs(logs, ["process-1-1.log", "process-2-2.log"], age_days=60)
+    _seed(db, [("process-1-1.log", REAL_NANO_AIU, 0)])   # only the first ingested
+
+    assert op.manage_logs(["--prune", "--days", "30"]) == 0
+    remaining = {p.name for p in logs.glob("*.log")}
+    assert remaining == {"process-2-2.log"}
+    assert "not yet ingested" in capsys.readouterr().out
+
+
+def test_prune_leaves_recent_logs(tmp_path, monkeypatch, capsys):
+    logs = tmp_path / "logs"
+    db = tmp_path / "m.db"
+    monkeypatch.setattr(op, "COPILOT_LOG_DIR", logs)
+    monkeypatch.setattr(op, "METRICS_DB", db)
+    _make_logs(logs, ["process-1-1.log"], age_days=1)
+    _seed(db, [("process-1-1.log", REAL_NANO_AIU, 0)])
+    assert op.manage_logs(["--prune", "--days", "30"]) == 0
+    assert len(list(logs.glob("*.log"))) == 1
+
+
+def test_logs_handles_empty_directory(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(op, "COPILOT_LOG_DIR", tmp_path / "nope")
+    assert op.manage_logs([]) == 0
+    assert "No Copilot logs" in capsys.readouterr().out

@@ -45,7 +45,7 @@ LAUNCH_BACKOFF_BASE = 5
 SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
 RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
-                  "version", "forget"}
+                  "version", "forget", "logs"}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
@@ -823,6 +823,86 @@ def ingest_all_logs(force: bool = False) -> int:
     return 0
 
 
+def _log_files() -> list[Path]:
+    if not COPILOT_LOG_DIR.is_dir():
+        return []
+    return sorted(COPILOT_LOG_DIR.glob("process-*.log"))
+
+
+def manage_logs(args: list[str]) -> int:
+    """Report on, and optionally prune, Copilot's process logs.
+
+    The operator runs Copilot at debug level so usage data exists at all, which
+    makes logs considerably larger. Copilot does not rotate them, so this gives
+    a way to see and reclaim the space.
+
+    Pruning is never automatic: logs are the only record of usage, and deleting
+    them silently would destroy data the user may not have ingested yet.
+    """
+    prune = "--prune" in args
+    days = 30
+    for i, a in enumerate(args):
+        if a == "--days" and i + 1 < len(args):
+            try:
+                days = int(args[i + 1])
+            except ValueError:
+                die("--days requires a whole number")
+        elif a.startswith("--days="):
+            try:
+                days = int(a.split("=", 1)[1])
+            except ValueError:
+                die("--days requires a whole number")
+
+    files = _log_files()
+    if not files:
+        print(f"No Copilot logs found in {COPILOT_LOG_DIR}")
+        return 0
+
+    total = sum(f.stat().st_size for f in files)
+    print(f"Copilot logs in {COPILOT_LOG_DIR}")
+    print(f"  files: {len(files)}")
+    print(f"  size:  {total / 1_048_576:.1f} MB")
+
+    cutoff = time.time() - days * 86400
+    old = [f for f in files if f.stat().st_mtime < cutoff]
+    old_size = sum(f.stat().st_size for f in old)
+
+    if not prune:
+        print(f"\n  older than {days} days: {len(old)} files "
+              f"({old_size / 1_048_576:.1f} MB)")
+        if old:
+            print(f"  remove them with: operator logs --prune --days {days}")
+        return 0
+
+    if not old:
+        print(f"\nNothing older than {days} days to prune.")
+        return 0
+
+    # Only prune what has already been recorded, so usage is never lost.
+    operator_ingest.init_db(METRICS_DB)
+    with operator_ingest.connect(METRICS_DB) as conn:
+        known = {r["log_file"] for r in
+                 conn.execute("SELECT log_file FROM sessions WHERE log_file IS NOT NULL")}
+
+    removed = skipped = 0
+    freed = 0
+    for f in old:
+        if f.name not in known:
+            skipped += 1
+            continue
+        freed += f.stat().st_size
+        try:
+            f.unlink()
+            removed += 1
+        except OSError as exc:
+            print(f"  could not remove {f.name}: {exc}", file=sys.stderr)
+
+    print(f"\nRemoved {removed} ingested log(s), freed {freed / 1_048_576:.1f} MB.")
+    if skipped:
+        print(f"Kept {skipped} log(s) not yet ingested — run 'operator ingest' first.")
+    return 0
+
+
 def run_single_session(instance: Instance, copilot_args: list[str]) -> int:
     args = ["--autopilot", "--effort", "high", *copilot_args]
     handle_existing_session(instance)
@@ -1031,6 +1111,7 @@ USAGE
     operator forget NAME                                       Drop operator state only
     operator report [type]                                     View usage reports
     operator ingest [--force]                                  Process copilot logs
+    operator logs [--prune] [--days N]                         Inspect/prune copilot logs
     operator help                                              Show this help
 
 OPTIONS
@@ -1076,6 +1157,10 @@ BILLING
     are only written at debug log level. The operator therefore adds
     --log-level debug when launching Copilot. Set COPILOT_OPERATOR_NO_DEBUG_LOG=1
     to opt out; sessions will then produce smaller logs but record no usage.
+
+    Debug logs are large and Copilot does not rotate them. `operator logs`
+    reports how much space they use; `operator logs --prune --days N` removes
+    logs older than N days, and only those already ingested.
 
 FILES
     ~/.operator/                        State directory (override with
@@ -1145,6 +1230,8 @@ def main(argv: list[str] | None = None) -> int:
         return reload_instance(args[1] if len(args) > 1 else None)
     if head == "forget":
         return forget_instance(args[1] if len(args) > 1 else None)
+    if head == "logs":
+        return manage_logs(args[1:])
 
     # Positional shortcut: `operator foo` joins a running instance named foo.
     if len(args) == 1 and not head.startswith("-") and head not in RESERVED_WORDS:

@@ -21,6 +21,7 @@ authority for expected behavior is `operator.sh` and `handoff.sh` on `main` (spe
 | `operator forget NAME` | Delete an instance's operator state without touching any running session. |
 | `operator report [TYPE]` | Usage report. Default `summary`. |
 | `operator ingest [--force]` | Process Copilot logs. |
+| `operator logs [--prune] [--days N]` | Inspect Copilot's process logs; prune only those already ingested. |
 | `operator help` \| `-h` \| `--help` \| `-?` | Help text. |
 
 Reserved words that are never treated as an instance name: `stop`, `list`, `report`, `ingest`, `help`,
