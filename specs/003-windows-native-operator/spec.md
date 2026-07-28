@@ -157,6 +157,11 @@ adapter; this is documented rather than claimed otherwise.
 ## Verification
 
 - 124 automated tests pass, of which 8 drive a **real psmux session** on Windows.
+- `verify_cross_platform.py` — a stdlib-only smoke test needing no pytest —
+  passes **36/36 on both platforms**: Windows with psmux 3.3.7 and Linux with
+  tmux 3.4, including full runner supervision and metrics capture on each.
+- Real tmux 3.4 was confirmed to accept the `-- argv` launch form, and an
+  argument containing spaces and both quote styles survived verbatim.
 - CI matrix: Ubuntu, Windows and macOS x Python 3.10 and 3.12, with a real
   multiplexer installed on each so the integration tests execute rather than
   skip.

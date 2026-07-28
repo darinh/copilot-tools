@@ -60,6 +60,11 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v
 
+      # Stdlib-only smoke test. Runs the same paths without pytest, so it also
+      # works in environments where installing test dependencies is not possible.
+      - name: Cross-platform verification
+        run: python verify_cross_platform.py
+
       - name: Verify console scripts
         run: |
           operator version
