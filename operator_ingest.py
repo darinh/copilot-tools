@@ -95,8 +95,17 @@ def init_db(db_path) -> None:
         conn.executescript(SCHEMA)
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
         if "log_file_mtime" not in cols:
-            conn.execute("ALTER TABLE sessions ADD COLUMN log_file_mtime TEXT")
-        conn.commit()
+            try:
+                conn.execute("ALTER TABLE sessions ADD COLUMN log_file_mtime TEXT")
+            except sqlite3.OperationalError as exc:
+                # Two operators can upgrade the same older database at once and
+                # both observe the column as missing. Losing that race is fine
+                # as long as the column now exists.
+                if "duplicate column" not in str(exc).lower():
+                    raise
+                cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+                if "log_file_mtime" not in cols:
+                    raise
 
 
 # ── helpers ─────────────────────────────────────────────────────
@@ -141,12 +150,28 @@ def _iter_json_objects(text: str):
     escape state misreads a ``}`` inside a string literal as structure, which
     makes the enclosing event unparseable and silently discards a session's
     metrics.
+
+    Copilot logs interleave JSON with plain text, and that text can contain an
+    unmatched ``{`` or ``"``. Scanner state is therefore reset at each newline
+    while no object is open, so one malformed line cannot swallow every event
+    after it.
     """
     depth = 0
     start = -1
     in_string = False
     escaped = False
+    at_line_start = True
+
     for i, ch in enumerate(text):
+        # Resynchronize at a record boundary. Without this, an unmatched quote
+        # or brace in ordinary prose leaves the scanner stuck for the rest of
+        # the file and every later event is lost.
+        if at_line_start and depth == 0:
+            in_string = False
+            escaped = False
+            start = -1
+        at_line_start = ch == "\n"
+
         if in_string:
             if escaped:
                 escaped = False
@@ -179,12 +204,28 @@ def _parse_object(raw: str) -> dict | None:
 
 
 def _telemetry_events(text: str):
-    """Yield parsed top-level telemetry objects that carry a ``kind``."""
+    """Yield parsed top-level telemetry objects that carry a ``kind``.
+
+    Falls back to a decoder-driven rescan when the primary pass finds nothing,
+    so a malformed region cannot hide an otherwise valid event.
+    """
+    seen_any = False
     for _, raw in _iter_json_objects(text):
         if '"kind"' not in raw:
             continue
         parsed = _parse_object(raw)
         if parsed is not None and "kind" in parsed:
+            seen_any = True
+            yield parsed
+    if seen_any:
+        return
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            parsed, _ = decoder.raw_decode(text, match.start())
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and "kind" in parsed:
             yield parsed
 
 

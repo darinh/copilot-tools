@@ -72,6 +72,11 @@ def sanitize_name(name: str) -> str:
 
 _DIGEST_SUFFIX = re.compile(r"-[0-9a-f]{6}$")
 
+# Windows and macOS filesystems are case-insensitive by default, and psmux
+# matches session names case-insensitively, so names differing only in case
+# must not be treated as distinct instances.
+_CASE_INSENSITIVE_FS = platform.system() in ("Windows", "Darwin")
+
 
 def safe_instance_id(name: str) -> str:
     """Map a display name to a collision-free, filesystem-safe instance id.
@@ -85,11 +90,22 @@ def safe_instance_id(name: str) -> str:
     A name that already ends in something shaped like a digest is also
     suffixed, otherwise a literal name such as ``a-b-69f664`` would collide
     with the generated id for ``a.b``.
+
+    On case-insensitive filesystems the digest is computed from the
+    case-folded name, because ``Build`` and ``build`` would otherwise produce
+    two ids that resolve to the same files and the same backend session.
     """
     cleaned = sanitize_name(name)
+    reference = name
+    if _CASE_INSENSITIVE_FS:
+        # Fold the id: 'Build' and 'build' address the same file and the same
+        # backend session, so they must be one instance rather than two that
+        # silently share state. The display name keeps the original spelling.
+        cleaned = cleaned.casefold()
+        reference = name.casefold()
     stem = cleaned.split(".", 1)[0].upper()
-    if cleaned != name or stem in _RESERVED or _DIGEST_SUFFIX.search(cleaned):
-        digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:6]
+    if cleaned != reference or stem in _RESERVED or _DIGEST_SUFFIX.search(cleaned):
+        digest = hashlib.sha1(reference.encode("utf-8")).hexdigest()[:6]
         cleaned = f"{cleaned}-{digest}"
     return cleaned
 
@@ -194,9 +210,23 @@ class Mux:
             )
 
     def kill_session(self, session: str) -> bool:
+        """Destroy a session. Returns False when it was already absent.
+
+        Raises when the backend reports failure or the session survives, so a
+        caller never deletes its state believing a still-running session is
+        gone.
+        """
         if not self.has_session(session):
             return False
-        self._run("kill-session", "-t", session)
+        _, err, rc = self._run("kill-session", "-t", session)
+        if rc != 0 and self.has_session(session):
+            raise MuxSessionError(
+                f"Failed to kill session {session!r}: {err or f'exit {rc}'}"
+            )
+        if self.has_session(session):
+            raise MuxSessionError(
+                f"Session {session!r} still exists after kill-session reported success."
+            )
         return True
 
     def set_remain_on_exit(self, session: str, enabled: bool) -> None:

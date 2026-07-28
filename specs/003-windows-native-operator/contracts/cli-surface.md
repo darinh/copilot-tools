@@ -17,7 +17,8 @@ authority for expected behavior is `operator.sh` and `handoff.sh` on `main` (spe
 | `operator join [NAME]` | Explicit join. Bare form lists instances. |
 | `operator reload NAME` | Regenerate the instance run script. |
 | `operator list` | Show running instances. |
-| `operator stop [NAME]` | Stop one instance, or all when omitted. |
+| `operator stop [NAME]` | Stop one instance, or all when omitted. Refuses to stop a running session this operator does not own. |
+| `operator forget NAME` | Delete an instance's operator state without touching any running session. |
 | `operator report [TYPE]` | Usage report. Default `summary`. |
 | `operator ingest [--force]` | Process Copilot logs. |
 | `operator help` \| `-h` \| `--help` \| `-?` | Help text. |

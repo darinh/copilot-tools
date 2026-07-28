@@ -181,7 +181,23 @@ operator stop
 ```
 
 `list` and bare `stop` act only on sessions the operator created. A session of
-the same name created by anything else is never listed, adopted, or killed.
+the same name created by anything else is never listed as owned, adopted, or
+killed.
+
+### Ownership
+
+A session is *owned* when a claim record written at launch matches a session
+that is currently running. Continuity state (`<id>.state`, which deliberately
+outlives a session so a named loop can auto-continue) never confers ownership
+on its own — otherwise a leftover file could authorize stopping an unrelated
+session that happened to take the same name later.
+
+If `operator stop NAME` reports that a running session was not started by this
+operator, drop the stale state without touching the session:
+
+```
+operator forget NAME
+```
 
 ## Metrics
 
@@ -244,9 +260,14 @@ Install the one for your platform — the error message names the exact command.
 On Windows: `winget install --id marlocarlo.psmux`.
 
 **"No instance found" when stopping**
-`stop` finds operator-managed sessions via ownership markers in
+`stop` finds operator-managed sessions via ownership records in
 `~/.operator/restart/`. Sessions started outside the operator are deliberately
 not listed or stopped; end those yourself.
+
+**"running but was not started by this operator"**
+A session with that name exists but carries no matching claim — usually stale
+state left by an earlier run whose name has since been reused. Run
+`operator forget NAME` to drop the state; the running session is untouched.
 
 **Metrics not captured**
 The supervisor attributes logs to the process tree it launched. If Copilot was

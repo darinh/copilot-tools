@@ -156,7 +156,7 @@ adapter; this is documented rather than claimed otherwise.
 
 ## Verification
 
-- 151 automated tests pass, of which 8 drive a **real psmux session** on Windows.
+- 162 automated tests pass, of which 8 drive a **real psmux session** on Windows.
 - `verify_cross_platform.py` — a stdlib-only smoke test needing no pytest —
   passes **36/36 on both platforms**: Windows with psmux 3.3.7 and Linux with
   tmux 3.4, including full runner supervision and metrics capture on each.
@@ -187,6 +187,13 @@ and covered by a regression test; the notable ones:
 | `_link_directory` rmtree'd real directories | **Destroyed user-edited extensions without consent** |
 | Pre-launch state write cleared the resume id | A failed launch lost the resume id from disk |
 | Process tree sampled once before a fast exit | A shim's child pid never observed, so its log was unattributable |
+| Continuity state treated as ownership | **`stop` could kill an unrelated session that reused the name** |
+| `kill_session` ignored the backend's exit status | State deleted while the session was still running |
+| Case-only name variants aliased on Windows/macOS | Two "instances" silently sharing one set of state files |
+| Unmatched quote or brace in log prose | Scanner stuck, every later event lost, session recorded as no-op |
+| Concurrent schema migration | Second operator crashed with `duplicate column` |
+| Filesystem-root guard dropped | Copilot could be pointed at an entire drive |
+| Interrupted retry saved an unlaunched session number | Numbering skipped and the resume id was overwritten |
 
 ## Out of Scope
 

@@ -104,7 +104,7 @@ need neither Developer Mode nor elevation, falling back to a refreshed copy.
 
 ## Verification
 
-- 124 automated tests; 8 drive a real psmux session.
+- 162 automated tests; 8 drive a real psmux session.
 - CI: Ubuntu / Windows / macOS x Python 3.10, 3.12, each with a real
   multiplexer installed so integration tests execute rather than skip.
 - Manual Windows 11 verification of loop mode, restart, resume after a killed

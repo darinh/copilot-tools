@@ -64,9 +64,13 @@
 
 ## Verification
 
-- [x] 151 tests pass, including 8 against a real psmux session on Windows
+- [x] 162 tests pass, including 8 against a real psmux session on Windows
 - [x] `verify_cross_platform.py` passes 36/36 on Windows and on Linux
 - [x] `bash -n` clean on all shell scripts
 - [x] `git diff main -- operator.sh handoff.sh operator-ingest.py` empty (no Linux regression)
 - [x] Manual Windows 11: loop mode, restart, resume after killed operator, reports,
       `list`/`stop`, foreign-session isolation, `handoff`
+
+- [x] **T024** Third review round: ownership semantics, backend honesty, parser resynchronization,
+      case-only aliasing, schema-migration race, filesystem-root guard, retry checkpointing.
+      Adds `operator forget` for stale state. 11 new regression tests.

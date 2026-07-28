@@ -44,7 +44,8 @@ MAX_LAUNCH_FAILURES = 5
 LAUNCH_BACKOFF_BASE = 5
 SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
-RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload", "version"}
+RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
+                  "version", "forget"}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
@@ -173,8 +174,14 @@ class Instance:
 
     # -- ownership
     def claim(self, token: str) -> None:
-        """Record ownership. An empty marker cannot prove which process owns a
-        session, so the marker carries a token compared on stop/kill."""
+        """Record ownership of the *live* session.
+
+        The record binds a token to the session as it exists now. Continuity
+        state (``.state``) deliberately does **not** confer ownership: it
+        outlives the session so a named loop can auto-continue, and treating it
+        as proof of ownership would let a stale file authorize killing an
+        unrelated session that later took the same name.
+        """
         payload = {
             "token": token,
             "display_name": self.display_name,
@@ -192,10 +199,27 @@ class Instance:
         try:
             return json.loads(self.managed_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            # A legacy empty marker: treat as owned but tokenless.
+            # A legacy or truncated marker: present but tokenless.
             return {"token": None, "display_name": self.display_name}
 
+    def owns_live_session(self) -> bool:
+        """True only when this operator's claim matches a session that exists.
+
+        Required before any destructive action. ``is_managed`` is about
+        continuity, not authority.
+        """
+        owner = self.ownership()
+        if owner is None:
+            return False
+        if owner.get("session") not in (None, self.session):
+            return False
+        return MUX.has_session(self.session)
+
     def is_managed(self) -> bool:
+        """True when this instance has operator state of any kind.
+
+        Used for listing and continuity only — never to authorize a kill.
+        """
         return self.managed_file.exists() or self.state_file.exists()
 
     # -- persisted state
@@ -598,7 +622,12 @@ def list_instances() -> int:
             continue
         meta = managed[ident]
         display = meta.get("display_name", ident)
+        inst = Instance(display)
+        # A live session with only continuity state behind it is not ours.
+        owned = inst.owns_live_session()
         label = display if display == ident else f"{display} (session: {ident})"
+        if not owned:
+            label += "  [name in use by an unowned session]"
         print(f"  {label}")
         found = True
     if not found:
@@ -618,7 +647,18 @@ def stop_operator(target: str | None = None) -> int:
             list_instances()
             return 1
         if MUX.has_session(instance.session):
-            MUX.kill_session(instance.session)
+            # A live session is only ours to kill if we hold a matching claim.
+            # Continuity state alone must never authorize destroying a session
+            # that merely shares the name.
+            if not instance.owns_live_session():
+                print(f"A session named '{instance.session}' is running but was not "
+                      f"started by this operator. Refusing to stop it.", file=sys.stderr)
+                print("  Remove the stale state with: operator forget "
+                      f"{instance.display_name}", file=sys.stderr)
+                return 1
+            if not MUX.kill_session(instance.session):
+                print(f"Failed to stop session '{instance.session}'.", file=sys.stderr)
+                return 1
         instance.cleanup_files()
         instance.state_file.unlink(missing_ok=True)
         log(f"Stopped: {target}")
@@ -630,8 +670,13 @@ def stop_operator(target: str | None = None) -> int:
     for ident in sorted(managed):
         if ident not in live:
             continue
-        MUX.kill_session(ident)
         inst = Instance(managed[ident].get("display_name", ident))
+        if not inst.owns_live_session():
+            log(f"  Skipping {ident}: live session is not owned by this operator")
+            continue
+        if not MUX.kill_session(ident):
+            log(f"  Failed to stop {ident}")
+            continue
         inst.cleanup_files()
         inst.state_file.unlink(missing_ok=True)
         log(f"Stopped: {ident}")
@@ -640,6 +685,22 @@ def stop_operator(target: str | None = None) -> int:
         print("No running operator instances found.")
     else:
         log(f"Stopped {count} instance(s)")
+    return 0
+
+
+def forget_instance(target: str | None) -> int:
+    """Delete an instance's operator state without touching any session."""
+    if not target:
+        print("Usage: operator forget NAME", file=sys.stderr)
+        return 1
+    instance = Instance(target)
+    if not instance.is_managed():
+        print(f"No operator state for '{target}'.", file=sys.stderr)
+        return 1
+    instance.cleanup_files()
+    instance.state_file.unlink(missing_ok=True)
+    print(f"Removed operator state for '{instance.display_name}'.")
+    print("Any running session with that name was left untouched.")
     return 0
 
 
@@ -782,6 +843,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
     set_tab_title(f"operator - {instance.display_name}")
 
     session_num = start_session_num
+    last_launched = 0
     launch_failures = 0
     resume_id_used = ""
     try:
@@ -821,6 +883,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
                 continue
             launch_failures = 0
             resume_id_used = ""
+            last_launched = session_num
 
             # Record the CLI session id once the runner discovers it.
             for _ in range(SESSION_ID_WAIT):
@@ -866,7 +929,15 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
         print(file=sys.stderr)
         log("Signal received — shutting down")
         stop_session_gracefully(instance)
-        instance.save_state(session_num, run_started, instance.read_session_id())
+        # Record the last session actually launched, not one that never
+        # started, and keep whichever resume id is still pending so an
+        # interrupted retry does not lose it or skip a number.
+        discovered = instance.read_session_id()
+        instance.save_state(
+            last_launched or start_session_num - 1 or 1,
+            run_started,
+            discovered or resume_id or resume_id_used,
+        )
         show_run_summary(run_started)
         if MUX.has_session(instance.session):
             MUX.kill_session(instance.session)
@@ -892,6 +963,7 @@ USAGE
     operator reload NAME                                       Hot-reload launch spec
     operator list                                              Show running instances
     operator stop [NAME]                                       Stop instance(s)
+    operator forget NAME                                       Drop operator state only
     operator report [type]                                     View usage reports
     operator ingest [--force]                                  Process copilot logs
     operator help                                              Show this help
@@ -900,6 +972,13 @@ OPTIONS
     --name NAME     Set instance name (default: current directory name)
     --loop          Enable autonomous loop mode
     --fresh         Reset session numbering (ignore prior state)
+
+OWNERSHIP
+    The operator acts only on sessions it started. A session is owned when a
+    claim record matches a session that is currently running; continuity state
+    alone never confers ownership, so a leftover state file cannot authorize
+    stopping an unrelated session that later took the same name. Use
+    `operator forget NAME` to drop stale state without touching any session.
 
 MODES
     Single session (default)
@@ -948,7 +1027,18 @@ def show_help() -> int:
 
 # ── entry point ─────────────────────────────────────────────────
 def default_instance_name() -> str:
-    return Path.cwd().name or "operator"
+    """Derive an instance name from the working directory.
+
+    A filesystem root has no directory name, so falling back to a generic label
+    would silently run Copilot over the entire drive. Bash refuses this; so do
+    we.
+    """
+    cwd = Path.cwd()
+    name = cwd.name
+    if not name:
+        die(f"Refusing to start in the filesystem root ({cwd}).\n"
+            "  Run the operator from a project directory, or pass --name NAME.")
+    return name
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -977,6 +1067,8 @@ def main(argv: list[str] | None = None) -> int:
         return join_instance(args[1] if len(args) > 1 else None)
     if head == "reload":
         return reload_instance(args[1] if len(args) > 1 else None)
+    if head == "forget":
+        return forget_instance(args[1] if len(args) > 1 else None)
 
     # Positional shortcut: `operator foo` joins a running instance named foo.
     if len(args) == 1 and not head.startswith("-") and head not in RESERVED_WORDS:
