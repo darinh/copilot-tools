@@ -733,6 +733,18 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _on_signal)
 
+    def _sleep(total: float) -> None:
+        """Sleep in slices so a shutdown request is noticed promptly.
+
+        The handler sets a flag rather than raising, so a single long sleep
+        would delay Ctrl+C by up to a full poll interval.
+        """
+        end = time.time() + total
+        while time.time() < end:
+            if shutdown["requested"]:
+                return
+            time.sleep(min(0.25, max(0.0, end - time.time())))
+
     log("═══════════════════════════════════════════")
     log("Copilot CLI Operator starting (loop mode)")
     log(f"  Instance: {instance.display_name}")
@@ -771,7 +783,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
             while True:
                 if shutdown["requested"]:
                     raise KeyboardInterrupt
-                time.sleep(POLL_INTERVAL)
+                _sleep(POLL_INTERVAL)
                 if shutdown["requested"]:
                     raise KeyboardInterrupt
                 if not is_copilot_running(instance):

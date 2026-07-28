@@ -23,6 +23,58 @@ def test_connect_sets_busy_timeout(db_path):
         assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 1000
 
 
+def test_connect_closes_the_connection(db_path):
+    """sqlite3's own `with` manages the transaction but does NOT close, so a
+    bare connection would leak a handle on every report and ingest call."""
+    with operator_ingest.connect(db_path) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS probe(a)")
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+
+def test_connect_rolls_back_on_error(db_path):
+    operator_ingest.init_db(db_path)
+    with pytest.raises(RuntimeError):
+        with operator_ingest.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO sessions (session_num, log_file, started_at, ended_at) "
+                "VALUES (1, 'rollback.log', 'x', 'y')"
+            )
+            raise RuntimeError("boom")
+    with operator_ingest.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE log_file='rollback.log'"
+        ).fetchone()[0] == 0
+
+
+def test_cost_lookahead_does_not_cross_into_next_event():
+    """A malformed usage record must not borrow the next event's cost, which
+    would silently misreport billing."""
+    text = (
+        '{"kind": "assistant_usage",\n'
+        '  "model": "model-a"\n'          # no cost for this event
+        '}\n'
+        '{"kind": "assistant_usage",\n'
+        '  "model": "model-b",\n'
+        '  "cost": 5.0\n'
+        '}\n'
+    )
+    models, total = operator_ingest.extract_premium_from_usage(text)
+    assert total == 5
+    assert "model-a" not in models
+    assert models["model-b"]["cost"] == 5.0
+
+
+def test_multiple_usage_events_are_summed_not_double_counted():
+    text = "".join(
+        '{"kind": "assistant_usage",\n  "model": "m",\n  "cost": 2.0\n}\n'
+        for _ in range(3)
+    )
+    models, total = operator_ingest.extract_premium_from_usage(text)
+    assert total == 6
+    assert models["m"]["calls"] == 3
+
+
 def test_ingest_records_metrics(tmp_path, db_path):
     log = make_log(tmp_path / "process-1700000000000-4242.log")
     result = operator_ingest.ingest_file(log, db_path, session_num=3)

@@ -24,6 +24,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -60,17 +61,33 @@ CREATE TABLE IF NOT EXISTS model_usage (
 
 
 # ── database ────────────────────────────────────────────────────
-def connect(db_path) -> sqlite3.Connection:
+@contextmanager
+def connect(db_path):
+    """Open a connection, commit on success, and always close.
+
+    Deliberately a context manager rather than a bare connection: sqlite3's own
+    ``with`` block manages the *transaction* but does **not** close the
+    connection. Returning a raw connection therefore leaks a file handle on
+    every call, which matters for a long-running loop-mode process that reports
+    and ingests repeatedly.
+    """
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=BUSY_TIMEOUT)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.DatabaseError:
-        pass
-    conn.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT * 1000)}")
-    return conn
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:
+            pass
+        conn.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT * 1000)}")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db(db_path) -> None:
@@ -163,15 +180,23 @@ def extract_premium_from_usage(text: str) -> tuple[dict, int]:
 
     `session_shutdown.total_premium_requests` reports only the last call's cost
     rather than the sum, so the per-call `cost` values are authoritative.
+
+    The lookahead stops at the next telemetry event so a malformed record can
+    never borrow the following event's cost, which would misreport billing.
     """
     models: dict[str, dict] = {}
     total = 0.0
     lines = text.splitlines()
-    for idx, line in enumerate(lines):
-        if '"kind": "assistant_usage"' not in line and '"kind":"assistant_usage"' not in line:
-            continue
+    marker_lines = [
+        i for i, line in enumerate(lines)
+        if '"kind": "assistant_usage"' in line or '"kind":"assistant_usage"' in line
+    ]
+    for pos, idx in enumerate(marker_lines):
+        # Never scan past the start of the next usage event.
+        limit = marker_lines[pos + 1] if pos + 1 < len(marker_lines) else len(lines)
+        limit = min(limit, idx + 40, len(lines))
         model = None
-        for j in range(idx, min(idx + 40, len(lines))):
+        for j in range(idx, limit):
             probe = lines[j].strip()
             if model is None and '"model":' in probe:
                 candidate = probe.split(":", 1)[1].strip().strip('",')
