@@ -154,6 +154,68 @@ def test_preamble_uses_display_name_not_internal_id():
     assert "my.proj" in text
 
 
+def test_preamble_omits_crash_note_by_default():
+    text = op.build_preamble("anvil:anvil", op.Instance("proj"))
+    assert "crash" not in text.lower()
+
+
+def test_preamble_includes_crash_note_when_requested():
+    text = op.build_preamble("anvil:anvil", op.Instance("proj"), crash_recovery=True)
+    assert "handoff file could not be found" in text
+    assert "crash" in text.lower()
+
+
+# ── project handoff file resolution ─────────────────────────────
+def test_project_handoff_file_none_without_catalog(tmp_path, monkeypatch):
+    monkeypatch.setattr(op, "project_catalog_path", lambda: tmp_path / "missing.csv")
+    assert op.project_handoff_file(tmp_path) is None
+
+
+def test_project_handoff_file_resolves_from_catalog(tmp_path, monkeypatch):
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_text(f'"{project_root}",abc-123\n', encoding="utf-8")
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+
+    result = op.project_handoff_file(project_root)
+
+    assert result is not None
+    assert result.name == "next-session.md"
+    assert "abc-123" in str(result)
+
+
+def test_project_handoff_file_none_when_not_in_catalog(tmp_path, monkeypatch):
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_text('"C:\\some\\other\\dir",xyz-999\n', encoding="utf-8")
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+
+    assert op.project_handoff_file(project_root) is None
+
+
+# ── --yolo everywhere ────────────────────────────────────────────
+def test_run_single_session_always_includes_yolo(monkeypatch, tmp_path):
+    seen_args = []
+
+    def fake_start_session(instance, args, session_num, remain_on_exit=False, preamble=""):
+        seen_args.append(args)
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    monkeypatch.setattr(op, "start_session", fake_start_session)
+    monkeypatch.setattr(op, "handle_existing_session", lambda instance: None)
+    monkeypatch.setattr(op.MUX, "attach", lambda session: None)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
+    monkeypatch.setattr(op, "wait_for_exit", lambda instance, timeout=10: True)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+
+    inst = op.Instance("yolo-check")
+    op.run_single_session(inst, [])
+
+    assert "--yolo" in seen_args[0]
+
+
 # ── launch spec ─────────────────────────────────────────────────
 def test_launch_spec_roundtrip(tmp_path):
     inst = op.Instance("proj")

@@ -81,3 +81,68 @@ def test_resume_id_is_restored_when_launch_fails(monkeypatch):
     assert any(f"--resume={sid}" in a for a in seen[0])
     assert any(f"--resume={sid}" in a for a in seen[1]), \
         "resume id must survive a failed launch"
+
+
+def test_resume_without_handoff_file_gets_crash_note(monkeypatch, tmp_path):
+    """Resuming with no handoff file for the project is treated as crash
+    recovery and gets a note added to the preamble."""
+    seen_preambles = []
+
+    def capture(instance, args, session_num, remain_on_exit=False, preamble=""):
+        seen_preambles.append(preamble)
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    monkeypatch.setattr(op, "start_session", capture)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+    monkeypatch.setattr(op, "project_handoff_file", lambda cwd: None)
+
+    inst = op.Instance("crashy")
+    sid = "3f2a9c1e-1111-2222-3333-444455556666"
+    inst.save_state(1, "2026-07-27T10:00:00Z", sid)
+
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert "crash" in seen_preambles[0].lower()
+
+
+def test_resume_with_handoff_file_present_has_no_crash_note(monkeypatch, tmp_path):
+    """When the project's handoff file exists, resuming is a normal
+    continuation, not crash recovery — no note should be added."""
+    seen_preambles = []
+
+    def capture(instance, args, session_num, remain_on_exit=False, preamble=""):
+        seen_preambles.append(preamble)
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    handoff = tmp_path / "next-session.md"
+    handoff.write_text("# handoff", encoding="utf-8")
+
+    monkeypatch.setattr(op, "start_session", capture)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+    monkeypatch.setattr(op, "project_handoff_file", lambda cwd: handoff)
+
+    inst = op.Instance("tidy")
+    sid = "3f2a9c1e-1111-2222-3333-444455556666"
+    inst.save_state(1, "2026-07-27T10:00:00Z", sid)
+
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert "crash" not in seen_preambles[0].lower()
+
+
+def test_fresh_run_has_no_crash_note(monkeypatch):
+    """A --fresh loop has no resume id at all, so there is nothing to be a
+    crash recovery of."""
+    seen_preambles = []
+
+    def capture(instance, args, session_num, remain_on_exit=False, preamble=""):
+        seen_preambles.append(preamble)
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    monkeypatch.setattr(op, "start_session", capture)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+
+    inst = op.Instance("fresh-run")
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert "crash" not in seen_preambles[0].lower()

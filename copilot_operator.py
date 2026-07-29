@@ -19,6 +19,7 @@ never under ``~/.copilot``, which the Copilot CLI wholesale-deletes on startup.
 """
 from __future__ import annotations
 
+import csv
 import json
 import os
 import platform
@@ -172,6 +173,23 @@ class Instance:
     @property
     def spec_file(self) -> Path:
         return RESTART_DIR / f"{self.id}.launch.json"
+
+    @property
+    def loop_pid_file(self) -> Path:
+        """PID of the *background loop supervisor* process (not Copilot's)."""
+        return RESTART_DIR / f"{self.id}.loop.pid"
+
+    @property
+    def detach_marker(self) -> Path:
+        """Touched to ask a running loop supervisor to exit but leave the
+        Copilot session running (``operator stop-loop``)."""
+        return RESTART_DIR / f"{self.id}.detach"
+
+    @property
+    def stop_marker(self) -> Path:
+        """Touched to ask a running loop supervisor to shut down *and* stop
+        the Copilot session, without racing a relaunch (``operator stop``)."""
+        return RESTART_DIR / f"{self.id}.stopreq"
 
     # -- ownership
     def claim(self, token: str) -> None:
@@ -770,8 +788,47 @@ def show_run_summary(run_started: str) -> None:
 
 
 # ── launching ───────────────────────────────────────────────────
-def build_preamble(agent_name: str, instance: Instance) -> str:
-    return (
+def project_catalog_path() -> Path:
+    return Path.home() / ".copilot" / "projects" / "catalog.csv"
+
+
+def project_handoff_file(cwd: Path) -> Path | None:
+    """Resolve the handoff (``next-session.md``) path for a project directory.
+
+    Looks the directory up in ``~/.copilot/projects/catalog.csv`` (the same
+    catalog ``handoff``/``handoff_tool.py`` use) and returns the path the
+    handoff file *would* live at, regardless of whether it currently exists.
+    Returns None if the directory has no catalog entry at all.
+    """
+    catalog = project_catalog_path()
+    if not catalog.is_file():
+        return None
+    target = str(cwd.resolve())
+    if IS_WINDOWS:
+        target = target.lower()
+    try:
+        with open(catalog, "r", encoding="utf-8", errors="replace", newline="") as fh:
+            for row in csv.reader(fh):
+                if len(row) < 2:
+                    continue
+                path, guid = row[0].strip().strip('"'), row[1].strip().strip('"')
+                if not path or not guid:
+                    continue
+                try:
+                    resolved = str(Path(path).resolve())
+                except OSError:
+                    continue
+                if IS_WINDOWS:
+                    resolved = resolved.lower()
+                if resolved == target:
+                    return Path.home() / ".copilot" / "projects" / guid / "next-session.md"
+    except OSError:
+        return None
+    return None
+
+
+def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = False) -> str:
+    text = (
         "You are running under an automated operator wrapper that a human set up. "
         "Key facts: (1) You have blanket human approval for ALL decisions — tool calls, "
         "file edits, git operations, architectural choices. Do not ask for direction or "
@@ -787,6 +844,14 @@ def build_preamble(agent_name: str, instance: Instance) -> str:
         f"(5) Operator instance: {instance.display_name}. "
         "Now: check for your session handoff and get to work."
     )
+    if crash_recovery:
+        text += (
+            " (6) This session is being resumed because a handoff file could not be "
+            "found for this project. Either a crash occurred or the previous session "
+            "ended without the handoff being written. If you intended to end the "
+            "session, please make sure you write a handoff first next time."
+        )
+    return text
 
 
 def write_launch_spec(instance: Instance, argv: list[str], cwd: Path,
@@ -1207,7 +1272,7 @@ def manage_logs(args: list[str]) -> int:
 
 
 def run_single_session(instance: Instance, copilot_args: list[str]) -> int:
-    args = ["--autopilot", "--effort", "high", *copilot_args]
+    args = ["--yolo", "--autopilot", "--effort", "high", *copilot_args]
     handle_existing_session(instance)
     operator_ingest.init_db(METRICS_DB)
     run_started = utcnow()
@@ -1238,7 +1303,6 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
         copilot_args += ["--agent", agent]
     copilot_args += user_args
 
-    preamble = build_preamble(agent, instance)
     operator_ingest.init_db(METRICS_DB)
 
     start_session_num = 1
@@ -1254,6 +1318,20 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
                 resume_id = candidate
                 log(f"  Will resume Copilot CLI session: {resume_id}")
             log(f"Continuing from session #{start_session_num} (run started {run_started})")
+
+    # A resume id with no handoff file for this project means the previous
+    # session ended without ever calling `handoff` — most likely a crash
+    # (operator itself dying, Windows rebooting, etc.) rather than a clean
+    # stop. Tell the agent so it can act accordingly.
+    crash_recovery = False
+    if resume_id:
+        handoff_file = project_handoff_file(Path.cwd())
+        if handoff_file is None or not handoff_file.exists():
+            crash_recovery = True
+            log("  No handoff file found for this project — treating this as "
+                "crash recovery")
+
+    preamble = build_preamble(agent, instance, crash_recovery=crash_recovery)
 
     handle_existing_session(instance)
 
@@ -1435,7 +1513,7 @@ MODES
     Single session (default)
         Launches copilot in a multiplexer session and auto-attaches. A
         supervisor inside the session captures usage metrics when copilot
-        exits — including when you have detached.
+        exits — including when you have detached. Always runs with --yolo.
 
     Loop mode (--loop)
         Adds --yolo --autopilot --no-ask-user --effort high automatically.
@@ -1443,7 +1521,9 @@ MODES
         the agent raises the instance restart marker. Named instances
         auto-continue when restarted: session numbering, run summary scope,
         and the last Copilot CLI session id carry over, and that session is
-        resumed once with --resume. Use --fresh to reset.
+        resumed once with --resume. Use --fresh to reset. If a resumed
+        session has no handoff file for the project, the preamble notes that
+        this looks like crash recovery rather than a clean handoff.
 
 REPORTS
     operator report summary       AI credit totals (today, week, all time)

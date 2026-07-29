@@ -116,10 +116,10 @@ operator restore --all --dry-run     # preview without launching anything
 
 ### Single Session (default)
 
-Launches copilot in a tmux session, auto-attaches your terminal. When copilot exits, metrics are parsed from its process log and stored in the database.
+Launches copilot in a tmux session, auto-attaches your terminal. Always runs with `--yolo`. When copilot exits, metrics are parsed from its process log and stored in the database.
 
 ```bash
-operator --agent=anvil:anvil --yolo
+operator --agent=anvil:anvil
 ```
 
 ### Loop Mode (`--loop`)
@@ -157,6 +157,8 @@ operator --loop --name myproject --fresh --agent=anvil:anvil
 Unnamed instances (no `--name`) are always ephemeral and don't persist state.
 
 Intentional operator handoffs still start a fresh Copilot CLI session and rely on the handoff file for context. The saved CLI session ID is only reused when the operator process itself is restarted.
+
+If a named loop resumes with a saved CLI session ID but finds **no handoff file** for the project (`~/.copilot/projects/{guid}/next-session.md`, resolved from `~/.copilot/projects/catalog.csv`), that almost always means the previous session ended without calling `handoff` — most likely a crash. The preamble gets an extra note in that case telling the agent this looks like crash recovery and, if it *did* mean to stop cleanly, to remember to write a handoff next time. Resuming after a clean `handoff`-triggered restart (or any run where the handoff file already exists) never adds this note.
 
 ### Multi-Instance
 
