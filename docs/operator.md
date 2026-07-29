@@ -106,8 +106,10 @@ operator ingest --force              # reprocess all logs
 
 # Windows Terminal tab tracking and restore (see below)
 operator tabs list                   # show tracked tabs
-operator restore --dry-run           # preview what a restore would reopen
-operator restore                     # reopen every tracked tab, resuming sessions
+operator restore                     # pick which tracked tab(s) to reopen
+operator restore --all               # reopen every tracked tab, resuming sessions
+operator restore myproject           # reopen one tracked tab by name
+operator restore --all --dry-run     # preview without launching anything
 ```
 
 ## Modes
@@ -232,17 +234,23 @@ PowerShell — it needs `wt.exe`) reads the local registry plus every installed
 WSL distro's registry (queried live via `wsl.exe -d <distro> -- cat
 ~/.operator/tabs.json`, so it works regardless of that distro's `$HOME` layout
 or `COPILOT_OPERATOR_HOME`), then opens a single Windows Terminal window with
-one tab per tracked instance, replaying each command line. The operator's
+a tab per selected instance, replaying each command line. The operator's
 existing auto-continue logic (session numbering + saved `--resume=<uuid>`)
 takes it from there, so each Copilot session resumes rather than starting
 over.
 
 ```bash
-# Preview what would be reopened, without launching anything
-operator restore --dry-run
-
-# Actually reopen every tracked tab
+# List tracked tabs and choose which to restore
 operator restore
+
+# Restore every tracked tab without prompting
+operator restore --all
+
+# Restore one or more specific tabs by name
+operator restore myproject other-project
+
+# Preview any of the above without launching anything
+operator restore --all --dry-run
 ```
 
 WSL-based instances are relaunched as `wsl.exe -d <Distro> --cd <path> --

@@ -385,8 +385,10 @@ def _wsl_distros() -> list[str]:
     if not wsl:
         return []
     try:
+        # stdin=DEVNULL: wsl.exe otherwise inherits our stdin and can consume
+        # bytes meant for the interactive restore picker's input() call.
         out = subprocess.run([wsl, "-l", "-q"], capture_output=True,
-                             timeout=15, check=False)
+                             stdin=subprocess.DEVNULL, timeout=15, check=False)
     except (OSError, subprocess.SubprocessError):
         return []
     if out.returncode != 0:
@@ -411,9 +413,11 @@ def _read_remote_tabs(distro: str) -> dict[str, dict]:
     if not wsl:
         return {}
     try:
+        # stdin=DEVNULL for the same reason as _wsl_distros above.
         out = subprocess.run(
             [wsl, "-d", distro, "--", "cat", "$HOME/.operator/tabs.json"],
-            capture_output=True, timeout=15, check=False, shell=False,
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=15,
+            check=False, shell=False,
         )
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -455,21 +459,8 @@ def _build_wt_command(entries: list[tuple[str, dict]]) -> list[str]:
     return cmd
 
 
-def restore_tabs(args: list[str]) -> int:
-    """Reopen a Windows Terminal window with one tab per tracked instance.
-
-    A full reboot kills every multiplexer server and Copilot process, so there
-    is nothing left to reattach to — this simply replays each instance's
-    original `operator` command line in a fresh tab. The operator's own
-    auto-continue logic (session numbering + saved `--resume=<uuid>`) takes it
-    from there, so each Copilot session picks back up rather than starting
-    over.
-    """
-    if not IS_WINDOWS:
-        die("operator restore must be run from Windows PowerShell — it needs "
-            "wt.exe, which is only available there.")
-    dry_run = "--dry-run" in args or "--list" in args
-
+def _collect_tab_entries() -> list[tuple[str, dict]]:
+    """Gather tab registry entries from the local machine and every WSL distro."""
     local = load_tabs()
     combined: list[tuple[str, dict]] = [(f"local:{k}", v) for k, v in local.items()]
 
@@ -479,19 +470,99 @@ def restore_tabs(args: list[str]) -> int:
             meta = dict(meta)
             meta.setdefault("wsl_distro", distro)
             combined.append((f"{distro}:{ident}", meta))
+    return combined
 
+
+def _describe_entry(meta: dict) -> str:
+    kind = f"wsl:{meta['wsl_distro']}" if meta.get("wsl_distro") else "native"
+    return f"{meta.get('display_name', '?')}  [{kind}]  {meta.get('cwd', '?')}"
+
+
+def _parse_selection(selection: str, n: int) -> list[int]:
+    """Parse a picker response like '1,3' or 'all' into 0-based indices."""
+    selection = selection.strip().lower()
+    if not selection:
+        return []
+    if selection == "all":
+        return list(range(n))
+    indices: list[int] = []
+    for part in selection.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            idx = int(part) - 1
+        except ValueError:
+            continue
+        if 0 <= idx < n:
+            indices.append(idx)
+    return indices
+
+
+def _prompt_selection(n: int) -> str:
+    try:
+        return input(f"Select tab(s) to restore [1-{n}, comma-separated, or "
+                     "'all'] (blank to cancel): ")
+    except EOFError:
+        return ""
+
+
+def restore_tabs(args: list[str]) -> int:
+    """Reopen a Windows Terminal window with a tab per selected instance.
+
+    A full reboot kills every multiplexer server and Copilot process, so there
+    is nothing left to reattach to — this simply replays each instance's
+    original `operator` command line in a fresh tab. Loop mode's own
+    auto-continue logic (session numbering + saved `--resume=<uuid>`) takes it
+    from there, so each Copilot session picks back up rather than starting
+    over.
+
+    With no arguments, prompts for which tracked tab(s) to restore. `--all`
+    restores every tracked tab without prompting. Display names given as
+    positional arguments restore exactly those, without prompting.
+    """
+    if not IS_WINDOWS:
+        die("operator restore must be run from Windows PowerShell — it needs "
+            "wt.exe, which is only available there.")
+    dry_run = "--dry-run" in args or "--list" in args
+    restore_all = "--all" in args
+    names = [a for a in args if not a.startswith("--")]
+
+    combined = _collect_tab_entries()
     if not combined:
         print("No tracked tabs to restore. Tabs are recorded automatically "
               "when a named instance (--name/--loop) is started inside a "
               "Windows Terminal tab.")
         return 0
 
-    print(f"Restoring {len(combined)} tab(s):")
-    for _ident, meta in combined:
-        kind = f"wsl:{meta['wsl_distro']}" if meta.get("wsl_distro") else "native"
-        print(f"  {meta.get('display_name', '?')}  [{kind}]  {meta.get('cwd', '?')}")
+    if names:
+        wanted = set(names)
+        selected = [(ident, meta) for ident, meta in combined
+                    if meta.get("display_name") in wanted]
+        missing = wanted - {meta.get("display_name") for _, meta in selected}
+        if missing:
+            print(f"No tracked tab(s): {', '.join(sorted(missing))}", file=sys.stderr)
+        if not selected:
+            return 1
+    elif restore_all:
+        selected = combined
+    else:
+        print("═══ Tracked Tabs ═══\n")
+        for i, (_ident, meta) in enumerate(combined, 1):
+            print(f"  [{i}] {_describe_entry(meta)}")
+        print()
+        response = _prompt_selection(len(combined))
+        indices = _parse_selection(response, len(combined))
+        if not indices:
+            print("Nothing selected. Cancelled.")
+            return 0
+        selected = [combined[i] for i in indices]
 
-    cmd = _build_wt_command(combined)
+    print(f"\nRestoring {len(selected)} tab(s):")
+    for _ident, meta in selected:
+        print(f"  {_describe_entry(meta)}")
+
+    cmd = _build_wt_command(selected)
     if dry_run:
         print("\n--dry-run: not launching. Command that would run:")
         print("  " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
@@ -1345,7 +1416,7 @@ USAGE
     operator ingest [--force]                                  Process copilot logs
     operator logs [--prune] [--days N]                         Inspect/prune copilot logs
     operator tabs [list|remove NAME|clear]                     Manage tracked terminal tabs
-    operator restore [--dry-run]                                Reopen tracked tabs after a crash
+    operator restore [NAME...|--all] [--dry-run]               Reopen tracked tabs after a crash
     operator help                                              Show this help
 
 OPTIONS
@@ -1405,13 +1476,18 @@ TAB RESTORE
 
     `operator restore` (run from Windows PowerShell, since it needs wt.exe)
     reads the local registry plus every installed WSL distro's registry (via
-    `wsl.exe -d <distro>`), then opens one Windows Terminal window with one
-    tab per tracked instance, replaying each command line. A reboot kills
-    every multiplexer server, so there is nothing to reattach to — restore
-    simply relaunches, and the existing auto-continue/--resume logic picks
-    each Copilot session back up rather than starting fresh. Use
-    `operator restore --dry-run` to preview without launching anything, and
-    `operator tabs` to inspect or edit the registry directly.
+    `wsl.exe -d <distro>`), then opens one Windows Terminal window with a tab
+    per selected instance, replaying each command line. A reboot kills every
+    multiplexer server, so there is nothing to reattach to — restore simply
+    relaunches, and the existing auto-continue/--resume logic picks each
+    Copilot session back up rather than starting fresh.
+
+    With no arguments, `operator restore` lists tracked tabs and prompts for
+    which to restore. `operator restore --all` restores every tracked tab
+    without prompting. `operator restore NAME [NAME...]` restores exactly the
+    named instance(s). Add --dry-run to any form to preview the wt.exe command
+    without launching anything. Use `operator tabs` to inspect or edit the
+    registry directly.
 
 FILES
     ~/.operator/                        State directory (override with
@@ -1439,19 +1515,63 @@ def show_help() -> int:
 
 
 # ── entry point ─────────────────────────────────────────────────
+def _tracked_cwd_for(name: str) -> str | None:
+    """Best-effort lookup of the directory a tracked/managed instance name is
+    already bound to, so a same-named directory elsewhere doesn't collide."""
+    inst = Instance(name)
+    spec = inst.spec_file
+    if spec.exists():
+        try:
+            return json.loads(spec.read_text(encoding="utf-8")).get("cwd")
+        except (OSError, ValueError):
+            pass
+    entry = load_tabs().get(inst.id)
+    if entry:
+        return entry.get("cwd")
+    return None
+
+
+def _name_conflicts(name: str, cwd: Path) -> bool:
+    """True when `name` is already a live session bound to a different cwd.
+
+    A name is only a real conflict when something is actually running under
+    it right now; a stale state/tab entry for a directory that no longer has
+    a live session poses no risk of talking to the wrong project.
+    """
+    inst = Instance(name)
+    if not (MUX.available() and MUX.has_session(inst.session)):
+        return False
+    bound_to = _tracked_cwd_for(name)
+    return bound_to is not None and bound_to != str(cwd)
+
+
 def default_instance_name() -> str:
     """Derive an instance name from the working directory.
 
-    A filesystem root has no directory name, so falling back to a generic label
-    would silently run Copilot over the entire drive. Bash refuses this; so do
-    we.
+    A filesystem root has no directory name, so falling back to a generic
+    label would silently run Copilot over the entire drive. Bash refuses
+    this; so do we.
+
+    Two different directories that happen to share a folder name (e.g. two
+    checkouts both named "backend") would otherwise collide if both are
+    running at once. When the plain name is already a live session bound to
+    a different directory, append -1, -2, ... until a free name is found.
     """
     cwd = Path.cwd()
-    name = cwd.name
-    if not name:
+    base = cwd.name
+    if not base:
         die(f"Refusing to start in the filesystem root ({cwd}).\n"
             "  Run the operator from a project directory, or pass --name NAME.")
-    return name
+
+    candidate = base
+    suffix = 0
+    while suffix <= MAX_SESSIONS:
+        if not _name_conflicts(candidate, cwd):
+            return candidate
+        suffix += 1
+        candidate = f"{base}-{suffix}"
+    die(f"Could not find a free instance name derived from '{base}' after "
+        f"{MAX_SESSIONS} attempts. Pass --name NAME explicitly.")
 
 
 def main(argv: list[str] | None = None) -> int:

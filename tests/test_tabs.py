@@ -216,14 +216,14 @@ def test_restore_dry_run_does_not_launch(monkeypatch, capsys):
     launched = []
     monkeypatch.setattr(op.subprocess, "Popen", lambda *a, **k: launched.append((a, k)))
 
-    assert op.restore_tabs(["--dry-run"]) == 0
+    assert op.restore_tabs(["--dry-run", "--all"]) == 0
     assert launched == []
     out = capsys.readouterr().out
     assert "not launching" in out
     assert "proj" in out
 
 
-def test_restore_launches_wt(monkeypatch):
+def test_restore_all_launches_wt(monkeypatch):
     monkeypatch.setenv("WT_SESSION", "some-guid")
     inst = op.Instance("proj")
     op.register_tab(inst, False, [], Path("C:\\proj"))
@@ -239,9 +239,92 @@ def test_restore_launches_wt(monkeypatch):
 
     monkeypatch.setattr(op.subprocess, "Popen", _FakePopen)
 
-    assert op.restore_tabs([]) == 0
+    assert op.restore_tabs(["--all"]) == 0
     assert len(launched) == 1
     assert launched[0][0] == "wt.exe"
+
+
+def test_restore_by_name_launches_only_that_entry(monkeypatch):
+    monkeypatch.setenv("WT_SESSION", "some-guid")
+    op.register_tab(op.Instance("proj"), False, [], Path("C:\\proj"))
+    op.register_tab(op.Instance("other"), False, [], Path("C:\\other"))
+    monkeypatch.setattr(op, "IS_WINDOWS", True)
+    monkeypatch.setattr(op, "_wsl_distros", lambda: [])
+    monkeypatch.setattr(op.shutil, "which", lambda name: "wt.exe" if "wt" in name else None)
+
+    launched = []
+    monkeypatch.setattr(op.subprocess, "Popen", lambda cmd, **k: launched.append(cmd))
+
+    assert op.restore_tabs(["proj"]) == 0
+    assert len(launched) == 1
+    assert "proj" in " ".join(launched[0])
+    assert "other" not in " ".join(launched[0])
+
+
+def test_restore_by_unknown_name_fails(monkeypatch, capsys):
+    monkeypatch.setenv("WT_SESSION", "some-guid")
+    op.register_tab(op.Instance("proj"), False, [], Path("C:\\proj"))
+    monkeypatch.setattr(op, "IS_WINDOWS", True)
+    monkeypatch.setattr(op, "_wsl_distros", lambda: [])
+
+    assert op.restore_tabs(["nonexistent"]) == 1
+    assert "No tracked tab(s): nonexistent" in capsys.readouterr().err
+
+
+def test_restore_with_no_args_prompts_and_restores_selection(monkeypatch):
+    monkeypatch.setenv("WT_SESSION", "some-guid")
+    op.register_tab(op.Instance("proj"), False, [], Path("C:\\proj"))
+    op.register_tab(op.Instance("other"), False, [], Path("C:\\other"))
+    monkeypatch.setattr(op, "IS_WINDOWS", True)
+    monkeypatch.setattr(op, "_wsl_distros", lambda: [])
+    monkeypatch.setattr(op.shutil, "which", lambda name: "wt.exe" if "wt" in name else None)
+    monkeypatch.setattr(op, "_prompt_selection", lambda n: "1")
+
+    launched = []
+    monkeypatch.setattr(op.subprocess, "Popen", lambda cmd, **k: launched.append(cmd))
+
+    assert op.restore_tabs([]) == 0
+    assert len(launched) == 1
+
+
+def test_restore_with_no_args_prompts_all(monkeypatch):
+    monkeypatch.setenv("WT_SESSION", "some-guid")
+    op.register_tab(op.Instance("proj"), False, [], Path("C:\\proj"))
+    op.register_tab(op.Instance("other"), False, [], Path("C:\\other"))
+    monkeypatch.setattr(op, "IS_WINDOWS", True)
+    monkeypatch.setattr(op, "_wsl_distros", lambda: [])
+    monkeypatch.setattr(op.shutil, "which", lambda name: "wt.exe" if "wt" in name else None)
+    monkeypatch.setattr(op, "_prompt_selection", lambda n: "all")
+
+    cmds = []
+    monkeypatch.setattr(op.subprocess, "Popen", lambda cmd, **k: cmds.append(cmd))
+
+    assert op.restore_tabs([]) == 0
+    assert len(cmds) == 1
+    assert cmds[0].count("new-tab") == 2
+
+
+def test_restore_blank_prompt_cancels(monkeypatch, capsys):
+    monkeypatch.setenv("WT_SESSION", "some-guid")
+    op.register_tab(op.Instance("proj"), False, [], Path("C:\\proj"))
+    monkeypatch.setattr(op, "IS_WINDOWS", True)
+    monkeypatch.setattr(op, "_wsl_distros", lambda: [])
+    monkeypatch.setattr(op, "_prompt_selection", lambda n: "")
+
+    launched = []
+    monkeypatch.setattr(op.subprocess, "Popen", lambda cmd, **k: launched.append(cmd))
+
+    assert op.restore_tabs([]) == 0
+    assert launched == []
+    assert "Cancelled" in capsys.readouterr().out
+
+
+def test_parse_selection_variants():
+    assert op._parse_selection("1,2", 3) == [0, 1]
+    assert op._parse_selection("all", 3) == [0, 1, 2]
+    assert op._parse_selection("", 3) == []
+    assert op._parse_selection("bogus", 3) == []
+    assert op._parse_selection("99", 3) == []
 
 
 def test_restore_merges_wsl_registry(monkeypatch):
@@ -258,7 +341,76 @@ def test_restore_merges_wsl_registry(monkeypatch):
     monkeypatch.setattr(op, "_read_remote_tabs", lambda distro: remote_data if distro == "Ubuntu" else {})
     monkeypatch.setattr(op.shutil, "which", lambda name: "wt.exe" if "wt" in name else None)
 
-    assert op.restore_tabs(["--dry-run"]) == 0
+    assert op.restore_tabs(["--dry-run", "--all"]) == 0
+
+
+# ── default instance naming conflict resolution ─────────────────
+def test_default_instance_name_no_conflict(tmp_path, monkeypatch):
+    proj = tmp_path / "myproj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    assert op.default_instance_name() == "myproj"
+
+
+def test_default_instance_name_appends_suffix_on_live_conflict(tmp_path, monkeypatch):
+    proj_a = tmp_path / "a" / "backend"
+    proj_b = tmp_path / "b" / "backend"
+    proj_a.mkdir(parents=True)
+    proj_b.mkdir(parents=True)
+
+    inst = op.Instance("backend")
+    inst.spec_file.write_text(json.dumps({"cwd": str(proj_a)}), encoding="utf-8")
+
+    class _FakeMux:
+        def available(self_inner):
+            return True
+
+        def has_session(self_inner, session_id):
+            return session_id == inst.session
+
+    monkeypatch.setattr(op, "MUX", _FakeMux())
+    monkeypatch.chdir(proj_b)
+    assert op.default_instance_name() == "backend-1"
+
+
+def test_default_instance_name_reuses_name_for_same_directory(tmp_path, monkeypatch):
+    proj = tmp_path / "backend"
+    proj.mkdir()
+
+    inst = op.Instance("backend")
+    inst.spec_file.write_text(json.dumps({"cwd": str(proj)}), encoding="utf-8")
+
+    class _FakeMux:
+        def available(self_inner):
+            return True
+
+        def has_session(self_inner, session_id):
+            return session_id == inst.session
+
+    monkeypatch.setattr(op, "MUX", _FakeMux())
+    monkeypatch.chdir(proj)
+    assert op.default_instance_name() == "backend"
+
+
+def test_default_instance_name_ignores_conflict_when_not_live(tmp_path, monkeypatch):
+    proj_a = tmp_path / "a" / "backend"
+    proj_b = tmp_path / "b" / "backend"
+    proj_a.mkdir(parents=True)
+    proj_b.mkdir(parents=True)
+
+    inst = op.Instance("backend")
+    inst.spec_file.write_text(json.dumps({"cwd": str(proj_a)}), encoding="utf-8")
+
+    class _FakeMux:
+        def available(self_inner):
+            return True
+
+        def has_session(self_inner, session_id):
+            return False  # nothing actually running
+
+    monkeypatch.setattr(op, "MUX", _FakeMux())
+    monkeypatch.chdir(proj_b)
+    assert op.default_instance_name() == "backend"
 
 
 def test_read_remote_tabs_handles_missing_wsl(monkeypatch):

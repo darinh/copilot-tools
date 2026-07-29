@@ -106,7 +106,7 @@ operator report costs
 
 Named loop instances persist the active Copilot CLI session ID, so restarting the same loop after a WSL crash or Windows reboot automatically resumes the prior CLI session.
 
-On Windows, `operator` also tracks which Windows Terminal tabs are running named instances. After a reboot or crash, `operator restore` reopens a single Windows Terminal window with one tab per tracked instance (native and WSL), replaying each launch command so every Copilot session resumes where it left off — no manual re-`cd`-ing or hunting for session IDs.
+On Windows, `operator` also tracks which Windows Terminal tabs are running named instances. After a reboot or crash, `operator restore` lists tracked tabs so you can pick which to reopen (or `operator restore --all` for everything), replaying each launch command in a fresh tab so every Copilot session resumes where it left off — no manual re-`cd`-ing or hunting for session IDs.
 
 See [Operator Documentation](docs/operator.md) for full details.
 
