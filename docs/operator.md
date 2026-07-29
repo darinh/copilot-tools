@@ -103,6 +103,11 @@ operator report tokens               # token counts by type
 # Ingest historical logs
 operator ingest                      # process unprocessed logs
 operator ingest --force              # reprocess all logs
+
+# Windows Terminal tab tracking and restore (see below)
+operator tabs list                   # show tracked tabs
+operator restore --dry-run           # preview what a restore would reopen
+operator restore                     # reopen every tracked tab, resuming sessions
 ```
 
 ## Modes
@@ -200,6 +205,50 @@ operator, drop the stale state without touching the session:
 operator forget NAME
 ```
 
+### Restoring tabs after a reboot or crash
+
+Windows Terminal (and most terminal apps) expose no API to list their own
+tabs, so the operator keeps its own record. Whenever a named instance
+(`--name`/`--loop`) is started inside a Windows Terminal tab (detected via
+`$WT_SESSION`), it upserts an entry in `~/.operator/tabs.json` recording the
+working directory and the exact `operator` command line used. `operator stop`
+and `operator forget` remove the entry again, since those are intentional
+shutdowns you don't want replayed.
+
+```bash
+# Inspect what's tracked
+operator tabs list
+
+# Drop one entry without touching any session
+operator tabs remove myproject
+
+# Drop everything
+operator tabs clear
+```
+
+After a reboot or crash every multiplexer server and Copilot process is gone,
+so there is nothing left to reattach to. `operator restore` (run from Windows
+PowerShell — it needs `wt.exe`) reads the local registry plus every installed
+WSL distro's registry (queried live via `wsl.exe -d <distro> -- cat
+~/.operator/tabs.json`, so it works regardless of that distro's `$HOME` layout
+or `COPILOT_OPERATOR_HOME`), then opens a single Windows Terminal window with
+one tab per tracked instance, replaying each command line. The operator's
+existing auto-continue logic (session numbering + saved `--resume=<uuid>`)
+takes it from there, so each Copilot session resumes rather than starting
+over.
+
+```bash
+# Preview what would be reopened, without launching anything
+operator restore --dry-run
+
+# Actually reopen every tracked tab
+operator restore
+```
+
+WSL-based instances are relaunched as `wsl.exe -d <Distro> --cd <path> --
+bash -lic "operator ..."` inside their own tab; native instances are relaunched
+as `powershell -NoExit -Command "operator ..."` in the recorded directory.
+
 ## Metrics
 
 The operator stores metrics in `~/.operator/metrics.db` (SQLite). Each session records:
@@ -241,6 +290,7 @@ logs.
 | `~/.operator/restart/<id>.exit` | Exit code, written after metrics capture |
 | `~/.operator/restart/<id>.launch.json` | Launch spec for the session |
 | `~/.operator/restart/<id>.runner.log` | Supervisor log for the instance |
+| `~/.operator/tabs.json` | Tracked terminal tabs, used by `operator restore` |
 | `~/.operator/backups/` | Historical backups of the operator script |
 | `~/.copilot/logs/process-*.log` | Copilot process logs (override with `COPILOT_LOG_DIR`) |
 
@@ -329,3 +379,13 @@ id.
 
 **Can't attach to a session**
 Find the name with `operator list`, then: `operator join myproject`
+
+**"operator restore must be run from Windows PowerShell"**
+`restore` shells out to `wt.exe`, which only exists on Windows. From WSL/Linux,
+just start the loop directly (`operator --loop --name myproject ...`) — its own
+auto-continue logic will resume the prior session.
+
+**`operator restore` reopens nothing**
+Only named instances (`--name`/`--loop`) started inside a Windows Terminal tab
+are tracked (`$WT_SESSION` must be set). Check `operator tabs list`; unnamed,
+ad-hoc `copilot`/`operator` runs are intentionally not tracked.

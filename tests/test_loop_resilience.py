@@ -16,6 +16,7 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(op, "LOG_FILE", tmp_path / "operator.log")
     monkeypatch.setattr(op, "METRICS_DB", tmp_path / "metrics.db")
     monkeypatch.setattr(op, "COPILOT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(op, "TABS_FILE", tmp_path / "tabs.json")
     monkeypatch.setattr(op, "POLL_INTERVAL", 0)
     monkeypatch.setattr(op, "LAUNCH_BACKOFF_BASE", 0)
     return tmp_path

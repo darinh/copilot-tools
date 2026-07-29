@@ -45,7 +45,7 @@ LAUNCH_BACKOFF_BASE = 5
 SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
 RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
-                  "version", "forget", "logs"}
+                  "version", "forget", "logs", "tabs", "restore"}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
@@ -65,6 +65,7 @@ RESTART_DIR = OPERATOR_HOME / "restart"
 LOG_FILE = OPERATOR_HOME / "operator.log"
 METRICS_DB = OPERATOR_HOME / "metrics.db"
 BACKUPS_DIR = OPERATOR_HOME / "backups"
+TABS_FILE = OPERATOR_HOME / "tabs.json"
 COPILOT_LOG_DIR = Path(
     os.environ.get("COPILOT_LOG_DIR") or HOME / ".copilot" / "logs"
 )
@@ -282,6 +283,226 @@ def managed_instances() -> dict[str, dict]:
             except (OSError, ValueError):
                 pass
     return found
+
+
+# ── tab registry ────────────────────────────────────────────────
+# Windows Terminal (and most terminal emulators) expose no API to list their
+# own tabs, so the operator keeps its own record of which named instances were
+# started from a terminal tab, in which directory, and with which arguments.
+# After a reboot or crash every process is gone, but this file survives, and
+# `operator restore` replays each entry in a fresh tab — the existing
+# auto-continue/--resume logic then picks the Copilot session back up.
+def load_tabs() -> dict[str, dict]:
+    if not TABS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(TABS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_tabs(entries: dict[str, dict]) -> None:
+    OPERATOR_HOME.mkdir(parents=True, exist_ok=True)
+    tmp = TABS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(entries, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, TABS_FILE)
+
+
+def register_tab(instance: Instance, loop_mode: bool,
+                 copilot_args: list[str], cwd: Path) -> None:
+    """Remember how to relaunch this instance's tab after a crash.
+
+    Only runs when a Windows Terminal session id is present (``$WT_SESSION``),
+    since that's the signal an interactive tab — as opposed to a one-off or
+    CI invocation — started this instance. ``--fresh`` is deliberately never
+    persisted here: a restore should always try to resume, never reset
+    numbering, even if the tab that crashed had just been started fresh.
+    """
+    if not os.environ.get("WT_SESSION"):
+        return
+    argv = ["--loop"] if loop_mode else []
+    argv += ["--name", instance.display_name, *copilot_args]
+    entries = load_tabs()
+    entries[instance.id] = {
+        "display_name": instance.display_name,
+        "cwd": str(cwd),
+        "argv": argv,
+        "wsl_distro": os.environ.get("WSL_DISTRO_NAME", ""),
+        "updated_at": utcnow(),
+    }
+    save_tabs(entries)
+
+
+def remove_tab(instance_id: str) -> None:
+    entries = load_tabs()
+    if instance_id in entries:
+        del entries[instance_id]
+        save_tabs(entries)
+
+
+def manage_tabs(args: list[str]) -> int:
+    """Inspect or edit the tab registry used by `operator restore`."""
+    entries = load_tabs()
+    if not args or args[0] == "list":
+        if not entries:
+            print("No tracked tabs. Tabs are recorded automatically when a "
+                  "named instance (--name/--loop) is started inside a "
+                  "Windows Terminal tab.")
+            return 0
+        print("═══ Tracked Tabs ═══\n")
+        for ident, meta in sorted(entries.items()):
+            kind = f"wsl:{meta['wsl_distro']}" if meta.get("wsl_distro") else "native"
+            print(f"  {meta.get('display_name', ident)}  [{kind}]")
+            print(f"    cwd:  {meta.get('cwd', '?')}")
+            print(f"    argv: operator {' '.join(meta.get('argv', []))}")
+        print("\nRestore: operator restore")
+        print("Remove:  operator tabs remove <name>")
+        return 0
+    if args[0] == "remove":
+        if len(args) < 2:
+            print("Usage: operator tabs remove NAME", file=sys.stderr)
+            return 1
+        target = Instance(args[1]).id
+        if target not in entries:
+            print(f"No tracked tab for '{args[1]}'.", file=sys.stderr)
+            return 1
+        del entries[target]
+        save_tabs(entries)
+        print(f"Removed tracked tab '{args[1]}'.")
+        return 0
+    if args[0] == "clear":
+        save_tabs({})
+        print("Cleared all tracked tabs.")
+        return 0
+    print("Usage: operator tabs [list|remove NAME|clear]", file=sys.stderr)
+    return 1
+
+
+def _wsl_distros() -> list[str]:
+    """List installed WSL distros, oldest/most-reliable enumeration first."""
+    wsl = shutil.which("wsl.exe") or shutil.which("wsl")
+    if not wsl:
+        return []
+    try:
+        out = subprocess.run([wsl, "-l", "-q"], capture_output=True,
+                             timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    # wsl -l -q emits UTF-16LE with a BOM on stock Windows builds.
+    try:
+        text = out.stdout.decode("utf-16-le")
+    except UnicodeDecodeError:
+        text = out.stdout.decode("utf-8", errors="ignore")
+    names = [line.strip().strip("\x00") for line in text.splitlines()]
+    return [n for n in names if n]
+
+
+def _read_remote_tabs(distro: str) -> dict[str, dict]:
+    """Read another distro's tab registry via `wsl.exe -d <distro>`.
+
+    Reading through the WSL command (rather than guessing a \\\\wsl.localhost
+    UNC path) works regardless of each distro's actual $HOME layout and
+    whether COPILOT_OPERATOR_HOME is overridden there.
+    """
+    wsl = shutil.which("wsl.exe") or shutil.which("wsl")
+    if not wsl:
+        return {}
+    try:
+        out = subprocess.run(
+            [wsl, "-d", distro, "--", "cat", "$HOME/.operator/tabs.json"],
+            capture_output=True, timeout=15, check=False, shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if out.returncode != 0 or not out.stdout:
+        return {}
+    try:
+        data = json.loads(out.stdout.decode("utf-8", errors="ignore"))
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _build_wt_command(entries: list[tuple[str, dict]]) -> list[str]:
+    """Build a single `wt.exe` argv that opens one tab per entry."""
+    wt = shutil.which("wt.exe") or shutil.which("wt")
+    if not wt:
+        die("Windows Terminal ('wt.exe') was not found on PATH.")
+    cmd = [wt]
+    for i, (_ident, meta) in enumerate(entries):
+        if i:
+            cmd += [";", "new-tab"]
+        else:
+            cmd += ["new-tab"]
+        title = meta.get("display_name", "operator")
+        cmd += ["--title", title]
+        argv = meta.get("argv", [])
+        distro = meta.get("wsl_distro", "")
+        cwd = meta.get("cwd", "")
+        if distro:
+            inner = "operator " + " ".join(argv) if argv else "operator"
+            cmd += ["-d", cwd or "~", "wsl.exe", "-d", distro]
+            if cwd:
+                cmd += ["--cd", cwd]
+            cmd += ["--", "bash", "-lic", inner]
+        else:
+            if cwd:
+                cmd += ["-d", cwd]
+            cmd += ["powershell", "-NoExit", "-Command", "operator " + " ".join(argv)]
+    return cmd
+
+
+def restore_tabs(args: list[str]) -> int:
+    """Reopen a Windows Terminal window with one tab per tracked instance.
+
+    A full reboot kills every multiplexer server and Copilot process, so there
+    is nothing left to reattach to — this simply replays each instance's
+    original `operator` command line in a fresh tab. The operator's own
+    auto-continue logic (session numbering + saved `--resume=<uuid>`) takes it
+    from there, so each Copilot session picks back up rather than starting
+    over.
+    """
+    if not IS_WINDOWS:
+        die("operator restore must be run from Windows PowerShell — it needs "
+            "wt.exe, which is only available there.")
+    dry_run = "--dry-run" in args or "--list" in args
+
+    local = load_tabs()
+    combined: list[tuple[str, dict]] = [(f"local:{k}", v) for k, v in local.items()]
+
+    for distro in _wsl_distros():
+        remote = _read_remote_tabs(distro)
+        for ident, meta in remote.items():
+            meta = dict(meta)
+            meta.setdefault("wsl_distro", distro)
+            combined.append((f"{distro}:{ident}", meta))
+
+    if not combined:
+        print("No tracked tabs to restore. Tabs are recorded automatically "
+              "when a named instance (--name/--loop) is started inside a "
+              "Windows Terminal tab.")
+        return 0
+
+    print(f"Restoring {len(combined)} tab(s):")
+    for _ident, meta in combined:
+        kind = f"wsl:{meta['wsl_distro']}" if meta.get("wsl_distro") else "native"
+        print(f"  {meta.get('display_name', '?')}  [{kind}]  {meta.get('cwd', '?')}")
+
+    cmd = _build_wt_command(combined)
+    if dry_run:
+        print("\n--dry-run: not launching. Command that would run:")
+        print("  " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
+        return 0
+
+    try:
+        subprocess.Popen(cmd, close_fds=True)
+    except OSError as exc:
+        die(f"Failed to launch Windows Terminal: {exc}")
+    print("\nLaunched. Each tab resumes its own Copilot session as it starts.")
+    return 0
 
 
 # ── metrics presentation ────────────────────────────────────────
@@ -734,6 +955,7 @@ def stop_operator(target: str | None = None) -> int:
                 return 1
         instance.cleanup_files()
         instance.state_file.unlink(missing_ok=True)
+        remove_tab(instance.id)
         log(f"Stopped: {target}")
         return 0
 
@@ -752,6 +974,7 @@ def stop_operator(target: str | None = None) -> int:
             continue
         inst.cleanup_files()
         inst.state_file.unlink(missing_ok=True)
+        remove_tab(inst.id)
         log(f"Stopped: {ident}")
         count += 1
     if count == 0:
@@ -772,6 +995,7 @@ def forget_instance(target: str | None) -> int:
         return 1
     instance.cleanup_files()
     instance.state_file.unlink(missing_ok=True)
+    remove_tab(instance.id)
     print(f"Removed operator state for '{instance.display_name}'.")
     print("Any running session with that name was left untouched.")
     return 0
@@ -1120,6 +1344,8 @@ USAGE
     operator report [type]                                     View usage reports
     operator ingest [--force]                                  Process copilot logs
     operator logs [--prune] [--days N]                         Inspect/prune copilot logs
+    operator tabs [list|remove NAME|clear]                     Manage tracked terminal tabs
+    operator restore [--dry-run]                                Reopen tracked tabs after a crash
     operator help                                              Show this help
 
 OPTIONS
@@ -1170,12 +1396,30 @@ BILLING
     reports how much space they use; `operator logs --prune --days N` removes
     logs older than N days, and only those already ingested.
 
+TAB RESTORE
+    Terminal apps expose no API to list their own tabs, so the operator keeps
+    its own record: whenever a named instance (--name/--loop) is started
+    inside a Windows Terminal tab ($WT_SESSION set), it upserts an entry in
+    ~/.operator/tabs.json recording the directory and the exact `operator`
+    command line used. `operator stop`/`forget` drop the entry again.
+
+    `operator restore` (run from Windows PowerShell, since it needs wt.exe)
+    reads the local registry plus every installed WSL distro's registry (via
+    `wsl.exe -d <distro>`), then opens one Windows Terminal window with one
+    tab per tracked instance, replaying each command line. A reboot kills
+    every multiplexer server, so there is nothing to reattach to — restore
+    simply relaunches, and the existing auto-continue/--resume logic picks
+    each Copilot session back up rather than starting fresh. Use
+    `operator restore --dry-run` to preview without launching anything, and
+    `operator tabs` to inspect or edit the registry directly.
+
 FILES
     ~/.operator/                        State directory (override with
                                         COPILOT_OPERATOR_HOME)
     ~/.operator/metrics.db              SQLite metrics database
     ~/.operator/operator.log            Operator log file
     ~/.operator/restart/                Per-instance markers and state
+    ~/.operator/tabs.json               Tracked terminal tabs (for `operator restore`)
     ~/.operator/backups/                Backups of the operator script
     ~/.copilot/logs/process-*.log       Copilot process logs (source data)
 
@@ -1240,6 +1484,10 @@ def main(argv: list[str] | None = None) -> int:
         return forget_instance(args[1] if len(args) > 1 else None)
     if head == "logs":
         return manage_logs(args[1:])
+    if head == "tabs":
+        return manage_tabs(args[1:])
+    if head == "restore":
+        return restore_tabs(args[1:])
 
     # Positional shortcut: `operator foo` joins a running instance named foo.
     if len(args) == 1 and not head.startswith("-") and head not in RESERVED_WORDS:
@@ -1283,6 +1531,7 @@ def run_dispatch(args: list[str]) -> int:
         i += 1
 
     instance = Instance(name or default_instance_name())
+    register_tab(instance, loop_mode, copilot_args, Path.cwd())
     try:
         if loop_mode:
             return run_loop_mode(instance, copilot_args, is_fresh)
