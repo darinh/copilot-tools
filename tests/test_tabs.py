@@ -344,6 +344,85 @@ def test_restore_merges_wsl_registry(monkeypatch):
     assert op.restore_tabs(["--dry-run", "--all"]) == 0
 
 
+# ── background loop + auto-attach ────────────────────────────────
+def test_start_and_attach_loop_spawns_when_no_supervisor_running(monkeypatch):
+    inst = op.Instance("fresh-loop")
+    spawned = {}
+
+    def fake_spawn(instance, copilot_args, is_fresh):
+        spawned["called"] = (instance.display_name, copilot_args, is_fresh)
+        return 4242
+
+    monkeypatch.setattr(op, "_running_loop_pid", lambda instance: None)
+    monkeypatch.setattr(op, "_spawn_background_loop", fake_spawn)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: True)
+    attached = []
+    monkeypatch.setattr(op.MUX, "attach", lambda session: attached.append(session))
+
+    rc = op.start_and_attach_loop(inst, ["--agent", "a:b"], is_fresh=True)
+
+    assert rc == 0
+    assert spawned["called"] == ("fresh-loop", ["--agent", "a:b"], True)
+    assert attached == [inst.session]
+
+
+def test_start_and_attach_loop_reuses_existing_supervisor(monkeypatch):
+    inst = op.Instance("already-running")
+    monkeypatch.setattr(op, "_running_loop_pid", lambda instance: 1234)
+
+    spawn_calls = []
+    monkeypatch.setattr(op, "_spawn_background_loop",
+                        lambda *a, **k: spawn_calls.append(1))
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: True)
+    attached = []
+    monkeypatch.setattr(op.MUX, "attach", lambda session: attached.append(session))
+
+    rc = op.start_and_attach_loop(inst, [], is_fresh=False)
+
+    assert rc == 0
+    assert spawn_calls == [], "an already-running supervisor must not be duplicated"
+    assert attached == [inst.session]
+
+
+def test_start_and_attach_loop_times_out_if_session_never_appears(monkeypatch):
+    inst = op.Instance("never-starts")
+    monkeypatch.setattr(op, "_running_loop_pid", lambda instance: None)
+    monkeypatch.setattr(op, "_spawn_background_loop", lambda *a, **k: 1)
+    monkeypatch.setattr(op, "SESSION_ID_WAIT", 0)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
+
+    rc = op.start_and_attach_loop(inst, [], is_fresh=False)
+
+    assert rc == 1
+
+
+def test_spawn_background_loop_builds_supervise_command(monkeypatch, tmp_path):
+    inst = op.Instance("cmdcheck")
+    captured = {}
+
+    class FakeProc:
+        pid = 5555
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(op.subprocess, "Popen", fake_popen)
+    monkeypatch.chdir(tmp_path)
+
+    pid = op._spawn_background_loop(inst, ["--agent", "x:y"], is_fresh=True)
+
+    assert pid == 5555
+    cmd = captured["cmd"]
+    assert "--_supervise" in cmd
+    assert "--loop" in cmd
+    assert "--name" in cmd and "cmdcheck" in cmd
+    assert "--fresh" in cmd
+    assert "--agent" in cmd and "x:y" in cmd
+    assert captured["kwargs"]["stdin"] == op.subprocess.DEVNULL
+
+
 # ── default instance naming conflict resolution ─────────────────
 def test_default_instance_name_no_conflict(tmp_path, monkeypatch):
     proj = tmp_path / "myproj"

@@ -19,6 +19,7 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(op, "TABS_FILE", tmp_path / "tabs.json")
     monkeypatch.setattr(op, "POLL_INTERVAL", 0)
     monkeypatch.setattr(op, "LAUNCH_BACKOFF_BASE", 0)
+    monkeypatch.setattr(op, "RESTART_PAUSE_SECONDS", 0)
     return tmp_path
 
 
@@ -31,6 +32,10 @@ def test_launch_failure_retries_then_succeeds(monkeypatch):
         if attempts["n"] == 1:
             raise MuxSessionError("simulated silent failure")
         instance.exit_file.write_text("0", encoding="utf-8")
+        # A launch that succeeds and then exits with no restart marker is now
+        # treated as an unexpected crash and relaunched; stop the loop here so
+        # this test only exercises the launch-failure retry, not that.
+        instance.stop_marker.touch()
 
     monkeypatch.setattr(op, "start_session", flaky)
     monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
@@ -68,6 +73,7 @@ def test_resume_id_is_restored_when_launch_fails(monkeypatch):
         if len(seen) == 1:
             raise MuxSessionError("boom")
         instance.exit_file.write_text("0", encoding="utf-8")
+        instance.stop_marker.touch()
 
     monkeypatch.setattr(op, "start_session", capture)
     monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
@@ -91,6 +97,7 @@ def test_resume_without_handoff_file_gets_crash_note(monkeypatch, tmp_path):
     def capture(instance, args, session_num, remain_on_exit=False, preamble=""):
         seen_preambles.append(preamble)
         instance.exit_file.write_text("0", encoding="utf-8")
+        instance.stop_marker.touch()
 
     monkeypatch.setattr(op, "start_session", capture)
     monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
@@ -113,6 +120,7 @@ def test_resume_with_handoff_file_present_has_no_crash_note(monkeypatch, tmp_pat
     def capture(instance, args, session_num, remain_on_exit=False, preamble=""):
         seen_preambles.append(preamble)
         instance.exit_file.write_text("0", encoding="utf-8")
+        instance.stop_marker.touch()
 
     handoff = tmp_path / "next-session.md"
     handoff.write_text("# handoff", encoding="utf-8")
@@ -138,6 +146,7 @@ def test_fresh_run_has_no_crash_note(monkeypatch):
     def capture(instance, args, session_num, remain_on_exit=False, preamble=""):
         seen_preambles.append(preamble)
         instance.exit_file.write_text("0", encoding="utf-8")
+        instance.stop_marker.touch()
 
     monkeypatch.setattr(op, "start_session", capture)
     monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
@@ -146,3 +155,110 @@ def test_fresh_run_has_no_crash_note(monkeypatch):
     op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
 
     assert "crash" not in seen_preambles[0].lower()
+
+
+def test_unexpected_exit_without_marker_is_relaunched(monkeypatch):
+    """An unexpected session death (crash, or `operator stop-session`) with no
+    restart marker and no stop/detach marker must be relaunched automatically
+    rather than ending the loop — that's the whole point of "loop" mode."""
+    attempts = {"n": 0}
+
+    def flaky_session(instance, args, session_num, remain_on_exit=False, preamble=""):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            instance.exit_file.write_text("0", encoding="utf-8")
+        else:
+            instance.exit_file.write_text("0", encoding="utf-8")
+            instance.stop_marker.touch()
+
+    monkeypatch.setattr(op, "start_session", flaky_session)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+
+    inst = op.Instance("relaunch-me")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == 0
+    assert attempts["n"] == 3, "each unexpected exit should trigger a fresh launch"
+
+
+def test_repeated_unexpected_exits_eventually_give_up(monkeypatch):
+    """Unbounded crash-relaunching would spin forever; there must be a cap
+    distinct from (but the same size as) the launch-failure cap."""
+    attempts = {"n": 0}
+
+    def always_crashes(instance, args, session_num, remain_on_exit=False, preamble=""):
+        attempts["n"] += 1
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    monkeypatch.setattr(op, "start_session", always_crashes)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+
+    inst = op.Instance("doomed")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == 1
+    assert attempts["n"] == op.MAX_LAUNCH_FAILURES
+
+
+def test_detach_marker_leaves_session_running(monkeypatch):
+    """`operator stop-loop NAME` (a touched detach marker) must stop the
+    supervisor without touching the session or calling stop_session_gracefully."""
+    calls = {"start": 0, "stop_gracefully": 0}
+    session_live = {"v": False}
+
+    def start(instance, args, session_num, remain_on_exit=False, preamble=""):
+        calls["start"] += 1
+        instance.session_file.write_text(
+            "11111111-2222-3333-4444-555555555555", encoding="utf-8")
+        instance.detach_marker.touch()
+        session_live["v"] = True
+
+    def fake_stop_gracefully(instance):
+        calls["stop_gracefully"] += 1
+
+    monkeypatch.setattr(op, "start_session", start)
+    monkeypatch.setattr(op, "stop_session_gracefully", fake_stop_gracefully)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: session_live["v"])
+    monkeypatch.setattr(op.MUX, "pane_dead", lambda session: False)
+
+    inst = op.Instance("detach-me")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == 0
+    assert calls["stop_gracefully"] == 0, "detach must not stop the session"
+    assert not inst.detach_marker.exists()
+    assert not inst.loop_pid_file.exists()
+
+
+def test_stop_marker_stops_session_and_supervisor(monkeypatch):
+    """`operator stop NAME` (a touched stop marker) must stop both the
+    supervisor and the session."""
+    calls = {"stop_gracefully": 0, "kill_session": 0}
+    session_live = {"v": False}
+
+    def start(instance, args, session_num, remain_on_exit=False, preamble=""):
+        instance.session_file.write_text(
+            "11111111-2222-3333-4444-555555555555", encoding="utf-8")
+        instance.stop_marker.touch()
+        session_live["v"] = True
+
+    def fake_stop_gracefully(instance):
+        calls["stop_gracefully"] += 1
+
+    monkeypatch.setattr(op, "start_session", start)
+    monkeypatch.setattr(op, "stop_session_gracefully", fake_stop_gracefully)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: session_live["v"])
+    monkeypatch.setattr(op.MUX, "kill_session", lambda session: calls.__setitem__(
+        "kill_session", calls["kill_session"] + 1) or True)
+    monkeypatch.setattr(op.MUX, "pane_dead", lambda session: False)
+
+    inst = op.Instance("stop-me")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == 0
+    assert calls["stop_gracefully"] == 1
+    assert calls["kill_session"] == 1
+    assert not inst.stop_marker.exists()
+    assert not inst.loop_pid_file.exists()

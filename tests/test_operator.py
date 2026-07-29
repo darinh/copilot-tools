@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -315,6 +316,124 @@ def test_stop_all_ignores_foreign_sessions(monkeypatch):
     monkeypatch.setattr(op.MUX, "kill_session", lambda s: killed.append(s))
     op.stop_operator()
     assert killed == [inst.id]
+
+
+# ── loop supervisor PID tracking ────────────────────────────────
+def test_pid_alive_true_for_current_process():
+    assert op._pid_alive(os.getpid()) is True
+
+
+def test_pid_alive_false_for_bogus_pid():
+    assert op._pid_alive(999_999_999) is False
+
+
+def test_running_loop_pid_none_without_file():
+    inst = op.Instance("no-loop")
+    assert op._running_loop_pid(inst) is None
+
+
+def test_running_loop_pid_prunes_stale_entry():
+    inst = op.Instance("stale-loop")
+    inst.loop_pid_file.write_text("999999999", encoding="utf-8")
+    assert op._running_loop_pid(inst) is None
+    assert not inst.loop_pid_file.exists()
+
+
+def test_running_loop_pid_returns_live_pid():
+    inst = op.Instance("live-loop")
+    inst.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    assert op._running_loop_pid(inst) == os.getpid()
+
+
+# ── stop-loop / stop-session split ──────────────────────────────
+def test_stop_loop_only_without_supervisor_errors():
+    assert op.stop_loop_only("nothing-running") == 1
+
+
+def test_stop_loop_only_requires_name():
+    assert op.stop_loop_only(None) == 1
+
+
+def test_stop_loop_only_touches_detach_marker_and_waits(monkeypatch):
+    inst = op.Instance("has-loop")
+    inst.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
+    calls = {"n": 0}
+
+    def fake_running_pid(instance):
+        calls["n"] += 1
+        # Simulate the supervisor exiting after being asked to detach.
+        if calls["n"] >= 2:
+            return None
+        return os.getpid()
+
+    monkeypatch.setattr(op, "_running_loop_pid", fake_running_pid)
+    monkeypatch.setattr(op.time, "sleep", lambda s: None)
+    rc = op.stop_loop_only("has-loop")
+    assert rc == 0
+    assert inst.detach_marker.exists()  # unlinked by the supervisor itself, not us
+    assert calls["n"] >= 2
+
+
+def test_stop_session_only_requires_running_session(monkeypatch):
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: False)
+    assert op.stop_session_only("ghost") == 1
+
+
+def test_stop_session_only_refuses_foreign_session(monkeypatch, capsys):
+    inst = op.Instance("foreign-owned")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    monkeypatch.setattr(type(inst), "owns_live_session", lambda self: False)
+    assert op.stop_session_only("foreign-owned") == 1
+    assert "Refusing to stop it" in capsys.readouterr().err
+
+
+def test_stop_session_only_kills_session_leaves_loop_state(monkeypatch):
+    inst = op.Instance("owned-session")
+    inst.claim("tok")
+    inst.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    killed = []
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    monkeypatch.setattr(op.MUX, "kill_session", lambda s: killed.append(s) or True)
+
+    rc = op.stop_session_only("owned-session")
+
+    assert rc == 0
+    assert killed == [inst.id]
+    # A live supervisor is left in place — it owns relaunching, not us.
+    assert inst.loop_pid_file.exists()
+
+
+def test_stop_session_only_removes_tab_when_no_loop(monkeypatch, tmp_path):
+    inst = op.Instance("no-loop-session")
+    inst.claim("tok")
+    op.register_tab(inst, False, [], tmp_path)
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    monkeypatch.setattr(op.MUX, "kill_session", lambda s: True)
+
+    op.stop_session_only("no-loop-session")
+
+    assert inst.id not in op.load_tabs()
+
+
+# ── interactive menu ─────────────────────────────────────────────
+def test_menu_exits_cleanly_on_blank_input(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    assert op.show_menu() == 0
+
+
+def test_menu_dispatches_selected_action(monkeypatch):
+    called = {"n": 0}
+    monkeypatch.setattr(op, "list_instances", lambda: called.__setitem__("n", 1) or 0)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "1")
+    assert op.show_menu() == 0
+    assert called["n"] == 1
+
+
+def test_menu_rejects_out_of_range_choice(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda prompt="": "999")
+    assert op.show_menu() == 1
+    assert "Out of range" in capsys.readouterr().err
 
 
 def test_is_copilot_running_treats_dead_pane_as_stopped(monkeypatch):

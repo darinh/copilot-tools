@@ -88,8 +88,11 @@ operator --loop --name project-a --agent=anvil:anvil
 operator --loop --name project-b --agent=anvil:anvil
 
 # Management
+operator                             # interactive menu (no args)
 operator list                        # show running instances
-operator stop project-a              # stop one instance
+operator stop project-a              # stop one instance (loop + session)
+operator stop-loop project-a         # stop only the background supervisor
+operator stop-session project-a      # stop only the Copilot session
 operator stop                        # stop all instances
 
 # Reports
@@ -129,13 +132,71 @@ Adds `--yolo --autopilot --no-ask-user` automatically. Sends a preamble that tel
 - How to trigger a restart (create a marker file)
 - To check for session handoff files on startup
 
-The operator polls for the restart marker. When detected, it captures metrics, restarts copilot, and delivers the same preamble.
+`operator --loop` never occupies your invoking terminal with raw supervisor
+logs. It spawns the supervisor as a detached background process, waits for
+the Copilot session to come up, then attaches your current tab to that
+session — the same as running `operator join NAME` right afterward. The
+supervisor keeps running in the background even after you detach (`Ctrl-b d`
+in tmux/psmux, or just closing the tab), watching for restart signals and
+unexpected crashes. If you rerun `operator --loop --name X` while a
+supervisor for `X` is already running, it skips spawning a new one and just
+attaches you to the existing session.
+
+The supervisor polls for the restart marker. When detected, it captures
+metrics, restarts copilot, and delivers the same preamble. If the Copilot
+session disappears **without** a restart/detach/stop marker present (an
+unexpected crash, an OOM kill, a killed pane, etc.), the supervisor treats
+this the same as a restart request and relaunches automatically, up to a
+bounded number of consecutive failures — the loop keeping a project running
+unattended is the whole point of `--loop`.
 
 ```bash
 operator --loop --name myproject --agent=anvil:anvil --model=claude-opus-4.6-1m
 ```
 
-Ctrl+C captures final metrics and shows an aggregate run summary.
+Ctrl+C (from an attached pane) captures final metrics and shows an aggregate run summary.
+
+### Loop vs. session: stopping just one
+
+Loop mode has two independent lifecycles: the background supervisor and the
+Copilot session it's watching. Plain `operator stop NAME` stops both. To
+control them independently:
+
+```bash
+operator stop-loop NAME     # stop only the supervisor; session keeps running
+                             # re-attach any time with `operator join NAME`
+operator stop-session NAME  # stop only the session; if the supervisor is
+                             # still running it relaunches a fresh one shortly
+operator stop NAME          # stop both, cleanly, with no relaunch
+```
+
+This is useful when you want to keep working in a session by hand for a bit
+without the supervisor auto-restarting it out from under you (`stop-loop`),
+or you want to force a clean restart of just the Copilot process while
+leaving the crash-recovery supervisor in place (`stop-session`).
+
+### Interactive menu
+
+Running `operator` with no arguments at all shows an interactive menu instead
+of starting a session:
+
+```
+═══ Copilot Operator ═══
+
+  1) List running instances
+  2) Join a session
+  3) Restore tabs (pick which)
+  4) Restore all tracked tabs
+  5) Stop a loop only (leave its session running)
+  6) Stop a session only (leave its loop running)
+  7) Stop an instance completely (loop + session)
+  8) View usage report
+  9) Exit
+```
+
+It wraps the same operations documented above (`list`, `join`, `restore`,
+`stop-loop`, `stop-session`, `stop`, `report`) behind a single command for
+when you don't remember the exact subcommand or arguments.
 
 ### Auto-Continue
 
