@@ -532,6 +532,61 @@ def test_spawn_background_loop_builds_supervise_command(monkeypatch, tmp_path):
     assert captured["kwargs"]["stdin"] == op.subprocess.DEVNULL
 
 
+def test_spawn_background_loop_uses_no_window_not_detached(monkeypatch, tmp_path):
+    """Regression: a stray console window popped up on `operator --loop`.
+
+    DETACHED_PROCESS leaves the supervisor with no console at all, so when
+    sys.executable is a venv/Store *shim* it re-execs the real python.exe and
+    Windows hands that child a brand new **visible** console. CREATE_NO_WINDOW
+    gives the supervisor an invisible console that all descendants inherit.
+    """
+    if not op.IS_WINDOWS:
+        pytest.skip("creationflags are Windows-only")
+
+    inst = op.Instance("flagcheck")
+    captured = {}
+
+    class FakeProc:
+        pid = 1234
+
+    def fake_popen(cmd, **kwargs):
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(op.subprocess, "Popen", fake_popen)
+    monkeypatch.chdir(tmp_path)
+    op._spawn_background_loop(inst, [], is_fresh=False)
+
+    flags = captured["kwargs"]["creationflags"]
+    assert flags & op.subprocess.CREATE_NO_WINDOW
+    assert flags & op.subprocess.CREATE_NEW_PROCESS_GROUP
+    # DETACHED_PROCESS is what caused the visible window; it must be gone.
+    assert not flags & 0x00000008
+
+
+def test_wsl_probes_suppress_console_window(monkeypatch):
+    """The wsl.exe probes run from the same console-less contexts.
+
+    Injects a sentinel rather than asserting the constant's own value, so the
+    wiring is verified on every platform instead of restating the
+    implementation's platform branch.
+    """
+    monkeypatch.setattr(op, "NO_WINDOW_KWARGS", {"creationflags": 0xABCD})
+    monkeypatch.setattr(op.shutil, "which", lambda name: "wsl.exe")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return op.subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op._wsl_distros()
+    assert seen["creationflags"] == 0xABCD
+    # CREATE_NO_WINDOW rebinds std handles, so capture must stay explicit or
+    # the probe's output would vanish into the hidden console.
+    assert seen["capture_output"] is True
+
+
 # ── default instance naming conflict resolution ─────────────────
 def test_default_instance_name_no_conflict(tmp_path, monkeypatch):
     proj = tmp_path / "myproj"

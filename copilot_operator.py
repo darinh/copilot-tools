@@ -56,6 +56,24 @@ SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
 
 IS_WINDOWS = platform.system() == "Windows"
 
+# Extra Popen/run kwargs for helper subprocesses that must never show a window.
+#
+# On Windows, a process that has no console of its own (for example the
+# background loop supervisor) makes Windows allocate a brand new *visible*
+# console for any console child it starts. CREATE_NO_WINDOW suppresses that.
+#
+# Constraint: CREATE_NO_WINDOW does not merely hide a window, it gives the
+# child a *fresh* invisible console and rebinds its std handles to it. It is
+# therefore safe only on calls that pass explicit pipes/handles
+# (capture_output=True, stdout=DEVNULL, ...). Never apply it to a spawn that
+# has to inherit the caller's terminal, such as an interactive attach or
+# anything whose output the user is meant to read -- that output would be
+# written into the hidden console and silently lost.
+NO_WINDOW_KWARGS: dict = (
+    {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    if IS_WINDOWS else {}
+)
+
 
 def is_wsl() -> bool:
     """True when running inside WSL (Windows Subsystem for Linux).
@@ -426,7 +444,8 @@ def _wsl_distros() -> list[str]:
         # stdin=DEVNULL: wsl.exe otherwise inherits our stdin and can consume
         # bytes meant for the interactive restore picker's input() call.
         out = subprocess.run([wsl, "-l", "-q"], capture_output=True,
-                             stdin=subprocess.DEVNULL, timeout=15, check=False)
+                             stdin=subprocess.DEVNULL, timeout=15, check=False,
+                             **NO_WINDOW_KWARGS)
     except (OSError, subprocess.SubprocessError):
         return []
     if out.returncode != 0:
@@ -455,7 +474,7 @@ def _read_remote_tabs(distro: str) -> dict[str, dict]:
         out = subprocess.run(
             [wsl, "-d", distro, "--", "cat", "$HOME/.operator/tabs.json"],
             capture_output=True, stdin=subprocess.DEVNULL, timeout=15,
-            check=False, shell=False,
+            check=False, shell=False, **NO_WINDOW_KWARGS,
         )
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -1886,6 +1905,16 @@ def _spawn_background_loop(instance: Instance, copilot_args: list[str],
 
     Re-execs this same script with --_supervise so the child runs
     run_loop_mode directly instead of recursing into this function again.
+
+    Windows note: use CREATE_NO_WINDOW, *not* DETACHED_PROCESS. Both detach
+    the child from the parent terminal's console, but DETACHED_PROCESS leaves
+    the child with no console at all -- so the moment it (or any descendant)
+    starts another console program, Windows allocates a brand new *visible*
+    console window for it. That bites immediately here because `sys.executable`
+    is typically a venv/Store shim that re-execs the real python.exe as a
+    child process. CREATE_NO_WINDOW instead gives the supervisor its own
+    console that has no window, and every descendant inherits that invisible
+    console, so nothing ever pops up.
     """
     cmd = [sys.executable, str(Path(__file__).resolve()),
            "--_supervise", "--loop", "--name", instance.display_name]
@@ -1897,7 +1926,7 @@ def _spawn_background_loop(instance: Instance, copilot_args: list[str],
     if IS_WINDOWS:
         kwargs["creationflags"] = (
             subprocess.CREATE_NEW_PROCESS_GROUP
-            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         )
     else:
         kwargs["start_new_session"] = True

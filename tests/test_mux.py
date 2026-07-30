@@ -219,3 +219,68 @@ def test_kill_session_is_idempotent(monkeypatch):
         operator_mux.subprocess, "run", FakeRunner({"has-session": ("", 1)})
     )
     assert mux.kill_session("gone") is False
+
+
+# ── Windows console-window suppression ──────────────────────────
+#
+# Regression tests for the "a python window pops up and stays open" bug.
+# A console-less parent (the `operator --loop` supervisor) makes Windows
+# allocate a fresh *visible* console for any console child it spawns.
+# CREATE_NO_WINDOW suppresses that, but it also rebinds the child's std
+# handles to that new hidden console -- so it must NOT be used for the
+# interactive attach path, which has to inherit the user's real terminal.
+
+
+class FlagRecorder:
+    """Captures the kwargs each subprocess.run call was made with."""
+
+    def __init__(self, results=None):
+        self.results = results or {}
+        self.kwargs = []
+
+    def __call__(self, cmd, **kwargs):
+        self.kwargs.append(kwargs)
+        verb = cmd[1] if len(cmd) > 1 else ""
+        out, rc = self.results.get(verb, ("", 0))
+        return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
+
+
+def test_captured_calls_pass_no_window_flag(monkeypatch):
+    """Control-plane calls must actually forward _POPEN_KWARGS.
+
+    A sentinel is injected rather than asserting the real constant's value,
+    so this tests the *wiring* (which is what regresses) on every platform
+    instead of re-deriving the implementation's own platform branch.
+    """
+    mux = Mux(binary="tmux")
+    monkeypatch.setattr(operator_mux, "_POPEN_KWARGS", {"creationflags": 0xABCD})
+    rec = FlagRecorder({"has-session": ("", 0)})
+    monkeypatch.setattr(operator_mux.subprocess, "run", rec)
+    mux.has_session("s")
+    assert len(rec.kwargs) == 1
+    assert rec.kwargs[0]["creationflags"] == 0xABCD
+
+
+def test_captured_calls_use_explicit_pipes(monkeypatch):
+    """CREATE_NO_WINDOW rebinds std handles, so capture must be explicit.
+
+    Without capture_output the child would write into the new hidden
+    console and its output would be silently lost.
+    """
+    mux = Mux(binary="tmux")
+    rec = FlagRecorder({"list-sessions": ("a\n", 0)})
+    monkeypatch.setattr(operator_mux.subprocess, "run", rec)
+    mux.list_sessions()
+    assert rec.kwargs[0]["capture_output"] is True
+
+
+def test_attach_never_passes_creationflags(monkeypatch):
+    """attach() must inherit the real console or the user sees a dead prompt."""
+    mux = Mux(binary="tmux")
+    monkeypatch.setattr(operator_mux, "_POPEN_KWARGS", {"creationflags": 0xABCD})
+    rec = FlagRecorder({"attach": ("", 0)})
+    monkeypatch.setattr(operator_mux.subprocess, "run", rec)
+    mux.attach("s")
+    assert len(rec.kwargs) == 1
+    assert "creationflags" not in rec.kwargs[0]
+    assert "capture_output" not in rec.kwargs[0]
