@@ -702,3 +702,76 @@ def test_wsl_distros_decodes_utf16(monkeypatch):
     names = op._wsl_distros()
     assert "Ubuntu" in names
     assert "Debian" in names
+
+
+class _FakeStdout:
+    """Captures what the operator writes to the terminal."""
+
+    def __init__(self, tty=True):
+        self.text = ""
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+    def write(self, data):
+        self.text += data
+
+    def flush(self):
+        pass
+
+
+def test_loop_mode_shows_the_animated_tab_ring(monkeypatch):
+    """State 3 is the indeterminate ring Windows Terminal animates."""
+    out = _FakeStdout()
+    monkeypatch.setattr(op.sys, "stdout", out)
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("OPERATOR_NO_TAB_PROGRESS", raising=False)
+    op.set_tab_progress(op.TAB_LOOPING)
+    assert out.text == "\033]9;4;3;100\007"
+
+
+def test_single_session_ring_differs_from_the_loop_ring(monkeypatch):
+    out = _FakeStdout()
+    monkeypatch.setattr(op.sys, "stdout", out)
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("OPERATOR_NO_TAB_PROGRESS", raising=False)
+    op.set_tab_progress(op.TAB_STEADY)
+    assert out.text == "\033]9;4;1;100\007"
+    assert op.TAB_STEADY != op.TAB_LOOPING
+
+
+def test_tab_ring_is_wrapped_for_tmux(monkeypatch):
+    """tmux discards sequences it does not implement unless they are wrapped
+    in its DCS passthrough, with every ESC doubled."""
+    out = _FakeStdout()
+    monkeypatch.setattr(op.sys, "stdout", out)
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")
+    monkeypatch.delenv("OPERATOR_NO_TAB_PROGRESS", raising=False)
+    op.set_tab_progress(op.TAB_LOOPING)
+    assert out.text == "\033Ptmux;\033\033]9;4;3;100\007\033\\"
+
+
+def test_tab_ring_is_silent_when_not_a_terminal(monkeypatch):
+    out = _FakeStdout(tty=False)
+    monkeypatch.setattr(op.sys, "stdout", out)
+    monkeypatch.delenv("OPERATOR_NO_TAB_PROGRESS", raising=False)
+    op.set_tab_progress(op.TAB_LOOPING)
+    assert out.text == ""
+
+
+def test_tab_ring_can_be_switched_off(monkeypatch):
+    out = _FakeStdout()
+    monkeypatch.setattr(op.sys, "stdout", out)
+    monkeypatch.setenv("OPERATOR_NO_TAB_PROGRESS", "1")
+    op.set_tab_progress(op.TAB_LOOPING)
+    assert out.text == ""
+
+
+def test_clearing_the_ring_uses_the_hide_state(monkeypatch):
+    out = _FakeStdout()
+    monkeypatch.setattr(op.sys, "stdout", out)
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("OPERATOR_NO_TAB_PROGRESS", raising=False)
+    op.clear_tab_progress()
+    assert out.text == "\033]9;4;0;0\007"

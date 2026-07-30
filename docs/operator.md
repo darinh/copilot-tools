@@ -270,6 +270,26 @@ operator, drop the stale state without touching the session:
 operator forget NAME
 ```
 
+### Telling a looping tab from an idle one
+
+The tab title is set to `operator - NAME` (or `terminal - NAME` when you
+join), and the operator also emits the OSC `9;4` progress sequence, which
+Windows Terminal and ConEmu draw as a ring on the tab itself:
+
+| Tab shows | Meaning |
+|---|---|
+| Animated indeterminate ring | Loop mode — the agent is running unattended |
+| Steady ring | A single interactive session, or a join |
+| No ring | Nothing running in that tab |
+
+The animation is the closest a terminal gets to an animated tab icon:
+custom icons (`"icon"` in a Windows Terminal profile) are static images
+only, and are per-profile rather than per-tab, so they cannot reflect state.
+Terminals that do not implement the sequence ignore it. Inside tmux the
+sequence is sent through tmux's DCS passthrough, which requires
+`set -g allow-passthrough on` (tmux 3.3+) to reach the outer terminal. Set
+`OPERATOR_NO_TAB_PROGRESS=1` to turn the ring off entirely.
+
 ### Restoring tabs after a reboot or crash
 
 Windows Terminal (and most terminal apps) expose no API to list their own

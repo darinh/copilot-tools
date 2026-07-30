@@ -19,6 +19,7 @@ never under ``~/.copilot``, which the Copilot CLI wholesale-deletes on startup.
 """
 from __future__ import annotations
 
+import atexit
 import csv
 import json
 import os
@@ -140,6 +141,42 @@ def set_tab_title(title: str) -> None:
     if sys.stdout.isatty():
         sys.stdout.write(f"\033]0;{title}\007")
         sys.stdout.flush()
+
+
+# Windows Terminal, ConEmu and a few others draw OSC 9;4 as a progress ring on
+# the tab itself. State 3 is an animated indeterminate ring, which is as close
+# to an animated tab icon as a terminal gets: custom icons are static images.
+TAB_IDLE = 0
+TAB_STEADY = 1
+TAB_ERROR = 2
+TAB_LOOPING = 3
+TAB_WAITING = 4
+
+
+def set_tab_progress(state: int, value: int = 100) -> None:
+    """Show a state ring on the terminal tab. Terminals that do not know the
+    sequence ignore it, so this is safe everywhere."""
+    if os.environ.get("OPERATOR_NO_TAB_PROGRESS"):
+        return
+    if not sys.stdout.isatty():
+        return
+    sequence = f"\033]9;4;{state};{value}\007"
+    if os.environ.get("TMUX"):
+        # tmux drops sequences it does not implement unless they are wrapped in
+        # its DCS passthrough (and allow-passthrough is on).
+        sequence = "\033Ptmux;" + sequence.replace("\033", "\033\033") + "\033\\"
+    try:
+        sys.stdout.write(sequence)
+        sys.stdout.flush()
+    except OSError:
+        pass
+
+
+def clear_tab_progress() -> None:
+    set_tab_progress(TAB_IDLE, 0)
+
+
+atexit.register(clear_tab_progress)
 
 
 def migrate_legacy_state() -> None:
@@ -1320,6 +1357,7 @@ def join_instance(target: str | None) -> int:
     instance = Instance(target)
     if MUX.has_session(instance.session):
         set_tab_title(f"terminal - {instance.display_name}")
+        set_tab_progress(TAB_LOOPING if _running_loop_pid(instance) else TAB_STEADY)
         MUX.attach(instance.session)
         return 0
     print(f"No instance '{target}' found.", file=sys.stderr)
@@ -1457,6 +1495,7 @@ def run_single_session(instance: Instance, copilot_args: list[str]) -> int:
 
     start_session(instance, args, 1, remain_on_exit=False)
     set_tab_title(f"operator - {instance.display_name}")
+    set_tab_progress(TAB_STEADY)
     MUX.attach(instance.session)
 
     if MUX.has_session(instance.session) and not instance.exit_file.exists():
@@ -1551,6 +1590,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
     log(f"  Attach: operator join {instance.display_name}")
     log("═══════════════════════════════════════════")
     set_tab_title(f"operator - {instance.display_name}")
+    set_tab_progress(TAB_LOOPING)
 
     session_num = start_session_num
     last_launched = 0
@@ -1973,6 +2013,7 @@ def start_and_attach_loop(instance: Instance, copilot_args: list[str],
         return 1
 
     set_tab_title(f"operator - {instance.display_name}")
+    set_tab_progress(TAB_LOOPING)
     MUX.attach(instance.session)
     return 0
 
@@ -2072,6 +2113,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate = Instance(head)
         if MUX.available() and MUX.has_session(candidate.session):
             set_tab_title(f"terminal - {candidate.display_name}")
+            set_tab_progress(TAB_LOOPING if _running_loop_pid(candidate) else TAB_STEADY)
             MUX.attach(candidate.session)
             return 0
 

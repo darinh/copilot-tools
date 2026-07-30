@@ -101,6 +101,29 @@ set_tab_title() {
     fi
 }
 
+# Windows Terminal and ConEmu draw OSC 9;4 as a progress ring on the tab
+# itself. State 3 is an animated indeterminate ring, which is as close to an
+# animated tab icon as a terminal gets: custom icons are static images.
+# States: 0 clear, 1 steady, 2 error, 3 animated (loop), 4 waiting.
+set_tab_progress() {
+    [[ -n "${OPERATOR_NO_TAB_PROGRESS:-}" ]] && return 0
+    [[ -t 1 ]] || return 0
+    local seq
+    printf -v seq '\033]9;4;%s;%s\007' "$1" "${2:-100}"
+    if [[ -n "${TMUX:-}" ]]; then
+        # tmux drops sequences it does not implement unless they are wrapped
+        # in its DCS passthrough (and allow-passthrough is on).
+        printf '\033Ptmux;%s\033\\' "${seq//$'\033'/$'\033\033'}"
+    else
+        printf '%s' "$seq"
+    fi
+}
+
+clear_tab_progress() {
+    set_tab_progress 0 0
+}
+trap clear_tab_progress EXIT
+
 derive_instance_paths() {
     local name="$1"
     INSTANCE_NAME="$name"
@@ -980,6 +1003,7 @@ run_single_session() {
     start_copilot_in_tmux 1 off
 
     set_tab_title "operator - $INSTANCE_NAME"
+    set_tab_progress 1
     tmux attach -t "$TMUX_SESSION" 2>/dev/null || true
 
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
@@ -1051,6 +1075,7 @@ run_loop_mode() {
     log "═══════════════════════════════════════════"
 
     set_tab_title "operator - $INSTANCE_NAME"
+    set_tab_progress 3
 
     for session_num in $(seq "$start_session" "$MAX_SESSIONS"); do
         CURRENT_SESSION_NUM=$session_num
@@ -1125,6 +1150,7 @@ join_instance() {
     target="$(sanitize_session_name "$target")"
     if tmux has-session -t "$target" 2>/dev/null; then
         set_tab_title "terminal - $target"
+        set_tab_progress 1
         exec tmux attach -t "$target"
     else
         echo "No instance '$target' found." >&2
@@ -1223,6 +1249,7 @@ main() {
     if [[ $# -eq 1 && "${1:-}" != --* && -n "${1:-}" ]] && ! is_reserved_word "${1:-}"; then
         if tmux has-session -t "$1" 2>/dev/null; then
             set_tab_title "terminal - $1"
+            set_tab_progress 1
             exec tmux attach -t "$1"
         fi
     fi
