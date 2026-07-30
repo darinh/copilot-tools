@@ -93,9 +93,14 @@ def test_unsafe_session_name_is_rejected_loudly(tmp_path):
 
 
 def test_remain_on_exit_keeps_session_after_program_exits(session, tmp_path):
-    MUX.new_session(session, str(tmp_path), [sys.executable, "-c", "pass"])
+    # The program has to outlive the set_remain_on_exit call: a program that
+    # has already exited takes its pane (and the session) with it, so the
+    # option would be set on nothing and the pane could never report dead.
+    MUX.new_session(session, str(tmp_path),
+                    [sys.executable, "-c", "import time; time.sleep(5)"])
+    assert _wait(lambda: MUX.has_session(session), timeout=10)
     MUX.set_remain_on_exit(session, True)
-    assert _wait(lambda: MUX.pane_dead(session), timeout=20)
+    assert _wait(lambda: MUX.pane_dead(session), timeout=30)
     assert MUX.has_session(session)
 
 
