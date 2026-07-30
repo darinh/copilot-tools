@@ -41,6 +41,14 @@ import sys
 import time
 from pathlib import Path
 
+# `operator_ingest` is imported lazily below. When this module runs as the
+# installed `operator-runner` console script rather than by path, an editable
+# install's frozen module list is the only thing that can resolve it, so make
+# our own directory importable as a fallback.
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 SESSION_ID_TIMEOUT = 20
 LOG_PIN_TIMEOUT = 30
 TREE_SETTLE_SECONDS = 1.5

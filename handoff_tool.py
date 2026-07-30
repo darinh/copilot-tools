@@ -22,9 +22,18 @@ import platform
 import sys
 from pathlib import Path
 
-from operator_console import enable_utf8_output
-from operator_mux import Mux, MuxError, safe_instance_id
-from project_paths import primary_repo_root
+# An editable install freezes the module list into its import finder, so a
+# module added to this directory after the last `pip install -e .` is invisible
+# to the installed `handoff` entry point even though the file sits right here.
+# Making our own directory importable turns that stale-install failure into a
+# no-op instead of a traceback on startup.
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from operator_console import enable_utf8_output               # noqa: E402
+from operator_mux import Mux, MuxError, safe_instance_id      # noqa: E402
+from project_paths import primary_repo_root                   # noqa: E402
 
 IS_WINDOWS = platform.system() == "Windows"
 CATALOG = Path.home() / ".copilot" / "projects" / "catalog.csv"
