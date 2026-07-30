@@ -292,15 +292,19 @@ operator tabs clear
 ```
 
 After a reboot or crash every multiplexer server and Copilot process is gone,
-so there is nothing left to reattach to. `operator restore` (run from Windows
-PowerShell — it needs `wt.exe`) reads the local registry plus every installed
-WSL distro's registry (queried live via `wsl.exe -d <distro> -- cat
+so there is nothing left to reattach to. `operator restore` needs Windows
+Terminal reachable on PATH (`wt.exe`), so run it from native Windows
+PowerShell **or from within a WSL distro** (Windows interop must be enabled).
+It reads the local machine's registry plus every installed WSL distro's
+registry (queried live via `wsl.exe -d <distro> -- cat
 ~/.operator/tabs.json`, so it works regardless of that distro's `$HOME` layout
 or `COPILOT_OPERATOR_HOME`), then opens a single Windows Terminal window with
-a tab per selected instance, replaying each command line. The operator's
-existing auto-continue logic (session numbering + saved `--resume=<uuid>`)
-takes it from there, so each Copilot session resumes rather than starting
-over.
+a tab per selected instance, replaying each command line. When run from
+inside WSL, only this machine's WSL registries are visible — restore can't
+see a native Windows-side registry from there, and vice versa; each side only
+knows about its own tracked tabs. The operator's existing auto-continue logic
+(session numbering + saved `--resume=<uuid>`) takes it from there, so each
+Copilot session resumes rather than starting over.
 
 ```bash
 # List tracked tabs and choose which to restore
@@ -451,10 +455,14 @@ id.
 **Can't attach to a session**
 Find the name with `operator list`, then: `operator join myproject`
 
-**"operator restore must be run from Windows PowerShell"**
-`restore` shells out to `wt.exe`, which only exists on Windows. From WSL/Linux,
-just start the loop directly (`operator --loop --name myproject ...`) — its own
-auto-continue logic will resume the prior session.
+**"operator restore needs Windows Terminal (wt.exe)"**
+`restore` shells out to `wt.exe`, which only exists on Windows. It's reachable
+from native Windows PowerShell and from within WSL (via Windows interop), but
+not from plain Linux or macOS. On those platforms, just start the loop
+directly (`operator --loop --name myproject ...`) — its own auto-continue
+logic will resume the prior session. If you're in WSL and still see this
+error, check that interop is enabled (`/etc/wsl.conf`: `[interop]
+enabled=true`, `appendWindowsPath=true`) so `wt.exe`/`wsl.exe` resolve on PATH.
 
 **`operator restore` reopens nothing**
 Only named instances (`--name`/`--loop`) started inside a Windows Terminal tab

@@ -50,6 +50,21 @@ _RESERVED = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 
+# On Windows, a process with no console of its own (e.g. `operator --loop`'s
+# background supervisor) auto-allocates a brand-new *visible* console for any
+# plain console-subsystem child it spawns. CREATE_NO_WINDOW suppresses that.
+#
+# Important: CREATE_NO_WINDOW does not merely hide a window, it gives the child
+# a *fresh* invisible console and rebinds its std handles to it. That is
+# harmless -- and correct -- for the captured control-plane calls below, which
+# pass explicit pipes for stdout/stderr and so never touch the console. It is
+# NOT safe for `attach`, which must inherit the user's real terminal to render
+# the interactive session; applying it there would leave the user staring at a
+# dead prompt. Hence this is applied only to the capturing branch of _run().
+_POPEN_KWARGS: dict[str, int] = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW} if platform.system() == "Windows" else {}
+)
+
 
 class MuxError(Exception):
     """Base class for multiplexer failures."""
@@ -161,6 +176,8 @@ class Mux:
     def _run(self, *args: str, capture: bool = True) -> tuple[str, str, int]:
         cmd = [self.binary, *args]
         if not capture:
+            # No _POPEN_KWARGS here: this is the interactive `attach` path and
+            # it must inherit the caller's real console. See _POPEN_KWARGS.
             return "", "", subprocess.run(cmd).returncode
         proc = subprocess.run(
             cmd,
@@ -168,6 +185,7 @@ class Mux:
             text=True,
             encoding="utf-8",
             errors="replace",
+            **_POPEN_KWARGS,
         )
         return (proc.stdout or "").strip(), (proc.stderr or "").strip(), proc.returncode
 

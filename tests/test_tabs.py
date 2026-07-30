@@ -138,11 +138,120 @@ def test_manage_tabs_unknown_subcommand():
     assert op.manage_tabs(["bogus"]) == 1
 
 
+# ── is_wsl() detection ───────────────────────────────────────────
+def test_is_wsl_true_from_env_var(monkeypatch):
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    assert op.is_wsl() is True
+
+
+def test_is_wsl_true_from_proc_version(monkeypatch):
+    monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+    def fake_read_text(self, **k):
+        if self.as_posix() == "/proc/version":
+            return "Linux version ... Microsoft ..."
+        raise OSError("no such file")
+
+    monkeypatch.setattr(op.Path, "read_text", fake_read_text)
+    assert op.is_wsl() is True
+
+
+def test_is_wsl_false_on_plain_linux(monkeypatch):
+    monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+
+    def fake_read_text(self, **k):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(op.Path, "read_text", fake_read_text)
+    assert op.is_wsl() is False
+
+
+def test_is_wsl_false_when_proc_version_lacks_microsoft(monkeypatch):
+    monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+    monkeypatch.setattr(op.Path, "read_text", lambda self, **k: "Linux version 6.8.0-generic")
+    assert op.is_wsl() is False
+
+
 # ── restore: platform / dependency gating ───────────────────────
-def test_restore_requires_windows(monkeypatch):
+def test_restore_dies_on_plain_linux_without_wsl(monkeypatch):
     monkeypatch.setattr(op, "IS_WINDOWS", False)
+    monkeypatch.setattr(op, "is_wsl", lambda: False)
     with pytest.raises(SystemExit):
         op.restore_tabs([])
+
+
+def test_restore_dies_from_wsl_without_wt_reachable(monkeypatch):
+    monkeypatch.setenv("WT_SESSION", "some-guid")
+    op.register_tab(op.Instance("proj"), False, [], Path("/home/me/proj"))
+    monkeypatch.setattr(op, "IS_WINDOWS", False)
+    monkeypatch.setattr(op, "is_wsl", lambda: True)
+    monkeypatch.setattr(op, "_wsl_distros", lambda: [])
+    monkeypatch.setattr(op.shutil, "which", lambda name: None)
+    with pytest.raises(SystemExit):
+        op.restore_tabs(["--all"])
+
+
+def test_restore_works_from_wsl_when_wt_reachable(monkeypatch, capsys):
+    monkeypatch.setenv("WT_SESSION", "some-guid")
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    inst = op.Instance("proj")
+    expected_cwd = str(Path("/home/me/proj"))
+    op.register_tab(inst, False, [], Path("/home/me/proj"))
+    monkeypatch.setattr(op, "IS_WINDOWS", False)
+    monkeypatch.setattr(op, "is_wsl", lambda: True)
+    monkeypatch.setattr(op, "_wsl_distros", lambda: ["Ubuntu"])
+    monkeypatch.setattr(op.shutil, "which", lambda name: "wt.exe" if "wt" in name else None)
+
+    launched = []
+    monkeypatch.setattr(op.subprocess, "Popen", lambda cmd, **k: launched.append(cmd))
+
+    assert op.restore_tabs(["--all"]) == 0
+    assert len(launched) == 1
+    joined = " ".join(launched[0])
+    assert "Ubuntu" in joined
+    assert expected_cwd in joined
+    out = capsys.readouterr().out
+    assert "Running inside WSL" in out
+
+
+def test_restore_wsl_does_not_double_count_current_distro(monkeypatch):
+    """`_wsl_distros()` enumerates every installed distro, including the one
+    this process is itself running inside. Its entries are already covered by
+    `load_tabs()` (the local registry), so re-reading it via `wsl.exe -d
+    <this-distro>` must not duplicate every tracked tab."""
+    monkeypatch.setenv("WT_SESSION", "some-guid")
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    inst = op.Instance("proj")
+    op.register_tab(inst, False, [], Path("/home/me/proj"))
+    monkeypatch.setattr(op, "IS_WINDOWS", False)
+    monkeypatch.setattr(op, "is_wsl", lambda: True)
+    monkeypatch.setattr(op, "_wsl_distros", lambda: ["Ubuntu", "Debian"])
+
+    remote_calls = []
+
+    def fake_read_remote(distro):
+        remote_calls.append(distro)
+        return {}
+
+    monkeypatch.setattr(op, "_read_remote_tabs", fake_read_remote)
+
+    entries = op._collect_tab_entries()
+    assert remote_calls == ["Debian"], "the current distro must not be re-queried remotely"
+    assert len(entries) == 1
+    assert entries[0][0] == f"local:{inst.id}"
+
+
+def test_restore_native_windows_still_merges_all_wsl_distros(monkeypatch):
+    """Sanity check that the current-distro skip is a no-op on native
+    Windows, where WSL_DISTRO_NAME is never set."""
+    monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+    monkeypatch.setattr(op, "_wsl_distros", lambda: ["Ubuntu", "Debian"])
+    monkeypatch.setattr(op, "_read_remote_tabs", lambda distro: {
+        f"{distro}-inst": {"display_name": distro, "cwd": f"/home/me/{distro}",
+                           "argv": [], "wsl_distro": distro}
+    })
+    entries = op._collect_tab_entries()
+    idents = [ident for ident, _ in entries]
+    assert idents == ["Ubuntu:Ubuntu-inst", "Debian:Debian-inst"]
 
 
 def test_restore_reports_nothing_to_do(monkeypatch, capsys):
@@ -421,6 +530,61 @@ def test_spawn_background_loop_builds_supervise_command(monkeypatch, tmp_path):
     assert "--fresh" in cmd
     assert "--agent" in cmd and "x:y" in cmd
     assert captured["kwargs"]["stdin"] == op.subprocess.DEVNULL
+
+
+def test_spawn_background_loop_uses_no_window_not_detached(monkeypatch, tmp_path):
+    """Regression: a stray console window popped up on `operator --loop`.
+
+    DETACHED_PROCESS leaves the supervisor with no console at all, so when
+    sys.executable is a venv/Store *shim* it re-execs the real python.exe and
+    Windows hands that child a brand new **visible** console. CREATE_NO_WINDOW
+    gives the supervisor an invisible console that all descendants inherit.
+    """
+    if not op.IS_WINDOWS:
+        pytest.skip("creationflags are Windows-only")
+
+    inst = op.Instance("flagcheck")
+    captured = {}
+
+    class FakeProc:
+        pid = 1234
+
+    def fake_popen(cmd, **kwargs):
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(op.subprocess, "Popen", fake_popen)
+    monkeypatch.chdir(tmp_path)
+    op._spawn_background_loop(inst, [], is_fresh=False)
+
+    flags = captured["kwargs"]["creationflags"]
+    assert flags & op.subprocess.CREATE_NO_WINDOW
+    assert flags & op.subprocess.CREATE_NEW_PROCESS_GROUP
+    # DETACHED_PROCESS is what caused the visible window; it must be gone.
+    assert not flags & 0x00000008
+
+
+def test_wsl_probes_suppress_console_window(monkeypatch):
+    """The wsl.exe probes run from the same console-less contexts.
+
+    Injects a sentinel rather than asserting the constant's own value, so the
+    wiring is verified on every platform instead of restating the
+    implementation's platform branch.
+    """
+    monkeypatch.setattr(op, "NO_WINDOW_KWARGS", {"creationflags": 0xABCD})
+    monkeypatch.setattr(op.shutil, "which", lambda name: "wsl.exe")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return op.subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op._wsl_distros()
+    assert seen["creationflags"] == 0xABCD
+    # CREATE_NO_WINDOW rebinds std handles, so capture must stay explicit or
+    # the probe's output would vanish into the hidden console.
+    assert seen["capture_output"] is True
 
 
 # ── default instance naming conflict resolution ─────────────────

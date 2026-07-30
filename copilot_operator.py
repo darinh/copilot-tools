@@ -56,6 +56,40 @@ SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
 
 IS_WINDOWS = platform.system() == "Windows"
 
+# Extra Popen/run kwargs for helper subprocesses that must never show a window.
+#
+# On Windows, a process that has no console of its own (for example the
+# background loop supervisor) makes Windows allocate a brand new *visible*
+# console for any console child it starts. CREATE_NO_WINDOW suppresses that.
+#
+# Constraint: CREATE_NO_WINDOW does not merely hide a window, it gives the
+# child a *fresh* invisible console and rebinds its std handles to it. It is
+# therefore safe only on calls that pass explicit pipes/handles
+# (capture_output=True, stdout=DEVNULL, ...). Never apply it to a spawn that
+# has to inherit the caller's terminal, such as an interactive attach or
+# anything whose output the user is meant to read -- that output would be
+# written into the hidden console and silently lost.
+NO_WINDOW_KWARGS: dict = (
+    {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    if IS_WINDOWS else {}
+)
+
+
+def is_wsl() -> bool:
+    """True when running inside WSL (Windows Subsystem for Linux).
+
+    ``platform.system()`` reports ``"Linux"`` for WSL, so this is a separate
+    check for anything (like `operator restore`) that needs to know whether
+    Windows Terminal / ``wt.exe`` might be reachable via interop.
+    """
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text(
+            encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+
 
 # ── paths ───────────────────────────────────────────────────────
 def operator_home() -> Path:
@@ -410,7 +444,8 @@ def _wsl_distros() -> list[str]:
         # stdin=DEVNULL: wsl.exe otherwise inherits our stdin and can consume
         # bytes meant for the interactive restore picker's input() call.
         out = subprocess.run([wsl, "-l", "-q"], capture_output=True,
-                             stdin=subprocess.DEVNULL, timeout=15, check=False)
+                             stdin=subprocess.DEVNULL, timeout=15, check=False,
+                             **NO_WINDOW_KWARGS)
     except (OSError, subprocess.SubprocessError):
         return []
     if out.returncode != 0:
@@ -439,7 +474,7 @@ def _read_remote_tabs(distro: str) -> dict[str, dict]:
         out = subprocess.run(
             [wsl, "-d", distro, "--", "cat", "$HOME/.operator/tabs.json"],
             capture_output=True, stdin=subprocess.DEVNULL, timeout=15,
-            check=False, shell=False,
+            check=False, shell=False, **NO_WINDOW_KWARGS,
         )
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -486,7 +521,14 @@ def _collect_tab_entries() -> list[tuple[str, dict]]:
     local = load_tabs()
     combined: list[tuple[str, dict]] = [(f"local:{k}", v) for k, v in local.items()]
 
+    # When this process is itself running inside a WSL distro, that distro's
+    # own registry is already included above via `local` -- querying it again
+    # through `wsl.exe -d <this-distro>` would duplicate every entry. This is
+    # a no-op on native Windows, where $WSL_DISTRO_NAME is never set.
+    current_distro = os.environ.get("WSL_DISTRO_NAME", "")
     for distro in _wsl_distros():
+        if current_distro and distro == current_distro:
+            continue
         remote = _read_remote_tabs(distro)
         for ident, meta in remote.items():
             meta = dict(meta)
@@ -543,9 +585,15 @@ def restore_tabs(args: list[str]) -> int:
     restores every tracked tab without prompting. Display names given as
     positional arguments restore exactly those, without prompting.
     """
-    if not IS_WINDOWS:
-        die("operator restore must be run from Windows PowerShell — it needs "
-            "wt.exe, which is only available there.")
+    if not IS_WINDOWS and not is_wsl():
+        die("operator restore needs Windows Terminal (wt.exe), which is only "
+            "reachable from native Windows or from within WSL (with Windows "
+            "interop enabled).")
+    if is_wsl() and not IS_WINDOWS:
+        print("(Running inside WSL — this only sees this machine's local and "
+              "sibling-WSL-distro tab registries, not a native Windows-side "
+              "registry. Run `operator restore` from Windows PowerShell for "
+              "that.)\n")
     dry_run = "--dry-run" in args or "--list" in args
     restore_all = "--all" in args
     names = [a for a in args if not a.startswith("--")]
@@ -1747,13 +1795,17 @@ TAB RESTORE
     ~/.operator/tabs.json recording the directory and the exact `operator`
     command line used. `operator stop`/`forget` drop the entry again.
 
-    `operator restore` (run from Windows PowerShell, since it needs wt.exe)
-    reads the local registry plus every installed WSL distro's registry (via
-    `wsl.exe -d <distro>`), then opens one Windows Terminal window with a tab
-    per selected instance, replaying each command line. A reboot kills every
-    multiplexer server, so there is nothing to reattach to — restore simply
-    relaunches, and the existing auto-continue/--resume logic picks each
-    Copilot session back up rather than starting fresh.
+    `operator restore` needs Windows Terminal (`wt.exe`) reachable on PATH,
+    so run it from native Windows PowerShell or from within a WSL distro
+    (Windows interop must be enabled). It reads the local machine's registry
+    plus every installed WSL distro's registry (via `wsl.exe -d <distro>`),
+    then opens one Windows Terminal window with a tab per selected instance,
+    replaying each command line. When run from inside WSL, only this
+    machine's WSL registries are visible — a native Windows-side registry
+    can't be seen from there. A reboot kills every multiplexer server, so
+    there is nothing to reattach to — restore simply relaunches, and the
+    existing auto-continue/--resume logic picks each Copilot session back up
+    rather than starting fresh.
 
     With no arguments, `operator restore` lists tracked tabs and prompts for
     which to restore. `operator restore --all` restores every tracked tab
@@ -1853,6 +1905,16 @@ def _spawn_background_loop(instance: Instance, copilot_args: list[str],
 
     Re-execs this same script with --_supervise so the child runs
     run_loop_mode directly instead of recursing into this function again.
+
+    Windows note: use CREATE_NO_WINDOW, *not* DETACHED_PROCESS. Both detach
+    the child from the parent terminal's console, but DETACHED_PROCESS leaves
+    the child with no console at all -- so the moment it (or any descendant)
+    starts another console program, Windows allocates a brand new *visible*
+    console window for it. That bites immediately here because `sys.executable`
+    is typically a venv/Store shim that re-execs the real python.exe as a
+    child process. CREATE_NO_WINDOW instead gives the supervisor its own
+    console that has no window, and every descendant inherits that invisible
+    console, so nothing ever pops up.
     """
     cmd = [sys.executable, str(Path(__file__).resolve()),
            "--_supervise", "--loop", "--name", instance.display_name]
@@ -1864,7 +1926,7 @@ def _spawn_background_loop(instance: Instance, copilot_args: list[str],
     if IS_WINDOWS:
         kwargs["creationflags"] = (
             subprocess.CREATE_NEW_PROCESS_GROUP
-            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         )
     else:
         kwargs["start_new_session"] = True
