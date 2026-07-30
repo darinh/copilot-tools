@@ -27,6 +27,7 @@ import platform
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -38,6 +39,7 @@ from typing import Callable
 import operator_ingest
 from operator_console import enable_utf8_output
 from operator_mux import Mux, MuxError, MuxNotFoundError, safe_instance_id
+from project_paths import primary_repo_root
 
 __version__ = "1.0.0"
 
@@ -888,11 +890,14 @@ def project_handoff_file(cwd: Path) -> Path | None:
     catalog ``handoff``/``handoff_tool.py`` use) and returns the path the
     handoff file *would* live at, regardless of whether it currently exists.
     Returns None if the directory has no catalog entry at all.
+
+    The lookup is keyed on the primary checkout, so running from a worktree
+    finds the project's real entry instead of reporting it unregistered.
     """
     catalog = project_catalog_path()
     if not catalog.is_file():
         return None
-    target = str(cwd.resolve())
+    target = str(primary_repo_root(cwd).resolve())
     if IS_WINDOWS:
         target = target.lower()
     try:
@@ -1180,27 +1185,18 @@ def handle_existing_session(instance: Instance) -> None:
 
 # ── commands ────────────────────────────────────────────────────
 def list_instances() -> int:
+    """Non-interactive listing — the scriptable counterpart to bare
+    ``operator``, which lists the same instances and then lets you act on
+    one."""
     print("═══ Running Operator Instances ═══\n")
-    managed = managed_instances()
-    live = set(MUX.list_sessions()) if MUX.available() else set()
-    found = False
-    for ident in sorted(managed):
-        if ident not in live:
-            continue
-        meta = managed[ident]
-        display = meta.get("display_name", ident)
-        inst = Instance(display)
-        # A live session with only continuity state behind it is not ours.
-        owned = inst.owns_live_session()
-        label = display if display == ident else f"{display} (session: {ident})"
-        if not owned:
-            label += "  [name in use by an unowned session]"
-        print(f"  {label}")
-        found = True
-    if not found:
+    instances = active_instances()
+    for inst in instances:
+        print(f"  {_instance_summary(instance_snapshot(inst))}")
+    if not instances:
         print("  (none)")
-    print("\nAttach: operator join <name>")
-    print("Stop:   operator stop <name>")
+    print("\nInspect: operator             (interactive: stats, join, stop)")
+    print("Attach:  operator join <name>")
+    print("Stop:    operator stop <name>")
     return 0
 
 
@@ -1809,9 +1805,12 @@ LOOP VS. SESSION
         operator stop NAME            Stop both, cleanly, with no relaunch.
 
 MENU
-    Running `operator` with no arguments at all shows an interactive menu:
-    list instances, join a session, restore tabs (all or picked), stop a
-    loop only, stop a session only, or stop an instance completely.
+    Running `operator` with no arguments at all opens an interactive menu.
+    Pick "Sessions" to see everything that is running, select one, and read
+    its stats — which loop session it is on, how long the run has been going,
+    the loop supervisor and Copilot pids, its directory and recorded usage.
+    From there you can join it, stop just its loop, stop just its session, or
+    stop it completely. The menu stays open until you choose Exit.
 
 REPORTS
     operator report summary       AI credit totals (today, week, all time)
@@ -2026,45 +2025,321 @@ def _prompt_line(prompt: str) -> str:
         return ""
 
 
-def show_menu() -> int:
-    """Bare `operator` (no arguments): an interactive action picker.
+# ── interactive session browser ─────────────────────────────────
+def _parse_utc(stamp: str) -> datetime | None:
+    """Parse the operator's own ``%Y-%m-%dT%H:%M:%SZ`` timestamps."""
+    try:
+        return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
 
-    Exists so juggling loops and sessions never requires memorizing exact
-    subcommand names — list what's running, then pick an action.
+
+def _fmt_elapsed(seconds: float) -> str:
+    total = int(max(0, seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _age_since(stamp: str) -> str:
+    started = _parse_utc(stamp)
+    if started is None:
+        return "unknown"
+    return _fmt_elapsed((datetime.now(timezone.utc) - started).total_seconds())
+
+
+def _shorten_home(path: str) -> str:
+    home = str(HOME)
+    return "~" + path[len(home):] if path.startswith(home) else path
+
+
+def instance_snapshot(instance: Instance) -> dict:
+    """Everything the browser needs in order to describe one instance.
+
+    Reads only state that already exists on disk, so it is safe to call
+    repeatedly — refreshing the view never disturbs a running session.
     """
-    print("═══ Copilot Operator ═══\n")
-    options: list[tuple[str, Callable[[], int]]] = [
-        ("List running instances", list_instances),
-        ("Join a session", lambda: join_instance(_prompt_line("Instance name: "))),
-        ("Restore tabs (pick which)", lambda: restore_tabs([])),
-        ("Restore all tracked tabs", lambda: restore_tabs(["--all"])),
-        ("Stop a loop only (leave its session running)",
-         lambda: stop_loop_only(_prompt_line("Instance name: "))),
-        ("Stop a session only (leave its loop running)",
-         lambda: stop_session_only(_prompt_line("Instance name: "))),
-        ("Stop an instance completely (loop + session)",
-         lambda: stop_operator(_prompt_line("Instance name: "))),
-        ("View usage report", lambda: report_metrics("summary")),
-        ("Exit", None),
-    ]
-    for i, (label, _) in enumerate(options, 1):
-        print(f"  {i}) {label}")
+    state = instance.load_state() or {}
+    owner = instance.ownership() or {}
+    try:
+        session_num = int(state.get("SESSION_NUM", 0) or 0)
+    except ValueError:
+        session_num = 0
+    spec: dict = {}
+    if instance.spec_file.exists():
+        try:
+            spec = json.loads(instance.spec_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            spec = {}
+    cwd = spec.get("cwd") or (load_tabs().get(instance.id) or {}).get("cwd") or ""
+    session_live = MUX.available() and MUX.has_session(instance.session)
+    return {
+        "instance": instance,
+        "name": instance.display_name,
+        "id": instance.id,
+        "session_live": session_live,
+        # Ownership gates every destructive action, so the browser has to
+        # surface it: a same-named session we did not start is look-only.
+        "owned": session_live and instance.owns_live_session(),
+        "loop_pid": _running_loop_pid(instance),
+        "session_num": session_num,
+        "run_started": state.get("RUN_STARTED", "") or owner.get("claimed_at", ""),
+        "copilot_session_id": (state.get("COPILOT_SESSION_ID", "")
+                               or instance.read_session_id()),
+        "copilot_pid": instance.copilot_pid(),
+        "cwd": cwd,
+        "argv": list(spec.get("argv") or []),
+    }
+
+
+def _status_label(snap: dict) -> str:
+    if snap["loop_pid"] and snap["session_live"]:
+        return f"looping · session #{snap['session_num'] or 1}"
+    if snap["loop_pid"]:
+        return "looping · starting next session"
+    if snap["session_live"]:
+        return "single session · no loop"
+    return "stopped"
+
+
+def _instance_summary(snap: dict) -> str:
+    parts = [snap["name"], _status_label(snap)]
+    if snap["run_started"]:
+        parts.append(f"up {_age_since(snap['run_started'])}")
+    if snap["cwd"]:
+        parts.append(_shorten_home(snap["cwd"]))
+    if snap["session_live"] and not snap["owned"]:
+        parts.append("[unowned session]")
+    return "  ·  ".join(parts)
+
+
+def active_instances() -> list[Instance]:
+    """Managed instances with a live session and/or a live loop supervisor.
+
+    A loop between sessions has no session for a few seconds, and a session
+    whose loop was stopped has no supervisor. Both are exactly the states a
+    user needs to act on, so neither one alone may exclude an instance.
+    """
+    live = set(MUX.list_sessions()) if MUX.available() else set()
+    found: list[Instance] = []
+    for ident, meta in sorted(managed_instances().items()):
+        inst = Instance(meta.get("display_name", ident))
+        if inst.id in live or _running_loop_pid(inst) is not None:
+            found.append(inst)
+    return found
+
+
+def _recorded_usage(cwd: str) -> str:
+    """Spend already recorded for this directory, as one line.
+
+    Metrics are keyed by working directory rather than by instance name, so
+    this is the project's total across every run — not just this one.
+    """
+    if not cwd or not METRICS_DB.exists():
+        return ""
+    try:
+        rows, _ = _query(f"""
+            SELECT COUNT(*) AS n,
+                   printf('%.1f', {_credits()}) AS credits,
+                   printf('$%.2f', {_usd()}) AS est_cost
+            FROM sessions WHERE no_op = 0 AND work_dir = ?
+        """, (cwd,))
+    except sqlite3.Error:
+        return ""
+    if not rows or not rows[0][0]:
+        return ""
+    count, credits, cost = rows[0][0], rows[0][1], rows[0][2]
+    return f"{count} recorded session(s) · {credits} credits · {cost}"
+
+
+def _print_instance_detail(snap: dict) -> None:
+    print(f"\n═══ {snap['name']} ═══\n")
+    rows: list[tuple[str, str]] = [("Status", _status_label(snap))]
+    if snap["run_started"]:
+        rows.append(("Running for", f"{_age_since(snap['run_started'])} "
+                                    f"(since {snap['run_started']})"))
+    if snap["session_num"]:
+        rows.append(("Loop session", f"#{snap['session_num']}"))
+    rows.append(("Loop supervisor",
+                 f"pid {snap['loop_pid']}" if snap["loop_pid"] else "not running"))
+    if snap["session_live"]:
+        rows.append(("Session", f"{snap['id']} — live"
+                                + ("" if snap["owned"] else
+                                   " (NOT started by this operator)")))
+    else:
+        rows.append(("Session", "not running"))
+    if snap["copilot_pid"]:
+        rows.append(("Copilot pid", str(snap["copilot_pid"])))
+    if snap["copilot_session_id"]:
+        rows.append(("Copilot session", snap["copilot_session_id"]))
+    if snap["cwd"]:
+        rows.append(("Directory", _shorten_home(snap["cwd"])))
+    usage = _recorded_usage(snap["cwd"])
+    if usage:
+        rows.append(("Usage", usage))
+    if snap["argv"]:
+        # The preamble is a paragraph of prose; showing it in full buries
+        # everything else, so keep the flags and elide the rest.
+        flags = []
+        for arg in snap["argv"]:
+            if arg == "-i":
+                flags.append("-i <preamble>")
+                break
+            flags.append(arg)
+        rows.append(("Command", " ".join(flags)))
+    width = max(len(label) for label, _ in rows)
+    for label, value in rows:
+        print(f"  {label.ljust(width)}   {value}")
+
+
+def _pick_instance(purpose: str) -> Instance | None:
+    """List what is running and return the one the user picked."""
+    instances = active_instances()
+    if not instances:
+        print("\nNo operator instances are running.")
+        print("  Start one with: operator --loop --name <name>")
+        return None
+    snaps = [instance_snapshot(inst) for inst in instances]
+    print(f"\n═══ {purpose} ═══\n")
+    for i, snap in enumerate(snaps, 1):
+        print(f"  {i}) {_instance_summary(snap)}")
     print()
-    choice = _prompt_line("Choose an action: ")
+    choice = _prompt_line(f"Instance [1-{len(snaps)}] (blank to cancel): ")
     if not choice:
-        return 0
+        return None
     try:
         idx = int(choice)
     except ValueError:
         print("Not a number.", file=sys.stderr)
-        return 1
-    if idx < 1 or idx > len(options):
+        return None
+    if not 1 <= idx <= len(snaps):
         print("Out of range.", file=sys.stderr)
+        return None
+    return instances[idx - 1]
+
+
+def _join_snapshot(snap: dict) -> int:
+    """Attach to a picked instance without a second name lookup."""
+    if not snap["session_live"]:
+        print(f"'{snap['name']}' has no live session to join.", file=sys.stderr)
+        if snap["loop_pid"]:
+            print("  Its loop is between sessions — try again in a moment.",
+                  file=sys.stderr)
         return 1
-    _, action = options[idx - 1]
-    if action is None:
+    return join_instance(snap["name"])
+
+
+def show_instance_detail(instance: Instance) -> int:
+    """Stats for one instance plus the actions that apply to its state.
+
+    Only offers what the instance can actually do right now: stopping a loop
+    that is not running, or a session that is not live, is not an option the
+    user should have to discover is a no-op.
+    """
+    while True:
+        snap = instance_snapshot(instance)
+        _print_instance_detail(snap)
+        if not snap["session_live"] and not snap["loop_pid"]:
+            print("\n  This instance is no longer running.")
+            return 0
+
+        options: list[tuple[str, Callable[[], int]]] = []
+        if snap["session_live"]:
+            options.append(("Join this session (attach the terminal)",
+                            lambda: _join_snapshot(snap)))
+        if snap["loop_pid"]:
+            options.append(("Stop the loop, leave the session running",
+                            lambda: stop_loop_only(snap["name"])))
+        if snap["session_live"]:
+            label = ("Stop the session, let the loop restart it"
+                     if snap["loop_pid"] else "Stop the session")
+            options.append((label, lambda: stop_session_only(snap["name"])))
+        options.append(("Stop everything (loop and session)",
+                        lambda: stop_operator(snap["name"])))
+        options.append(("Refresh", None))
+        options.append(("Back", None))
+
+        print()
+        for i, (label, _) in enumerate(options, 1):
+            print(f"  {i}) {label}")
+        print()
+        choice = _prompt_line(f"Action [1-{len(options)}] (blank to go back): ")
+        if not choice:
+            return 0
+        try:
+            idx = int(choice)
+        except ValueError:
+            print("Not a number.", file=sys.stderr)
+            continue
+        if not 1 <= idx <= len(options):
+            print("Out of range.", file=sys.stderr)
+            continue
+        label, action = options[idx - 1]
+        if label == "Back":
+            return 0
+        if action is None:      # Refresh
+            continue
+        rc = action()
+        if label.startswith("Join"):
+            return rc
+        # Any stop changes the instance's state; loop round and re-read it so
+        # the next menu reflects what is actually left running.
+
+
+def browse_instances() -> int:
+    """List running instances, pick one, then act on it."""
+    instance = _pick_instance("Running Operator Instances")
+    if instance is None:
         return 0
-    return action()
+    return show_instance_detail(instance)
+
+
+def show_menu() -> int:
+    """Bare ``operator`` (no arguments): an interactive action picker.
+
+    Every session action funnels through the browser rather than asking the
+    user to retype a name the operator already knows. The menu loops so a
+    single action is not the end of the program.
+    """
+    while True:
+        running = len(active_instances())
+        print("\n═══ Copilot Operator ═══\n")
+        options: list[tuple[str, Callable[[], int] | None]] = [
+            (f"Sessions — inspect, join or stop  ({running} running)",
+             browse_instances),
+            ("Restore tabs (pick which)", lambda: restore_tabs([])),
+            ("Restore all tracked tabs", lambda: restore_tabs(["--all"])),
+            ("View usage report", lambda: report_metrics("summary")),
+            ("Exit", None),
+        ]
+        for i, (label, _) in enumerate(options, 1):
+            print(f"  {i}) {label}")
+        print()
+        choice = _prompt_line("Choose an action: ")
+        if not choice:
+            return 0
+        try:
+            idx = int(choice)
+        except ValueError:
+            print("Not a number.", file=sys.stderr)
+            return 1
+        if idx < 1 or idx > len(options):
+            print("Out of range.", file=sys.stderr)
+            return 1
+        _, action = options[idx - 1]
+        if action is None:
+            return 0
+        rc = action()
+        if rc != 0:
+            return rc
 
 
 def main(argv: list[str] | None = None) -> int:

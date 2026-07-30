@@ -4,6 +4,70 @@ These conventions apply to all projects I work on. They complement any agent-spe
 
 ---
 
+## Git Worktrees — Always
+
+**This is not optional and not feature-flagged. All work happens in a git worktree.**
+
+Never edit files in the primary checkout. Before your first file change, create a worktree for the
+branch you are about to work on.
+
+### Layout
+
+- Worktrees live in `<repoRoot>/.worktrees/<name>`, where `<repoRoot>` is the **primary** checkout.
+- `<name>` is the branch name with `/` replaced by `-` (branch `feat/login` → `.worktrees/feat-login`).
+- `/.worktrees/` **must** be in the repo's tracked `.gitignore`. Add it if it is missing — worktrees
+  are checkouts, not repository content, and every clone needs the rule, so `.git/info/exclude` is
+  not good enough.
+
+### Finding the primary repo root
+
+Inside a worktree, `git rev-parse --show-toplevel` returns the *worktree*, not the repo. Never use it
+to locate the project. The first record of `git worktree list --porcelain` is always the primary
+checkout, from anywhere in the repo:
+
+**bash (Linux/macOS/WSL)**
+```bash
+repo_root=$(git worktree list --porcelain | head -1 | cut -d' ' -f2-)
+```
+
+**PowerShell (Windows)**
+```powershell
+$repoRoot = (git worktree list --porcelain | Select-Object -First 1) -replace '^worktree '
+```
+
+Use that path — never the worktree path — for anything that identifies the *project* rather than the
+checkout: the `catalog.csv` lookup, the per-project directory, the handoff file, `.specify/`
+initialization. A worktree is a second directory for the same project, not a second project. Cataloging
+one mints a duplicate GUID and silently splits the project's state in two.
+
+### Working in one
+
+```bash
+# Create (run from the primary checkout, or use git -C "$repo_root")
+git -C "$repo_root" worktree add .worktrees/feat-login -b feat/login
+cd "$repo_root/.worktrees/feat-login"
+
+# ... make changes, commit ...
+
+# Finish: merge into main, then remove the worktree
+cd "$repo_root"
+git merge --no-ff feat/login
+git worktree remove .worktrees/feat-login
+git branch -d feat/login
+```
+
+The commands are identical on every platform; only the path separators differ.
+
+### Rules
+
+- One worktree per branch. Git refuses to check out the same branch in two worktrees.
+- Never create a worktree inside another worktree — resolve the primary root first.
+- `cd` out of a worktree before removing it.
+- Leave worktrees you did not create alone; another agent may be working in one.
+- Worktree branches merge into `main`. There is no separate integration branch.
+
+---
+
 ## Project Configuration System
 
 Each project can have a persistent configuration stored outside the repo at `~/.copilot/projects/`.
@@ -30,7 +94,9 @@ case-insensitively; on Linux and macOS compare case-sensitively.
 
 ### On Session Start — Project Lookup
 
-1. Determine the current project root (git root or cwd).
+1. Determine the current project root. This is the **primary checkout** — if you are in a worktree,
+   resolve it with `git worktree list --porcelain` as described under **Git Worktrees**, never with
+   `git rev-parse --show-toplevel`. Fall back to the cwd only outside a git repo.
 2. Read `~/.copilot/projects/catalog.csv` and look for a matching path.
 3. **If found**: Read `~/.copilot/projects/{guid}/copilot-instructions.md` and follow its conventions. Check for `next-session.md` handoff.
 4. **If not found**: Ask the user:
@@ -60,7 +126,7 @@ When setting up a new project, the user selects which conventions to enable:
 | **Session History** | SQL `session_log` table for audit trail | ON |
 | **Spec-Driven Development** | Spec as source of truth. Uses GitHub spec-kit. Location: `.specify/` and `specs/`. | ON |
 | **Parallel Agents** | SQL-coordinated parallel task execution via `todo_claims`. | ON |
-| **Branching Strategy** | develop → feature branches, conventional commits | ON |
+| **Branching Strategy** | Feature branches in worktrees, merged to `main`, conventional commits | ON |
 
 The generated `copilot-instructions.md` includes only the enabled sections.
 
@@ -75,7 +141,7 @@ Agents use `~/.copilot/projects/{guid}/next-session.md` for continuity across se
 ### On Session Start
 When the user greets you (e.g., "hey", "hello", "hi"), **immediately**:
 
-1. **Check for unmerged work**: Run `git branch --no-merged` against the integration branch (usually `develop` or `main`). If any feature branches have unmerged commits, tell the user: *"Found unmerged work on branch X (N commits). Want to continue that, merge it, or start fresh?"*
+1. **Check for unmerged work**: Run `git branch --no-merged main` (the ref matters — with no argument git compares against HEAD, which tells you nothing). If any feature branches have unmerged commits, tell the user: *"Found unmerged work on branch X (N commits). Want to continue that, merge it, or start fresh?"*
 2. **Read handoff**: Check if `~/.copilot/projects/{guid}/next-session.md` exists. If it does:
    - Read it and use it as your starting context.
    - Tell the user what was left in progress and what you're picking up.
@@ -345,7 +411,7 @@ When multiple agents collaborate on a feature, coordinate via a shared SQLite da
    `heartbeat_at` during long-running work.
    Only a coordinator may recover a stale claim after confirming the agent stopped.
 
-7. **Task Granularity**: `[P]` means eligible for parallel execution, not assigned. Same-file work is sequential. Work in isolated worktrees.
+7. **Task Granularity**: `[P]` means eligible for parallel execution, not assigned. Same-file work is sequential. Each agent works in its own worktree under `<repoRoot>/.worktrees/` (see **Git Worktrees** above).
 
 8. **Task Artifact Reconciliation**: In parallel mode, worker agents update SQL status and report completion, but ONLY the coordinator serially updates `tasks.md` checkboxes to prevent filesystem conflicts. Single agents update both.
 
@@ -355,10 +421,10 @@ When multiple agents collaborate on a feature, coordinate via a shared SQLite da
 
 *Enabled by feature flag: `branching-strategy`*
 
-- `main` — stable releases only. Never push directly.
-- `develop` — integration branch. PRs from feature branches merge here.
-- `feat/xxx`, `fix/xxx`, `docs/xxx` — feature branches off `develop`.
-- All work happens on feature branches. PRs go to `develop`.
+- `main` — the integration branch. Feature branches merge here. Don't commit to it directly.
+- `feat/xxx`, `fix/xxx`, `docs/xxx` — feature branches off `main`, worked on in a worktree
+  (see **Git Worktrees** above).
+- There is no `develop` branch. Don't create one and don't assume one exists.
 - Use conventional commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`
 
 ---
@@ -368,4 +434,5 @@ When multiple agents collaborate on a feature, coordinate via a shared SQLite da
 - Don't skip spec verification after implementation
 - Don't add features without updating the spec (if spec-driven is enabled)
 - Don't hardcode configuration values — use config files or environment variables
-- Don't push directly to `main` — always use a feature branch and PR
+- Don't edit files in the primary checkout — create a worktree first
+- Don't commit directly on `main` — branch, work in a worktree, then merge back

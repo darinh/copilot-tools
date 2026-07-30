@@ -177,26 +177,66 @@ leaving the crash-recovery supervisor in place (`stop-session`).
 
 ### Interactive menu
 
-Running `operator` with no arguments at all shows an interactive menu instead
+Running `operator` with no arguments at all opens an interactive menu instead
 of starting a session:
 
 ```
 ═══ Copilot Operator ═══
 
-  1) List running instances
-  2) Join a session
-  3) Restore tabs (pick which)
-  4) Restore all tracked tabs
-  5) Stop a loop only (leave its session running)
-  6) Stop a session only (leave its loop running)
-  7) Stop an instance completely (loop + session)
-  8) View usage report
-  9) Exit
+  1) Sessions — inspect, join or stop  (2 running)
+  2) Restore tabs (pick which)
+  3) Restore all tracked tabs
+  4) View usage report
+  5) Exit
 ```
 
-It wraps the same operations documented above (`list`, `join`, `restore`,
-`stop-loop`, `stop-session`, `stop`, `report`) behind a single command for
-when you don't remember the exact subcommand or arguments.
+The menu stays open until you choose Exit, so one action is not the end of the
+program.
+
+**Sessions** lists everything that is running and lets you pick one rather than
+retyping a name the operator already knows:
+
+```
+═══ Running Operator Instances ═══
+
+  1) my-project  ·  looping · session #7  ·  up 10h 45m  ·  ~/repos/my-project
+  2) scratch     ·  single session · no loop  ·  up 12m  ·  ~/repos/scratch
+
+Instance [1-2] (blank to cancel):
+```
+
+Picking one shows its stats and only the actions that apply to its current
+state:
+
+```
+═══ my-project ═══
+
+  Status            looping · session #7
+  Running for       10h 45m (since 2026-07-30T09:00:00Z)
+  Loop session      #7
+  Loop supervisor   pid 49532
+  Session           my-project — live
+  Copilot pid       51204
+  Copilot session   3f2a1b4c-5d6e-7f80-9a1b-2c3d4e5f6071
+  Directory         ~/repos/my-project
+  Usage             41 recorded session(s) · 812.4 credits · $32.50
+  Command           --yolo --autopilot --effort high -i <preamble>
+
+  1) Join this session (attach the terminal)
+  2) Stop the loop, leave the session running
+  3) Stop the session, let the loop restart it
+  4) Stop everything (loop and session)
+  5) Refresh
+  6) Back
+```
+
+A loop that is between sessions still appears here, because that is exactly
+when you may want to stop it. Stop options are only offered for things that
+are actually running, and after a stop the view re-reads state rather than
+offering actions against something already gone.
+
+`operator list` prints the same one-line summaries non-interactively, for
+scripts and for a quick glance.
 
 ### Auto-Continue
 

@@ -55,9 +55,10 @@ Enabled. Log sessions to `session_log` SQL table per protocol.
 ## Branching Strategy
 
 Enabled. Follow convention:
-- `main` — stable releases only
-- `develop` — integration branch
-- `feat/xxx`, `fix/xxx`, `docs/xxx` — feature branches off `develop`
+- `main` — the integration branch; feature branches merge here
+- `feat/xxx`, `fix/xxx`, `docs/xxx` — feature branches off `main`, worked on in a worktree under
+  `<repoRoot>/.worktrees/` (see `~/.copilot/copilot-instructions.md`)
+- No `develop` branch
 - Conventional commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`
 
 ---

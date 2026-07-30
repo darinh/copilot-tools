@@ -417,23 +417,164 @@ def test_stop_session_only_removes_tab_when_no_loop(monkeypatch, tmp_path):
 
 
 # ── interactive menu ─────────────────────────────────────────────
+def _feed(monkeypatch, *answers):
+    """Answer successive prompts, then behave like a closed stdin."""
+    pending = list(answers)
+
+    def fake_input(prompt=""):
+        if not pending:
+            raise EOFError
+        return pending.pop(0)
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+
 def test_menu_exits_cleanly_on_blank_input(monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    _feed(monkeypatch, "")
     assert op.show_menu() == 0
 
 
 def test_menu_dispatches_selected_action(monkeypatch):
     called = {"n": 0}
-    monkeypatch.setattr(op, "list_instances", lambda: called.__setitem__("n", 1) or 0)
-    monkeypatch.setattr("builtins.input", lambda prompt="": "1")
+    monkeypatch.setattr(op, "browse_instances",
+                        lambda: called.__setitem__("n", 1) or 0)
+    _feed(monkeypatch, "1", "")
     assert op.show_menu() == 0
     assert called["n"] == 1
 
 
+def test_menu_returns_to_itself_after_an_action(monkeypatch):
+    """One action is not the end of the program — the menu is a loop."""
+    seen = {"n": 0}
+    monkeypatch.setattr(op, "browse_instances",
+                        lambda: seen.__setitem__("n", seen["n"] + 1) or 0)
+    _feed(monkeypatch, "1", "1", "")
+    assert op.show_menu() == 0
+    assert seen["n"] == 2
+
+
 def test_menu_rejects_out_of_range_choice(monkeypatch, capsys):
-    monkeypatch.setattr("builtins.input", lambda prompt="": "999")
+    _feed(monkeypatch, "999")
     assert op.show_menu() == 1
     assert "Out of range" in capsys.readouterr().err
+
+
+# ── session browser ──────────────────────────────────────────────
+@pytest.fixture
+def running_loop(monkeypatch):
+    """A managed instance with both a live session and a live supervisor."""
+    inst = op.Instance("proj")
+    inst.claim("tok")
+    inst.save_state(7, "2026-07-30T09:00:00Z")
+    inst.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setattr(op.MUX, "available", lambda: True)
+    monkeypatch.setattr(op.MUX, "list_sessions", lambda: [inst.id])
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: s == inst.id)
+    return inst
+
+
+@pytest.mark.parametrize("seconds,expected", [
+    (45, "45s"), (90, "1m 30s"), (3660, "1h 1m"), (90000, "1d 1h"),
+])
+def test_elapsed_formatting(seconds, expected):
+    assert op._fmt_elapsed(seconds) == expected
+
+
+def test_snapshot_reports_loop_iteration_and_ownership(running_loop):
+    snap = op.instance_snapshot(running_loop)
+    assert snap["session_num"] == 7
+    assert snap["loop_pid"] == os.getpid()
+    assert snap["session_live"] is True
+    assert snap["owned"] is True
+    assert "#7" in op._status_label(snap)
+
+
+def test_snapshot_survives_a_corrupt_state_file(running_loop):
+    running_loop.state_file.write_text("SESSION_NUM=banana\n", encoding="utf-8")
+    assert op.instance_snapshot(running_loop)["session_num"] == 0
+
+
+def test_active_instances_includes_loop_with_no_live_session(monkeypatch):
+    """Between sessions a loop has no session; it must stay actionable."""
+    inst = op.Instance("between")
+    inst.claim("tok")
+    inst.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setattr(op.MUX, "available", lambda: True)
+    monkeypatch.setattr(op.MUX, "list_sessions", lambda: [])
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: False)
+    assert [i.id for i in op.active_instances()] == [inst.id]
+
+
+def test_pick_instance_returns_the_chosen_one(running_loop, monkeypatch):
+    _feed(monkeypatch, "1")
+    picked = op._pick_instance("pick")
+    assert picked is not None and picked.id == running_loop.id
+
+
+def test_pick_instance_cancels_on_blank(running_loop, monkeypatch):
+    _feed(monkeypatch, "")
+    assert op._pick_instance("pick") is None
+
+
+def test_detail_view_shows_stats_then_joins(running_loop, monkeypatch, capsys):
+    joined = {}
+
+    def fake_join(name):
+        joined["name"] = name
+        return 0
+
+    monkeypatch.setattr(op, "join_instance", fake_join)
+    _feed(monkeypatch, "1")
+    assert op.show_instance_detail(running_loop) == 0
+    out = capsys.readouterr().out
+    assert "Loop session" in out and "#7" in out
+    assert "Running for" in out
+    assert joined["name"] == "proj"
+
+
+def test_detail_view_hides_loop_stop_when_no_loop_runs(monkeypatch, capsys):
+    inst = op.Instance("solo")
+    inst.claim("tok")
+    monkeypatch.setattr(op.MUX, "available", lambda: True)
+    monkeypatch.setattr(op.MUX, "list_sessions", lambda: [inst.id])
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    _feed(monkeypatch, "")
+    assert op.show_instance_detail(inst) == 0
+    out = capsys.readouterr().out
+    assert "Stop the loop" not in out
+    assert "Stop the session" in out
+
+
+def test_detail_view_exits_when_nothing_is_running(monkeypatch, capsys):
+    inst = op.Instance("gone")
+    inst.claim("tok")
+    monkeypatch.setattr(op.MUX, "available", lambda: True)
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: False)
+    assert op.show_instance_detail(inst) == 0
+    assert "no longer running" in capsys.readouterr().out
+
+
+def test_detail_view_rereads_state_after_a_stop(running_loop, monkeypatch, capsys):
+    """After stopping, the view must re-read state rather than re-offer
+    actions against something that is already gone."""
+    live = {"on": True}
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: live["on"])
+    monkeypatch.setattr(op.MUX, "list_sessions",
+                        lambda: [running_loop.id] if live["on"] else [])
+
+    def fake_stop(name):
+        live["on"] = False
+        running_loop.loop_pid_file.unlink()
+        return 0
+
+    monkeypatch.setattr(op, "stop_operator", fake_stop)
+    _feed(monkeypatch, "4")     # Stop everything (loop and session)
+    assert op.show_instance_detail(running_loop) == 0
+    assert "no longer running" in capsys.readouterr().out
+
+
+def test_recorded_usage_is_silent_without_a_database():
+    assert op._recorded_usage("/nowhere") == ""
 
 
 def test_is_copilot_running_treats_dead_pane_as_stopped(monkeypatch):
