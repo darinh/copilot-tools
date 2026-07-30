@@ -175,7 +175,8 @@ The `templates/copilot-instructions.md` file establishes conventions for:
 - **Session History** — SQL-based audit trail of work across sessions
 - **Spec-Driven Development** — specs as the single source of truth (enabled by default)
 - **Parallel Agents** — SQL-coordinated parallel task execution via `todo_claims`
-- **Branching Strategy** — develop → feature branches with conventional commits
+- **Branching Strategy** — feature branches worked on in worktrees, merged to `main`, conventional commits
+- **Git Worktrees** — all work happens in `<repoRoot>/.worktrees/`; always on, not optional
 
 Copy to `~/.copilot/copilot-instructions.md` and customize for your workflow.
 

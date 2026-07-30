@@ -24,6 +24,7 @@ from pathlib import Path
 
 from operator_console import enable_utf8_output
 from operator_mux import Mux, MuxError, safe_instance_id
+from project_paths import primary_repo_root
 
 IS_WINDOWS = platform.system() == "Windows"
 CATALOG = Path.home() / ".copilot" / "projects" / "catalog.csv"
@@ -186,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
               "Handoff file will be written but restart may not trigger.",
               file=sys.stderr)
 
-    guid = resolve_guid(project_root)
+    guid = resolve_guid(primary_repo_root(project_root))
     project_dir = Path.home() / ".copilot" / "projects" / guid
     handoff_file = project_dir / "next-session.md"
     marker = state_dir() / instance_id

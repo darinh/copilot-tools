@@ -39,6 +39,7 @@ from typing import Callable
 import operator_ingest
 from operator_console import enable_utf8_output
 from operator_mux import Mux, MuxError, MuxNotFoundError, safe_instance_id
+from project_paths import primary_repo_root
 
 __version__ = "1.0.0"
 
@@ -889,11 +890,14 @@ def project_handoff_file(cwd: Path) -> Path | None:
     catalog ``handoff``/``handoff_tool.py`` use) and returns the path the
     handoff file *would* live at, regardless of whether it currently exists.
     Returns None if the directory has no catalog entry at all.
+
+    The lookup is keyed on the primary checkout, so running from a worktree
+    finds the project's real entry instead of reporting it unregistered.
     """
     catalog = project_catalog_path()
     if not catalog.is_file():
         return None
-    target = str(cwd.resolve())
+    target = str(primary_repo_root(cwd).resolve())
     if IS_WINDOWS:
         target = target.lower()
     try:
