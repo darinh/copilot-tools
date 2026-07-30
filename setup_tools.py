@@ -290,6 +290,20 @@ def _sudo_prefix() -> list[str]:
     return [sudo] if sudo else []
 
 
+def _sudo_usable(sudo: str) -> bool:
+    """True when sudo will not block on a password prompt.
+
+    Without this a non-interactive run (CI, a backgrounded operator loop)
+    stalls for minutes on sudo's password retries before failing anyway.
+    """
+    if run([sudo, "-n", "true"], quiet=True):
+        return True
+    try:
+        return bool(sys.stdin and sys.stdin.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
 def detect_package_manager() -> str | None:
     if IS_WINDOWS:
         return "winget" if which("winget") else None
@@ -324,6 +338,10 @@ def install_system_package(logical: str) -> bool:
         ok = run([exe, "install", package])
     else:
         sudo = _sudo_prefix()
+        if sudo and not _sudo_usable(sudo[0]):
+            warn(f"Installing '{package}' needs root, and sudo would block "
+                 "waiting for a password here. Skipping.")
+            return False
         if manager == "apt-get" and not _APT_UPDATED:
             run(sudo + [exe, "update"])
             _APT_UPDATED = True

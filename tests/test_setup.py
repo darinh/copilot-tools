@@ -158,6 +158,7 @@ def machine(monkeypatch):
         monkeypatch.setattr(setup_tools, "refresh_path", lambda: None)
         monkeypatch.setattr(setup_tools, "persist_user_path", lambda d: None)
         monkeypatch.setattr(setup_tools, "_prepend_process_path", lambda d: None)
+        monkeypatch.setattr(setup_tools, "_sudo_usable", lambda sudo: True)
         return m
     return _make
 
@@ -394,3 +395,48 @@ def test_persist_user_path_writes_the_shell_profile_on_posix(tmp_path, monkeypat
     target = Path("/opt/tools/bin")
     setup_tools.persist_user_path(target)
     assert str(target) in (tmp_path / ".bashrc").read_text(encoding="utf-8")
+
+
+def test_package_install_does_not_block_on_a_sudo_password_prompt(monkeypatch):
+    """A non-interactive run must fail fast, not sit through sudo's retries."""
+    monkeypatch.setattr(setup_tools, "IS_WINDOWS", False)
+    monkeypatch.setattr(setup_tools, "IS_MACOS", False)
+    monkeypatch.setattr(setup_tools, "detect_package_manager", lambda: "apt-get")
+    monkeypatch.setattr(setup_tools, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(setup_tools, "refresh_path", lambda: None)
+    monkeypatch.setattr(setup_tools.os, "geteuid", lambda: 1000, raising=False)
+
+    class _NoTTY:
+        @staticmethod
+        def isatty():
+            return False
+
+    monkeypatch.setattr(setup_tools.sys, "stdin", _NoTTY)
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append([str(p) for p in cmd])
+        return False  # sudo -n fails: a password is required
+
+    monkeypatch.setattr(setup_tools, "run", fake_run)
+    assert setup_tools.install_system_package("pip") is False
+    assert commands == [["/usr/bin/sudo", "-n", "true"]]
+
+
+def test_package_install_proceeds_when_sudo_is_passwordless(monkeypatch):
+    monkeypatch.setattr(setup_tools, "IS_WINDOWS", False)
+    monkeypatch.setattr(setup_tools, "IS_MACOS", False)
+    monkeypatch.setattr(setup_tools, "detect_package_manager", lambda: "apt-get")
+    monkeypatch.setattr(setup_tools, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(setup_tools, "refresh_path", lambda: None)
+    monkeypatch.setattr(setup_tools.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(setup_tools, "_APT_UPDATED", True)
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append([str(p) for p in cmd])
+        return True
+
+    monkeypatch.setattr(setup_tools, "run", fake_run)
+    assert setup_tools.install_system_package("pip") is True
+    assert any("python3-pip" in c for c in commands[-1])
