@@ -54,7 +54,7 @@ whose dependencies are all done.
 
 ```bash
 bash -n setup.sh
-bash tests/test-setup-spec-kit.sh
+python3 -m pytest tests/test_setup.py
 bash tests/test-todo-claims.sh
 .specify/scripts/bash/check-prerequisites.sh --json --require-tasks --include-tasks
 python3 -m json.tool templates/mcp-config.json >/dev/null

@@ -4,15 +4,17 @@
     copilot-tools setup for native Windows (PowerShell).
 
 .DESCRIPTION
-    Locates a Python 3.10+ interpreter and hands off to setup_tools.py, which
-    installs the operator/handoff console scripts, runtime extensions, and
-    configuration templates. Windows has no legacy bash install to migrate
-    away from (that only exists for Linux/WSL/macOS), so this script is a
-    thin, version-checked launcher rather than a migration.
+    Locates a Python 3.10+ interpreter -- installing one with winget if the
+    machine has none -- and hands off to setup_tools.py, which provisions the
+    remaining prerequisites (terminal multiplexer, git, Copilot CLI), the
+    operator/handoff console scripts, runtime extensions, configuration
+    templates, Anvil, spec-kit, and the MCP servers. Windows has no legacy
+    bash install to migrate away from (that only exists for Linux/WSL/macOS),
+    so this script has no migration step.
 
 .PARAMETER SetupArgs
-    Arguments forwarded verbatim to setup_tools.py, e.g. --yes or
-    --skip-package.
+    Arguments forwarded verbatim to setup_tools.py, e.g. --yes,
+    --skip-package, --skip-optional, or --check-only.
 
 .EXAMPLE
     ./setup.ps1 --yes
@@ -48,37 +50,64 @@ $Candidates = @(
     @{ Exe = 'python3'; Args = @() }
 )
 
-Write-Host "Locating Python..."
-$PythonExe = $null
-$PythonArgs = @()
+# Windows installers extend PATH in the registry and broadcast a change this
+# already-running process never sees, so PATH is re-read after installing.
+function Update-SessionPath {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:PATH = (@($machine, $user) | Where-Object { $_ }) -join ';'
+}
 
-foreach ($candidate in $Candidates) {
-    $cmd = Get-Command $candidate.Exe -ErrorAction SilentlyContinue
-    if (-not $cmd) { continue }
+function Find-Python {
+    foreach ($candidate in $Candidates) {
+        $cmd = Get-Command $candidate.Exe -ErrorAction SilentlyContinue
+        if (-not $cmd) { continue }
 
-    try {
-        $verOutput = & $candidate.Exe @($candidate.Args) -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>$null
-    } catch {
-        continue
+        try {
+            $verOutput = & $candidate.Exe @($candidate.Args) -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>$null
+        } catch {
+            continue
+        }
+        if (-not $verOutput) { continue }
+
+        $parts = $verOutput.Trim().Split('.')
+        if ($parts.Count -lt 2) { continue }
+        $major = [int]$parts[0]
+        $minor = [int]$parts[1]
+
+        if ($major -gt $MinPythonMajor -or ($major -eq $MinPythonMajor -and $minor -ge $MinPythonMinor)) {
+            return @{ Exe = $candidate.Exe; Args = $candidate.Args }
+        }
     }
-    if (-not $verOutput) { continue }
+    return $null
+}
 
-    $parts = $verOutput.Trim().Split('.')
-    if ($parts.Count -lt 2) { continue }
-    $major = [int]$parts[0]
-    $minor = [int]$parts[1]
+Write-Host "Locating Python..."
+$found = Find-Python
 
-    if ($major -gt $MinPythonMajor -or ($major -eq $MinPythonMajor -and $minor -ge $MinPythonMinor)) {
-        $PythonExe = $candidate.Exe
-        $PythonArgs = $candidate.Args
-        break
+if (-not $found) {
+    # Setup installs what is missing rather than handing the user a homework
+    # list, so a machine without a usable Python gets one here.
+    Write-WarnMsg "Python $MinPythonMajor.$MinPythonMinor+ not found - installing it with winget..."
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        & winget install --id Python.Python.3.12 --exact --silent `
+            --accept-package-agreements --accept-source-agreements --disable-interactivity
+        Update-SessionPath
+        $found = Find-Python
+    } else {
+        Write-WarnMsg "winget is unavailable on this machine."
     }
 }
 
-if (-not $PythonExe) {
-    Write-ErrMsg "Python $MinPythonMajor.$MinPythonMinor+ is required. Install it from https://python.org or the Microsoft Store, then re-run."
+if (-not $found) {
+    Write-ErrMsg "Could not install Python $MinPythonMajor.$MinPythonMinor+ automatically."
+    Write-ErrMsg "Install it from https://python.org or the Microsoft Store, then re-run."
     exit 1
 }
+
+$PythonExe = $found.Exe
+$PythonArgs = $found.Args
 
 $versionString = (& $PythonExe @PythonArgs --version 2>&1)
 Write-Info "Using '$PythonExe $($PythonArgs -join ' ')' ($versionString)"

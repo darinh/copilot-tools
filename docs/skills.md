@@ -43,7 +43,7 @@ Helps discover and install agent skills. Use when looking for functionality that
 ### Anvil
 
 **Source**: [burkeholland/anvil](https://github.com/burkeholland/anvil)
-**Install**: `copilot install burkeholland/anvil`
+**Install**: `copilot plugin install burkeholland/anvil`
 
 Evidence-first coding agent. Verification loop:
 1. Understands and boosts your prompt

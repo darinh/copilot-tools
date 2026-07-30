@@ -198,7 +198,6 @@ Validates FR-017, SC-007. **Gating** — this must pass before merge.
 ```bash
 cd ~/projects/copilot-tools
 bash -n operator.sh && bash -n handoff.sh && bash -n setup.sh
-bash tests/test-setup-spec-kit.sh
 bash tests/test-todo-claims.sh
 python3 -m pytest tests/ -v
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════
 # copilot-tools setup — migrates any legacy bash operator/handoff install
-# to the cross-platform Python implementation, then configures the rest of
-# the environment (Anvil, MCP servers, Spec Kit, templates).
+# to the cross-platform Python implementation, then hands off to
+# setup_tools.py, which provisions everything else (prerequisites, Anvil,
+# MCP servers, Spec Kit, extensions, templates).
 #
 # Usage: ./setup.sh [setup_tools.py args...]   e.g. ./setup.sh --yes
 # ═══════════════════════════════════════════════════════════════════
@@ -10,7 +11,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_BIN="${HOME}/.local/bin"
-SPEC_KIT_VERSION="${SPEC_KIT_VERSION:-v0.13.4}"
 LEGACY_BACKUP_SUFFIX=".copilot-tools-legacy-bak"
 FOREIGN_BACKUP_SUFFIX=".copilot-tools-preexisting-bak"
 
@@ -22,30 +22,67 @@ fi
 info()  { echo "  ✅ $*"; }
 warn()  { echo "  ⚠️  $*"; }
 err()   { echo "  ❌ $*" >&2; }
-ask()   { read -rp "  → $1 [y/N] " ans; [[ "$ans" =~ ^[Yy] ]]; }
 
 
 echo ""
 echo "═══ Copilot Tools Setup ═══"
 echo ""
 
-# ── Step 1: Locate Python 3.10+ ─────────────────────────────────
+# ── Step 1: Locate (or install) Python 3.10+ ────────────────────
 # Needed both to hand off to setup_tools.py and to canonicalize paths below
 # (avoids relying on GNU-only `readlink -f`, which macOS's BSD readlink lacks).
 echo "Locating Python..."
-PYTHON_BIN=""
-for candidate in python3 python; do
-    if command -v "$candidate" &>/dev/null; then
-        ver=$("$candidate" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || echo "0.0")
-        major="${ver%%.*}"; minor="${ver##*.}"
-        if [[ "$major" -gt 3 || ( "$major" -eq 3 && "$minor" -ge 10 ) ]]; then
-            PYTHON_BIN="$candidate"
-            break
+
+find_python() {
+    local candidate ver major minor
+    for candidate in python3 python; do
+        if command -v "$candidate" &>/dev/null; then
+            ver=$("$candidate" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || echo "0.0")
+            major="${ver%%.*}"; minor="${ver##*.}"
+            if [[ "$major" -gt 3 || ( "$major" -eq 3 && "$minor" -ge 10 ) ]]; then
+                echo "$candidate"
+                return 0
+            fi
         fi
+    done
+    return 1
+}
+
+# Setup installs what is missing rather than handing the user a homework
+# list, so a machine without a usable Python gets one here.
+install_python() {
+    local sudo_cmd=()
+    if [[ "$(id -u)" -ne 0 ]] && command -v sudo &>/dev/null; then
+        sudo_cmd=(sudo)
     fi
-done
+    if command -v brew &>/dev/null; then
+        brew install python@3.12 || brew install python3 || return 1
+    elif command -v apt-get &>/dev/null; then
+        "${sudo_cmd[@]}" apt-get update || true
+        DEBIAN_FRONTEND=noninteractive "${sudo_cmd[@]}" apt-get install -y python3 python3-pip python3-venv || return 1
+    elif command -v dnf &>/dev/null; then
+        "${sudo_cmd[@]}" dnf install -y python3 python3-pip || return 1
+    elif command -v pacman &>/dev/null; then
+        "${sudo_cmd[@]}" pacman -S --noconfirm python python-pip || return 1
+    elif command -v zypper &>/dev/null; then
+        "${sudo_cmd[@]}" zypper install -y python3 python3-pip || return 1
+    elif command -v apk &>/dev/null; then
+        "${sudo_cmd[@]}" apk add python3 py3-pip || return 1
+    else
+        return 1
+    fi
+}
+
+PYTHON_BIN="$(find_python || true)"
 if [[ -z "$PYTHON_BIN" ]]; then
-    err "Python 3.10+ is required. Install it and re-run."
+    warn "Python 3.10+ not found — installing it..."
+    if install_python; then
+        PYTHON_BIN="$(find_python || true)"
+    fi
+fi
+if [[ -z "$PYTHON_BIN" ]]; then
+    err "Could not install Python 3.10+ automatically. Install it from"
+    err "https://www.python.org/downloads/ (or your package manager) and re-run."
     exit 1
 fi
 info "Using $PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
@@ -201,116 +238,20 @@ if [[ -n "$HANDOFF_BACKUP" ]]; then
 fi
 echo ""
 
-# ── Step 4: Anvil plugin ──────────────────────────────────────
-echo "Installing Anvil agent plugin..."
-if copilot extensions list 2>/dev/null | grep -q "anvil"; then
-    info "Anvil already installed"
-else
-    if copilot install burkeholland/anvil 2>/dev/null; then
-        info "Installed Anvil from burkeholland/anvil"
-    else
-        warn "Could not auto-install Anvil. Install manually:"
-        echo "       copilot install burkeholland/anvil"
-    fi
-fi
-echo ""
-
-# ── Step 5: MCP Servers ──────────────────────────────────────
-echo "Checking MCP servers..."
-
-# dotnet-roslyn-mcp
-if command -v dotnet-roslyn-mcp &>/dev/null || command -v dotnet &>/dev/null && dotnet tool list -g 2>/dev/null | grep -q "roslyn-mcp"; then
-    info "dotnet-roslyn-mcp ready"
-else
-    if command -v dotnet &>/dev/null; then
-        if ask "Install dotnet-roslyn-mcp as a global .NET tool?"; then
-            dotnet tool install -g dotnet-roslyn-mcp && info "Installed dotnet-roslyn-mcp" || warn "Install failed"
-        fi
-    else
-        warn "dotnet CLI not found — cannot install roslyn-mcp. Install .NET SDK first."
-    fi
-fi
-echo ""
-
-# ── Step 6: Spec-kit CLI ─────────────────────────────────────
-echo "Checking spec-kit (specify)..."
-if command -v specify &>/dev/null; then
-    if ! specify_version=$(specify --version 2>&1); then
-        err "specify was found at $(command -v specify) but failed its version check."
-        err "Repair or remove the broken command, then re-run setup."
-        exit 1
-    fi
-    info "specify already installed: ${specify_version%%$'\n'*}"
-else
-    # spec-kit requires Python >= 3.11, a stricter floor than the 3.10 used
-    # above for this script's own Python hand-off.
-    python_ver=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
-    python_major=$(echo "$python_ver" | cut -d. -f1)
-    python_minor=$(echo "$python_ver" | cut -d. -f2)
-    if [[ "$python_major" -lt 3 ]] || { [[ "$python_major" -eq 3 ]] && [[ "$python_minor" -lt 11 ]]; }; then
-        err "spec-kit requires Python >= 3.11 (found ${python_ver}). Upgrade Python and re-run."
-        exit 1
-    fi
-    info "Python ${python_ver} OK"
-
-    # Bootstrap uv via Astral's official installer when absent
-    if ! command -v uv &>/dev/null; then
-        info "uv not found — bootstrapping via Astral installer..."
-        uv_installer=$(mktemp)
-        if ! curl -LsSf https://astral.sh/uv/install.sh -o "$uv_installer"; then
-            rm -f "$uv_installer"
-            err "Failed to download the Astral uv installer."
-            exit 1
-        fi
-        if ! sh "$uv_installer"; then
-            rm -f "$uv_installer"
-            err "Astral uv installer exited with an error."
-            exit 1
-        fi
-        rm -f "$uv_installer"
-        if ! command -v uv &>/dev/null; then
-            err "uv installer ran but 'uv' is still not on PATH. Add ~/.local/bin to PATH and re-run."
-            exit 1
-        fi
-        info "uv bootstrapped"
-    else
-        info "uv found: $(command -v uv)"
-    fi
-
-    # Install specify-cli from the pinned GitHub tag
-    info "Installing specify-cli ${SPEC_KIT_VERSION} via uv..."
-    if ! uv tool install specify-cli --from "git+https://github.com/github/spec-kit.git@${SPEC_KIT_VERSION}"; then
-        err "uv tool install failed for specify-cli ${SPEC_KIT_VERSION}."
-        exit 1
-    fi
-
-    # Verify specify is callable
-    if ! command -v specify &>/dev/null; then
-        err "'specify' is not callable after installation. Ensure ~/.local/bin is on PATH and re-run."
-        exit 1
-    fi
-    if ! specify_version=$(specify --version 2>&1); then
-        err "specify was installed but failed its version check."
-        exit 1
-    fi
-    info "specify installed: ${specify_version%%$'\n'*}"
-fi
-echo ""
-
-# ── Step 7: Code Intelligence skill ─────────────────────────
-echo "Installing skills..."
-echo "  The code-intelligence skill should be copied into each project's"
-echo "  .github/skills/ directory. Example:"
-echo ""
-echo "    cp -r ${SCRIPT_DIR}/skills/code-intelligence your-project/.github/skills/"
-echo ""
+# ── Step 4: Everything else lives in setup_tools.py ───────────
+# Anvil, the MCP servers, and spec-kit used to be installed by this script,
+# which meant Windows users got none of them. They are now provisioned by
+# setup_tools.py above, on every platform, along with the prerequisites
+# (multiplexer, git, Copilot CLI) that this script previously only checked
+# for before giving up.
 
 # ── Done ─────────────────────────────────────────────────────
 echo "═══ Setup Complete ═══"
 echo ""
 echo "Next steps:"
 echo "  1. Run: operator help"
-echo "  2. Copy code-intelligence skill into your project (see above)"
+echo "  2. Copy code-intelligence skill into your project:"
+echo "       cp -r ${SCRIPT_DIR}/skills/code-intelligence your-project/.github/skills/"
 echo "  3. Review ~/.copilot/copilot-instructions.md and customize"
 echo "  4. Start a session: operator --agent=anvil:anvil --yolo"
 echo "  5. Start an autonomous loop: operator --loop --name myproject"

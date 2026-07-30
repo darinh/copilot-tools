@@ -17,7 +17,7 @@ Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Buil
 | [`templates/`](templates/) | Configuration templates for copilot-instructions, MCP servers, and per-project setup |
 | [`docs/`](docs/) | Documentation for operator, skills, and spec-kit |
 | [`setup.sh`](setup.sh) | Linux/WSL/macOS setup: migrates any legacy bash install to Python, then delegates to `setup_tools.py` |
-| [`setup.ps1`](setup.ps1) | Windows setup: locates Python 3.10+ and delegates to `setup_tools.py` |
+| [`setup.ps1`](setup.ps1) | Windows setup: locates or installs Python 3.10+, then delegates to `setup_tools.py` |
 
 ## Platform Support
 
@@ -50,7 +50,6 @@ elsewhere. See [Operator](docs/operator.md) for details.
 **PowerShell (Windows)**
 
 ```powershell
-winget install --id marlocarlo.psmux
 git clone <this-repo> $HOME\repos\copilot-tools
 cd $HOME\repos\copilot-tools
 ./setup.ps1
@@ -65,16 +64,35 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-Both scripts locate a Python 3.10+ interpreter and delegate to
+Setup **installs** what's missing rather than telling you to go install it.
+Both scripts locate a Python 3.10+ interpreter — installing one via `winget`
+or your distro's package manager if the machine has none — and delegate to
 `setup_tools.py`, which is itself cross-platform and idempotent. It will:
 
-1. Check prerequisites (multiplexer, Python 3.10+, `copilot`, `git`)
+1. Install any missing prerequisites: a terminal multiplexer (psmux via
+   `winget`, or its GitHub release as a fallback / tmux via `apt-get`, `dnf`,
+   `pacman`, `zypper`, `apk`, or `brew`), `git`, and the `copilot` CLI (via
+   `npm`, pulling in Node.js first if needed)
 2. Install the `operator`, `handoff` and `operator-ingest` console scripts
 3. Link runtime extensions into `~/.copilot/extensions/`
 4. Install configuration templates to `~/.copilot/`
+5. Install the Anvil plugin, the Spec Kit CLI (`specify`, via `uv`), and
+   optionally `dotnet-roslyn-mcp`
+
+Anything installed to a directory that isn't on `PATH` yet (npm's global bin,
+`~/.local/bin`, the psmux download) is added to your user `PATH`, so new
+shells pick it up.
+
+Only a genuinely unautomatable failure — no package manager at all, or an
+install that errors — stops setup, and it prints the exact manual command.
+
+Useful flags: `--yes` (assume yes to overwrite prompts), `--check-only`
+(report missing prerequisites and change nothing), `--no-install-prereqs`
+(old check-and-bail behavior), `--skip-optional` (skip Anvil, spec-kit, and
+the MCP servers), `--skip-package` (skip `pip install -e .`).
 
 You can also invoke `python setup_tools.py` / `python3 setup_tools.py`
-directly if you don't need the extra steps below.
+directly if you don't need the migration step below.
 
 `sqlite3` is **not** required — the toolkit uses Python's standard-library
 `sqlite3` module.
@@ -97,10 +115,12 @@ on `PATH`, or setup is interrupted (Ctrl-C) mid-install, everything is
 restored automatically and `setup.sh` exits non-zero — you're never left
 without a working command.
 
-`setup.sh` then additionally installs the Anvil plugin, `dotnet-roslyn-mcp`,
-and the Spec Kit CLI (`specify`) via `uv` — none of which `setup_tools.py`
-manages. `operator.sh`/`handoff.sh` themselves are left on disk unchanged;
-they're just no longer the thing installed into `PATH`.
+That migration is all `setup.sh` still does on its own. Anvil,
+`dotnet-roslyn-mcp`, and the Spec Kit CLI used to be installed here, which
+meant Windows users never got them; they're now provisioned by
+`setup_tools.py` on every platform. `operator.sh`/`handoff.sh` themselves are
+left on disk unchanged; they're just no longer the thing installed into
+`PATH`.
 </details>
 
 See [Spec Kit Workflow](docs/spec-kit.md) for project initialization, commands,

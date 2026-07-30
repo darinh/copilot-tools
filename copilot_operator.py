@@ -1500,10 +1500,17 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
     # session ended without ever calling `handoff` — most likely a crash
     # (operator itself dying, Windows rebooting, etc.) rather than a clean
     # stop. Tell the agent so it can act accordingly.
+    #
+    # An *unregistered* project is a different situation entirely: no catalog
+    # entry means no handoff file could ever have been written there, so the
+    # absence proves nothing and must not be reported to the agent as a crash.
     crash_recovery = False
     if resume_id:
         handoff_file = project_handoff_file(Path.cwd())
-        if handoff_file is None or not handoff_file.exists():
+        if handoff_file is None:
+            log("  Project is not registered in the catalog — no handoff file "
+                "is expected here")
+        elif not handoff_file.exists():
             crash_recovery = True
             log("  No handoff file found for this project — treating this as "
                 "crash recovery")
