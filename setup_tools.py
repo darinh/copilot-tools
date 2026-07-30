@@ -263,6 +263,13 @@ PACKAGES: dict[str, dict[str, str | None]] = {
     "npm":    {"brew": "node", "apt-get": "npm", "dnf": "npm",
                "pacman": "npm", "zypper": "npm", "apk": "npm",
                "winget": "OpenJS.NodeJS.LTS"},
+    # Debian and its derivatives ship python3 without pip; everywhere else it
+    # comes with the interpreter, so there is nothing to install.
+    "pip":    {"brew": None, "apt-get": "python3-pip", "dnf": "python3-pip",
+               "pacman": "python-pip", "zypper": "python3-pip",
+               "apk": "py3-pip", "winget": None},
+    "venv":   {"brew": None, "apt-get": "python3-venv", "dnf": None,
+               "pacman": None, "zypper": None, "apk": None, "winget": None},
 }
 
 LINUX_MANAGERS = (
@@ -468,6 +475,121 @@ def _python_scripts_dir() -> Path:
     return Path(sys.executable).parent
 
 
+def _user_scripts_dir() -> Path:
+    """Where console scripts from a `pip install --user` land."""
+    import sysconfig
+
+    try:
+        path = sysconfig.get_path("scripts", f"{os.name}_user")
+    except KeyError:
+        path = None
+    return Path(path) if path else LOCAL_BIN
+
+
+def in_virtualenv() -> bool:
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+
+def have_pip() -> bool:
+    return run([sys.executable, "-m", "pip", "--version"], quiet=True)
+
+
+def ensure_pip() -> bool:
+    """Make `python -m pip` work for the interpreter running this script.
+
+    Debian and Ubuntu ship python3 with pip removed, so the toolkit cannot
+    install itself out of the box there. Telling the user to go and install
+    pip is not setup's job — setup's job is to put it there.
+    """
+    if have_pip():
+        return True
+
+    print("  Installing pip...")
+
+    # 1. stdlib bootstrap: no network, no package manager, no privileges.
+    run([sys.executable, "-m", "ensurepip", "--upgrade"], quiet=True)
+    if have_pip():
+        info("pip installed (ensurepip)")
+        return True
+
+    # 2. the distro's own package. Debian also splits out ensurepip's
+    #    payload, which is what makes venv creation fail later.
+    if not IS_WINDOWS and not IS_MACOS:
+        install_system_package("pip")
+        install_system_package("venv")
+        if have_pip():
+            info("pip installed (system package)")
+            return True
+
+    # 3. PyPA's bootstrap script, fetched to a file and run by path.
+    if _install_pip_from_bootstrap():
+        info("pip installed (get-pip.py)")
+        return True
+
+    err("Could not install pip for this interpreter automatically:\n"
+        f"       {sys.executable}\n"
+        "       Install your distribution's python3-pip package and re-run.")
+    return False
+
+
+def _install_pip_from_bootstrap() -> bool:
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "get-pip.py"
+        try:
+            with urllib.request.urlopen("https://bootstrap.pypa.io/get-pip.py",
+                                        timeout=120) as resp:
+                script.write_bytes(resp.read())
+        except (OSError, urllib.error.URLError) as exc:
+            warn(f"Could not download get-pip.py: {exc}")
+            return False
+        for extra in ([], ["--user"], ["--user", "--break-system-packages"]):
+            if in_virtualenv() and extra:
+                break
+            run([sys.executable, str(script)] + extra)
+            if have_pip():
+                return True
+    return False
+
+
+def pip_install(args: list[str]) -> bool:
+    """`pip install`, coping with interpreters that refuse to be modified.
+
+    Distro Pythons are marked externally managed (PEP 668), so a plain
+    install aborts with a wall of text telling the user to use a venv.
+    Retrying with --user writes to the user's own site-packages, which is
+    precisely what that marker exists to steer people towards, so it is
+    tried before the blunt --break-system-packages.
+    """
+    if not ensure_pip():
+        return False
+
+    attempts: list[list[str]] = [[]]
+    if not in_virtualenv():
+        attempts += [["--user"], ["--user", "--break-system-packages"]]
+
+    output = ""
+    for extra in attempts:
+        cmd = [sys.executable, "-m", "pip", "install"] + extra + args
+        print(f"     $ {' '.join(cmd)}")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  env=_clean_env())
+        except OSError as exc:
+            warn(f"could not run pip: {exc}")
+            return False
+        output = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode == 0:
+            if "--user" in extra:
+                persist_user_path(_user_scripts_dir())
+                _prepend_process_path(_user_scripts_dir())
+            return True
+        if "externally-managed-environment" not in output:
+            break
+
+    print(output.strip())
+    return False
+
+
 def ensure_uv() -> str | None:
     """Install Astral's uv, used to install the spec-kit CLI.
 
@@ -492,7 +614,7 @@ def ensure_uv() -> str | None:
     if not which("uv"):
         # uv publishes wheels to PyPI, so this needs no shell, no execution
         # policy, and no network scripts piped into an interpreter.
-        run([sys.executable, "-m", "pip", "install", "--upgrade", "uv"])
+        pip_install(["--upgrade", "uv"])
         scripts = _python_scripts_dir()
         if scripts.is_dir():
             _prepend_process_path(scripts)
@@ -703,13 +825,29 @@ def install_package(assume_yes: bool = False) -> bool:
         info("operator and handoff already on PATH")
         if not ask("Reinstall the package anyway?", assume_yes=False):
             return True
-    cmd = [sys.executable, "-m", "pip", "install", "-e", str(REPO_ROOT)]
-    print(f"  Running: {' '.join(cmd)}")
-    proc = subprocess.run(cmd)
-    if proc.returncode != 0:
+    if not pip_install(["-e", str(REPO_ROOT)]):
         err("pip install failed. Setup cannot continue — the console scripts "
             "would be missing and the toolkit would be unusable.")
         return False
+    info("Package installed")
+
+    if not shutil.which("operator"):
+        for candidate in (_python_scripts_dir(), _user_scripts_dir()):
+            if (candidate / ("operator.exe" if IS_WINDOWS else "operator")).exists():
+                _prepend_process_path(candidate)
+                persist_user_path(candidate)
+                break
+    if not shutil.which("operator"):
+        scripts_dir = _python_scripts_dir()
+        warn("'operator' is not on PATH yet. Add this directory to PATH:")
+        print(f"       {scripts_dir}")
+        if IS_WINDOWS:
+            print('       PowerShell: $env:PATH = "' + str(scripts_dir) + ';$env:PATH"')
+        else:
+            print(f'       bash: export PATH="{scripts_dir}:$PATH"')
+    else:
+        info(f"operator resolves to {shutil.which('operator')}")
+    return True
     info("Package installed")
 
     if not shutil.which("operator"):
@@ -725,7 +863,6 @@ def install_package(assume_yes: bool = False) -> bool:
     else:
         info(f"operator resolves to {shutil.which('operator')}")
     return True
-
 
 def _dirs_match(a: Path, b: Path) -> bool:
     """True when two directory trees have identical file names and contents."""

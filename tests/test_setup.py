@@ -262,11 +262,107 @@ def test_uv_never_pipes_a_download_into_a_shell(machine, monkeypatch):
 def test_uv_falls_back_to_pip_when_the_package_manager_fails(machine, monkeypatch):
     monkeypatch.setattr(setup_tools, "IS_WINDOWS", True)
     monkeypatch.setattr(setup_tools, "IS_MACOS", False)
+    pip_args: list[list[str]] = []
+    monkeypatch.setattr(setup_tools, "pip_install",
+                        lambda args: pip_args.append(args) or False)
     m = machine(present=["winget"], installable=[])
     setup_tools.ensure_uv()
     joined = [" ".join(str(p) for p in c) for c in m.commands]
     assert any("astral-sh.uv" in c for c in joined)
-    assert any("pip install --upgrade uv" in c for c in joined)
+    assert pip_args == [["--upgrade", "uv"]]
+
+
+def test_missing_pip_is_installed_not_just_reported(monkeypatch):
+    """Debian ships python3 without pip. Setup installs it; it does not
+    hand the user a homework assignment and quit."""
+    monkeypatch.setattr(setup_tools, "IS_WINDOWS", False)
+    monkeypatch.setattr(setup_tools, "IS_MACOS", False)
+    state = {"pip": False}
+    monkeypatch.setattr(setup_tools, "have_pip", lambda: state["pip"])
+    monkeypatch.setattr(setup_tools, "run", lambda cmd, **kw: False)
+    installed: list[str] = []
+
+    def fake_install(logical):
+        installed.append(logical)
+        state["pip"] = True
+        return True
+
+    monkeypatch.setattr(setup_tools, "install_system_package", fake_install)
+    assert setup_tools.ensure_pip() is True
+    assert "pip" in installed
+
+
+def test_pip_bootstrap_is_downloaded_not_piped(monkeypatch):
+    """When no package manager has pip, get-pip.py is fetched to a file and
+    run by path, never streamed into an interpreter."""
+    monkeypatch.setattr(setup_tools, "IS_WINDOWS", False)
+    monkeypatch.setattr(setup_tools, "IS_MACOS", False)
+    monkeypatch.setattr(setup_tools, "have_pip", lambda: False)
+    monkeypatch.setattr(setup_tools, "run", lambda cmd, **kw: False)
+    monkeypatch.setattr(setup_tools, "install_system_package", lambda logical: False)
+    called = {"bootstrap": False}
+
+    def fake_bootstrap():
+        called["bootstrap"] = True
+        return False
+
+    monkeypatch.setattr(setup_tools, "_install_pip_from_bootstrap", fake_bootstrap)
+    assert setup_tools.ensure_pip() is False
+    assert called["bootstrap"] is True
+
+
+def test_pip_install_retries_when_the_interpreter_is_externally_managed(monkeypatch):
+    """PEP 668 distro Pythons refuse a plain install; --user is allowed."""
+    monkeypatch.setattr(setup_tools, "ensure_pip", lambda: True)
+    monkeypatch.setattr(setup_tools, "in_virtualenv", lambda: False)
+    monkeypatch.setattr(setup_tools, "persist_user_path", lambda d: None)
+    monkeypatch.setattr(setup_tools, "_prepend_process_path", lambda d: None)
+    calls: list[list[str]] = []
+
+    class Result:
+        def __init__(self, returncode):
+            self.returncode = returncode
+            self.stdout = ""
+            self.stderr = "" if returncode == 0 else \
+                "error: externally-managed-environment"
+
+    def fake_run(cmd, **kwargs):
+        calls.append([str(p) for p in cmd])
+        return Result(0 if "--user" in cmd else 1)
+
+    monkeypatch.setattr(setup_tools.subprocess, "run", fake_run)
+    assert setup_tools.pip_install(["-e", "."]) is True
+    assert len(calls) == 2
+    assert "--user" in calls[1]
+
+
+def test_pip_install_does_not_retry_a_genuine_failure(monkeypatch):
+    monkeypatch.setattr(setup_tools, "ensure_pip", lambda: True)
+    monkeypatch.setattr(setup_tools, "in_virtualenv", lambda: False)
+    calls: list[list[str]] = []
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: No matching distribution found"
+
+    def fake_run(cmd, **kwargs):
+        calls.append([str(p) for p in cmd])
+        return Result()
+
+    monkeypatch.setattr(setup_tools.subprocess, "run", fake_run)
+    assert setup_tools.pip_install(["nope"]) is False
+    assert len(calls) == 1
+
+
+def test_install_package_goes_through_the_resilient_pip_path(monkeypatch):
+    """install_package must inherit the pip bootstrap and PEP 668 retries."""
+    monkeypatch.setattr(setup_tools.shutil, "which", lambda name: None)
+    seen: list[list[str]] = []
+    monkeypatch.setattr(setup_tools, "pip_install",
+                        lambda args: seen.append(args) or True)
+    assert setup_tools.install_package(assume_yes=True) is True
+    assert seen and seen[0][0] == "-e"
 
 
 def test_spawned_shells_do_not_inherit_a_broken_psmodulepath(monkeypatch):
