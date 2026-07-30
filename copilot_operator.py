@@ -57,6 +57,22 @@ SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
 IS_WINDOWS = platform.system() == "Windows"
 
 
+def is_wsl() -> bool:
+    """True when running inside WSL (Windows Subsystem for Linux).
+
+    ``platform.system()`` reports ``"Linux"`` for WSL, so this is a separate
+    check for anything (like `operator restore`) that needs to know whether
+    Windows Terminal / ``wt.exe`` might be reachable via interop.
+    """
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text(
+            encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+
+
 # ── paths ───────────────────────────────────────────────────────
 def operator_home() -> Path:
     override = os.environ.get("COPILOT_OPERATOR_HOME")
@@ -486,7 +502,14 @@ def _collect_tab_entries() -> list[tuple[str, dict]]:
     local = load_tabs()
     combined: list[tuple[str, dict]] = [(f"local:{k}", v) for k, v in local.items()]
 
+    # When this process is itself running inside a WSL distro, that distro's
+    # own registry is already included above via `local` -- querying it again
+    # through `wsl.exe -d <this-distro>` would duplicate every entry. This is
+    # a no-op on native Windows, where $WSL_DISTRO_NAME is never set.
+    current_distro = os.environ.get("WSL_DISTRO_NAME", "")
     for distro in _wsl_distros():
+        if current_distro and distro == current_distro:
+            continue
         remote = _read_remote_tabs(distro)
         for ident, meta in remote.items():
             meta = dict(meta)
@@ -543,9 +566,15 @@ def restore_tabs(args: list[str]) -> int:
     restores every tracked tab without prompting. Display names given as
     positional arguments restore exactly those, without prompting.
     """
-    if not IS_WINDOWS:
-        die("operator restore must be run from Windows PowerShell — it needs "
-            "wt.exe, which is only available there.")
+    if not IS_WINDOWS and not is_wsl():
+        die("operator restore needs Windows Terminal (wt.exe), which is only "
+            "reachable from native Windows or from within WSL (with Windows "
+            "interop enabled).")
+    if is_wsl() and not IS_WINDOWS:
+        print("(Running inside WSL — this only sees this machine's local and "
+              "sibling-WSL-distro tab registries, not a native Windows-side "
+              "registry. Run `operator restore` from Windows PowerShell for "
+              "that.)\n")
     dry_run = "--dry-run" in args or "--list" in args
     restore_all = "--all" in args
     names = [a for a in args if not a.startswith("--")]
@@ -1747,13 +1776,17 @@ TAB RESTORE
     ~/.operator/tabs.json recording the directory and the exact `operator`
     command line used. `operator stop`/`forget` drop the entry again.
 
-    `operator restore` (run from Windows PowerShell, since it needs wt.exe)
-    reads the local registry plus every installed WSL distro's registry (via
-    `wsl.exe -d <distro>`), then opens one Windows Terminal window with a tab
-    per selected instance, replaying each command line. A reboot kills every
-    multiplexer server, so there is nothing to reattach to — restore simply
-    relaunches, and the existing auto-continue/--resume logic picks each
-    Copilot session back up rather than starting fresh.
+    `operator restore` needs Windows Terminal (`wt.exe`) reachable on PATH,
+    so run it from native Windows PowerShell or from within a WSL distro
+    (Windows interop must be enabled). It reads the local machine's registry
+    plus every installed WSL distro's registry (via `wsl.exe -d <distro>`),
+    then opens one Windows Terminal window with a tab per selected instance,
+    replaying each command line. When run from inside WSL, only this
+    machine's WSL registries are visible — a native Windows-side registry
+    can't be seen from there. A reboot kills every multiplexer server, so
+    there is nothing to reattach to — restore simply relaunches, and the
+    existing auto-continue/--resume logic picks each Copilot session back up
+    rather than starting fresh.
 
     With no arguments, `operator restore` lists tracked tabs and prompts for
     which to restore. `operator restore --all` restores every tracked tab
