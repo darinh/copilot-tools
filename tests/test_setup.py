@@ -1,6 +1,7 @@
 """Tests for cross-platform setup."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -156,6 +157,7 @@ def machine(monkeypatch):
         monkeypatch.setattr(setup_tools, "capture", m.capture)
         monkeypatch.setattr(setup_tools, "refresh_path", lambda: None)
         monkeypatch.setattr(setup_tools, "persist_user_path", lambda d: None)
+        monkeypatch.setattr(setup_tools, "_prepend_process_path", lambda d: None)
         return m
     return _make
 
@@ -244,3 +246,55 @@ def test_anvil_not_reinstalled_when_present(machine):
     m = machine(present=["copilot"], output="anvil  burkeholland/anvil")
     setup_tools.ensure_anvil()
     assert not any("install" in " ".join(str(p) for p in c) for c in m.commands)
+
+
+def test_uv_never_pipes_a_download_into_a_shell(machine, monkeypatch):
+    """`irm ... | iex` dies on machines whose PowerShell cannot load its own
+    modules, which is exactly where setup has to keep working."""
+    monkeypatch.setattr(setup_tools, "IS_WINDOWS", True)
+    monkeypatch.setattr(setup_tools, "IS_MACOS", False)
+    m = machine(present=["winget", "pwsh"], installable=[])
+    setup_tools.ensure_uv()
+    joined = [" ".join(str(p) for p in c) for c in m.commands]
+    assert not any("iex" in c for c in joined)
+
+
+def test_uv_falls_back_to_pip_when_the_package_manager_fails(machine, monkeypatch):
+    monkeypatch.setattr(setup_tools, "IS_WINDOWS", True)
+    monkeypatch.setattr(setup_tools, "IS_MACOS", False)
+    m = machine(present=["winget"], installable=[])
+    setup_tools.ensure_uv()
+    joined = [" ".join(str(p) for p in c) for c in m.commands]
+    assert any("astral-sh.uv" in c for c in joined)
+    assert any("pip install --upgrade uv" in c for c in joined)
+
+
+def test_spawned_shells_do_not_inherit_a_broken_psmodulepath(monkeypatch):
+    """A pwsh-set PSModulePath makes powershell.exe unable to load even
+    built-in modules, which is what broke the uv install."""
+    monkeypatch.setenv("PSModulePath", "C:\\only\\pwsh\\modules")
+    assert "PSModulePath" not in setup_tools._clean_env()
+
+
+def test_prepend_process_path_is_idempotent(monkeypatch):
+    monkeypatch.setenv("PATH", "/a/b")
+    setup_tools._prepend_process_path(Path("/new/dir"))
+    setup_tools._prepend_process_path(Path("/new/dir"))
+    assert os.environ["PATH"].split(os.pathsep).count(str(Path("/new/dir"))) == 1
+
+
+def test_refresh_path_is_a_noop_off_windows(monkeypatch):
+    monkeypatch.setattr(setup_tools, "IS_WINDOWS", False)
+    monkeypatch.setenv("PATH", "/only/this")
+    setup_tools.refresh_path()
+    assert os.environ["PATH"] == "/only/this"
+
+
+def test_persist_user_path_writes_the_shell_profile_on_posix(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup_tools, "IS_WINDOWS", False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    monkeypatch.setenv("PATH", "/existing")
+    target = Path("/opt/tools/bin")
+    setup_tools.persist_user_path(target)
+    assert str(target) in (tmp_path / ".bashrc").read_text(encoding="utf-8")

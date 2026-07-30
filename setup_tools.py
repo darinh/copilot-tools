@@ -73,12 +73,28 @@ def ask(question: str, assume_yes: bool = False) -> bool:
 
 
 # ── running external commands ───────────────────────────────────
+def _clean_env() -> dict[str, str]:
+    """Environment for spawned shells, with inherited poison removed.
+
+    A parent process (pwsh 7, a venv launcher, an IDE terminal) may export a
+    PSModulePath that doesn't include Windows PowerShell's own module
+    directory. A powershell.exe child then inherits it and fails to load even
+    built-in modules -- "the module could not be loaded" from
+    Microsoft.PowerShell.Security is the usual symptom. Dropping the variable
+    lets each shell rebuild its own default.
+    """
+    env = dict(os.environ)
+    env.pop("PSModulePath", None)
+    return env
+
+
 def run(cmd: list[str], *, quiet: bool = False) -> bool:
     """Run a command, echoing it first. True when it exits 0."""
     if not quiet:
         print(f"     $ {' '.join(cmd)}")
     try:
-        proc = subprocess.run(cmd, capture_output=quiet, text=True)
+        proc = subprocess.run(cmd, capture_output=quiet, text=True,
+                              env=_clean_env())
     except OSError as exc:
         warn(f"could not run {cmd[0]}: {exc}")
         return False
@@ -93,18 +109,49 @@ def which(name: str) -> str | None:
 def capture(cmd: list[str]) -> tuple[bool, str]:
     """Run a command for its output. Returns (succeeded, stdout)."""
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              env=_clean_env())
     except OSError:
         return False, ""
     return proc.returncode == 0, proc.stdout or ""
 
 
+def powershell() -> str | None:
+    """A PowerShell that can actually start. pwsh is preferred: it is the
+    less restricted of the two on locked-down machines, where invoking
+    powershell.exe can fail outright with 'Access is denied'."""
+    for name in ("pwsh", "powershell"):
+        exe = which(name)
+        if not exe:
+            continue
+        ok, _ = capture([exe, "-NoProfile", "-Command", "exit 0"])
+        if ok:
+            return exe
+    return None
+
+
 # ── PATH maintenance ────────────────────────────────────────────
+_WIN_USER_ENV = r"Environment"
+_WIN_MACHINE_ENV = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+
+
 def _prepend_process_path(directory: Path) -> None:
     entry = str(directory)
     parts = os.environ.get("PATH", "").split(os.pathsep)
-    if entry not in parts:
+    if entry.lower() not in {p.lower() for p in parts}:
         os.environ["PATH"] = os.pathsep.join([entry] + parts)
+
+
+def _read_registry_path(root, subkey: str) -> tuple[str, int]:
+    """Return the raw (unexpanded) Path value and its registry type."""
+    import winreg
+
+    try:
+        with winreg.OpenKey(root, subkey) as key:
+            value, kind = winreg.QueryValueEx(key, "Path")
+            return value or "", kind
+    except OSError:
+        return "", winreg.REG_EXPAND_SZ
 
 
 def refresh_path() -> None:
@@ -114,48 +161,72 @@ def refresh_path() -> None:
     Windows installers write PATH to the registry and broadcast a settings
     change that already-running processes never see, so a tool installed
     moments ago is invisible to ``shutil.which`` until this runs.
+
+    Read straight from the registry rather than by shelling out: on locked
+    down machines ``powershell.exe`` can be blocked outright, and a PATH
+    refresh that silently does nothing is worse than none at all -- it makes
+    already-installed tools look missing and triggers pointless reinstalls.
     """
     if not IS_WINDOWS:
         return
-    ps = which("powershell") or which("pwsh")
-    if not ps:
-        return
-    script = (
-        "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + "
-        "[Environment]::GetEnvironmentVariable('Path','User')"
-    )
+    import winreg
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    current = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    registry = []
+    for root, subkey in ((winreg.HKEY_LOCAL_MACHINE, _WIN_MACHINE_ENV),
+                         (winreg.HKEY_CURRENT_USER, _WIN_USER_ENV)):
+        raw, _ = _read_registry_path(root, subkey)
+        registry.extend(os.path.expandvars(p) for p in raw.split(os.pathsep) if p)
+
+    for entry in current + registry:
+        key = entry.rstrip("\\").lower()
+        if key not in seen:
+            seen.add(key)
+            merged.append(entry)
+    os.environ["PATH"] = os.pathsep.join(merged)
+
+
+def _broadcast_environment_change() -> None:
+    """Tell running shells the environment changed. Best effort."""
     try:
-        proc = subprocess.run([ps, "-NoProfile", "-Command", script],
-                              capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return
-    if proc.returncode != 0:
-        return
-    current = os.environ.get("PATH", "").split(os.pathsep)
-    seen = {p for p in current if p}
-    added = [p for p in proc.stdout.strip().split(os.pathsep)
-             if p and p not in seen]
-    if added:
-        os.environ["PATH"] = os.pathsep.join(current + added)
+        import ctypes
+
+        HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG = 0xFFFF, 0x1A, 0x0002
+        ctypes.windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+            ctypes.c_wchar_p("Environment"), SMTO_ABORTIFHUNG, 2000, None)
+    except Exception:
+        pass
 
 
 def persist_user_path(directory: Path) -> None:
     """Add a directory to PATH for this process and for future shells."""
     _prepend_process_path(directory)
     if IS_WINDOWS:
-        ps = which("powershell") or which("pwsh")
-        if not ps:
+        import winreg
+
+        entry = str(directory)
+        raw, kind = _read_registry_path(winreg.HKEY_CURRENT_USER, _WIN_USER_ENV)
+        existing = [p for p in raw.split(os.pathsep) if p]
+        expanded = {os.path.expandvars(p).rstrip("\\").lower() for p in existing}
+        if entry.rstrip("\\").lower() in expanded:
             return
+        new_value = os.pathsep.join([entry] + existing) if existing else entry
         # setx is deliberately avoided: it truncates PATH at 1024 characters.
-        script = (
-            "$d = $args[0]; "
-            "$p = [Environment]::GetEnvironmentVariable('Path','User'); "
-            "if (-not $p) { $p = '' }; "
-            "if (($p -split ';') -notcontains $d) { "
-            "  $new = if ($p) { $d + ';' + $p } else { $d }; "
-            "  [Environment]::SetEnvironmentVariable('Path', $new, 'User') }"
-        )
-        run([ps, "-NoProfile", "-Command", script, str(directory)], quiet=True)
+        # An unexpanded %VAR% anywhere in the value must stay REG_EXPAND_SZ or
+        # every such entry silently stops resolving.
+        if "%" in new_value:
+            kind = winreg.REG_EXPAND_SZ
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_USER_ENV, 0,
+                                winreg.KEY_READ | winreg.KEY_WRITE) as key:
+                winreg.SetValueEx(key, "Path", 0, kind, new_value)
+        except OSError as exc:
+            warn(f"Could not add {directory} to your user PATH: {exc}")
+            return
+        _broadcast_environment_change()
         info(f"Added {directory} to your user PATH (new shells pick it up)")
         return
 
@@ -167,8 +238,8 @@ def persist_user_path(directory: Path) -> None:
     }.get(shell, Path.home() / ".profile")
     line = f'export PATH="{directory}:$PATH"'
     try:
-        existing = profile.read_text(encoding="utf-8") if profile.is_file() else ""
-        if str(directory) not in existing:
+        existing_text = profile.read_text(encoding="utf-8") if profile.is_file() else ""
+        if str(directory) not in existing_text:
             with open(profile, "a", encoding="utf-8") as fh:
                 fh.write(f"\n# added by copilot-tools setup\n{line}\n")
             info(f"Added {directory} to PATH in {profile}")
@@ -386,29 +457,51 @@ def ensure_copilot() -> bool:
     return False
 
 
+def _python_scripts_dir() -> Path:
+    """Where console scripts from this interpreter's pip land."""
+    import sysconfig
+
+    for key in ("scripts", "purelib"):
+        path = sysconfig.get_path(key)
+        if key == "scripts" and path:
+            return Path(path)
+    return Path(sys.executable).parent
+
+
 def ensure_uv() -> str | None:
-    """Install Astral's uv, used to install the spec-kit CLI."""
+    """Install Astral's uv, used to install the spec-kit CLI.
+
+    Three independent routes, because each fails on some machines: a package
+    manager, PyPI (this interpreter already has pip, which is how the toolkit
+    itself was installed), and finally Astral's own installer script.
+    """
     if which("uv"):
         info(f"uv found: {which('uv')}")
         return which("uv")
 
     print("  Installing uv...")
-    if IS_WINDOWS:
-        ps = which("powershell") or which("pwsh")
-        if ps:
-            run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-                 "irm https://astral.sh/uv/install.ps1 | iex"])
-    else:
-        curl = which("curl")
-        sh = which("sh")
-        if curl and sh:
-            with tempfile.TemporaryDirectory() as tmp:
-                script = Path(tmp) / "uv-install.sh"
-                # Downloaded to a file first so a truncated transfer cannot be
-                # executed as a half-written script.
-                if run([curl, "-LsSf", "https://astral.sh/uv/install.sh",
-                        "-o", str(script)]):
-                    run([sh, str(script)])
+
+    if IS_WINDOWS and which("winget"):
+        run([which("winget"), "install", "--id", "astral-sh.uv", "--exact",
+             "--silent", "--accept-package-agreements",
+             "--accept-source-agreements", "--disable-interactivity"])
+        refresh_path()
+    elif IS_MACOS and which("brew"):
+        run([which("brew"), "install", "uv"])
+
+    if not which("uv"):
+        # uv publishes wheels to PyPI, so this needs no shell, no execution
+        # policy, and no network scripts piped into an interpreter.
+        run([sys.executable, "-m", "pip", "install", "--upgrade", "uv"])
+        scripts = _python_scripts_dir()
+        if scripts.is_dir():
+            _prepend_process_path(scripts)
+            if which("uv"):
+                persist_user_path(scripts)
+
+    if not which("uv"):
+        _install_uv_from_astral_script()
+
     # uv installs itself into ~/.local/bin on every platform.
     if LOCAL_BIN.is_dir():
         persist_user_path(LOCAL_BIN)
@@ -416,8 +509,43 @@ def ensure_uv() -> str | None:
     if which("uv"):
         info(f"uv installed: {which('uv')}")
         return which("uv")
-    warn("Could not install uv automatically; skipping spec-kit.")
+    warn("Could not install uv automatically; skipping spec-kit. "
+         "Install it manually from https://docs.astral.sh/uv/")
     return None
+
+
+def _install_uv_from_astral_script() -> None:
+    """Last resort: Astral's official installer, downloaded to a file first.
+
+    The documented one-liners pipe the script straight into a shell. That is
+    exactly what breaks on machines whose PowerShell cannot load its own
+    modules, and a truncated download would be executed as a half-written
+    script, so the script is always fetched to disk and run by path.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        if IS_WINDOWS:
+            ps = powershell()
+            if not ps:
+                return
+            script = Path(tmp) / "uv-install.ps1"
+            try:
+                with urllib.request.urlopen("https://astral.sh/uv/install.ps1",
+                                            timeout=120) as resp:
+                    script.write_bytes(resp.read())
+            except (OSError, urllib.error.URLError) as exc:
+                warn(f"Could not download the uv installer: {exc}")
+                return
+            run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                 str(script)])
+            return
+
+        curl, sh = which("curl"), which("sh")
+        if not (curl and sh):
+            return
+        script = Path(tmp) / "uv-install.sh"
+        if run([curl, "-LsSf", "https://astral.sh/uv/install.sh",
+                "-o", str(script)]):
+            run([sh, str(script)])
 
 
 def ensure_specify() -> bool:
