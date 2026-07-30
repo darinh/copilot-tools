@@ -82,3 +82,10 @@ jobs:
             bash -n "$f" || { echo "FAIL $f"; status=1; }
           done < <(find . -name '*.sh' -not -path './.git/*' -print0)
           exit $status
+
+      # Functional coverage for setup.sh's legacy-migration logic. It runs in
+      # throwaway sandboxes (fake HOME + fake checkout) with a stub
+      # setup_tools.py, so it never touches the runner's real ~/.local/bin.
+      - name: setup.sh migration tests
+        timeout-minutes: 10
+        run: bash tests/test_setup_sh.sh

@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════
-# copilot-tools setup — Configure your environment for the full
-# Copilot CLI power-user toolkit.
+# copilot-tools setup — migrates any legacy bash operator/handoff install
+# to the cross-platform Python implementation, then configures the rest of
+# the environment (Anvil, MCP servers, Spec Kit, templates).
 #
-# Usage: ./setup.sh
+# Usage: ./setup.sh [setup_tools.py args...]   e.g. ./setup.sh --yes
 # ═══════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COPILOT_DIR="${HOME}/.copilot"
 LOCAL_BIN="${HOME}/.local/bin"
 SPEC_KIT_VERSION="${SPEC_KIT_VERSION:-v0.13.4}"
-ORIGINAL_PATH="$PATH"
+LEGACY_BACKUP_SUFFIX=".copilot-tools-legacy-bak"
+FOREIGN_BACKUP_SUFFIX=".copilot-tools-preexisting-bak"
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$LOCAL_BIN"; then
     export PATH="${LOCAL_BIN}:${PATH}"
@@ -23,97 +24,180 @@ warn()  { echo "  ⚠️  $*"; }
 err()   { echo "  ❌ $*" >&2; }
 ask()   { read -rp "  → $1 [y/N] " ans; [[ "$ans" =~ ^[Yy] ]]; }
 
-check_cmd() {
-    if command -v "$1" &>/dev/null; then
-        info "$1 found: $(command -v "$1")"
-        return 0
-    else
-        err "$1 not found"
-        return 1
-    fi
-}
-
-copy_template() {
-    local src="$1" dest="$2" label="$3"
-    if [[ -f "$dest" ]]; then
-        if ask "$label already exists at $dest. Overwrite?"; then
-            cp "$src" "$dest"
-            info "Updated $label"
-        else
-            warn "Skipped $label (kept existing)"
-        fi
-    else
-        cp "$src" "$dest"
-        info "Installed $label"
-    fi
-}
 
 echo ""
 echo "═══ Copilot Tools Setup ═══"
 echo ""
 
-# ── Step 1: Prerequisites ──────────────────────────────────────
-echo "Checking prerequisites..."
-missing=0
-for cmd in tmux sqlite3 python3 git; do
-    check_cmd "$cmd" || (( missing++ )) || true
+# ── Step 1: Locate Python 3.10+ ─────────────────────────────────
+# Needed both to hand off to setup_tools.py and to canonicalize paths below
+# (avoids relying on GNU-only `readlink -f`, which macOS's BSD readlink lacks).
+echo "Locating Python..."
+PYTHON_BIN=""
+for candidate in python3 python; do
+    if command -v "$candidate" &>/dev/null; then
+        ver=$("$candidate" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || echo "0.0")
+        major="${ver%%.*}"; minor="${ver##*.}"
+        if [[ "$major" -gt 3 || ( "$major" -eq 3 && "$minor" -ge 10 ) ]]; then
+            PYTHON_BIN="$candidate"
+            break
+        fi
+    fi
 done
-
-if ! check_cmd copilot; then
-    err "GitHub Copilot CLI is required. Install from: https://docs.github.com/en/copilot/github-copilot-in-the-cli"
-    (( missing++ )) || true
-fi
-
-if (( missing > 0 )); then
-    err "$missing prerequisite(s) missing. Install them and re-run."
+if [[ -z "$PYTHON_BIN" ]]; then
+    err "Python 3.10+ is required. Install it and re-run."
     exit 1
 fi
+info "Using $PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
 echo ""
 
-# ── Step 2: Directory scaffolding ──────────────────────────────
-echo "Setting up directories..."
+canon() { "$PYTHON_BIN" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || true; }
+
+# ── Step 2: Set aside anything currently at ~/.local/bin/{operator,handoff} ──
+# `pip install -e .` (invoked below via setup_tools.py) will unconditionally
+# create console scripts named `operator`/`handoff`, replacing whatever
+# currently occupies those paths -- symlink or regular file -- with no
+# backup of its own. So *anything* found there is moved aside first:
+#   - a symlink resolving to *this checkout's* operator.sh/handoff.sh is
+#     "legacy" -- its backup is deleted once the new install is confirmed
+#     working (see Step 3).
+#   - anything else (a symlink elsewhere, a plain file, another checkout)
+#     is "foreign" -- it is never auto-deleted, only ever restored or left
+#     as a permanent backup, so an unrelated pre-existing command a user
+#     had is never silently destroyed.
+# Either way the original is renamed (never deleted outright), so a failed
+# or interrupted Python install below can never strand the user without a
+# working `operator`/`handoff` command: see restore_legacy_links() and the
+# INT/TERM trap right after this step.
+echo "Checking ~/.local/bin/{operator,handoff} before installing..."
 mkdir -p "$LOCAL_BIN"
-mkdir -p "${COPILOT_DIR}/restart"
-mkdir -p "${COPILOT_DIR}/projects"
-mkdir -p "${COPILOT_DIR}/logs"
-info "Created ~/.copilot/ directories"
+OPERATOR_BACKUP=""; OPERATOR_KIND=""
+HANDOFF_BACKUP=""; HANDOFF_KIND=""
+
+stash_legacy_link() {
+    # Sets STASH_RESULT to the backup path and STASH_KIND to "legacy" or
+    # "foreign" if something was set aside, or both to "" if there was
+    # nothing at $link to begin with.
+    STASH_RESULT=""
+    STASH_KIND=""
+    local name="$1" script="$2" link="${LOCAL_BIN}/${1}"
+
+    if [[ -L "$link" && ! -e "$link" ]]; then
+        warn "${link} is a broken symlink — removing"
+        rm -f "$link"
+        return 0
+    fi
+
+    [[ -e "$link" ]] || return 0
+
+    local kind="foreign" target=""
+    if [[ -L "$link" ]]; then
+        target="$(canon "$link")"
+        local expected
+        expected="$(canon "${SCRIPT_DIR}/${script}")"
+        if [[ -n "$target" && -n "$expected" && "$target" == "$expected" ]]; then
+            kind="legacy"
+        fi
+    fi
+
+    local suffix backup
+    if [[ "$kind" == "legacy" ]]; then
+        suffix="$LEGACY_BACKUP_SUFFIX"
+    else
+        suffix="$FOREIGN_BACKUP_SUFFIX"
+    fi
+    backup="${link}${suffix}"
+    if [[ "$kind" == "legacy" ]]; then
+        rm -f "$backup"   # clear any stale backup from a prior interrupted run
+    elif [[ -e "$backup" || -L "$backup" ]]; then
+        # Never clobber a pre-existing foreign backup -- number it instead.
+        local n=2
+        while [[ -e "${backup}.${n}" || -L "${backup}.${n}" ]]; do n=$((n+1)); done
+        backup="${backup}.${n}"
+    fi
+    mv "$link" "$backup"
+    if [[ "$kind" == "legacy" ]]; then
+        info "Set aside legacy symlink ${link} -> ${target} (finalized after install succeeds)"
+    else
+        warn "${link} doesn't point at this checkout's ${script} — moved existing '${name}' aside to ${backup} so it won't be silently overwritten (not auto-deleted)"
+    fi
+    STASH_RESULT="$backup"
+    STASH_KIND="$kind"
+}
+
+stash_legacy_link operator operator.sh
+OPERATOR_BACKUP="$STASH_RESULT"; OPERATOR_KIND="$STASH_KIND"
+stash_legacy_link handoff handoff.sh
+HANDOFF_BACKUP="$STASH_RESULT"; HANDOFF_KIND="$STASH_KIND"
+if [[ -z "$OPERATOR_BACKUP" && -z "$HANDOFF_BACKUP" ]]; then
+    info "Nothing at ~/.local/bin/{operator,handoff} yet"
+fi
 echo ""
 
-# ── Step 3: Operator symlink ──────────────────────────────────
-echo "Installing operator..."
-if [[ -L "${LOCAL_BIN}/operator" ]]; then
-    current_target=$(readlink -f "${LOCAL_BIN}/operator")
-    expected_target=$(readlink -f "${SCRIPT_DIR}/operator.sh")
-    if [[ "$current_target" == "$expected_target" ]]; then
-        info "operator symlink already correct"
-    else
-        ln -sf "${SCRIPT_DIR}/operator.sh" "${LOCAL_BIN}/operator"
-        info "Updated operator symlink → ${SCRIPT_DIR}/operator.sh"
+restore_legacy_links() {
+    local reason="$1"
+    if [[ -n "$OPERATOR_BACKUP" ]]; then
+        mv "$OPERATOR_BACKUP" "${LOCAL_BIN}/operator"
+        warn "Restored ${LOCAL_BIN}/operator ($reason)"
     fi
-else
-    ln -sf "${SCRIPT_DIR}/operator.sh" "${LOCAL_BIN}/operator"
-    info "Created operator symlink → ${SCRIPT_DIR}/operator.sh"
+    if [[ -n "$HANDOFF_BACKUP" ]]; then
+        mv "$HANDOFF_BACKUP" "${LOCAL_BIN}/handoff"
+        warn "Restored ${LOCAL_BIN}/handoff ($reason)"
+    fi
+}
+
+# A Ctrl-C (or kill) between the stash above and the commit/rollback below
+# must not leave the user with neither the old command nor the new one.
+trap 'restore_legacy_links "setup interrupted"; exit 130' INT TERM
+
+# ── Step 3: Hand off to the cross-platform Python installer ────
+# Installs the operator/handoff/operator-ingest console scripts, runtime
+# extensions, and configuration templates -- everything the old Steps
+# "operator symlink" / "runtime extensions" / "templates" used to do here.
+echo "Running Python setup (package, extensions, templates)..."
+set +e
+"$PYTHON_BIN" "${SCRIPT_DIR}/setup_tools.py" "$@"
+status=$?
+set -e
+echo ""
+
+if (( status != 0 )); then
+    err "Python setup failed (exit ${status})."
+    restore_legacy_links "Python setup failed"
+    exit "$status"
 fi
 
-# Ensure ~/.local/bin is on PATH
-if ! echo "$ORIGINAL_PATH" | tr ':' '\n' | grep -qx "$LOCAL_BIN"; then
-    warn "~/.local/bin is not on your PATH. Add to your shell profile:"
-    echo "       export PATH=\"\$HOME/.local/bin:\$PATH\""
+missing=0
+for name in operator handoff; do
+    command -v "$name" &>/dev/null || { err "'${name}' does not resolve on PATH after setup."; (( missing++ )) || true; }
+done
+
+if (( missing > 0 )); then
+    restore_legacy_links "new install isn't resolvable on PATH yet"
+    err "Fix PATH (see warnings above from setup_tools.py) and re-run ./setup.sh."
+    exit 1
 fi
 
-# Handoff script symlink
-if [[ -L "${LOCAL_BIN}/handoff" ]]; then
-    current_target=$(readlink -f "${LOCAL_BIN}/handoff")
-    expected_target=$(readlink -f "${SCRIPT_DIR}/handoff.sh")
-    if [[ "$current_target" == "$expected_target" ]]; then
-        info "handoff symlink already correct"
+# Migration/rollback window is over -- operator/handoff are confirmed
+# resolvable, so a later Ctrl-C (e.g. during Anvil/MCP/spec-kit steps below)
+# has nothing left to protect.
+trap - INT TERM
+
+if [[ -n "$OPERATOR_BACKUP" ]]; then
+    if [[ "$OPERATOR_KIND" == "legacy" ]]; then
+        rm -f "$OPERATOR_BACKUP"
+        info "Migrated 'operator' off the legacy bash script -> $(command -v operator)"
     else
-        ln -sf "${SCRIPT_DIR}/handoff.sh" "${LOCAL_BIN}/handoff"
-        info "Updated handoff symlink → ${SCRIPT_DIR}/handoff.sh"
+        info "Your previous 'operator' command is preserved at ${OPERATOR_BACKUP}"
     fi
-else
-    ln -sf "${SCRIPT_DIR}/handoff.sh" "${LOCAL_BIN}/handoff"
-    info "Created handoff symlink → ${SCRIPT_DIR}/handoff.sh"
+fi
+if [[ -n "$HANDOFF_BACKUP" ]]; then
+    if [[ "$HANDOFF_KIND" == "legacy" ]]; then
+        rm -f "$HANDOFF_BACKUP"
+        info "Migrated 'handoff' off the legacy bash script -> $(command -v handoff)"
+    else
+        info "Your previous 'handoff' command is preserved at ${HANDOFF_BACKUP}"
+    fi
 fi
 echo ""
 
@@ -128,37 +212,6 @@ else
         warn "Could not auto-install Anvil. Install manually:"
         echo "       copilot install burkeholland/anvil"
     fi
-fi
-echo ""
-
-
-
-# ── Step 4b: Runtime Extensions ──────────────────────────────
-echo "Installing runtime extensions..."
-EXTENSIONS_DIR="${COPILOT_DIR}/extensions"
-mkdir -p "$EXTENSIONS_DIR"
-if [[ -d "${SCRIPT_DIR}/extensions" ]]; then
-    shopt -s nullglob
-    for ext_dir in "${SCRIPT_DIR}/extensions/"*/; do
-        ext_name=$(basename "$ext_dir")
-        target="${EXTENSIONS_DIR}/${ext_name}"
-        src="${ext_dir%/}"
-        if [[ -L "$target" ]]; then
-            if [[ "$(readlink -f "$target")" == "$(readlink -f "$src")" ]]; then
-                info "Extension '$ext_name' symlink already correct"
-                continue
-            fi
-            rm "$target"
-        elif [[ -e "$target" ]]; then
-            warn "Extension '$ext_name' exists at $target as a real directory — skipping (remove it to symlink)"
-            continue
-        fi
-        ln -s "$src" "$target"
-        info "Linked extension '$ext_name' → $src"
-    done
-    shopt -u nullglob
-else
-    warn "No extensions/ directory found in copilot-tools — skipping"
 fi
 echo ""
 
@@ -179,7 +232,7 @@ else
 fi
 echo ""
 
-# ── Step 5b: Spec-kit CLI ─────────────────────────────────────
+# ── Step 6: Spec-kit CLI ─────────────────────────────────────
 echo "Checking spec-kit (specify)..."
 if command -v specify &>/dev/null; then
     if ! specify_version=$(specify --version 2>&1); then
@@ -189,8 +242,9 @@ if command -v specify &>/dev/null; then
     fi
     info "specify already installed: ${specify_version%%$'\n'*}"
 else
-    # Require Python >= 3.11
-    python_ver=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
+    # spec-kit requires Python >= 3.11, a stricter floor than the 3.10 used
+    # above for this script's own Python hand-off.
+    python_ver=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
     python_major=$(echo "$python_ver" | cut -d. -f1)
     python_minor=$(echo "$python_ver" | cut -d. -f2)
     if [[ "$python_major" -lt 3 ]] || { [[ "$python_major" -eq 3 ]] && [[ "$python_minor" -lt 11 ]]; }; then
@@ -241,19 +295,6 @@ else
     fi
     info "specify installed: ${specify_version%%$'\n'*}"
 fi
-echo ""
-
-# ── Step 6: Templates ────────────────────────────────────────
-echo "Installing templates..."
-copy_template \
-    "${SCRIPT_DIR}/templates/mcp-config.json" \
-    "${COPILOT_DIR}/mcp-config.json" \
-    "MCP config"
-
-copy_template \
-    "${SCRIPT_DIR}/templates/copilot-instructions.md" \
-    "${COPILOT_DIR}/copilot-instructions.md" \
-    "Copilot instructions"
 echo ""
 
 # ── Step 7: Code Intelligence skill ─────────────────────────

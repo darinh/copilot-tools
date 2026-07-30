@@ -11,12 +11,13 @@ Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Buil
 | [`operator_mux.py`](docs/operator.md#platform-support) | Session-backend abstraction (tmux / psmux) |
 | [`operator_ingest.py`](operator_ingest.py) | Pure-Python log parser for copilot process logs |
 | [`handoff_tool.py`](docs/operator.md) | Atomic session handoff for agents |
-| [`operator.sh`](operator.sh), [`handoff.sh`](handoff.sh), [`operator-ingest.py`](operator-ingest.py) | Original bash implementation, retained unchanged for existing Linux/WSL users |
+| [`operator.sh`](operator.sh), [`handoff.sh`](handoff.sh), [`operator-ingest.py`](operator-ingest.py) | Original bash implementation, retained unchanged on disk for rollback but no longer installed fresh by `setup.sh` |
 | [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | Roslyn-backed C# structural analysis |
 | [`extensions/`](extensions/README.md) | Copilot CLI runtime extensions: open-in-vs-code, lint-on-edit, security-shield, test-enforcer, architecture-enforcer, copy-to-clipboard-tool |
 | [`templates/`](templates/) | Configuration templates for copilot-instructions, MCP servers, and per-project setup |
 | [`docs/`](docs/) | Documentation for operator, skills, and spec-kit |
-| [`setup.sh`](setup.sh) | Automated environment setup script |
+| [`setup.sh`](setup.sh) | Linux/WSL/macOS setup: migrates any legacy bash install to Python, then delegates to `setup_tools.py` |
+| [`setup.ps1`](setup.ps1) | Windows setup: locates Python 3.10+ and delegates to `setup_tools.py` |
 
 ## Platform Support
 
@@ -26,11 +27,20 @@ Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Buil
 | Spec Kit workflow | ✅ | ✅ | ✅ |
 | Runtime extensions | ✅ | ✅ | ✅ |
 | `operator` / `handoff` (Python) | ✅ | ✅ | ✅ |
-| `operator.sh` / `handoff.sh` (bash, legacy) | ❌ | ✅ | ✅ |
+| `operator.sh` / `handoff.sh` (bash, legacy, unmaintained) | ❌ | rollback only | rollback only |
+| `operator restore` (Windows Terminal tabs) | ✅ (native tabs) | ✅ (WSL-hosted tabs only) | ❌ |
 
-The Python implementation is the supported entry point on every platform. The
-original bash scripts are retained unchanged for existing Linux and WSL users
-and will be retired once the Python path has proven parity in daily use.
+The Python implementation is the supported entry point on every platform.
+`setup.sh` migrates existing Linux/WSL/macOS installs off the bash scripts
+automatically (see [Quick Start](#quick-start)); the bash scripts themselves
+are left on disk, untouched, purely so a failed migration can never strand a
+user without a working `operator`/`handoff` command.
+
+`operator restore` re-launches tracked Windows Terminal tabs. It works from
+both native Windows PowerShell and from inside WSL (via `wt.exe`/`wsl.exe`
+interop), but a restore invoked from WSL only sees tabs tracked by that WSL
+distro and its siblings, not tabs tracked by a native Windows session, and
+vice versa — the two sides don't share a tab registry.
 
 Session management uses a terminal multiplexer: **psmux** on Windows, **tmux**
 elsewhere. See [Operator](docs/operator.md) for details.
@@ -43,7 +53,7 @@ elsewhere. See [Operator](docs/operator.md) for details.
 winget install --id marlocarlo.psmux
 git clone <this-repo> $HOME\repos\copilot-tools
 cd $HOME\repos\copilot-tools
-python setup_tools.py
+./setup.ps1
 ```
 
 **bash (Linux/macOS/WSL)**
@@ -51,30 +61,46 @@ python setup_tools.py
 ```bash
 git clone <this-repo> ~/projects/copilot-tools
 cd ~/projects/copilot-tools
-python3 setup_tools.py
+chmod +x setup.sh
+./setup.sh
 ```
 
-`setup_tools.py` is cross-platform. It will:
+Both scripts locate a Python 3.10+ interpreter and delegate to
+`setup_tools.py`, which is itself cross-platform and idempotent. It will:
 
 1. Check prerequisites (multiplexer, Python 3.10+, `copilot`, `git`)
 2. Install the `operator`, `handoff` and `operator-ingest` console scripts
 3. Link runtime extensions into `~/.copilot/extensions/`
 4. Install configuration templates to `~/.copilot/`
 
+You can also invoke `python setup_tools.py` / `python3 setup_tools.py`
+directly if you don't need the extra steps below.
+
 `sqlite3` is **not** required — the toolkit uses Python's standard-library
 `sqlite3` module.
 
 <details>
-<summary>Legacy bash setup (Linux/WSL only)</summary>
+<summary>What <code>setup.sh</code> does beyond <code>setup_tools.py</code> (Linux/WSL/macOS)</summary>
 
-```bash
-chmod +x setup.sh operator.sh
-./setup.sh
-```
+If a previous run of the *original bash* installer left an `operator` and/or
+`handoff` symlink in `~/.local/bin` pointing at this checkout's
+`operator.sh`/`handoff.sh`, `setup.sh` sets those symlinks aside, runs the
+Python install, and confirms `operator`/`handoff` resolve to the new
+console scripts before deleting the old symlinks. If anything else occupies
+those paths instead — a symlink pointing elsewhere, a different checkout, or
+an unrelated command with the same name — it's moved aside the same way but
+**never auto-deleted**, since `pip install -e .` would otherwise silently
+overwrite it with no backup of its own; look for a
+`~/.local/bin/{operator,handoff}.copilot-tools-preexisting-bak` file if that
+happens to you. If the Python install fails, the new commands don't resolve
+on `PATH`, or setup is interrupted (Ctrl-C) mid-install, everything is
+restored automatically and `setup.sh` exits non-zero — you're never left
+without a working command.
 
-This installs the original bash `operator.sh`, symlinks it into
-`~/.local/bin`, and additionally installs the Anvil plugin, MCP servers and the
-Spec Kit CLI.
+`setup.sh` then additionally installs the Anvil plugin, `dotnet-roslyn-mcp`,
+and the Spec Kit CLI (`specify`) via `uv` — none of which `setup_tools.py`
+manages. `operator.sh`/`handoff.sh` themselves are left on disk unchanged;
+they're just no longer the thing installed into `PATH`.
 </details>
 
 See [Spec Kit Workflow](docs/spec-kit.md) for project initialization, commands,
