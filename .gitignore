@@ -3,3 +3,6 @@ __pycache__/
 *.egg-info/
 *.pyc
 .pytest_cache/
+
+# All work happens in worktrees rooted here; they are checkouts, not content.
+/.worktrees/
