@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 
 import pytest
 
@@ -16,7 +17,12 @@ from operator_mux import (
 
 
 class FakeRunner:
-    """Records invocations and replays scripted results."""
+    """Records invocations and replays scripted results.
+
+    A scripted result is ``(stdout, returncode)``, or a callable receiving the
+    command and returning ``(stdout, returncode)`` or
+    ``(stdout, returncode, stderr)`` when a test needs to drive stderr.
+    """
 
     def __init__(self, results):
         self.results = results
@@ -25,10 +31,27 @@ class FakeRunner:
     def __call__(self, cmd, **kwargs):
         self.calls.append(cmd)
         verb = cmd[1] if len(cmd) > 1 else ""
-        out, rc = self.results.get(verb, ("", 0))
-        if callable(out):
-            out, rc = out(cmd)
-        return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
+        result = self.results.get(verb, ("", 0))
+        if callable(result[0]):
+            result = result[0](cmd)
+        out, rc = result[0], result[1]
+        err = result[2] if len(result) > 2 else ""
+        return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr=err)
+
+    def count(self, verb):
+        return sum(1 for cmd in self.calls if len(cmd) > 1 and cmd[1] == verb)
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    """Keep retry tests instant while recording that a backoff happened.
+
+    Patched on the stdlib module rather than on ``operator_mux`` so the test
+    still exercises real behavior if the implementation stops importing time.
+    """
+    slept = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    return slept
 
 
 # ── naming ──────────────────────────────────────────────────────
@@ -187,6 +210,91 @@ def test_new_session_refuses_to_clobber_existing(monkeypatch):
     )
     with pytest.raises(MuxSessionError, match="already exists"):
         mux.new_session("taken", "/tmp", ["prog"])
+
+
+# ── server-shutdown race ────────────────────────────────────────
+def test_new_session_retries_when_the_server_was_shutting_down(monkeypatch, no_sleep):
+    """Killing the last session takes the server with it.
+
+    A create issued during that shutdown window fails for a reason that has
+    nothing to do with the request, and the next attempt starts a fresh
+    server. Surfacing it would break a loop restart for no reason.
+    """
+    mux = Mux(binary="tmux")
+    state = {"attempts": 0, "created": False}
+
+    def create(cmd):
+        state["attempts"] += 1
+        if state["attempts"] == 1:
+            return ("", 1, "server exited unexpectedly")
+        state["created"] = True
+        return ("", 0)
+
+    runner = FakeRunner({
+        "new-session": (create, 0),
+        "has-session": (lambda cmd: ("", 0 if state["created"] else 1), 0),
+    })
+    monkeypatch.setattr(operator_mux.subprocess, "run", runner)
+
+    mux.new_session("good", "/tmp", ["prog"])
+
+    assert runner.count("new-session") == 2
+    assert no_sleep, "retry must back off rather than spin"
+
+
+def test_new_session_adopts_a_session_the_dying_server_created(monkeypatch, no_sleep):
+    """The create may land even though the client lost the server.
+
+    Retrying then collides with the name it just made, so an existing session
+    is adopted instead.
+    """
+    mux = Mux(binary="tmux")
+    state = {"created": False}
+
+    def create(cmd):
+        state["created"] = True
+        return ("", 1, "lost server")
+
+    runner = FakeRunner({
+        "new-session": (create, 0),
+        "has-session": (lambda cmd: ("", 0 if state["created"] else 1), 0),
+    })
+    monkeypatch.setattr(operator_mux.subprocess, "run", runner)
+
+    mux.new_session("adopted", "/tmp", ["prog"])
+
+    assert runner.count("new-session") == 1
+
+
+def test_new_session_does_not_retry_a_real_failure(monkeypatch, no_sleep):
+    """Only server-lifecycle errors are transient. Bad requests stay loud."""
+    mux = Mux(binary="tmux")
+    runner = FakeRunner({
+        "new-session": (lambda cmd: ("", 1, "bad session name: nope"), 0),
+        "has-session": ("", 1),
+    })
+    monkeypatch.setattr(operator_mux.subprocess, "run", runner)
+
+    with pytest.raises(MuxSessionError, match="bad session name"):
+        mux.new_session("nope", "/tmp", ["prog"])
+
+    assert runner.count("new-session") == 1
+    assert not no_sleep, "a real failure must be reported without delay"
+
+
+def test_new_session_gives_up_after_the_retry_budget(monkeypatch, no_sleep):
+    """A backend that never recovers must still fail, and say why."""
+    mux = Mux(binary="tmux")
+    runner = FakeRunner({
+        "new-session": (lambda cmd: ("", 1, "server exited unexpectedly"), 0),
+        "has-session": ("", 1),
+    })
+    monkeypatch.setattr(operator_mux.subprocess, "run", runner)
+
+    with pytest.raises(MuxSessionError, match="server exited unexpectedly"):
+        mux.new_session("doomed", "/tmp", ["prog"])
+
+    assert runner.count("new-session") == operator_mux._NEW_SESSION_ATTEMPTS
 
 
 def test_pane_dead_maps_to_boolean(monkeypatch):
