@@ -328,9 +328,51 @@ When reviewing completed work:
 
 ---
 
+## Operator — Parallel Agents
+
+`operator` runs a **full, first-party Copilot CLI** in its own terminal
+session. Starting one gives you a **peer agent, not a sub-agent**: a separate
+process with its own context, its own session history and its own git work.
+A sub-agent (`task` tool) is a function call that returns to you. An operator
+agent is a colleague that keeps working after you stop watching.
+
+**Delegate to one** when a piece of the work is large, has a **clear
+boundary**, and meets the rest of the system through a **defined contract** —
+not when you would have to supervise it turn by turn.
+
+**Give it its own folder, ideally its own repo.** Instance names, handoff files
+and git state are all keyed to the directory, and two loops in one working tree
+fight over the index and each other's uncommitted changes. Two agents *can*
+share a project, but understand what that is: **there is no enforcement.** The
+only thing keeping a parallel agent in its lane is the instruction you gave it
+asking nicely — a vibe-wish, not a sandbox. If the boundary matters, use
+separate repos.
+
+```bash
+# Start a peer without your terminal being taken over by its TUI:
+operator --loop --headless --name payments-api --agent anvil
+
+# Talk to it. --from and --to are required so it knows who to answer:
+operator send --from <your-instance> --to payments-api "the contract is ..."
+operator inbox          # read your own messages
+```
+
+Your instance name is in your session preamble ("Operator instance: ...").
+Messages reach a running agent immediately and a sleeping one at the start of
+its next session. **Check `operator inbox` when you start work and before you
+write a handoff**, and answer what you are asked — a peer blocked on your reply
+is burning sessions doing nothing.
+
+Full reference, including when *not* to spin one up and message etiquette:
+the **`operator-agents` skill**.
+
 ## Parallel Agents
 
 *Enabled by feature flag: `parallel-agents`*
+
+This is about **sub-agents inside one session** sharing a todo list — not the
+separate Copilot CLI processes described under "Operator — Parallel Agents"
+above. Operator agents coordinate by mail; these coordinate by database.
 
 When multiple agents collaborate on a feature, coordinate via a shared SQLite database. The protocol relies on atomic `BEGIN IMMEDIATE` transactions to prevent race conditions.
 

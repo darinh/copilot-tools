@@ -46,6 +46,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import operator_ingest                                       # noqa: E402
+import operator_mail                                         # noqa: E402
 from operator_console import enable_utf8_output               # noqa: E402
 from operator_mux import (                                    # noqa: E402
     Mux, MuxError, MuxNotFoundError, safe_instance_id,
@@ -1493,7 +1494,150 @@ def manage_logs(args: list[str]) -> int:
     return 0
 
 
-def run_single_session(instance: Instance, copilot_args: list[str]) -> int:
+# ── agent-to-agent messaging ────────────────────────────────────
+def _instance_is_known(instance: Instance) -> bool:
+    """True when this name refers to an instance the operator has seen.
+
+    Used to reject a mistyped recipient. A message addressed to a name nobody
+    answers to would sit in a directory forever with nothing to report it, so
+    this fails closed and lists the real names instead.
+    """
+    if instance.is_managed():
+        return True
+    if instance.id in load_tabs():
+        return True
+    try:
+        return MUX.has_session(instance.session)
+    except MuxError:
+        return False
+
+
+def _can_receive_live(instance: Instance) -> bool:
+    """True when there is a running Copilot session to type into.
+
+    All three conditions matter: between sessions a loop keeps its state and
+    (with remain-on-exit) even its mux session, but the pane is dead and
+    anything typed into it would be swallowed silently.
+    """
+    try:
+        if not MUX.has_session(instance.session):
+            return False
+        if MUX.pane_dead(instance.session):
+            return False
+    except MuxError:
+        return False
+    return is_copilot_running(instance)
+
+
+def send_message(args: list[str]) -> int:
+    """``operator send --from NAME --to NAME "message"``."""
+    sender = ""
+    recipient = ""
+    force = False
+    queue_only = False
+    body: list[str] = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--from", "--to"):
+            if i + 1 >= len(args) or not args[i + 1]:
+                print(f"{arg} requires a value", file=sys.stderr)
+                return 2
+            if arg == "--from":
+                sender = args[i + 1]
+            else:
+                recipient = args[i + 1]
+            i += 1
+        elif arg.startswith("--from="):
+            sender = arg.split("=", 1)[1]
+        elif arg.startswith("--to="):
+            recipient = arg.split("=", 1)[1]
+        elif arg == "--force":
+            force = True
+        elif arg == "--queue":
+            queue_only = True
+        else:
+            body.append(arg)
+        i += 1
+
+    text = " ".join(body).strip()
+    if not sender or not recipient or not text:
+        print('Usage: operator send --from NAME --to NAME "message"',
+              file=sys.stderr)
+        print("  --from and --to are both required so the recipient knows who "
+              "wrote and who to reply to.", file=sys.stderr)
+        print("  --queue  leave it for the next session even if one is running",
+              file=sys.stderr)
+        print("  --force  send to a name the operator does not recognize",
+              file=sys.stderr)
+        return 2
+
+    target = Instance(recipient)
+    if not _instance_is_known(target) and not force:
+        print(f"No operator instance '{recipient}' found — not sending.",
+              file=sys.stderr)
+        print("  Use --force to queue it anyway for an instance that has not "
+              "started yet.\n", file=sys.stderr)
+        list_instances()
+        return 1
+
+    msg = operator_mail.new_message(sender, target.display_name, target.id, text)
+
+    if not queue_only and _can_receive_live(target):
+        try:
+            MUX.send_keys(target.session, operator_mail.render_line(msg))
+        except MuxError as exc:
+            print(f"Live delivery failed ({exc}) — queueing instead.",
+                  file=sys.stderr)
+        else:
+            operator_mail.record_delivered(OPERATOR_HOME, msg)
+            log(f"Message delivered live: {sender} -> {target.display_name}")
+            print(f"Delivered to '{target.display_name}' (session is live).")
+            return 0
+
+    operator_mail.queue(OPERATOR_HOME, msg)
+    log(f"Message queued: {sender} -> {target.display_name}")
+    print(f"Queued for '{target.display_name}' — it will be delivered at the "
+          f"start of its next session.")
+    print(f"  Pending: {operator_mail.pending_count(OPERATOR_HOME, target.id)}")
+    return 0
+
+
+def show_inbox(args: list[str]) -> int:
+    """``operator inbox [NAME]`` — read messages addressed to an instance."""
+    peek = "--peek" in args
+    as_json = "--json" in args
+    want_history = "--history" in args
+    names = [a for a in args if not a.startswith("--")]
+
+    if names:
+        name = names[0]
+    else:
+        name = default_instance_name()
+
+    instance = Instance(name)
+    if want_history:
+        msgs = operator_mail.history(OPERATOR_HOME, instance.id)
+    elif peek:
+        msgs = operator_mail.pending(OPERATOR_HOME, instance.id)
+    else:
+        msgs = operator_mail.consume(OPERATOR_HOME, instance.id)
+
+    if as_json:
+        print(json.dumps(msgs, indent=2))
+        return 0
+
+    label = "history" if want_history else "messages"
+    print(f"═══ Inbox for '{instance.display_name}' ({len(msgs)} {label}) ═══\n")
+    print(operator_mail.render_for_terminal(msgs))
+    if msgs and not peek and not want_history:
+        print("\n(These are now marked read.)")
+    return 0
+
+
+def run_single_session(instance: Instance, copilot_args: list[str],
+                       headless: bool = False) -> int:
     args = ["--yolo", "--autopilot", "--effort", "high", *copilot_args]
     handle_existing_session(instance)
     operator_ingest.init_db(METRICS_DB)
@@ -1501,6 +1645,12 @@ def run_single_session(instance: Instance, copilot_args: list[str]) -> int:
     log(f"Starting single session: {instance.display_name}")
 
     start_session(instance, args, 1, remain_on_exit=False)
+    if headless:
+        print(f"Session '{instance.display_name}' started headless.")
+        print(f"  Attach:  operator join {instance.display_name}")
+        print(f"  Message: operator send --from <you> --to {instance.display_name} \"...\"")
+        print("  Metrics are captured by the session supervisor when copilot exits.")
+        return 0
     set_tab_title(f"operator - {instance.display_name}")
     set_tab_progress(TAB_STEADY)
     MUX.attach(instance.session)
@@ -1617,13 +1767,25 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
                         resume_id_used = resume_id
                     resume_id = ""
 
+                # Messages that arrived while no session was running are
+                # handed over here, per launch rather than once: the base
+                # preamble is built before the loop starts, so mail that
+                # arrives during session #3 must still reach session #4.
+                # Read now, archive only once the session is really up.
+                launch_preamble = preamble
+                waiting = operator_mail.pending(OPERATOR_HOME, instance.id)
+                if waiting:
+                    senders = ", ".join(sorted({m.get("from", "?") for m in waiting}))
+                    log(f"  Delivering {len(waiting)} queued message(s) from {senders}")
+                    launch_preamble += operator_mail.render_for_agent(waiting)
+
                 # Persist the pending resume id too: if the launch fails or the
                 # process dies here, the id must survive on disk rather than being
                 # cleared by a pre-launch write.
                 instance.save_state(session_num, run_started, resume_id_used)
                 try:
                     start_session(instance, launch_args, session_num,
-                                  remain_on_exit=True, preamble=preamble)
+                                  remain_on_exit=True, preamble=launch_preamble)
                 except MuxError as exc:
                     # A launch failure must not kill an unattended loop. Back off
                     # and retry the same session number rather than exiting.
@@ -1642,6 +1804,9 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
                         raise KeyboardInterrupt
                     continue
                 launch_failures = 0
+                if waiting:
+                    operator_mail.archive(OPERATOR_HOME, instance.id,
+                                          [m["id"] for m in waiting])
                 resume_id_used = ""
                 last_launched = session_num
 
@@ -1753,6 +1918,9 @@ USAGE
     operator                                                    Interactive menu
     operator [--name NAME] [copilot-args...]                   Single session
     operator --loop [--name NAME] [--fresh] [copilot-args...]  Loop mode (backgrounded, auto-attaches)
+    operator --loop --headless [--name NAME] [copilot-args...] Loop mode without attaching
+    operator send --from NAME --to NAME "message"              Message another instance
+    operator inbox [NAME] [--peek|--history|--json]            Read messages sent to an instance
     operator NAME                                              Join a running instance
     operator join [NAME]                                       Join (explicit form)
     operator reload NAME                                       Hot-reload launch spec
@@ -1772,6 +1940,10 @@ OPTIONS
     --name NAME     Set instance name (default: current directory name)
     --loop          Enable autonomous loop mode
     --fresh         Reset session numbering (ignore prior state)
+    --headless      Start without attaching, and return. Use this when one
+                    agent starts another agent's loop: the caller's terminal
+                    is left alone instead of being taken over by a TUI.
+                    (--detached is accepted as a synonym.)
 
 OWNERSHIP
     The operator acts only on sessions it started. A session is owned when a
@@ -1814,6 +1986,27 @@ LOOP VS. SESSION
         operator stop-session NAME    Stop the session; if a supervisor is still
                                       running it relaunches a fresh one shortly.
         operator stop NAME            Stop both, cleanly, with no relaunch.
+
+MESSAGING
+    Operator instances are separate processes and cannot see each other's
+    context, so they talk by mail:
+
+        operator send --from alpha --to beta "the schema is frozen"
+        operator inbox                 Read this directory's instance mail
+        operator inbox beta --peek     Read without marking read
+        operator inbox beta --history  What was already delivered
+
+    --from and --to are both required: the recipient has to know who wrote
+    and where to send an answer, and every delivered message carries the
+    exact reply command. A --to that names no known instance is refused
+    rather than queued into a mailbox nobody reads (--force overrides, for
+    an instance that has not started yet).
+
+    Delivery depends on what the recipient is doing. If its Copilot session
+    is running, the message is typed straight into it. If it is between
+    sessions, the message waits and is handed over in the next session's
+    preamble. --queue forces the second path. Read messages are archived,
+    not deleted, so --history is an audit trail.
 
 MENU
     Running `operator` with no arguments at all opens an interactive menu.
@@ -2025,6 +2218,47 @@ def start_and_attach_loop(instance: Instance, copilot_args: list[str],
     set_tab_title(f"operator - {instance.display_name}")
     set_tab_progress(TAB_LOOPING)
     MUX.attach(instance.session)
+    return 0
+
+
+def start_loop_headless(instance: Instance, copilot_args: list[str],
+                        is_fresh: bool) -> int:
+    """Start a background loop supervisor and return without attaching.
+
+    Same supervisor as ``operator --loop``, minus the attach — for starting a
+    loop from somewhere that must not be taken over by a full-screen TUI, such
+    as one agent starting another agent's loop.
+
+    It still waits for the session to appear rather than returning the moment
+    the process is spawned: a caller that never attaches would otherwise have
+    no way to learn that the launch failed.
+    """
+    existing_pid = _running_loop_pid(instance)
+    if existing_pid is not None:
+        log(f"Loop supervisor already running for '{instance.display_name}' "
+            f"(pid {existing_pid}) — nothing to start")
+        print(f"Loop already running for '{instance.display_name}' (pid {existing_pid}).")
+        print(f"  Attach: operator join {instance.display_name}")
+        return 0
+
+    pid = _spawn_background_loop(instance, copilot_args, is_fresh)
+    log(f"Started headless loop supervisor for '{instance.display_name}' (pid {pid})")
+
+    deadline = time.time() + SESSION_ID_WAIT
+    while time.time() < deadline:
+        if MUX.has_session(instance.session):
+            break
+        time.sleep(0.5)
+    else:
+        print(f"Timed out waiting for session '{instance.display_name}' to start.",
+              file=sys.stderr)
+        print(f"Check the log for details: {LOG_FILE}", file=sys.stderr)
+        return 1
+
+    print(f"Loop '{instance.display_name}' started headless (supervisor pid {pid}).")
+    print(f"  Attach:  operator join {instance.display_name}")
+    print(f"  Message: operator send --from <you> --to {instance.display_name} \"...\"")
+    print(f"  Stop:    operator stop {instance.display_name}")
     return 0
 
 
@@ -2387,6 +2621,10 @@ def main(argv: list[str] | None = None) -> int:
         return reload_instance(args[1] if len(args) > 1 else None)
     if head == "forget":
         return forget_instance(args[1] if len(args) > 1 else None)
+    if head == "send":
+        return send_message(args[1:])
+    if head == "inbox":
+        return show_inbox(args[1:])
     if head == "logs":
         return manage_logs(args[1:])
     if head == "tabs":
@@ -2414,6 +2652,7 @@ def run_dispatch(args: list[str]) -> int:
     loop_mode = False
     is_fresh = False
     supervise = False
+    headless = False
     name = ""
     copilot_args: list[str] = []
 
@@ -2424,6 +2663,8 @@ def run_dispatch(args: list[str]) -> int:
             loop_mode = True
         elif arg == "--fresh":
             is_fresh = True
+        elif arg in ("--headless", "--detached"):
+            headless = True
         elif arg == "--_supervise":
             # Internal: marks the re-exec'd background supervisor process so
             # it runs run_loop_mode directly instead of spawning yet another
@@ -2448,8 +2689,10 @@ def run_dispatch(args: list[str]) -> int:
         if loop_mode:
             if supervise:
                 return run_loop_mode(instance, copilot_args, is_fresh)
+            if headless:
+                return start_loop_headless(instance, copilot_args, is_fresh)
             return start_and_attach_loop(instance, copilot_args, is_fresh)
-        return run_single_session(instance, copilot_args)
+        return run_single_session(instance, copilot_args, headless=headless)
     except MuxError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

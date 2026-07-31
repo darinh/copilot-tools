@@ -4,13 +4,32 @@ Skills extend Copilot CLI agents with specialized capabilities. They're markdown
 
 ## Included in this repo
 
+Both skills install for the **user**, not for one project: `setup.ps1` /
+`setup.sh` copy them to `~/.copilot/skills/<name>/`, so they are available in
+every project on the machine. Project-level skills (`.github/skills/`) are
+shared with everyone who clones that repo; user-level skills follow you.
+
+### operator-agents
+
+**Location**: `skills/operator-agents/SKILL.md`
+**Install**: automatic — `setup.ps1` / `setup.sh` install it to `~/.copilot/skills/`
+
+How to use `operator` to run **parallel peer agents** rather than sub-agents:
+when delegating a bounded piece of work is worth it, how to start a loop
+headlessly so your own terminal is not taken over, why each agent wants its own
+directory, and how agents message each other with `operator send` /
+`operator inbox`.
+
 ### code-intelligence
 
 **Location**: `skills/code-intelligence/SKILL.md`
-**Install**: Copy into your project's `.github/skills/` directory
+**Install**: automatic — `setup.ps1` / `setup.sh` install it to `~/.copilot/skills/`
 
 Use Roslyn for C# structural questions. For other languages, use the built-in
 code intelligence, LSP, or search tools in your environment.
+
+To install a skill into a single project instead, copy its directory into that
+project's `.github/skills/`:
 
 **PowerShell (Windows)**
 ```powershell

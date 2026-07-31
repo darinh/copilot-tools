@@ -440,3 +440,77 @@ def test_package_install_proceeds_when_sudo_is_passwordless(monkeypatch):
     monkeypatch.setattr(setup_tools, "run", fake_run)
     assert setup_tools.install_system_package("pip") is True
     assert any("python3-pip" in c for c in commands[-1])
+
+
+# ── skill installation ──────────────────────────────────────────
+#
+# Skills install for the *user* (~/.copilot/skills), not into one project:
+# the operator skill is about work that spans projects, so a copy under a
+# single repo's .github/skills would be invisible where it is needed.
+@pytest.fixture
+def skill_repo(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / "skills" / "demo").mkdir(parents=True)
+    (repo / "skills" / "demo" / "SKILL.md").write_text("v1", encoding="utf-8")
+    home = tmp_path / "copilot"
+    monkeypatch.setattr(setup_tools, "REPO_ROOT", repo)
+    monkeypatch.setattr(setup_tools, "COPILOT_DIR", home)
+    return repo, home
+
+
+def test_skills_install_at_user_level(skill_repo):
+    _, home = skill_repo
+    setup_tools.install_skills(assume_yes=True)
+    assert (home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8") == "v1"
+
+
+def test_skill_reinstall_is_a_noop_when_identical(skill_repo, capsys):
+    _, home = skill_repo
+    setup_tools.install_skills(assume_yes=True)
+    capsys.readouterr()
+    setup_tools.install_skills(assume_yes=True)
+    assert "already up to date" in capsys.readouterr().out
+
+
+def test_modified_skill_is_kept_without_consent(skill_repo, monkeypatch):
+    repo, home = skill_repo
+    setup_tools.install_skills(assume_yes=True)
+    (home / "skills" / "demo" / "SKILL.md").write_text("mine", encoding="utf-8")
+    (repo / "skills" / "demo" / "SKILL.md").write_text("v2", encoding="utf-8")
+    monkeypatch.setattr(setup_tools, "ask", lambda *_a, **_k: False)
+    setup_tools.install_skills()
+    assert (home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8") == "mine"
+
+
+def test_modified_skill_is_replaced_when_consented(skill_repo, monkeypatch):
+    repo, home = skill_repo
+    setup_tools.install_skills(assume_yes=True)
+    (home / "skills" / "demo" / "SKILL.md").write_text("mine", encoding="utf-8")
+    (repo / "skills" / "demo" / "SKILL.md").write_text("v2", encoding="utf-8")
+    monkeypatch.setattr(setup_tools, "ask", lambda *_a, **_k: True)
+    setup_tools.install_skills()
+    assert (home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8") == "v2"
+
+
+def test_directory_without_a_skill_file_is_not_installed(skill_repo):
+    repo, home = skill_repo
+    (repo / "skills" / "notaskill").mkdir()
+    setup_tools.install_skills(assume_yes=True)
+    assert not (home / "skills" / "notaskill").exists()
+
+
+def test_missing_skills_directory_is_not_an_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup_tools, "REPO_ROOT", tmp_path / "empty")
+    monkeypatch.setattr(setup_tools, "COPILOT_DIR", tmp_path / "copilot")
+    setup_tools.install_skills(assume_yes=True)
+
+
+def test_the_operator_skill_is_shipped():
+    """The skill the instructions point agents at must actually exist."""
+    root = Path(__file__).resolve().parent.parent
+    skill = root / "skills" / "operator-agents" / "SKILL.md"
+    assert skill.is_file()
+    text = skill.read_text(encoding="utf-8")
+    assert text.startswith("---")
+    assert "name: operator-agents" in text
+    assert "operator send" in text and "--headless" in text
