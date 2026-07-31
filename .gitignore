@@ -4,5 +4,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Packaging output (`pip wheel .`, `python -m build`).
+/build/
+/dist/
+
 # All work happens in worktrees rooted here; they are checkouts, not content.
 /.worktrees/

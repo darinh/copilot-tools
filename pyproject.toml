@@ -1,6 +1,6 @@
 [project]
 name = "copilot-tools"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Tools, skills, and workflow conventions for GitHub Copilot CLI power users"
 readme = "README.md"
 license = { text = "MIT" }
@@ -30,6 +30,8 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 py-modules = [
     "copilot_operator",
+    "copilot_tools_version",
+    "install_manifest",
     "operator_console",
     "operator_ingest",
     "operator_mail",
@@ -39,6 +41,11 @@ py-modules = [
     "project_paths",
     "setup_tools",
 ]
+
+# The version lives in one module so packaging metadata and the install
+# manifest cannot disagree about what is installed.
+[tool.setuptools.dynamic]
+version = { attr = "copilot_tools_version.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

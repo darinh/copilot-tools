@@ -15,9 +15,10 @@ Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Buil
 | [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | Roslyn-backed C# structural analysis |
 | [`skills/operator-agents`](skills/operator-agents/SKILL.md) | Starting parallel operator agents and messaging them |
 | [`operator_mail.py`](docs/operator.md#parallel-agents-and-messaging) | Message store behind `operator send` / `operator inbox` |
+| [`install_manifest.py`](docs/versioning.md) | Records what setup deployed and its hash, so upgrades know what's safe to replace |
 | [`extensions/`](extensions/README.md) | Copilot CLI runtime extensions: open-in-vs-code, lint-on-edit, security-shield, test-enforcer, architecture-enforcer, copy-to-clipboard-tool |
 | [`templates/`](templates/) | Configuration templates for copilot-instructions, MCP servers, and per-project setup |
-| [`docs/`](docs/) | Documentation for operator, skills, and spec-kit |
+| [`docs/`](docs/) | Documentation for operator, skills, versioning, and spec-kit |
 | [`setup.sh`](setup.sh) | Linux/WSL/macOS setup: migrates any legacy bash install to Python, then delegates to `setup_tools.py` |
 | [`setup.ps1`](setup.ps1) | Windows setup: locates or installs Python 3.10+, then delegates to `setup_tools.py` |
 
@@ -88,10 +89,18 @@ shells pick it up.
 Only a genuinely unautomatable failure — no package manager at all, or an
 install that errors — stops setup, and it prints the exact manual command.
 
-Useful flags: `--yes` (assume yes to overwrite prompts), `--check-only`
-(report missing prerequisites and change nothing), `--no-install-prereqs`
-(old check-and-bail behavior), `--skip-optional` (skip Anvil, spec-kit, and
-the MCP servers), `--skip-package` (skip `pip install -e .`).
+Useful flags: `--yes` (assume yes to overwrite prompts), `--status` (report
+what's installed and whether an update is needed, changing nothing),
+`--check-only` (report missing prerequisites and change nothing),
+`--no-install-prereqs` (old check-and-bail behavior), `--skip-optional` (skip
+Anvil, spec-kit, and the MCP servers), `--skip-package` (skip
+`pip install -e .`).
+
+Setup records what it deployed in `~/.operator/install-manifest.json`, so a
+later run can tell "the repository moved on and you never touched your copy"
+(update silently) from "you customised this" (ask first). After pulling on
+another machine, `python setup_tools.py --status` answers whether you need to
+re-run setup. See [Versioning](docs/versioning.md).
 
 You can also invoke `python setup_tools.py` / `python3 setup_tools.py`
 directly if you don't need the migration step below.
@@ -215,14 +224,18 @@ copilot-tools/
 ├── operator_console.py      # UTF-8 console output
 ├── handoff_tool.py          # Session handoff
 ├── setup_tools.py           # Cross-platform environment setup
+├── install_manifest.py      # Records what setup deployed; upgrade strategies
+├── copilot_tools_version.py # The single source of the version number
 ├── pyproject.toml           # Packaging and console scripts
 ├── operator.sh              # Legacy bash wrapper (Linux/WSL)
 ├── operator-ingest.py       # Legacy log parser, used by operator.sh
 ├── handoff.sh               # Legacy bash handoff (Linux/WSL)
 ├── setup.sh                 # Legacy bash setup (Linux/WSL)
 ├── skills/
-│   └── code-intelligence/
-│       └── SKILL.md          # Roslyn routing
+│   ├── code-intelligence/
+│   │   └── SKILL.md          # Roslyn routing
+│   └── operator-agents/
+│       └── SKILL.md          # Parallel operator agents and mail
 ├── templates/
 │   ├── copilot-instructions.md    # Workflow conventions
 │   ├── mcp-config.json            # MCP server config
@@ -231,5 +244,6 @@ copilot-tools/
 └── docs/
     ├── operator.md           # Operator documentation
     ├── skills.md             # Skills reference
+    ├── versioning.md         # Install manifest and upgrade strategies
     └── spec-kit.md           # GitHub spec-kit documentation
 ```

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import install_manifest
 import setup_tools
 
 
@@ -514,3 +515,243 @@ def test_the_operator_skill_is_shipped():
     assert text.startswith("---")
     assert "name: operator-agents" in text
     assert "operator send" in text and "--headless" in text
+
+
+# ── install manifest integration ─────────────────────────────────
+@pytest.fixture()
+def install_env(tmp_path, monkeypatch):
+    """A miniature repo and a home to deploy it into."""
+    repo = tmp_path / "repo"
+    (repo / "templates").mkdir(parents=True)
+    (repo / "templates" / "copilot-instructions.md").write_text("v1", encoding="utf-8")
+    (repo / "templates" / "mcp-config.json").write_text("{}", encoding="utf-8")
+    (repo / "skills" / "demo").mkdir(parents=True)
+    (repo / "skills" / "demo" / "SKILL.md").write_text("v1", encoding="utf-8")
+    home = tmp_path / "copilot"
+    operator_home = tmp_path / "operator"
+    monkeypatch.setattr(setup_tools, "REPO_ROOT", repo)
+    monkeypatch.setattr(setup_tools, "COPILOT_DIR", home)
+    monkeypatch.setattr(setup_tools, "OPERATOR_HOME", operator_home)
+    return repo, home, operator_home
+
+
+def _forbid_ask(monkeypatch):
+    def explode(*_a, **_k):
+        raise AssertionError("setup asked about a file the user never touched")
+    monkeypatch.setattr(setup_tools, "ask", explode)
+
+
+def test_unmodified_template_updates_without_asking(install_env, monkeypatch):
+    """The whole point of the manifest: if the deployed bytes are the bytes we
+    wrote, the user has nothing invested in them and there is no question to
+    ask. Before the manifest this prompted on every upgrade."""
+    repo, home, _ = install_env
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_templates(assume_yes=True, manifest=manifest)
+
+    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    _forbid_ask(monkeypatch)
+    setup_tools.install_templates(manifest=manifest)
+
+    assert (home / "copilot-instructions.md").read_text(encoding="utf-8") == "v2"
+
+
+def test_unmodified_skill_updates_without_asking(install_env, monkeypatch):
+    repo, home, _ = install_env
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_skills(assume_yes=True, manifest=manifest)
+
+    (repo / "skills" / "demo" / "SKILL.md").write_text("v2", encoding="utf-8")
+    _forbid_ask(monkeypatch)
+    setup_tools.install_skills(manifest=manifest)
+
+    assert (home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8") == "v2"
+
+
+def test_locally_edited_template_still_asks(install_env, monkeypatch):
+    repo, home, _ = install_env
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_templates(assume_yes=True, manifest=manifest)
+
+    (home / "copilot-instructions.md").write_text("MY EDITS", encoding="utf-8")
+    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(setup_tools, "ask",
+                        lambda q, *_a, **_k: asked.append(q) or False)
+    setup_tools.install_templates(manifest=manifest)
+
+    assert asked, "a locally edited file must not be silently overwritten"
+    assert (home / "copilot-instructions.md").read_text(encoding="utf-8") == "MY EDITS"
+
+
+def test_edited_template_is_replaced_when_consented(install_env, monkeypatch):
+    repo, home, _ = install_env
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_templates(assume_yes=True, manifest=manifest)
+    (home / "copilot-instructions.md").write_text("MY EDITS", encoding="utf-8")
+    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    monkeypatch.setattr(setup_tools, "ask", lambda *_a, **_k: True)
+    setup_tools.install_templates(manifest=manifest)
+    assert (home / "copilot-instructions.md").read_text(encoding="utf-8") == "v2"
+
+
+def test_without_a_manifest_setup_falls_back_to_asking(install_env, monkeypatch):
+    """A machine that predates manifests, or one whose manifest was lost, keeps
+    the old conservative behaviour."""
+    repo, home, _ = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "copilot-instructions.md").write_text("from an older setup",
+                                                  encoding="utf-8")
+    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(setup_tools, "ask",
+                        lambda q, *_a, **_k: asked.append(q) or False)
+    setup_tools.install_templates(manifest=install_manifest.empty_manifest())
+    assert asked
+    assert (home / "copilot-instructions.md").read_text(
+        encoding="utf-8") == "from an older setup"
+
+
+def test_install_records_what_it_wrote(install_env):
+    _repo, home, _ = install_env
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_templates(assume_yes=True, manifest=manifest)
+    setup_tools.install_skills(assume_yes=True, manifest=manifest)
+
+    entry = manifest["artifacts"]["templates/copilot-instructions.md"]
+    assert entry["version"] == setup_tools.TOOLKIT_VERSION
+    assert entry["sha256"] == install_manifest.file_digest(
+        home / "copilot-instructions.md")
+    assert "skills/demo" in manifest["artifacts"]
+
+
+def test_an_already_current_file_becomes_tracked(install_env):
+    """A file that happens to match the repo is recorded too, so the very next
+    upgrade can be applied silently."""
+    _repo, home, _ = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "copilot-instructions.md").write_text("v1", encoding="utf-8")
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_templates(assume_yes=True, manifest=manifest)
+    assert "templates/copilot-instructions.md" in manifest["artifacts"]
+
+
+def test_declining_leaves_the_artifact_untracked(install_env, monkeypatch):
+    """Refusing an overwrite must not record the file as ours, or the next run
+    would overwrite it without asking."""
+    repo, home, _ = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "copilot-instructions.md").write_text("mine", encoding="utf-8")
+    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    manifest = install_manifest.empty_manifest()
+    monkeypatch.setattr(setup_tools, "ask", lambda *_a, **_k: False)
+    setup_tools.install_templates(manifest=manifest)
+    assert "templates/copilot-instructions.md" not in manifest["artifacts"]
+
+
+def test_deployed_artifacts_covers_templates_and_skills(install_env):
+    keys = {key for key, _kind, _src, _dest in setup_tools.deployed_artifacts()}
+    assert "templates/copilot-instructions.md" in keys
+    assert "templates/mcp-config.json" in keys
+    assert "skills/demo" in keys
+
+
+def test_status_reports_stale_and_exits_nonzero(install_env, capsys):
+    repo, _home, operator_home = install_env
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_templates(assume_yes=True, manifest=manifest)
+    setup_tools.install_skills(assume_yes=True, manifest=manifest)
+    manifest["package_version"] = setup_tools.TOOLKIT_VERSION
+    install_manifest.save(operator_home, manifest)
+
+    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    code = setup_tools.report_status()
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "safe to update" in out
+
+
+def test_status_is_clean_when_everything_is_current(install_env, capsys):
+    _repo, _home, operator_home = install_env
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_templates(assume_yes=True, manifest=manifest)
+    setup_tools.install_skills(assume_yes=True, manifest=manifest)
+    manifest["package_version"] = setup_tools.TOOLKIT_VERSION
+    install_manifest.save(operator_home, manifest)
+
+    assert setup_tools.report_status() == 0
+    assert "up to date" in capsys.readouterr().out
+
+
+def test_status_flags_a_machine_that_never_ran_setup(install_env, capsys):
+    setup_tools.report_status()
+    assert "No install manifest" in capsys.readouterr().out
+
+
+def test_upgrades_are_skipped_on_a_fresh_machine(install_env, monkeypatch, capsys):
+    """There is no old state to migrate before the first install, so running
+    historical upgrades would be noise."""
+    called = []
+    monkeypatch.setattr(install_manifest, "pending_migrations",
+                        lambda *_a, **_k: [("1.0.0", "1.1.0",
+                                            lambda ctx: called.append(1))])
+    setup_tools.apply_upgrades(install_manifest.empty_manifest())
+    assert called == []
+
+
+def test_upgrades_run_when_files_are_already_deployed(install_env, monkeypatch):
+    _repo, home, _ = install_env
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_templates(assume_yes=True, manifest=manifest)
+    called = []
+    monkeypatch.setattr(install_manifest, "pending_migrations",
+                        lambda *_a, **_k: [("1.0.0", "1.1.0",
+                                            lambda ctx: called.append(ctx))])
+    setup_tools.apply_upgrades(manifest)
+    assert len(called) == 1
+    assert called[0].copilot_dir == home
+
+
+def test_the_version_is_a_single_source_of_truth():
+    """pyproject reads the version from the module, so the two cannot drift."""
+    root = Path(__file__).resolve().parent.parent
+    text = (root / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'attr = "copilot_tools_version.__version__"' in text
+    assert 'dynamic = ["version"]' in text
+
+
+def _declared_py_modules():
+    root = Path(__file__).resolve().parent.parent
+    text = (root / "pyproject.toml").read_text(encoding="utf-8")
+    block = text.split("py-modules = [", 1)[1].split("]", 1)[0]
+    return {line.strip().strip('",') for line in block.splitlines() if line.strip()}
+
+
+def test_every_imported_local_module_is_packaged():
+    """A top-level module that another packaged module imports must itself be
+    declared, or the installed package raises ModuleNotFoundError at runtime
+    while the repo checkout keeps working."""
+    import ast
+
+    root = Path(__file__).resolve().parent.parent
+    declared = _declared_py_modules()
+    local = {p.stem for p in root.glob("*.py")}
+
+    missing = {}
+    for name in sorted(declared):
+        source = root / f"{name}.py"
+        if not source.is_file():
+            missing[name] = "declared but no such file"
+            continue
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported = {alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported = {node.module.split(".")[0]}
+            else:
+                continue
+            for dep in imported & local:
+                if dep not in declared:
+                    missing[dep] = f"imported by {name}.py"
+    assert not missing, f"add these to pyproject py-modules: {missing}"

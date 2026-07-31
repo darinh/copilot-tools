@@ -35,6 +35,8 @@ import urllib.request
 from pathlib import Path
 
 from operator_console import enable_utf8_output
+from copilot_tools_version import __version__ as TOOLKIT_VERSION
+import install_manifest
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_MACOS = platform.system() == "Darwin"
@@ -106,12 +108,16 @@ def which(name: str) -> str | None:
     return shutil.which(name)
 
 
-def capture(cmd: list[str]) -> tuple[bool, str]:
-    """Run a command for its output. Returns (succeeded, stdout)."""
+def capture(cmd: list[str], timeout: float | None = None) -> tuple[bool, str]:
+    """Run a command for its output. Returns (succeeded, stdout).
+
+    ``timeout`` guards the version probes: a wedged tool should cost setup a
+    few seconds, not hang it.
+    """
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              env=_clean_env())
-    except OSError:
+                              env=_clean_env(), timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
         return False, ""
     return proc.returncode == 0, proc.stdout or ""
 
@@ -866,21 +872,7 @@ def install_package(assume_yes: bool = False) -> bool:
     else:
         info(f"operator resolves to {shutil.which('operator')}")
     return True
-    info("Package installed")
 
-    if not shutil.which("operator"):
-        scripts_dir = Path(sys.executable).parent
-        if IS_WINDOWS:
-            scripts_dir = scripts_dir / "Scripts"
-        warn("'operator' is not on PATH yet. Add this directory to PATH:")
-        print(f"       {scripts_dir}")
-        if IS_WINDOWS:
-            print('       PowerShell: $env:PATH = "' + str(scripts_dir) + ';$env:PATH"')
-        else:
-            print(f'       bash: export PATH="{scripts_dir}:$PATH"')
-    else:
-        info(f"operator resolves to {shutil.which('operator')}")
-    return True
 
 def _dirs_match(a: Path, b: Path) -> bool:
     """True when two directory trees have identical file names and contents."""
@@ -900,11 +892,13 @@ def _dirs_match(a: Path, b: Path) -> bool:
     return True
 
 
-def _link_directory(src: Path, dest: Path, assume_yes: bool = False) -> str:
+def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
+                    may_replace: bool = False) -> str:
     """Link src -> dest, preferring a link and falling back to a copy.
 
     A real directory at ``dest`` may contain edits the user made in place, so it
-    is never removed without consent.
+    is never removed without consent — unless ``may_replace`` says the manifest
+    has already proved its contents are the ones setup wrote.
     """
     if dest.is_symlink() or (IS_WINDOWS and dest.is_dir() and _is_junction(dest)):
         try:
@@ -919,8 +913,9 @@ def _link_directory(src: Path, dest: Path, assume_yes: bool = False) -> str:
     elif dest.exists():
         if dest.is_dir() and _dirs_match(src, dest):
             return "already up to date"
-        if not ask(f"{dest} exists and differs from the repository copy. Replace it?",
-                   assume_yes):
+        if not may_replace and not ask(
+                f"{dest} exists and differs from the repository copy. Replace it?",
+                assume_yes):
             return "skipped (kept existing)"
         shutil.rmtree(dest, ignore_errors=True)
         shutil.copytree(src, dest)
@@ -948,46 +943,147 @@ def _is_junction(path: Path) -> bool:
         return False
 
 
-def install_extensions(assume_yes: bool = False) -> None:
+#: Files copied from ``templates/`` into ``~/.copilot``.
+TEMPLATE_ARTIFACTS = (
+    ("mcp-config.json", "mcp-config.json", "MCP config"),
+    ("copilot-instructions.md", "copilot-instructions.md", "Copilot instructions"),
+)
+
+
+def _skill_sources() -> list[Path]:
+    root = REPO_ROOT / "skills"
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.iterdir()
+                  if p.is_dir() and (p / "SKILL.md").is_file())
+
+
+def _extension_sources() -> list[Path]:
+    root = REPO_ROOT / "extensions"
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.iterdir() if p.is_dir())
+
+
+def deployed_artifacts() -> list[tuple[str, str, Path, Path]]:
+    """Every ``(key, kind, source, dest)`` setup copies out of this repository.
+
+    One definition shared by the installers and ``--status`` so a report can
+    never describe a different set of files than the one setup writes.
+    """
+    items: list[tuple[str, str, Path, Path]] = []
+    for src_name, dest_name, _label in TEMPLATE_ARTIFACTS:
+        items.append((f"templates/{src_name}", "template",
+                      REPO_ROOT / "templates" / src_name, COPILOT_DIR / dest_name))
+    for src in _skill_sources():
+        items.append((f"skills/{src.name}", "skill",
+                      src, COPILOT_DIR / "skills" / src.name))
+    for src in _extension_sources():
+        items.append((f"extensions/{src.name}", "extension",
+                      src, COPILOT_DIR / "extensions" / src.name))
+    return items
+
+
+def detect_tool_versions() -> dict[str, str]:
+    """Versions of the external tools this toolkit drives.
+
+    Recorded for diagnosis only — nothing branches on these. When a machine
+    misbehaves, knowing which Copilot CLI and multiplexer it was set up against
+    is usually the first question.
+    """
+    versions: dict[str, str] = {
+        "python": platform.python_version(),
+        "copilot-tools": TOOLKIT_VERSION,
+    }
+    probes = [("git", ["git", "--version"]), ("copilot", ["copilot", "--version"])]
+    mux = find_multiplexer()
+    if mux:
+        probes.append((mux, [mux, "-V"]))
+    for name, cmd in probes:
+        if not which(cmd[0]):
+            continue
+        ok, out = capture(cmd, timeout=20)
+        if ok and out.strip():
+            versions[name] = out.strip().splitlines()[0].strip()
+    return versions
+
+
+def _resolve_overwrite(state: str, label: str, dest: Path, assume_yes: bool) -> bool:
+    """Decide whether to write over an existing artifact.
+
+    The manifest is what makes this more than a byte comparison: ``STALE``
+    means the bytes on disk are the bytes setup wrote, so the user has nothing
+    invested in them and the update is not a question worth asking.
+    """
+    if state == install_manifest.STALE:
+        info(f"{label}: updating (your copy was unmodified)")
+        return True
+    if state == install_manifest.MODIFIED:
+        return ask(f"{label} at {dest} has local edits. Overwrite them?", assume_yes)
+    if state == install_manifest.UNTRACKED:
+        return ask(f"{label} at {dest} differs and was not installed by setup. "
+                   "Overwrite?", assume_yes)
+    return True
+
+
+def install_extensions(assume_yes: bool = False, manifest: dict | None = None) -> None:
     print("\nInstalling runtime extensions...")
-    src_root = REPO_ROOT / "extensions"
-    if not src_root.is_dir():
+    sources = _extension_sources()
+    if not sources:
         warn("No extensions/ directory found — skipping")
         return
+    manifest = install_manifest.empty_manifest() if manifest is None else manifest
     dest_root = COPILOT_DIR / "extensions"
     dest_root.mkdir(parents=True, exist_ok=True)
-    for src in sorted(p for p in src_root.iterdir() if p.is_dir()):
+    for src in sources:
+        dest = dest_root / src.name
+        key = f"extensions/{src.name}"
+        state = install_manifest.classify(manifest, key, dest,
+                                          install_manifest.tree_digest(src))
         try:
-            result = _link_directory(src, dest_root / src.name, assume_yes)
+            result = _link_directory(src, dest, assume_yes,
+                                     may_replace=install_manifest.may_overwrite(state))
             info(f"extension '{src.name}': {result}")
         except OSError as exc:
             warn(f"extension '{src.name}': {exc}")
+            continue
+        if result.startswith("skipped"):
+            continue
+        linked = "link" in result or "junction" in result
+        install_manifest.record(
+            manifest, key, dest, kind="extension", linked=linked,
+            digest=None if linked else install_manifest.tree_digest(dest),
+        )
 
 
-def install_templates(assume_yes: bool = False) -> None:
+def install_templates(assume_yes: bool = False, manifest: dict | None = None) -> None:
     print("\nInstalling templates...")
     COPILOT_DIR.mkdir(parents=True, exist_ok=True)
-    for src_name, dest_name, label in (
-        ("mcp-config.json", "mcp-config.json", "MCP config"),
-        ("copilot-instructions.md", "copilot-instructions.md", "Copilot instructions"),
-    ):
+    manifest = install_manifest.empty_manifest() if manifest is None else manifest
+    for src_name, dest_name, label in TEMPLATE_ARTIFACTS:
         src = REPO_ROOT / "templates" / src_name
         dest = COPILOT_DIR / dest_name
+        key = f"templates/{src_name}"
         if not src.is_file():
             warn(f"{label}: source missing ({src})")
             continue
-        if dest.exists():
-            if src.read_bytes() == dest.read_bytes():
-                info(f"{label} already up to date")
-                continue
-            if not ask(f"{label} exists at {dest} and differs. Overwrite?", assume_yes):
-                warn(f"Skipped {label} (kept existing)")
-                continue
+        source_digest = install_manifest.file_digest(src)
+        state = install_manifest.classify(manifest, key, dest, source_digest)
+        if state == install_manifest.CURRENT:
+            info(f"{label} already up to date")
+            install_manifest.record(manifest, key, dest, kind="template",
+                                    digest=source_digest)
+            continue
+        if not _resolve_overwrite(state, label, dest, assume_yes):
+            warn(f"Skipped {label} (kept existing)")
+            continue
         shutil.copyfile(src, dest)
+        install_manifest.record(manifest, key, dest, kind="template",
+                                digest=source_digest)
         info(f"Installed {label}")
 
 
-def install_skills(assume_yes: bool = False) -> None:
+def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> None:
     """Install this repo's skills for the user, not for one project.
 
     Skills go to ``~/.copilot/skills/<name>/`` so they are available in every
@@ -995,34 +1091,111 @@ def install_skills(assume_yes: bool = False) -> None:
     would only reach agents working in that one repository, and the operator
     skill is specifically about work that spans projects.
     """
-    source_root = REPO_ROOT / "skills"
-    if not source_root.is_dir():
-        return
-    skills = sorted(p for p in source_root.iterdir()
-                    if p.is_dir() and (p / "SKILL.md").is_file())
+    skills = _skill_sources()
     if not skills:
         return
 
     print("\nInstalling skills...")
+    manifest = install_manifest.empty_manifest() if manifest is None else manifest
     dest_root = COPILOT_DIR / "skills"
     dest_root.mkdir(parents=True, exist_ok=True)
     for src in skills:
         dest = dest_root / src.name
-        source = src / "SKILL.md"
-        target = dest / "SKILL.md"
-        if target.exists():
-            if source.read_bytes() == target.read_bytes():
-                info(f"skill '{src.name}' already up to date")
-                continue
-            if not ask(f"skill '{src.name}' exists at {dest} and differs. Overwrite?",
-                       assume_yes):
-                warn(f"Skipped skill '{src.name}' (kept existing)")
-                continue
+        key = f"skills/{src.name}"
+        label = f"skill '{src.name}'"
+        source_digest = install_manifest.tree_digest(src)
+        state = install_manifest.classify(manifest, key, dest, source_digest)
+        if state == install_manifest.CURRENT:
+            info(f"{label} already up to date")
+            install_manifest.record(manifest, key, dest, kind="skill",
+                                    digest=source_digest)
+            continue
+        if not _resolve_overwrite(state, label, dest, assume_yes):
+            warn(f"Skipped {label} (kept existing)")
+            continue
         dest.mkdir(parents=True, exist_ok=True)
         for item in src.iterdir():
             if item.is_file():
                 shutil.copyfile(item, dest / item.name)
-        info(f"Installed skill '{src.name}'")
+        install_manifest.record(manifest, key, dest, kind="skill",
+                                digest=install_manifest.tree_digest(dest))
+        info(f"Installed {label}")
+
+
+def report_status() -> int:
+    """Print what is installed against what this checkout would install.
+
+    Answers the question a second machine has after ``git pull``: is anything
+    stale, and can it be updated without losing local edits?
+    """
+    manifest = install_manifest.load(OPERATOR_HOME)
+    installed = manifest.get("package_version")
+    print(f"copilot-tools {TOOLKIT_VERSION} (this checkout)")
+    if installed is None:
+        warn("No install manifest found — setup has not run since manifests "
+             "were introduced.")
+    elif install_manifest.is_older(installed, TOOLKIT_VERSION):
+        warn(f"Installed version {installed} is older — run setup to update.")
+    elif install_manifest.is_older(TOOLKIT_VERSION, installed):
+        warn(f"Installed version {installed} is NEWER than this checkout. "
+             "Pull before running setup.")
+    else:
+        info(f"Installed version {installed} is current")
+    print(f"\nManifest: {install_manifest.manifest_path(OPERATOR_HOME)}")
+
+    report = install_manifest.status(manifest, deployed_artifacts())
+    if not report:
+        return 0
+    width = max(len(item.key) for item in report)
+    print("\nDeployed artifacts:")
+    for item in report:
+        version = item.installed_version or "—"
+        print(f"  {item.key.ljust(width)}  {version:>7}  "
+              f"{install_manifest.describe(item.state)}")
+
+    pending = install_manifest.pending_migrations(installed, TOOLKIT_VERSION)
+    if pending:
+        print("\nUpgrade steps setup would run:")
+        for source, target, _func in pending:
+            print(f"  {source} -> {target}")
+
+    tools = manifest.get("tools") or {}
+    if tools:
+        print("\nTool versions at last setup:")
+        for name in sorted(tools):
+            print(f"  {name}: {tools[name]}")
+
+    if install_manifest.needs_update(report):
+        print("\nRun setup to bring these up to date.")
+        return 1
+    return 0
+
+
+def apply_upgrades(manifest: dict, assume_yes: bool = False) -> None:
+    """Run any upgrade functions between the installed and current versions.
+
+    Skipped entirely on a machine with nothing deployed: there is no old state
+    to migrate, and running every historical upgrade against an empty
+    ``~/.copilot`` would be noise at best.
+    """
+    installed = manifest.get("package_version")
+    fresh = not any(dest.exists() for _key, _kind, _src, dest in deployed_artifacts())
+    pending = install_manifest.pending_migrations(installed, TOOLKIT_VERSION)
+    if fresh or not pending:
+        return
+    print(f"\nUpgrading installed files from {installed or 'an untracked version'} "
+          f"to {TOOLKIT_VERSION}...")
+    ctx = install_manifest.MigrationContext(
+        copilot_dir=COPILOT_DIR,
+        operator_home=OPERATOR_HOME,
+        repo_root=REPO_ROOT,
+        manifest=manifest,
+        from_version=installed,
+        to_version=TOOLKIT_VERSION,
+        assume_yes=assume_yes,
+        log=lambda message: info(message),
+    )
+    install_manifest.run_migrations(ctx)
 
 
 def scaffold_directories() -> None:
@@ -1045,6 +1218,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Do not run pip install")
     parser.add_argument("--check-only", action="store_true",
                         help="Report missing prerequisites without installing anything")
+    parser.add_argument("--status", action="store_true",
+                        help="Report installed versions and whether an update is needed")
     parser.add_argument("--no-install-prereqs", dest="install_prereqs",
                         action="store_false",
                         help="Do not install missing prerequisites automatically")
@@ -1053,6 +1228,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     print("\n\u2550\u2550\u2550 Copilot Tools Setup \u2550\u2550\u2550\n")
+
+    if args.status:
+        return report_status()
 
     if args.check_only:
         missing = check_prerequisites()
@@ -1073,18 +1251,31 @@ def main(argv: list[str] | None = None) -> int:
 
     scaffold_directories()
 
+    manifest = install_manifest.load(OPERATOR_HOME)
+    apply_upgrades(manifest, assume_yes=args.yes)
+
     if not args.skip_package:
         if not install_package(assume_yes=args.yes):
             return 1
 
-    install_extensions(assume_yes=args.yes)
-    install_templates(assume_yes=args.yes)
-    install_skills(assume_yes=args.yes)
+    install_extensions(assume_yes=args.yes, manifest=manifest)
+    install_templates(assume_yes=args.yes, manifest=manifest)
+    install_skills(assume_yes=args.yes, manifest=manifest)
 
     if not args.skip_optional:
         ensure_anvil()
         ensure_specify()
         ensure_roslyn_mcp(assume_yes=args.yes)
+
+    manifest["package_version"] = TOOLKIT_VERSION
+    manifest["tools"] = detect_tool_versions()
+    try:
+        install_manifest.save(OPERATOR_HOME, manifest)
+        info(f"Recorded install manifest ({TOOLKIT_VERSION})")
+    except OSError as exc:
+        # The manifest is bookkeeping. Losing it costs prompts on the next run,
+        # so it must never be the reason a successful setup reports failure.
+        warn(f"Could not write install manifest: {exc}")
 
     print("\n\u2550\u2550\u2550 Setup Complete \u2550\u2550\u2550\n")
     print("Next steps:")
