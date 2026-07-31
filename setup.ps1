@@ -14,7 +14,7 @@
 
 .PARAMETER SetupArgs
     Arguments forwarded verbatim to setup_tools.py, e.g. --yes,
-    --skip-package, --skip-optional, or --check-only.
+    --skip-package, --skip-optional, --status, or --check-only.
 
 .EXAMPLE
     ./setup.ps1 --yes
