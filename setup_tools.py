@@ -987,6 +987,44 @@ def install_templates(assume_yes: bool = False) -> None:
         info(f"Installed {label}")
 
 
+def install_skills(assume_yes: bool = False) -> None:
+    """Install this repo's skills for the user, not for one project.
+
+    Skills go to ``~/.copilot/skills/<name>/`` so they are available in every
+    project on the machine. A project-level copy under ``.github/skills/``
+    would only reach agents working in that one repository, and the operator
+    skill is specifically about work that spans projects.
+    """
+    source_root = REPO_ROOT / "skills"
+    if not source_root.is_dir():
+        return
+    skills = sorted(p for p in source_root.iterdir()
+                    if p.is_dir() and (p / "SKILL.md").is_file())
+    if not skills:
+        return
+
+    print("\nInstalling skills...")
+    dest_root = COPILOT_DIR / "skills"
+    dest_root.mkdir(parents=True, exist_ok=True)
+    for src in skills:
+        dest = dest_root / src.name
+        source = src / "SKILL.md"
+        target = dest / "SKILL.md"
+        if target.exists():
+            if source.read_bytes() == target.read_bytes():
+                info(f"skill '{src.name}' already up to date")
+                continue
+            if not ask(f"skill '{src.name}' exists at {dest} and differs. Overwrite?",
+                       assume_yes):
+                warn(f"Skipped skill '{src.name}' (kept existing)")
+                continue
+        dest.mkdir(parents=True, exist_ok=True)
+        for item in src.iterdir():
+            if item.is_file():
+                shutil.copyfile(item, dest / item.name)
+        info(f"Installed skill '{src.name}'")
+
+
 def scaffold_directories() -> None:
     print("\nSetting up directories...")
     for path in (COPILOT_DIR / "projects", COPILOT_DIR / "logs",
@@ -1041,6 +1079,7 @@ def main(argv: list[str] | None = None) -> int:
 
     install_extensions(assume_yes=args.yes)
     install_templates(assume_yes=args.yes)
+    install_skills(assume_yes=args.yes)
 
     if not args.skip_optional:
         ensure_anvil()

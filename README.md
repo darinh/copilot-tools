@@ -13,6 +13,8 @@ Tools, skills, and workflow conventions for GitHub Copilot CLI power users. Buil
 | [`handoff_tool.py`](docs/operator.md) | Atomic session handoff for agents |
 | [`operator.sh`](operator.sh), [`handoff.sh`](handoff.sh), [`operator-ingest.py`](operator-ingest.py) | Original bash implementation, retained unchanged on disk for rollback but no longer installed fresh by `setup.sh` |
 | [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | Roslyn-backed C# structural analysis |
+| [`skills/operator-agents`](skills/operator-agents/SKILL.md) | Starting parallel operator agents and messaging them |
+| [`operator_mail.py`](docs/operator.md#parallel-agents-and-messaging) | Message store behind `operator send` / `operator inbox` |
 | [`extensions/`](extensions/README.md) | Copilot CLI runtime extensions: open-in-vs-code, lint-on-edit, security-shield, test-enforcer, architecture-enforcer, copy-to-clipboard-tool |
 | [`templates/`](templates/) | Configuration templates for copilot-instructions, MCP servers, and per-project setup |
 | [`docs/`](docs/) | Documentation for operator, skills, and spec-kit |
@@ -146,6 +148,11 @@ operator --loop --name frontend --agent=anvil:anvil
 operator --loop --name backend --agent=anvil:anvil
 operator list
 
+# Start a loop without attaching, then message it
+operator --loop --headless --name payments-api --agent=anvil:anvil
+operator send --from backend --to payments-api "POST /charges returns {id, status}"
+operator inbox
+
 # Usage reports
 operator report costs
 ```
@@ -160,7 +167,8 @@ See [Operator Documentation](docs/operator.md) for full details.
 
 | Skill | Type | Source |
 |-------|------|--------|
-| **code-intelligence** | Project skill (copy to `.github/skills/`) | Included in this repo |
+| **code-intelligence** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **operator-agents** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
 | **Anvil** | Installable plugin | [`burkeholland/anvil`](https://github.com/burkeholland/anvil) |
 | **frontend-design** | Built-in CLI skill | Ships with Copilot CLI |
 | **find-skills** | Built-in CLI skill | Ships with Copilot CLI |
@@ -175,6 +183,7 @@ The `templates/copilot-instructions.md` file establishes conventions for:
 - **Session History** — SQL-based audit trail of work across sessions
 - **Spec-Driven Development** — specs as the single source of truth (enabled by default)
 - **Parallel Agents** — SQL-coordinated parallel task execution via `todo_claims`
+- **Operator Agents** — parallel *peer* agents in their own terminals, talking via `operator send` / `operator inbox`
 - **Branching Strategy** — feature branches worked on in worktrees, merged to `main`, conventional commits
 - **Git Worktrees** — all work happens in `<repoRoot>/.worktrees/`; always on, not optional
 

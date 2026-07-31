@@ -284,3 +284,37 @@ def test_attach_never_passes_creationflags(monkeypatch):
     assert len(rec.kwargs) == 1
     assert "creationflags" not in rec.kwargs[0]
     assert "capture_output" not in rec.kwargs[0]
+
+
+# ── send-keys literalness ───────────────────────────────────────
+#
+# Regression tests for message injection. Verified on psmux 3.3.7: without
+# `-l` the backend looks up every whitespace-separated token in the string as
+# a key name, so a message containing the word "Enter" submits early and the
+# rest is lost, and one containing "C-c" delivers Ctrl-C to the pane.
+def test_send_keys_is_literal_and_sends_enter_separately(monkeypatch):
+    mux = Mux(binary="tmux")
+    rec = FakeRunner({})
+    monkeypatch.setattr(operator_mux.subprocess, "run", rec)
+    mux.send_keys("sess", "hello Enter C-c world")
+    assert rec.calls == [
+        ["tmux", "send-keys", "-t", "sess", "-l", "hello Enter C-c world"],
+        ["tmux", "send-keys", "-t", "sess", "Enter"],
+    ]
+
+
+def test_send_keys_without_enter_sends_only_the_text(monkeypatch):
+    mux = Mux(binary="tmux")
+    rec = FakeRunner({})
+    monkeypatch.setattr(operator_mux.subprocess, "run", rec)
+    mux.send_keys("sess", "no newline", enter=False)
+    assert rec.calls == [["tmux", "send-keys", "-t", "sess", "-l", "no newline"]]
+
+
+def test_send_keys_can_still_send_key_names_when_asked(monkeypatch):
+    """The non-literal path stays available for real key names."""
+    mux = Mux(binary="tmux")
+    rec = FakeRunner({})
+    monkeypatch.setattr(operator_mux.subprocess, "run", rec)
+    mux.send_keys("sess", "C-c", literal=False, enter=False)
+    assert rec.calls == [["tmux", "send-keys", "-t", "sess", "C-c"]]

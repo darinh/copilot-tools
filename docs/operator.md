@@ -87,6 +87,15 @@ operator --loop --name myproject --agent=anvil:anvil
 operator --loop --name project-a --agent=anvil:anvil
 operator --loop --name project-b --agent=anvil:anvil
 
+# Start a loop without attaching (one agent starting another agent's loop)
+operator --loop --headless --name project-c --agent=anvil:anvil
+
+# Messaging between instances
+operator send --from project-a --to project-b "schema is frozen"
+operator inbox                       # read this directory's instance mail
+operator inbox project-b --peek      # read without marking read
+operator inbox project-b --history   # already-delivered messages
+
 # Management
 operator                             # interactive menu (no args)
 operator list                        # show running instances
@@ -384,6 +393,65 @@ WSL-based instances are relaunched as `wsl.exe -d <Distro> --cd <path> --
 bash -lic "operator ..."` inside their own tab; native instances are relaunched
 as `powershell -NoExit -Command "operator ..."` in the recorded directory.
 
+## Parallel agents and messaging
+
+An operator instance is a **full Copilot CLI in its own process**, not a
+sub-agent of whoever started it. Two instances share nothing — not context, not
+a working directory, not a git index — so they need a way to talk.
+
+### Starting one headlessly
+
+```bash
+operator --loop --headless --name payments-api --agent anvil
+```
+
+`--headless` (synonym: `--detached`) starts the background loop supervisor and
+returns instead of attaching. Without it, `operator --loop` takes over the
+calling terminal with a full-screen TUI, which makes it unusable for an agent
+starting another agent's loop. It still waits for the session to come up and
+exits non-zero if it never does, so a caller that never attaches still learns
+about a failed launch.
+
+Give each instance its own directory — ideally its own repository. Instance
+names, handoff files and git state are all keyed to the working directory, and
+two loops in one tree fight over the index and each other's uncommitted work.
+Pointing two agents at one project is possible but unenforced: nothing prevents
+an agent from editing outside its assigned area.
+
+### Messaging
+
+```bash
+operator send --from alpha --to beta "the schema is frozen"
+operator send --from alpha --to beta --queue "pick this up at a break"
+operator send --from alpha --to gamma --force "for an instance not started yet"
+
+operator inbox                    # this directory's instance, marks read
+operator inbox beta --peek        # leave them unread
+operator inbox beta --history     # already-delivered messages
+operator inbox beta --json        # machine-readable
+```
+
+`--from` and `--to` are both required. The recipient cannot see who is running
+what, so an unattributed message is one it cannot answer; every delivered
+message carries a ready-made reply command. A `--to` naming no known instance
+is refused and the known names are listed, because a typo would otherwise queue
+a message into a mailbox nobody ever reads.
+
+**Delivery.** If the recipient's Copilot process is running, the message is
+typed into its session and lands immediately. If it is between sessions (or the
+pane is dead), the message is queued and handed over in the next session's
+preamble. `--queue` forces the queued path.
+
+Queued mail is read when a session launches but only archived once that session
+is actually up, so a launch that fails and retries does not swallow it. Live
+delivery uses literal key input: without that, a message containing the word
+`Enter` would submit early and one containing `C-c` would interrupt the
+recipient.
+
+Messages live in `~/.operator/messages/<instance>/inbox/` and move to
+`../archive/` when read — read mail is archived rather than deleted, so
+`--history` is a genuine audit trail of what agents told each other.
+
 ## Metrics
 
 The operator stores metrics in `~/.operator/metrics.db` (SQLite). Each session records:
@@ -426,6 +494,8 @@ logs.
 | `~/.operator/restart/<id>.launch.json` | Launch spec for the session |
 | `~/.operator/restart/<id>.runner.log` | Supervisor log for the instance |
 | `~/.operator/tabs.json` | Tracked terminal tabs, used by `operator restore` |
+| `~/.operator/messages/<id>/inbox/` | Undelivered messages for an instance |
+| `~/.operator/messages/<id>/archive/` | Messages already delivered, kept as an audit trail |
 | `~/.operator/backups/` | Historical backups of the operator script |
 | `~/.copilot/logs/process-*.log` | Copilot process logs (override with `COPILOT_LOG_DIR`) |
 

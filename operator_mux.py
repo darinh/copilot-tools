@@ -252,7 +252,25 @@ class Mux:
             "set-option", "-t", session, "remain-on-exit", "on" if enabled else "off"
         )
 
-    def send_keys(self, session: str, text: str, enter: bool = True) -> None:
+    def send_keys(self, session: str, text: str, enter: bool = True,
+                  literal: bool = True) -> None:
+        """Type ``text`` into a session, optionally followed by Enter.
+
+        Literal by default, and callers should keep it that way for any text
+        they did not write themselves. Without ``-l`` the backend looks up
+        every whitespace-separated token in the string as a *key name*, so
+        arbitrary text is an input-injection vector rather than data:
+        verified on psmux 3.3.7, the word ``Enter`` inside a message submits
+        the line early and truncates the rest, and ``C-c`` would deliver
+        Ctrl-C to the program in the pane.
+
+        ``-l`` does not accept a trailing key name, so Enter is a second call.
+        """
+        if literal:
+            self._run("send-keys", "-t", session, "-l", text)
+            if enter:
+                self._run("send-keys", "-t", session, "Enter")
+            return
         args = ["send-keys", "-t", session, text]
         if enter:
             args.append("Enter")
