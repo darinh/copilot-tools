@@ -24,25 +24,26 @@ Enabled. See `~/.copilot/copilot-instructions.md` for protocol.
 Handoff file: `~/.copilot/projects/{guid}/next-session.md`
 
 ### Operator Restart Protocol
-When a session is complete or getting heavy (large context window), you MUST:
-1. Write `next-session.md` with full handoff context
-2. Present your final output to the user (summary of what was delivered, evidence bundles, etc.) — **everything you want recorded in the session log must be output BEFORE step 3**
-3. As your **absolute last action**, create the restart marker from your operator preamble using the
-   form for your platform — the operator kills the process immediately after detecting this file, so any
-   output after this point is lost:
+When a session is complete or getting heavy (large context window), call the
+`handoff` command. It takes the handoff text as arguments, writes
+`next-session.md`, and raises the restart marker in one step — so the restart
+can never be forgotten and a half-written handoff can never trigger one.
 
-   **PowerShell (Windows)**
-   ```powershell
-   New-Item -ItemType File -Force ~/.operator/restart/{instance-name}
-   ```
+```
+handoff --instance {instance-name} --status "What was completed" --next "Prioritized next steps" --context "Key decisions, gotchas" --prompt "Ready-to-execute prompt for next session"
+```
 
-   **bash (Linux/macOS/WSL)**
-   ```bash
-   touch ~/.operator/restart/{instance-name}
-   ```
-4. **DO NOT output anything after creating the marker.** No summary, no farewell, no tool calls. It is the final thing you do.
-5. **DO NOT FORGET STEP 3.** The handoff file is useless without the restart trigger.
-6. This applies to EVERY session end — whether task-complete or context-heavy.
+`--status` and `--next` are required; the command fails rather than writing a
+useless handoff. It takes the same arguments on every platform.
+
+1. Present your final output first — everything you want recorded must be
+   emitted **before** you call `handoff`.
+2. Call `handoff` as your **absolute last action**. The operator kills the
+   process as soon as it sees the marker, so anything after it is lost.
+3. **Never write `next-session.md` by hand and never touch the marker
+   yourself.** Doing it in two steps is exactly what `handoff` exists to
+   prevent.
+4. This applies to EVERY session end — task-complete or context-heavy.
 
 ---
 
