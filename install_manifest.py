@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -114,6 +115,39 @@ def path_present(path: Path) -> bool | None:
         # written there either.
         return False
     return True
+
+
+def dir_present(path: Path) -> bool | None:
+    """Whether ``path`` is a directory: True, False, or None for "cannot tell".
+
+    Follows symlinks, since a link to a directory is usable as one. That is
+    also the limit of what False means here. An exception type is a claim
+    about what the *call* did, not about what the object *is*: ``stat`` raises
+    ``FileNotFoundError`` for a dangling symlink, whose own directory entry is
+    very much there. So False reads as "not usable as a directory", never as
+    "the path is free". Callers for whom those differ must ask
+    ``path_present`` -- which does not follow the link -- as well.
+    """
+    try:
+        return stat.S_ISDIR(os.stat(path).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except (OSError, ValueError):
+        return None
+
+
+def file_present(path: Path) -> bool | None:
+    """Whether ``path`` is a regular file: True, False, or None.
+
+    The same caveat as ``dir_present``: False means "not usable as a regular
+    file", which a directory, a fifo and a dangling symlink all are.
+    """
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except (OSError, ValueError):
+        return None
 
 
 # ── hashing ──────────────────────────────────────────────────────
