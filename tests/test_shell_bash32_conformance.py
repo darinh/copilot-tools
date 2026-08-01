@@ -97,96 +97,241 @@ def _code_only(line: str) -> str:
             out.append(ch)
             i += 1
             continue
-        if ch == "#" and (i == 0 or line[i - 1].isspace()):
+        if ch == "#" and (i == 0 or line[i - 1].isspace()
+                          or line[i - 1] in ";&|()"):
             break
         out.append(ch)
         i += 1
     return "".join(out)
 
 
+def _outside_quotes(code: str) -> str:
+    """`code` with the contents of every quoted span blanked out.
+
+    Detectors for *words and operators* run against this, so that
+    `echo "|&"` is a string containing two characters rather than a bash 4
+    pipe. Detectors for `${...}` expansions deliberately do NOT use it: a
+    guarded expansion is written `${a[@]+"${a[@]}"}`, quotes and all, and
+    blanking them would erase the very text those detectors read.
+    """
+    out: list[str] = []
+    quote = None
+    i = 0
+    while i < len(code):
+        ch = code[i]
+        if quote is not None:
+            if ch == "\\" and quote == '"' and i + 1 < len(code):
+                out.append("  ")
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            out.append(" ")
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            out.append(" ")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+# `declare`/`local` flags, collected token-wise rather than matched in one
+# spelling. bash accepts the flags of a declaration in any order and in any
+# number of option words, so `declare -A seen`, `declare -r -A seen` and
+# `declare -rA seen` are the same declaration -- and a regex that expects the
+# letter in the first option word sees only the first of them. That was a real
+# hole in the first draft of this file, found by review: `declare -r -A seen`
+# and `declare -nr ref=x` both passed the scan.
+_DECLARATION = re.compile(
+    r"\b(local|declare|typeset|readonly|export)((?:\s+-[A-Za-z]+)+)")
+
+
+def _declaration_flags(code: str) -> list[tuple[str, set[str]]]:
+    """(command, set of flag letters) for each declaration command in `code`."""
+    return [
+        (m.group(1), set("".join(re.findall(r"-([A-Za-z]+)", m.group(2)))))
+        for m in _DECLARATION.finditer(code)
+    ]
+
+
+def _declares_with(flags: str, commands: tuple[str, ...]):
+    """Match a declaration by any of `flags`, whatever order they are given in."""
+    wanted = set(flags)
+    def matches(code: str) -> bool:
+        return any(cmd in commands and wanted & present
+                   for cmd, present in _declaration_flags(code))
+    return matches
+
+
 # `${a[@]+"${a[@]}"}` -- the guarded expansion. The backreferences matter:
 # `${a[@]+"${b[@]}"}` is a real bug (it guards on one array and expands
-# another) and must not be accepted as a guard for either of them.
+# another) and must not be accepted as a guard for either of them. The `!`
+# is optional on the inner half only: `${a[@]+"${!a[@]}"}` guards an index
+# expansion, and the guard is still written over the array's values.
 _GUARDED = re.compile(
-    r"""\$\{([A-Za-z_]\w*)\[([@*])\]\+"?\$\{\1\[\2\]\}"?\}""")
+    r"""\$\{([A-Za-z_]\w*)\[([@*])\]\+"?\$\{!?\1\[\2\]\}"?\}""")
 
-# A bare value expansion of an array: `"${a[@]}"` / `${a[*]}`. `${#a[@]}` is
-# NOT this -- the length operator is safe under `set -u` on every bash, which
-# is why the name has to follow `{` immediately here.
-_BARE_ARRAY = re.compile(r"\$\{[A-Za-z_]\w*\[[@*]\]\}")
+# A bare value or index expansion of an array: `"${a[@]}"` / `${a[*]}` /
+# `"${!a[@]}"`. Indices abort exactly as values do -- an empty array under
+# `set -u` is unbound either way before bash 4.4. `${#a[@]}` is NOT this: the
+# length operator is safe on every bash, which is why `#` is not accepted here
+# while `!` is.
+_BARE_ARRAY = re.compile(r"\$\{!?[A-Za-z_]\w*\[[@*]\]\}")
 
 
 def _unguarded_array_expansions(code: str) -> list[str]:
     return _BARE_ARRAY.findall(_GUARDED.sub("", code))
 
 
-# (name, predicate over one line of code, why it is fatal on bash 3.2)
-DETECTORS: tuple[tuple[str, object, str], ...] = (
+# (name, predicate, why it is fatal on bash 3.2, which text it reads)
+#
+# "bare" means quoted spans are blanked first, so a word or operator inside a
+# string is text rather than syntax. "code" means the line with quotes intact,
+# which the `${...}` detectors need: the portable guarded expansion is written
+# `${a[@]+"${a[@]}"}` and blanking its quotes would erase what they read.
+DETECTORS: tuple[tuple[str, object, str, str], ...] = (
     (
         "associative array",
-        re.compile(r"\b(?:local|declare|typeset|readonly|export)\s+-[A-Za-z]*A").search,
+        _declares_with("A", ("local", "declare", "typeset",
+                             "readonly", "export")),
         "bash 3.2 has no associative arrays: `declare: -A: invalid option`, "
         "which under `set -e` ends the run",
+        "bare",
     ),
     (
         "nameref",
-        re.compile(r"\b(?:local|declare|typeset)\s+-[A-Za-z]*n\b").search,
+        _declares_with("n", ("local", "declare", "typeset")),
         "namerefs are bash 4.3",
+        "bare",
     ),
     (
         "declare -g",
-        re.compile(r"\b(?:declare|typeset)\s+-[A-Za-z]*g").search,
+        _declares_with("g", ("declare", "typeset")),
         "`declare -g` is bash 4.2",
+        "bare",
     ),
     (
         "mapfile/readarray",
         re.compile(r"\b(?:mapfile|readarray)\b").search,
         "`mapfile`/`readarray` are bash 4.0",
+        "bare",
     ),
     (
         "coproc",
         re.compile(r"\bcoproc\b").search,
         "`coproc` is bash 4.0",
+        "bare",
     ),
     (
         "case modification",
         re.compile(r"\$\{[A-Za-z_]\w*(?:\[[^]]*\])?(?:\^|,)[^}]*\}").search,
         "`${v^^}` / `${v,,}` case modification is bash 4.0",
+        "code",
     ),
     (
         "parameter transformation",
         re.compile(r"\$\{[A-Za-z_]\w*(?:\[[^]]*\])?@[QEPAKakLUu]\}").search,
         "`${v@Q}` parameter transformation is bash 4.4",
+        "code",
     ),
     (
         "negative array index",
         re.compile(r"\$\{[A-Za-z_]\w*\[-").search,
         "negative array subscripts are bash 4.2",
+        "code",
     ),
     (
         "&>> redirect",
         re.compile(r"&>>").search,
         "`&>>` is bash 4.0",
+        "bare",
     ),
     (
         "|& pipe",
         re.compile(r"\|&").search,
         "`|&` is bash 4.0",
+        "bare",
     ),
     (
-        "[[ -v ]]",
-        re.compile(r"\[\[\s+-v\s").search,
-        "`[[ -v var ]]` is bash 4.2",
+        "-v test operator",
+        # All three spellings, in one detector so `[[ -v x ]]` is not reported
+        # twice. `[ -v x ]` is the one that bites hardest: it is not a syntax
+        # error on 3.2, it is `[: -v: unary operator expected` at runtime.
+        re.compile(r"(?:\[\[?\s+|\btest\s+)-v\s").search,
+        "`[[ -v var ]]` / `[ -v var ]` / `test -v var` is bash 4.2",
+        "bare",
     ),
     (
         "wait -n",
         re.compile(r"\bwait\s+-n\b").search,
         "`wait -n` is bash 4.3",
+        "bare",
     ),
     (
         "globstar",
         re.compile(r"\bglobstar\b").search,
         "`globstar` is bash 4.0",
+        "bare",
+    ),
+    (
+        "declare -l/-u",
+        _declares_with("lu", ("local", "declare", "typeset")),
+        "`declare -l` / `declare -u` case-forcing is bash 4.0",
+        "bare",
+    ),
+    (
+        "local -",
+        # `local -` (save and restore `set` options) only. `local -a` and
+        # `local -r` are 3.2 and must not match, so the `-` has to be the
+        # whole word.
+        re.compile(r"\blocal\s+-(?=\s|;|$)").search,
+        "`local -` is bash 4.4",
+        "bare",
+    ),
+    (
+        "case fallthrough",
+        re.compile(r";;?&").search,
+        "`;&` and `;;&` case terminators are bash 4.0 -- a *syntax* error on "
+        "3.2, so the script dies at parse time and nothing in it runs",
+        "bare",
+    ),
+    (
+        "automatic fd allocation",
+        re.compile(r"(?<![$\w])\{[A-Za-z_]\w*\}[<>]").search,
+        "`exec {fd}<file` automatic file-descriptor allocation is bash 4.1",
+        "bare",
+    ),
+    (
+        "printf -v array element",
+        re.compile(r"\bprintf\s+(?:-[A-Za-z]+\s+)*-v\s*[A-Za-z_]\w*\[").search,
+        "`printf -v var` is 3.1, but assigning into an array element with "
+        "`printf -v arr[0]` is bash 4.1",
+        "bare",
+    ),
+    (
+        "read -i/-N",
+        re.compile(r"\bread\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*[iN]\b").search,
+        "`read -i` is bash 4.0 and `read -N` is bash 4.1",
+        "bare",
+    ),
+    (
+        "\\u escape",
+        re.compile(r"\$'[^']*\\[uU][0-9A-Fa-f]").search,
+        "`$'\\uXXXX'` is bash 4.2. On 3.2 it does not abort -- it prints the "
+        "literal text `\\uXXXX`, so this one is silently wrong rather than "
+        "loudly broken",
+        "code",
+    ),
+    (
+        "negative substring length",
+        re.compile(r"\$\{[A-Za-z_]\w*(?:\[[^]]*\])?:[^}]*:\s*-").search,
+        "a negative *length* in `${v:off:-n}` is bash 4.2; on 3.2 it is a "
+        "`substring expression < 0` error",
+        "code",
     ),
     (
         # The one convention rather than a token. Bare `"${a[@]}"` is valid
@@ -202,6 +347,7 @@ DETECTORS: tuple[tuple[str, object, str], ...] = (
         'expanding an empty array as `"${a[@]}"` under `set -u` is an '
         'unbound-variable abort before bash 4.4; write '
         '`${a[@]+"${a[@]}"}` instead',
+        "code",
     ),
 )
 
@@ -215,8 +361,9 @@ def _findings(text: str) -> list[tuple[int, str, str]]:
         code = _code_only(raw)
         if not code.strip():
             continue
-        for name, matches, _why in DETECTORS:
-            if matches(code):
+        bare = _outside_quotes(code)
+        for name, matches, _why, source in DETECTORS:
+            if matches(bare if source == "bare" else code):
                 found.append((n, name, raw.strip()))
     return found
 
@@ -257,7 +404,7 @@ def test_shell_script_uses_no_bash_4_only_construct(script):
     so a newly added script is covered the moment it lands rather than when
     someone remembers to add it to a list.
     """
-    why = {name: reason for name, _m, reason in DETECTORS}
+    why = {name: reason for name, _m, reason, _s in DETECTORS}
     findings = _findings(script.read_text(encoding="utf-8"))
     assert not findings, "\n".join(
         [f"{script.relative_to(REPO).as_posix()} will not run on the bash "
@@ -287,20 +434,92 @@ def test_every_detector_fires_on_source_that_uses_the_feature():
         "negative array index": 'echo "${arr[-1]}"',
         "&>> redirect": 'run &>> log',
         "|& pipe": 'make |& tee log',
-        "[[ -v ]]": 'if [[ -v FOO ]]; then :; fi',
+        "-v test operator": 'if [[ -v FOO ]]; then :; fi',
         "wait -n": 'wait -n',
         "globstar": 'shopt -s globstar',
+        "declare -l/-u": 'declare -l lowered="$1"',
+        "local -": 'local -',
+        "case fallthrough": '  a) echo one ;;&',
+        "automatic fd allocation": 'exec {lock}< "$file"',
+        "printf -v array element": 'printf -v parts[0] "%s" "$x"',
+        "read -i/-N": 'read -N 1 ch',
+        "\\u escape": "sep=$'\\u2014'",
+        "negative substring length": 'echo "${name:0:-4}"',
         "unguarded array expansion": 'for x in "${arr[@]}"; do :; done',
     }
-    assert set(samples) == {name for name, _m, _w in DETECTORS}, (
+    assert set(samples) == {name for name, _m, _w, _s in DETECTORS}, (
         "a detector has no positive control, so nothing shows whether it "
         "works")
 
-    for name, matches, _why in DETECTORS:
+    for name, matches, _why, source in DETECTORS:
         line = samples[name]
-        assert matches(_code_only(line)), (
+        code = _code_only(line)
+        assert matches(_outside_quotes(code) if source == "bare" else code), (
             f"the {name!r} detector did not fire on {line!r}, so every "
             f"'no script uses this' assertion above is vacuous for it")
+
+
+@pytest.mark.parametrize("line, expected", [
+    ('printf "%s" "${!opts[@]}"', "unguarded array expansion"),
+    ('for i in ${opts[@]+"${!opts[@]}"}; do :; done', None),
+    ('[ -v FOO ] && echo set', "-v test operator"),
+    ('test -v FOO && echo set', "-v test operator"),
+    ('read -rN 1 ch', "read -i/-N"),
+    ('read -e -i "default" answer', "read -i/-N"),
+])
+def test_constructs_a_reviewer_had_to_point_out(line, expected):
+    """Every one of these was missing from the first draft.
+
+    The scan started from the constructs this codebase had already been bitten
+    by, which is the narrowest possible starting point: it makes the tool
+    exactly as good as the bugs already found. These came from asking a
+    reviewer what a bash-3.2 scanner *ought* to look for, and each is pinned
+    here so the answer is not lost the next time the detector list is edited.
+
+    `${!a[@]}` is the one worth understanding: index expansion of an empty
+    array is an unbound-variable abort under `set -u` on exactly the same
+    versions as value expansion, so it needs exactly the same guard.
+    """
+    got = [name for _n, name, _l in _findings(line + "\n")]
+    assert got == ([expected] if expected else [])
+
+
+def test_negative_substring_offset_is_not_treated_as_a_bash_4_construct():
+    """A reviewer suggestion that was checked and rejected, recorded so it is
+    not re-adopted.
+
+    `${v: -1}` (negative *offset*) has worked since bash 3.0 and is fine on
+    3.2. Only a negative *length*, `${v:0:-1}`, is bash 4.2. The two look
+    almost identical, and a detector for the offset form would fire on correct,
+    portable code -- the failure mode that gets a rule deleted rather than
+    obeyed.
+    """
+    assert _findings('echo "${name: -1}"\n') == []
+    assert _findings('echo "${name:1}"\n') == []
+    assert [f[1] for f in _findings('echo "${name:0:-1}"\n')] == [
+        "negative substring length"]
+
+
+@pytest.mark.parametrize("line, expected", [
+    # bash accepts declaration flags in any order and split across any number
+    # of option words. Every one of these is the same declaration as the
+    # one-word spelling, and every one of them passed the first version of
+    # this scan -- found by review, not by the tests, which is why they are
+    # pinned individually now rather than represented by one example.
+    ("declare -r -A seen", "associative array"),
+    ("declare -rA seen", "associative array"),
+    ("readonly -r -A seen", "associative array"),
+    ("typeset -x -A seen", "associative array"),
+    ("declare -r -n ref=target", "nameref"),
+    ("declare -nr ref=target", "nameref"),
+    ("declare -r -g GLOBAL=1", "declare -g"),
+    ("declare -gr GLOBAL=1", "declare -g"),
+])
+def test_declaration_flags_are_read_in_any_order_or_grouping(line, expected):
+    """A regex that expects the letter in the first option word sees only the
+    plainest spelling of a declaration -- and the plainest spelling is the one
+    nobody has trouble noticing in review anyway."""
+    assert [name for _n, name, _l in _findings(line + "\n")] == [expected]
 
 
 def test_the_detectors_accept_the_forms_that_are_actually_portable():
@@ -313,6 +532,9 @@ def test_the_detectors_accept_the_forms_that_are_actually_portable():
     """
     portable = [
         'local -a items=()',                       # indexed array, 3.2 has these
+        'declare -r -a items=()',                  # ...with more flags
+        'export -n VAR',                           # not a nameref: 3.2 has this
+        'readonly -f somefunc',
         'for x in ${arr[@]+"${arr[@]}"}; do :; done',   # the guarded expansion
         'if (( ${#arr[@]} > 0 )); then :; fi',     # length: safe under set -u
         'echo "$#"',
@@ -321,10 +543,29 @@ def test_the_detectors_accept_the_forms_that_are_actually_portable():
         'printf "%s\\n" "$@"',
         'if [[ -n "${VAR+x}" ]]; then :; fi',      # the 3.2 way to ask "is set?"
         'cmd1 || cmd2 &',                          # not `|&`
+        'local -a items=()',                       # not `local -`
+        'local -r name="$1"',                      # not `local -`
+        'printf -v total "%s" "$x"',               # 3.1: only `arr[0]` is 4.1
+        'read -r line',
+        'read -r -d "" chunk',
+        'echo "hi" > "${outfile}"',                # not fd allocation
+        'mv report{,.bak}',                        # brace expansion
+        'echo "${name: -1}"',                      # negative offset: 3.0
+        'case "$x" in a) echo one ;; esac',        # `;;` is not `;;&`
+        'cmd1; cmd2 &',                            # not `;&`
+        "sep=$'\\n'",                              # not a \\u escape
+        # Words and operators quoted as *data* are not syntax. A script that
+        # documents the rule it follows must not trip the rule.
+        'echo "&>>"',
+        'echo "|&"',
+        'echo "local -A seen"',
+        "grep 'mapfile' file",
     ]
     for line in portable:
-        fired = [name for name, matches, _w in DETECTORS
-                 if matches(_code_only(line))]
+        code = _code_only(line)
+        bare = _outside_quotes(code)
+        fired = [name for name, matches, _w, source in DETECTORS
+                 if matches(bare if source == "bare" else code)]
         assert not fired, f"{fired} rejected portable bash: {line!r}"
 
 
@@ -348,9 +589,15 @@ def test_comment_stripping_does_not_blind_the_scan():
     assert _code_only('# local -A seen').strip() == ''
     assert _code_only('    # ${a[@]}').strip() == ''
     assert _code_only('code # local -A seen').strip() == 'code'
+    # `#` opens a comment at the start of a word, which is after a shell
+    # metacharacter as well as after whitespace. Requiring whitespace made
+    # `echo ok;# note` read as code and flagged whatever the note discussed.
+    assert _code_only('echo ok;# local -A seen').strip() == 'echo ok;'
+    assert _code_only('cmd &# local -A seen').strip() == 'cmd &'
 
     # And the end-to-end consequence of both halves.
     assert _findings('# local -A seen\n') == []
+    assert _findings('echo ok;# local -A seen\n') == []
     assert [f[1] for f in _findings('local -A seen  # trailing note\n')] == [
         "associative array"]
 
