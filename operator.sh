@@ -989,7 +989,14 @@ restart_copilot() {
 
 # ── Single Session Mode ────────────────────────────────────────
 run_single_session() {
-    local copilot_args=("--autopilot" "--effort" "high" "$@")
+    # `--experimental` always, and always ahead of "$@": runtime extensions
+    # load only in experimental mode, and the flag is sticky global state in
+    # ~/.copilot/settings.json that any other session can flip. The CLI
+    # resolves conflicting spellings last-wins, so a user's own
+    # `--no-experimental` still beats this. See with_experimental() in
+    # copilot_operator.py for the full reasoning.
+    local copilot_args=("--autopilot" "--effort" "high" "--experimental")
+    copilot_args+=("$@")
 
     handle_existing_session
 
@@ -1027,7 +1034,7 @@ run_loop_mode() {
 
     trap cleanup SIGINT SIGTERM
 
-    local copilot_args=("--yolo" "--autopilot" "--no-ask-user" "--effort" "high")
+    local copilot_args=("--yolo" "--autopilot" "--no-ask-user" "--effort" "high" "--experimental")
 
     local agent_name
     agent_name=$(extract_agent_from_args "${user_args[@]}")

@@ -135,7 +135,7 @@ token and cost figures come from a different source and are always present.
 
 ### Single Session (default)
 
-Launches copilot in a tmux session, auto-attaches your terminal. Always runs with `--yolo`. When copilot exits, metrics are parsed from its process log and stored in the database.
+Launches copilot in a tmux session, auto-attaches your terminal. Always runs with `--yolo` and `--experimental`. When copilot exits, metrics are parsed from its process log and stored in the database.
 
 ```bash
 operator --agent=anvil:anvil
@@ -143,7 +143,7 @@ operator --agent=anvil:anvil
 
 ### Loop Mode (`--loop`)
 
-Adds `--yolo --autopilot --no-ask-user` automatically. Sends a preamble that tells the agent:
+Adds `--yolo --autopilot --no-ask-user --experimental` automatically. Sends a preamble that tells the agent:
 - It has blanket approval for all decisions
 - How to trigger a restart (create a marker file)
 - To check for session handoff files on startup
@@ -270,7 +270,7 @@ state:
   Copilot session   3f2a1b4c-5d6e-7f80-9a1b-2c3d4e5f6071
   Directory         ~/repos/my-project
   Usage             41 recorded session(s) · 812.4 credits · $32.50
-  Command           --yolo --autopilot --effort high -i <preamble>
+  Command           --yolo --autopilot --effort high --experimental -i <preamble>
 
   1) Join this session (attach the terminal)
   2) Stop the loop, leave the session running

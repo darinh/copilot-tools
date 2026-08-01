@@ -1645,6 +1645,41 @@ def has_agent_flag(args: list[str]) -> bool:
     return any(a == "--agent" or a.startswith("--agent=") for a in args)
 
 
+def with_experimental(defaults: list[str]) -> list[str]:
+    """Append `--experimental` to the operator's injected defaults.
+
+    Runtime extensions -- `checkout-guard` among them -- load ONLY when the
+    CLI is in experimental mode, and the CLI persists the last spelling it was
+    given into `~/.copilot/settings.json`. So the flag is sticky global state
+    that any other session, on any project, can flip; and when it is off,
+    every extension silently does not load. There is no error and no missing
+    output, because an extension that never loaded cannot report its own
+    absence. That was measured on this machine: agent sessions ran for over an
+    hour with no checkout-guard at all, in the shared primary checkout it
+    exists to protect, and nothing inside those sessions could have told.
+
+    Passing it explicitly on every launch is what makes the guard's silence
+    mean "scanned and found nothing" rather than "was never there".
+
+    It is added UNCONDITIONALLY, and callers must place the result BEFORE the
+    user's own arguments. A user who really wants `--no-experimental` still
+    gets it, because the CLI resolves conflicting spellings last-wins -- both
+    orders were measured against CLI 1.0.77:
+
+        copilot --experimental --no-experimental ...  -> experimental: false
+        copilot --no-experimental --experimental ...  -> experimental: true
+
+    Deciding by *inspecting* the user's arguments instead is what the earlier
+    version of this function did, and it was wrong: it could not tell a flag
+    from a value, so `-p --no-experimental` -- a prompt that merely looks like
+    a ruling -- suppressed the injected flag and put the session straight back
+    into the silent, guardless state this exists to prevent. Any such check
+    needs a list of which options take values, and that list goes stale every
+    time the CLI grows one. Ordering needs no list.
+    """
+    return [*defaults, "--experimental"]
+
+
 def handle_existing_session(instance: Instance) -> None:
     if not MUX.has_session(instance.session):
         return
@@ -2580,7 +2615,8 @@ def show_inbox(args: list[str]) -> int:
 
 def run_single_session(instance: Instance, copilot_args: list[str],
                        headless: bool = False) -> int:
-    args = ["--yolo", "--autopilot", "--effort", "high", *copilot_args]
+    args = [*with_experimental(["--yolo", "--autopilot", "--effort", "high"]),
+            *copilot_args]
     handle_existing_session(instance)
     operator_ingest.init_db(METRICS_DB)
     run_started = utcnow()
@@ -2620,7 +2656,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     operator code, say — without disturbing the Copilot session it was
     watching. Everything after the initial launch is identical either way.
     """
-    copilot_args = ["--yolo", "--autopilot", "--no-ask-user", "--effort", "high"]
+    copilot_args = with_experimental(
+        ["--yolo", "--autopilot", "--no-ask-user", "--effort", "high"])
     agent = extract_agent_from_args(user_args)
     if not has_agent_flag(user_args):
         copilot_args += ["--agent", agent]
