@@ -80,19 +80,43 @@ extra instead. Prefer that to `pytest.importorskip`, which turns "the library
 is missing" into a silent skip and retires the guarantee while staying green.
 
 The scan carries its own narrow TOML reader, because `tomllib` is 3.11+ and
-the floor is 3.10. Two things about it are load-bearing. `IMPORT_NAMES` — the
-table saying PyYAML is imported as `yaml` — is checked against
+the floor is 3.10. Three things about it are load-bearing. It masks the whole
+document before reading any line, because a line-based reader cannot see a
+multi-line string, and a `description = """..."""` containing a line that
+reads like `dependencies = ["ghost"]` then *widens* the allow-list silently —
+the one failure direction this scan cannot afford. `IMPORT_NAMES` — the table
+saying PyYAML is imported as `yaml` — is checked against
 `importlib.metadata.packages_distributions()`, so a wrong entry fails rather
 than silently widening the allow-list. And the parser's controls must contain
 a quote or a bracket *inside the comment*: the first draft's comment cases
 used `# why`, which a parser that never strips comments at all handles
 identically, so the whole control set passed with comment handling removed.
 A commented-out `# "ghost",` in a dependency array is the shape that matters.
+For the same reason the reference cross-check runs over a corpus of
+adversarial documents, not over this repository's own `pyproject.toml`, which
+contains none of these shapes and so proved nothing about any of them.
+
+First-party module names come only from directories that are actually on
+`sys.path` — the repository root plus `pythonpath` from
+`[tool.pytest.ini_options]`. Taking them from the stem of every `*.py` in the
+tree means one `docs/examples/requests.py` silently switches the detector off
+for `requests` everywhere, and every control keeps passing because the
+controls score against a fixed set. Files deeper in the tree are still
+scanned; they just do not get a vote on what counts as ours.
 
 Modules removed from the standard library after 3.10 (`distutils`, gone in
 3.12) are reported on the newer legs only. That is the correct verdict and it
-is the setuptools shape exactly. Modules *added* after 3.10 belong to
-`tests/test_python_floor_conformance.py`, not here.
+is the setuptools shape exactly — but resolving one costs two edits, not one:
+declaring `setuptools` is not enough, because setuptools does not *record*
+`distutils` in its metadata, so the mapping goes in `IMPORT_NAMES` and the
+reason goes next to it in `IMPORT_NAMES_UNRECORDED`. Modules *added* after
+3.10 belong to `tests/test_python_floor_conformance.py`, not here.
+
+`STDLIB` is `sys.stdlib_module_names` and deliberately not "what imports
+here". The documented set includes names that do not import on the running
+platform — `fcntl` on Windows, `winreg` on Linux — so an allow-list built by
+importing would be narrower on some legs than others, and `import fcntl`
+would go red on the Windows legs only, with no declaration able to fix it.
 
 ## Spec-kit workflow
 
