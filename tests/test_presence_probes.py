@@ -605,6 +605,45 @@ def test_a_row_that_cannot_be_compared_is_not_a_missing_entry(
         "'not registered'")
 
 
+def test_an_uncomparable_row_does_not_shadow_a_registered_project(
+        tmp_path, monkeypatch):
+    """A reviewer's worry, pinned: refusing to guess must not cost a lookup.
+
+    Treating an uncomparable row as "undecided" only governs what is said when
+    *nothing* matched. A project that is genuinely registered still has to
+    resolve to its own handoff file, even when a broken row sits beside it in
+    the same catalog -- otherwise the caution would have bought safety by
+    disabling the feature.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    target = str(Path(project).resolve())
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_text(
+        '"C:\\\\elsewhere\\\\broken",guid-broken\n'
+        '"' + target + '",guid-real\n', encoding="utf-8")
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+
+    real_resolve = Path.resolve
+    seen = {"n": 0}
+
+    def resolve_denied(self, *args, **kwargs):
+        if "elsewhere" in str(self):
+            seen["n"] += 1
+            raise PermissionError(13, "Permission denied")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_denied)
+    found = op.project_handoff_file(project)
+    monkeypatch.setattr(Path, "resolve", real_resolve)
+
+    assert seen["n"], "the resolve never failed; the test proves nothing"
+    assert isinstance(found, Path), (
+        "a registered project stopped resolving because another row in the "
+        "catalog could not be compared")
+    assert "guid-real" in str(found), found
+
+
 def test_the_loop_does_not_call_an_unreadable_catalog_unregistered(
         tmp_path, monkeypatch, capsys):
     """The claim that actually reaches the agent.
