@@ -198,6 +198,13 @@ def test_a_corporate_co_author_trailer_is_found(tmp_path):
     # read as clean. Found independently by two reviewers; it is a false
     # negative, which is the direction that publishes.
     f"Co-authored-by: Evil <{CORPORATE}> and Good <{ALLOWED}>",
+    # A bare address beside a bracketed one. The first fix for the bug above
+    # branched on spelling -- bracketed if any, bare otherwise -- so the
+    # bracketed branch won and this address was never examined at all.
+    f"Co-authored-by: Evil {CORPORATE} and Good <{ALLOWED}>",
+    # Two bare addresses, the allowed one last. The whole line was kept as a
+    # single "address", so it ended with an allowed suffix and passed.
+    f"Co-authored-by: {CORPORATE} 223556219+Copilot@users.noreply.github.com",
     # Trailing text after the bracket. The old `\\s*$` anchor made the line
     # fail to match at all, so the address was never examined.
     f"Co-authored-by: Evil <{CORPORATE}>  # a note",
@@ -206,6 +213,11 @@ def test_a_corporate_co_author_trailer_is_found(tmp_path):
     f"Co-authored-by: {CORPORATE}",
     # Indented, and in a different case than the canonical spelling.
     f"    co-authored-BY: Evil <{CORPORATE}>",
+    # Comma-separated, which is how a multi-author trailer is often written.
+    f"Co-authored-by: <{ALLOWED}>, Evil <{CORPORATE}>",
+    # Two separate trailer lines: the allowed one first, so an implementation
+    # that stops at the first line it can approve of misses the second.
+    f"Co-authored-by: Good <{ALLOWED}>\nCo-authored-by: Evil <{CORPORATE}>",
 ])
 def test_a_corporate_address_cannot_hide_in_a_trailer_line(tmp_path, trailer):
     repo = _repo(tmp_path / "r")
@@ -214,6 +226,33 @@ def test_a_corporate_address_cannot_hide_in_a_trailer_line(tmp_path, trailer):
     assert result.state == VIOLATIONS, (
         f"the corporate address hid in {trailer!r}")
     assert CORPORATE in {o.email for o in result.offenders}
+
+
+@pytest.mark.parametrize("trailer", [
+    # Bare, with a display name in front. An earlier fix kept the whole line
+    # as one address, so this was reported as the violation
+    # "Someone darinh@gmail.com" -- a false positive, which is the direction
+    # that erodes a check by making it noisy enough to switch off.
+    f"Co-authored-by: Someone {ALLOWED}",
+    f"Co-authored-by: {ALLOWED}",
+    f"Co-authored-by: Someone <{ALLOWED}>",
+    # Sentence punctuation after a bare address.
+    f"Co-authored-by: Someone {ALLOWED}.",
+    f"Co-authored-by: A <{ALLOWED}>, B <223556219+Copilot@users.noreply.github.com>",
+])
+def test_an_allowed_trailer_is_not_reported_however_it_is_spelled(tmp_path, trailer):
+    """Negative control for every spelling accepted above.
+
+    The strict direction and the permissive direction need pinning equally:
+    the first fix for the multi-address bug traded a false negative for a
+    false positive, and only the false negative had a test.
+    """
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "init", body=trailer)
+    result = scan(str(repo))
+    assert result.state == CLEAN, (
+        f"clean trailer {trailer!r} was reported as "
+        f"{[o.email for o in result.offenders]}")
 
 
 def test_an_allowed_address_beside_a_corporate_one_is_not_a_pass(tmp_path):
@@ -494,7 +533,7 @@ def test_the_default_scope_reaches_refs_outside_branches_and_tags(tmp_path):
         "default scope no longer covers every published ref")
 
 
-def test_a_commit_git_cannot_decode_is_undetermined_not_a_violation(tmp_path):
+def test_a_commit_git_cannot_decode_is_clean_not_a_violation(tmp_path):
     """Measured, not imagined: this crashed before the encoding was named.
 
     `text=True` decodes with the locale's preferred encoding, which is cp1252
@@ -503,6 +542,15 @@ def test_a_commit_git_cannot_decode_is_undetermined_not_a_violation(tmp_path):
     and surfaced as an uncaught AttributeError -- so Python exited 1, which
     this program defines as VIOLATIONS. An unreadable log reported a bad
     identity.
+
+    The outcome asserted here is CLEAN, not UNDETERMINED, and the name says so
+    -- an earlier name claimed UNDETERMINED while the body asserted CLEAN. The
+    reason it is CLEAN is that `errors="replace"` confines the damage to the
+    bytes that are actually undecodable: the message becomes a replacement
+    character, the *addresses* are still read exactly, and a commit whose
+    identities are all allowed is clean no matter what its subject line
+    contains. Refusing here would be its own defect -- an unreadable byte in
+    prose is not evidence about an identity.
     """
     repo = _repo(tmp_path / "r")
     (repo / "f.txt").write_text("x\n", encoding="utf-8")
@@ -521,6 +569,23 @@ def test_a_commit_git_cannot_decode_is_undetermined_not_a_violation(tmp_path):
         "an undecodable byte was reported as a disallowed identity")
     assert result.state == CLEAN
     assert result.examined == 1
+
+
+@pytest.mark.parametrize("mangled", [
+    "darinh@gmail.co\ufffd",
+    "\ufffd" + "darinh@gmail.com",
+    "darinh@gmail.com\ufffd",
+    "\ufffd@users.noreply.github.com\ufffd",
+])
+def test_an_address_damaged_by_the_replacement_codec_is_not_allowed(mangled):
+    """The other direction of `errors="replace"`, which must fail closed.
+
+    Replacing undecodable bytes keeps the scan running over a log it can
+    mostly read, but it also means an address can arrive damaged. A damaged
+    address must not resemble an allowed one: the substitution has to be able
+    to turn an allowed address into an unrecognised one, never the reverse.
+    """
+    assert not is_allowed(mangled)
 
 
 # ---------------------------------------------------------------------------

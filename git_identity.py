@@ -115,26 +115,36 @@ _RECORD = "\x1e"
 # with any trailing text after the bracket failed to match at all. Both are
 # false negatives, which is the direction that publishes. So: find the trailer
 # lines, then take *every* address on each one.
+#
+# The first fix for that was itself the same bug one layer down. It took the
+# bracketed addresses when there were any and the bare remainder only when
+# there were none, so `Co-authored-by: Evil bad@corp and Good <ok@allowed>`
+# reported nothing -- the bracketed branch won and the bare address was never
+# looked at. Worse, the bare branch kept the *whole line* as one address, so a
+# line ending in an allowed suffix was allowed wholesale. Both are false
+# negatives, and both came from branching on the spelling instead of just
+# collecting the addresses. There is no bracketed-vs-bare distinction here now:
+# an address is a token with an `@` in it, and every one of them counts.
 _TRAILER_LINE = re.compile(r"^[ \t]*Co-authored-by:(.*)$",
                            re.IGNORECASE | re.MULTILINE)
-_ANGLE_ADDRESS = re.compile(r"<([^>]*)>")
+_ADDRESS = re.compile(r"[^\s<>(),;:\"']+@[^\s<>(),;:\"']+")
 
 
 def _trailer_addresses(body: str) -> list[str]:
     """Every address on every ``Co-authored-by:`` line of a commit message.
 
-    A trailer with no angle brackets still names somebody -- git's own tooling
-    writes them, but a hand-typed ``Co-authored-by: Someone corp@example.com``
-    is neither rare nor less published -- so the bare remainder is taken when
-    there is no bracketed address to take.
+    Angle brackets are not required. Git's own tooling writes them, but a
+    hand-typed ``Co-authored-by: Someone corp@example.com`` names exactly the
+    same person and publishes exactly as widely, so the brackets are treated
+    as punctuation rather than as the thing that makes an address an address.
     """
     found: list[str] = []
     for line in _TRAILER_LINE.findall(body):
-        bracketed = _ANGLE_ADDRESS.findall(line)
-        if bracketed:
-            found.extend(bracketed)
-        elif "@" in line:
-            found.append(line.strip())
+        for address in _ADDRESS.findall(line):
+            # A trailing period is sentence punctuation, never part of an
+            # address; leaving it on would turn an allowed address into an
+            # unrecognised one and report a violation that is not there.
+            found.append(address.rstrip(".").strip())
     return found
 
 
