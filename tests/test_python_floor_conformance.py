@@ -474,7 +474,19 @@ def _guard_names(construct: str) -> set[str]:
 
 
 def _is_pathlib_receiver(node: ast.expr) -> bool:
-    """True for ``Path`` and for a ``Path(...)`` construction."""
+    """True for ``Path`` and for a ``Path(...)`` construction.
+
+    An ``Attribute`` receiver is accepted on its trailing name alone, so
+    ``pathlib.Path.walk`` is recognised and so is a nested class of somebody
+    else's that happens to be called ``Path``. That is a known false
+    positive, raised independently by two reviewers, and it is left in
+    deliberately: narrowing it means resolving the receiver's own parent
+    against the module-alias register, which buys nothing against a spelling
+    nobody writes and costs a miss on every ``import pathlib as X`` form not
+    anticipated here. It predates the move of method detection onto the
+    attribute — ``Obj.Path.walk(p)`` was flagged by the call-keyed version
+    too — so this widened where it can be reached, not what it believes.
+    """
     if isinstance(node, ast.Name):
         return node.id in PATHLIB_CLASSES
     if isinstance(node, ast.Attribute):
@@ -687,13 +699,26 @@ class _FloorFinder(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        # A Store is not a use. Measured on 3.10.20: `x = Path.walk` and
+        # `del Path.walk` both raise AttributeError, while `Path.walk = fake`
+        # succeeds — so the context decides, not the spelling, and the line
+        # falls between Store and everything else rather than at "is Load".
+        #
+        # Flagging the Store flagged the *polyfill*. Rebinding a post-floor
+        # method onto the class is the ordinary way to make code run on the
+        # floor, and a scan that reports the fix for the very thing it checks
+        # is a scan that gets switched off rather than fixed. `visit_Name`
+        # draws this same line and its comment records the same bug from the
+        # other side: without it, `fd = None` read as a use of the gated
+        # symbol it happened to be named after.
+        is_use = not isinstance(node.ctx, ast.Store)
         parent = node.value
         name = None
         if isinstance(parent, ast.Name):
             name = self.module_alias.get(parent.id, parent.id).split(".")[-1]
         elif isinstance(parent, ast.Attribute):
             name = parent.attr
-        if name is not None:
+        if is_use and name is not None:
             construct = ATTRIBUTE_GATED.get((name, node.attr))
             if construct is not None:
                 self._record(node, construct)
@@ -702,8 +727,10 @@ class _FloorFinder(ast.NodeVisitor):
         # Call whose `func` is this very node, so the called form is covered
         # by the same branch and reported once, not twice.
         construct = METHOD_GATED.get(node.attr)
-        if construct is not None and _is_pathlib_receiver(parent):
+        if is_use and construct is not None and _is_pathlib_receiver(parent):
             self._record(node, construct)
+        # Descend regardless of context: the target of `obj[Path.walk].x = 1`
+        # is a Store whose subtree still contains a genuine use.
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -1286,6 +1313,15 @@ FIRES = {
         "for root, dirs, files in walker():\n"
         "    pass\n"
     ),
+    "a post-floor method deleted from the class, which needs it to exist": (
+        # `del` is a use and a Store is not, which is why the context check
+        # below tests for Store rather than for Load. Measured on 3.10.20:
+        # `del Path.walk` raises AttributeError exactly as reading it does,
+        # while `Path.walk = fake` succeeds. Written unguarded so only that
+        # distinction can decide it.
+        "from pathlib import Path\n"
+        "del Path.walk\n"
+    ),
 }
 
 #: Which construct each control in FIRES is a control *for*.
@@ -1343,6 +1379,8 @@ EXERCISES = {
         "pathlib.Path.exists(follow_symlinks=)",
     "Path.walk saved off the class without being called": "pathlib.Path.walk",
     "Path.walk bound off a construction, then called through the binding":
+        "pathlib.Path.walk",
+    "a post-floor method deleted from the class, which needs it to exist":
         "pathlib.Path.walk",
 }
 
@@ -1503,6 +1541,34 @@ PASSES = {
         # rule for the uncalled form, which is now a separate code path.
         "handler = tree.walk\n"
         "other = os.walk\n"
+    ),
+    "a post-floor pathlib method rebound onto the class, which is a polyfill": (
+        # Assigning to `Path.walk` does not require `Path.walk` to exist:
+        # measured on 3.10.20, the Store succeeds where a read raises. This
+        # is the shape of the fix, not of the defect — supplying the method
+        # the floor lacks — and the first version of the reference detector
+        # flagged it, which is a scan reporting the remedy for the thing it
+        # is checking for.
+        #
+        # Deliberately unguarded and unannotated. Under `if not hasattr(Path,
+        # 'walk')`, which is how a polyfill is really written, the whole
+        # branch is licensed by the feature test and this control would pass
+        # whether or not the context check existed at all.
+        "from pathlib import Path\n"
+        "def _walk(self):\n"
+        "    ...\n"
+        "Path.walk = _walk\n"
+    ),
+    "a post-floor module attribute rebound, which is the same polyfill": (
+        # The attribute-gated half of the rule above, and the reason the
+        # context check sits in front of both lookups rather than only the
+        # method one: `hashlib.file_digest = _backport` is a polyfill this
+        # repo could plausibly write, since install_manifest already feature-
+        # tests that exact name.
+        "import hashlib\n"
+        "def _file_digest(fh, name):\n"
+        "    ...\n"
+        "hashlib.file_digest = _file_digest\n"
     ),
     "an annotated use with a real reason": (
         "import hashlib\n"
