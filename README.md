@@ -35,14 +35,31 @@ messaging, and spec-driven workflow conventions.
 | Spec Kit workflow | ✅ | ✅ | ✅ |
 | Runtime extensions | ✅ | ✅ | ✅ |
 | `operator` / `handoff` (Python) | ✅ | ✅ | ✅ |
-| `operator.sh` / `handoff.sh` (bash, legacy, unmaintained) | ❌ | rollback only | rollback only |
+| `operator.sh` / `handoff.sh` (bash, legacy — rollback target, still tested) | ❌ | rollback only | rollback only |
 | `operator restore` (Windows Terminal tabs) | ✅ (native tabs) | ✅ (WSL-hosted tabs only) | ❌ |
 
 The Python implementation is the supported entry point on every platform.
 `setup.sh` migrates existing Linux/WSL/macOS installs off the bash scripts
 automatically (see [Quick Start](#quick-start)); the bash scripts themselves
-are left on disk, untouched, purely so a failed migration can never strand a
-user without a working `operator`/`handoff` command.
+are left on disk, unmodified by setup, purely so a failed migration can never
+strand a user without a working `operator`/`handoff` command.
+
+Here "legacy" means superseded, not abandoned. A rollback target is only worth
+having if it still runs, so the bash scripts stay under test: CI's "Shell
+script syntax" job parses every `*.sh` with `bash -n` on every pull request
+and every push to `main`, and the
+suite exercises `operator.sh` and `handoff.sh` directly —
+`tests/test_operator_sh_bash32.py`, `tests/test_handoff_sh.py`,
+`tests/test_operator_sh_entrypoint.py`, `tests/test_operator_sh_help.py` and
+`tests/test_shell_bash32_conformance.py`
+all read or run them, the last of those because macOS `/bin/bash` is
+permanently 3.2 and macOS is exactly where someone is most likely to need the
+fallback. They still get bug fixes; they get no new features, and a divergence
+in behaviour is resolved by changing the bash to match the Python. Don't
+install them on purpose — see [rolling
+back](docs/operator.md#installation) for the one supported reason to.
+`tests/test_legacy_bash_status.py` fails if this paragraph and that coverage
+ever stop agreeing.
 
 `operator restore` re-launches tracked Windows Terminal tabs. It works from
 both native Windows PowerShell and from inside WSL (via `wt.exe`/`wsl.exe`
@@ -135,7 +152,8 @@ That migration is all `setup.sh` still does on its own. Anvil,
 `dotnet-roslyn-mcp`, and the Spec Kit CLI used to be installed here, which
 meant Windows users never got them; they're now provisioned by
 `setup_tools.py` on every platform. `operator.sh`/`handoff.sh` themselves are
-left on disk unchanged; they're just no longer the thing installed into
+still on disk and still maintained (see [Platform
+Support](#platform-support)); they're just no longer the thing installed into
 `PATH`.
 </details>
 
@@ -249,9 +267,9 @@ copilot-tools/
 ├── e2e_restart_loop.py            # End-to-end restart-loop check, real processes
 ├── setup.sh                       # POSIX bootstrap; finds Python, runs setup_tools
 ├── setup.ps1                      # Windows bootstrap; same, winget if no Python
-├── operator.sh                    # Legacy bash wrapper (Linux/WSL)
+├── operator.sh                    # Legacy bash wrapper (Linux/WSL/macOS)
 ├── operator-ingest.py             # Legacy log parser, used by operator.sh
-├── handoff.sh                     # Legacy bash handoff (Linux/WSL)
+├── handoff.sh                     # Legacy bash handoff (Linux/WSL/macOS)
 ├── diagnose-restart-deleter.sh    # Diagnostic: who deleted the restart directory
 ├── extensions/                    # Copilot CLI runtime extensions; see its README
 ├── skills/
