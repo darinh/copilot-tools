@@ -75,6 +75,23 @@ def find_fabricated(conn: sqlite3.Connection, log_dir: Path,
     return fabricated
 
 
+def backup_path(db: Path) -> Path:
+    """A backup name that never overwrites an earlier one.
+
+    Widening the match (``--missing-logs``) makes a second run clear rows the
+    first did not, so its backup is not a superset of the first one. Silently
+    replacing the earlier file would destroy the only record of the rows run
+    one cleared.
+    """
+    base = db.with_suffix(db.suffix + ".bak-prezero")
+    if not base.exists():
+        return base
+    n = 2
+    while base.with_name(f"{base.name}.{n}").exists():
+        n += 1
+    return base.with_name(f"{base.name}.{n}")
+
+
 def write_backup(conn: sqlite3.Connection, dest: Path) -> None:
     """Snapshot the live database through SQLite's own backup API.
 
@@ -122,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Dry run. Re-run with --apply to clear them.")
             return 0
 
-        backup = args.db.with_suffix(args.db.suffix + ".bak-prezero")
+        backup = backup_path(args.db)
         write_backup(conn, backup)
 
         placeholders = ",".join("?" * len(ids))
