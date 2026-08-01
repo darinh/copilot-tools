@@ -444,8 +444,8 @@ def test_prune_keeps_logs_not_yet_ingested(tmp_path, monkeypatch, capsys):
     db = tmp_path / "m.db"
     monkeypatch.setattr(op, "COPILOT_LOG_DIR", logs)
     monkeypatch.setattr(op, "METRICS_DB", db)
-    _make_logs(logs, ["process-1-1.log", "process-2-2.log"], age_days=60)
-    _seed(db, [("process-1-1.log", REAL_NANO_AIU, 0)])   # only the first ingested
+    made = _make_logs(logs, ["process-1-1.log", "process-2-2.log"], age_days=60)
+    _seed(db, [(operator_ingest.log_key(made[0]), REAL_NANO_AIU, 0)])  # only the first
 
     assert op.manage_logs(["--prune", "--days", "30"]) == 0
     remaining = {p.name for p in logs.glob("*.log")}
@@ -473,21 +473,28 @@ def test_prune_removes_a_log_recorded_under_its_full_path(
     assert "Removed 1 ingested log" in capsys.readouterr().out
 
 
-def test_prune_still_recognises_a_legacy_basename_row(
+def test_prune_keeps_a_log_a_legacy_row_only_names_by_basename(
         tmp_path, monkeypatch, capsys):
-    """Rows written before logs were keyed by path hold a bare basename, and
-    are re-keyed only when their log is ingested again. Until then they are
-    the only record that the log was captured, so prune must still match
-    them or it will refuse to free anything in an existing database."""
+    """A basename row is not proof that *this* log was recorded.
+
+    Rows written before logs were keyed by path name a file in a directory
+    nobody wrote down, so a same-named log in the current directory matches
+    one without being it -- and prune deletes the only record of a session
+    that was never ingested. The strict test costs an old database one
+    `operator ingest` run before it can prune, which is what the output says.
+    """
     logs = tmp_path / "logs"
     db = tmp_path / "m.db"
     monkeypatch.setattr(op, "COPILOT_LOG_DIR", logs)
     monkeypatch.setattr(op, "METRICS_DB", db)
     _make_logs(logs, ["process-1-1.log"], age_days=60)
-    _seed(db, [("process-1-1.log", REAL_NANO_AIU, 0)])
+    _seed(db, [("process-1-1.log", REAL_NANO_AIU, 0)])   # legacy: basename only
 
     assert op.manage_logs(["--prune", "--days", "30"]) == 0
-    assert list(logs.glob("*.log")) == []
+    assert [p.name for p in logs.glob("*.log")] == ["process-1-1.log"], (
+        "a log was deleted on the strength of another directory's row"
+    )
+    assert "not yet ingested" in capsys.readouterr().out
 
 
 def test_prune_leaves_recent_logs(tmp_path, monkeypatch, capsys):
@@ -495,8 +502,8 @@ def test_prune_leaves_recent_logs(tmp_path, monkeypatch, capsys):
     db = tmp_path / "m.db"
     monkeypatch.setattr(op, "COPILOT_LOG_DIR", logs)
     monkeypatch.setattr(op, "METRICS_DB", db)
-    _make_logs(logs, ["process-1-1.log"], age_days=1)
-    _seed(db, [("process-1-1.log", REAL_NANO_AIU, 0)])
+    made = _make_logs(logs, ["process-1-1.log"], age_days=1)
+    _seed(db, [(operator_ingest.log_key(made[0]), REAL_NANO_AIU, 0)])
     assert op.manage_logs(["--prune", "--days", "30"]) == 0
     assert len(list(logs.glob("*.log"))) == 1
 

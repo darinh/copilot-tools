@@ -132,29 +132,61 @@ def log_key(path) -> str:
     normalise differently. :func:`copilot_operator.manage_logs` decides from
     this key whether a log has been ingested and may be deleted, so a
     disagreement here deletes an unrecorded log.
+
+    ``normcase`` on top of ``resolved_str``, because that helper is not total
+    and its fallback normalises less than its main path. ``Path.resolve``
+    returns Windows' canonical capitalisation; the ``os.path.abspath``
+    fallback preserves whatever the caller typed. A log ingested once while
+    its path would not resolve and again once it would therefore yielded two
+    keys differing only in case -- two rows for one file, and its credits
+    counted twice. ``normcase`` lower-cases on Windows, where paths are
+    case-insensitive, and is the identity on POSIX, where they are not; it is
+    already how :func:`ingest_all` matches log names for the same reason.
     """
-    return resolved_str(path)
+    return os.path.normcase(resolved_str(path))
 
 
-def _adopt_legacy_row(conn, basename: str, key: str) -> None:
+def _adopt_legacy_row(conn, basename: str, row_key: str,
+                      mtime: str, started_at: str) -> None:
     """Re-key a row written before ``log_file`` held a full path.
 
-    Without this, the first ingest after the change finds no row for the new
-    key and inserts a second one, so every historical session is counted twice
-    in every report -- a silent doubling of a user's recorded spend, which is
-    worse than the collision this change fixes.
+    Left alone, such a row would never match again, so the first ingest after
+    the change would insert a second row for the same log and every historical
+    session would be counted twice in every report -- a silent doubling of the
+    user's recorded spend.
 
-    The rename is skipped when the full path is already present, because that
-    row is the current one and the basename row is a genuine duplicate; and it
-    can only ever match a legacy row, since a key produced by :func:`log_key`
-    is absolute and a basename is not.
+    Adoption is evidence-driven, and the evidence is the point. A legacy row
+    names a basename and nothing else, so "there is a row with this name" is
+    exactly the ambiguity this change exists to remove; re-keying on the name
+    alone would let a log inherit the identity of a *different* session that
+    happened to share it -- and the upsert that follows would then overwrite
+    that session's row and delete its ``model_usage`` breakdown. That is the
+    original defect wearing the fix's clothes, and it destroys history rather
+    than merely mixing it.
+
+    Two independent facts are accepted, because each covers the other's blind
+    spot. ``started_at`` is parsed from the log's own first line, so it
+    survives the log being appended to since it was last ingested -- the
+    common case, and the one an mtime test fails. ``log_file_mtime`` is what
+    the previous ingest recorded, so it still matches a row written by the
+    bash ingester, whose timestamps this parser need not reproduce exactly.
+    A different session's log agrees with neither: its first line is its own,
+    and its mtime is when it stopped. When neither matches, the legacy row is
+    left exactly as it is and this log gets a row of its own -- a duplicate
+    count is a wrong number, but destroying the older session's history is a
+    wrong number *and* the loss of the only record that could correct it.
+
+    The rename is also skipped when the full path is already present, because
+    that row is the current one; renaming onto it would fail the ``UNIQUE``
+    constraint and abort the whole ingest.
     """
-    if key == basename:
+    if row_key == basename:
         return
     conn.execute(
-        "UPDATE sessions SET log_file = ? WHERE log_file = ? "
+        "UPDATE sessions SET log_file = ? "
+        "WHERE log_file = ? AND (started_at = ? OR log_file_mtime = ?) "
         "AND NOT EXISTS (SELECT 1 FROM sessions WHERE log_file = ?)",
-        (key, basename, key),
+        (row_key, basename, started_at, mtime, row_key),
     )
 
 
@@ -528,7 +560,6 @@ def ingest_file(
     mtime = _iso(logfile.stat().st_mtime)
 
     with connect(db_path) as conn:
-        _adopt_legacy_row(conn, basename, row_key)
         if not force:
             row = conn.execute(
                 "SELECT log_file_mtime FROM sessions WHERE log_file = ?", (row_key,)
@@ -549,6 +580,7 @@ def ingest_file(
         # every modern session.
         if not event and credit_usage["calls"] == 0:
             ts = _extract_ts(first_line) or _now()
+            _adopt_legacy_row(conn, basename, row_key, mtime, ts)
             conn.execute(
                 """
                 INSERT INTO sessions (session_num, log_file, log_file_mtime, no_op,
@@ -670,6 +702,7 @@ def ingest_file(
                     f"({cost})"
                 )
 
+        _adopt_legacy_row(conn, basename, row_key, mtime, started_at)
         conn.execute(
             """
             INSERT INTO sessions (session_num, log_file, log_file_mtime, no_op,

@@ -447,28 +447,93 @@ def test_a_log_named_like_another_does_not_overwrite_it(tmp_path, db_path):
     assert len(per_session) == 2, "a session lost its per-model breakdown"
 
 
-def test_a_pre_existing_basename_row_is_rekeyed_not_duplicated(tmp_path, db_path):
+def _parsed_started_at(log, tmp_path):
+    """The ``started_at`` this parser derives from ``log``, from the parser."""
+    probe = tmp_path / "started_at_probe.db"
+    operator_ingest.ingest_file(log, probe)
+    with operator_ingest.connect(probe) as conn:
+        return conn.execute("SELECT started_at FROM sessions").fetchone()[0]
+
+
+def _legacy_row(db_path, name, *, started_at="1970-01-01T00:00:00Z",
+                mtime=None, work_dir="legacy"):
+    """A row as the pre-full-path ingest wrote it: keyed by basename."""
+    operator_ingest.init_db(db_path)
+    with operator_ingest.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sessions (session_num, log_file, log_file_mtime, no_op,"
+            " started_at, ended_at, work_dir)"
+            " VALUES (99, ?, ?, 0, ?, 'y', ?)",
+            (name, mtime, started_at, work_dir),
+        )
+        conn.commit()
+
+
+def test_a_pre_existing_row_is_rekeyed_on_its_recorded_mtime(tmp_path, db_path):
     """Databases written before this change key on the basename.
 
     Left alone they would never match again, so the first ingest after the
     change would insert a second row for the same log and every historical
     session would be counted twice in every report -- a silent doubling of the
-    user's recorded spend.
+    user's recorded spend. The mtime the previous ingest recorded is evidence
+    that the row was written from this file, and it is the evidence that
+    survives a parser whose timestamps this one need not reproduce -- rows
+    written by the bash ingester.
     """
     log = make_log(tmp_path / "process-1700000000000-4.log")
-    operator_ingest.init_db(db_path)
-    with operator_ingest.connect(db_path) as conn:
-        conn.execute(
-            "INSERT INTO sessions (session_num, log_file, no_op, started_at,"
-            " ended_at, work_dir) VALUES (99, ?, 0, 'x', 'y', 'legacy')",
-            (log.name,),
-        )
-        conn.commit()
+    _legacy_row(db_path, log.name,
+                mtime=operator_ingest._iso(log.stat().st_mtime))
 
     assert operator_ingest.ingest_file(log, db_path).startswith("OK")
     rows = _sessions(db_path)
     assert len(rows) == 1, "the legacy row was left behind as a duplicate"
     assert rows[0]["log_file"] == operator_ingest.log_key(log)
+    assert rows[0]["id"] == 1, (
+        "the row was replaced rather than re-keyed, so its model_usage rows "
+        "now point at a session id that no longer exists"
+    )
+
+
+def test_a_pre_existing_row_is_rekeyed_on_the_logs_own_start_time(
+        tmp_path, db_path):
+    """The other half of the evidence, and the half that survives growth.
+
+    A log that was appended to since its last ingest no longer has the mtime
+    the row recorded -- the common case for a session ingested while it was
+    still running. Its first line does not change, so the start time parsed
+    from the log still identifies the row as this file's.
+    """
+    log = make_log(tmp_path / "process-1700000000000-14.log")
+    _legacy_row(db_path, log.name,
+                started_at=_parsed_started_at(log, tmp_path),
+                mtime="a mtime from before the log grew")
+
+    assert operator_ingest.ingest_file(log, db_path).startswith("OK")
+    rows = _sessions(db_path)
+    assert len(rows) == 1
+    assert rows[0]["log_file"] == operator_ingest.log_key(log)
+
+
+def test_a_legacy_row_for_a_different_session_is_not_adopted(tmp_path, db_path):
+    """The failure the collision fix would otherwise reintroduce.
+
+    A legacy row names a basename and nothing else, which is exactly the
+    ambiguity being removed. Re-keying on the name alone lets a log inherit a
+    different session's row, and the upsert that follows overwrites it and
+    deletes its ``model_usage`` breakdown -- destroying history rather than
+    merely mixing it. When neither the start time nor the recorded mtime says
+    the row is this file's, it must be left exactly as it is.
+    """
+    log = make_log(tmp_path / "process-1700000000000-15.log")
+    _legacy_row(db_path, log.name, work_dir="/some/other/session")
+
+    assert operator_ingest.ingest_file(log, db_path).startswith("OK")
+    rows = _sessions(db_path)
+    assert len(rows) == 2, "an unrelated session's row was adopted"
+    legacy = [r for r in rows if r["log_file"] == log.name]
+    assert legacy and legacy[0]["work_dir"] == "/some/other/session", (
+        "the older session's row was overwritten by this log"
+    )
 
 
 def test_rekeying_leaves_a_legacy_row_alone_when_the_path_is_recorded(
@@ -481,13 +546,8 @@ def test_rekeying_leaves_a_legacy_row_alone_when_the_path_is_recorded(
     """
     log = make_log(tmp_path / "process-1700000000000-5.log")
     operator_ingest.ingest_file(log, db_path)
-    with operator_ingest.connect(db_path) as conn:
-        conn.execute(
-            "INSERT INTO sessions (session_num, log_file, no_op, started_at,"
-            " ended_at, work_dir) VALUES (99, ?, 0, 'x', 'y', 'legacy')",
-            (log.name,),
-        )
-        conn.commit()
+    _legacy_row(db_path, log.name,
+                mtime=operator_ingest._iso(log.stat().st_mtime))
 
     assert operator_ingest.ingest_file(log, db_path, force=True).startswith("OK")
     rows = _sessions(db_path)
@@ -504,6 +564,67 @@ def test_status_line_names_the_file_not_the_path(tmp_path, db_path):
         f"OK {log.name}:")
     assert operator_ingest.ingest_file(log, db_path) == (
         f"SKIP {log.name} (already processed)")
+
+
+def test_the_log_is_parsed_without_holding_the_write_lock(
+        tmp_path, db_path, monkeypatch):
+    """Re-keying must not open the write transaction before the parse.
+
+    Instances share one database, so a write lock taken before ``_read_text``
+    is held across the whole read and parse of a multi-megabyte log. A
+    concurrent ingest then waits out the busy timeout and fails with
+    ``database is locked`` -- an ingest lost to a lock that was only ever held
+    for bookkeeping.
+    """
+    log = make_log(tmp_path / "process-1700000000000-16.log")
+    _legacy_row(db_path, log.name,
+                started_at=_parsed_started_at(log, tmp_path),
+                mtime="not this file's mtime, so the parse is not skipped")
+    outcome = {}
+    real_read = operator_ingest._read_text
+
+    def probing_read(path):
+        other = sqlite3.connect(str(db_path), timeout=0.2)
+        try:
+            other.execute(
+                "INSERT INTO sessions (session_num, log_file, started_at,"
+                " ended_at) VALUES (0, 'concurrent.log', 'x', 'y')")
+            other.commit()
+            outcome["blocked"] = None
+        except sqlite3.OperationalError as exc:
+            outcome["blocked"] = str(exc)
+        finally:
+            other.close()
+        return real_read(path)
+
+    monkeypatch.setattr(operator_ingest, "_read_text", probing_read)
+    operator_ingest.ingest_file(log, db_path)
+    assert outcome["blocked"] is None, (
+        f"a second ingest could not write while this one was parsing: "
+        f"{outcome['blocked']}"
+    )
+
+
+def test_a_key_does_not_change_when_the_path_stops_resolving(
+        tmp_path, db_path, monkeypatch):
+    """``resolved_str`` is not total, and its fallback normalises less.
+
+    ``Path.resolve`` returns Windows' canonical capitalisation; the
+    ``os.path.abspath`` fallback returns whatever the caller typed. A log
+    ingested once while its path would not resolve and again once it would
+    then produced two keys for one file, two rows, and its credits counted
+    twice.
+    """
+    if os.path.normcase("A") != "a":
+        pytest.skip("case-insensitive paths only")
+    logs = tmp_path / "Logs"
+    logs.mkdir()
+    log = make_log(logs / "process-1700000000000-17.log")
+    shouted = Path(str(log).replace("Logs", "LOGS"))
+
+    resolved = operator_ingest.log_key(shouted)
+    _resolve_raises(monkeypatch, shouted, OSError("cannot canonicalise"))
+    assert operator_ingest.log_key(shouted) == resolved
 
 
 def test_backfill_reconstructs_a_full_path_row(tmp_path, db_path):

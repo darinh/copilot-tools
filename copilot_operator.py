@@ -2193,16 +2193,18 @@ def manage_logs(args: list[str]) -> int:
     removed = skipped = 0
     freed = 0
     for f in old:
-        # Two spellings, because the column holds two. `operator_ingest.log_key`
-        # is what an ingest writes now -- the full path, so that two logs
-        # sharing a name in different directories stay two sessions -- while
-        # rows written before that change hold a bare basename and are only
-        # re-keyed when their log is ingested again. Matching just the new
-        # spelling would call every historical row unrecorded and refuse to
-        # prune anything; matching just the old one would delete a log
-        # recorded under a different directory's identical name. Both are
-        # accepted, and a log is pruned only when one of them names it.
-        if operator_ingest.log_key(f) not in known and f.name not in known:
+        # The full path only. `known` also holds bare basenames, from rows
+        # written before a log was keyed by path, and accepting those here
+        # would delete a log this database has no record of: a legacy row
+        # names a file in a directory nobody wrote down, so a same-named log
+        # in the current one matches it without being it. That is the loss
+        # this function exists to prevent -- the log is the only record of the
+        # session, and it would be gone before it could ever be ingested.
+        # A legacy row is re-keyed the next time its log is ingested, so the
+        # cost of the strict test is that an old database prunes nothing until
+        # `operator ingest` has run once, which is what the line below tells
+        # the user to do.
+        if operator_ingest.log_key(f) not in known:
             skipped += 1
             continue
         freed += f.stat().st_size
