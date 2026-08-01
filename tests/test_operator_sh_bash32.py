@@ -254,26 +254,26 @@ def test_generate_run_script_survives_and_quotes_an_empty_argument_list(tmp_path
 
 
 def test_operator_sh_uses_no_bash_4_only_declarations():
-    """A tripwire, and deliberately a textual one.
+    """Moved, not deleted -- see `tests/test_shell_bash32_conformance.py`.
 
-    This is the shape of test that is usually wrong -- pinning a *word* and
-    calling it a behaviour. It is exact here for one reason: `-A` is not a
-    proxy for the incompatibility, it *is* the token bash 3.2 rejects. There
-    is no way to write an associative array that this misses and no way to
-    trip it without writing one.
+    This test read one file, and that was the whole defect: `operator.sh` was
+    converted off associative arrays while `handoff.sh` kept one in
+    `resolve_instance`, and the tripwire that was supposed to prevent exactly
+    that had `OPERATOR_SH` baked into it. A rule enforced against a single
+    file is not a rule, it is that file's history.
 
-    It earns its place because the third associative array lived in
-    `start_copilot_in_tmux`'s recovery branch, which only runs when RESTART_DIR
-    is deleted between startup and launch. The tests above run the two commands
-    whose bodies can be reached; this covers the one whose body, in practice,
-    cannot.
+    Its replacement scans every first-party shell script, discovered rather
+    than listed, and covers the bash 4 feature set rather than the one
+    construct that happened to be found first -- so `operator.sh` and `-A`
+    remain covered, along with five more scripts and thirteen more
+    constructs. Kept here as a signpost because the reason this moved is
+    easier to lose than the assertion was.
     """
-    offenders = [
-        (n, line.strip())
-        for n, line in enumerate(OPERATOR_SH.read_text(encoding="utf-8").splitlines(), 1)
-        if ("local -A" in line or "declare -A" in line)
-        and not line.strip().startswith("#")
-    ]
-    assert not offenders, (
-        "operator.sh declares an associative array, which is a bash 4 feature "
-        f"and `declare: -A: invalid option` on the macOS default bash: {offenders}")
+    pytest.importorskip("test_shell_bash32_conformance")
+    from test_shell_bash32_conformance import (_findings,
+                                               _first_party_scripts)
+
+    scanned = [p.name for p in _first_party_scripts()]
+    assert OPERATOR_SH.name in scanned, (
+        f"operator.sh is no longer in the conformance scan: {scanned}")
+    assert not _findings(OPERATOR_SH.read_text(encoding="utf-8"))
