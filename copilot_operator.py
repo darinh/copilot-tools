@@ -32,6 +32,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -64,7 +65,7 @@ SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
 RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
                   "version", "forget", "logs", "tabs", "restore",
-                  "stop-loop", "stop-session", "menu"}
+                  "stop-loop", "stop-session", "restart-loop", "menu"}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
@@ -268,6 +269,26 @@ class Instance:
         return RESTART_DIR / f"{self.id}.loop.pid"
 
     @property
+    def loop_args_file(self) -> Path:
+        """The arguments loop mode was started with.
+
+        Recorded so a supervisor can be replaced (``operator restart-loop``)
+        without having to reconstruct them from the launch spec, where they
+        are already mixed with the preamble and the flags loop mode adds.
+        """
+        return RESTART_DIR / f"{self.id}.loopargs.json"
+
+    @property
+    def restart_lock_file(self) -> Path:
+        """Held while a supervisor handoff is in progress.
+
+        Two concurrent ``operator restart-loop`` runs would both retire the
+        old supervisor and both spawn a replacement, leaving two supervisors
+        fighting over one session — each relaunching what the other killed.
+        """
+        return RESTART_DIR / f"{self.id}.restartlock"
+
+    @property
     def detach_marker(self) -> Path:
         """Touched to ask a running loop supervisor to exit but leave the
         Copilot session running (``operator stop-loop``)."""
@@ -367,7 +388,8 @@ class Instance:
     def cleanup_files(self) -> None:
         for path in (self.restart_marker, self.managed_file, self.spec_file,
                      self.pid_file, self.exit_file, self.session_file,
-                     self.loop_pid_file, self.detach_marker, self.stop_marker):
+                     self.loop_pid_file, self.detach_marker, self.stop_marker,
+                     self.loop_args_file, self.restart_lock_file):
             path.unlink(missing_ok=True)
 
 
@@ -1086,6 +1108,36 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _save_loop_args(instance: Instance, user_args: list[str]) -> None:
+    """Record how loop mode was invoked so it can be reproduced later."""
+    payload = {"user_args": list(user_args), "cwd": str(Path.cwd())}
+    tmp = instance.loop_args_file.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, instance.loop_args_file)
+    except OSError as exc:
+        # Losing this costs a faithful restart-loop, never the running
+        # session, so it must not take the supervisor down with it.
+        log(f"  Warning: could not record loop args: {exc}")
+
+
+def _load_loop_args(instance: Instance) -> tuple[list[str], str | None]:
+    """The args loop mode was started with, plus its working directory.
+
+    Returns ``([], None)`` when nothing was recorded — the caller decides
+    whether that is fatal.
+    """
+    try:
+        payload = json.loads(instance.loop_args_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return [], None
+    args = payload.get("user_args")
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        return [], None
+    cwd = payload.get("cwd")
+    return args, cwd if isinstance(cwd, str) else None
+
+
 def _running_loop_pid(instance: Instance) -> int | None:
     """PID of instance's background loop supervisor, if one is alive.
 
@@ -1308,6 +1360,184 @@ def stop_loop_only(target: str | None) -> int:
             return 0
         time.sleep(0.5)
     print(f"Loop supervisor for '{target}' did not stop within 20s.", file=sys.stderr)
+    return 1
+
+
+@contextmanager
+def _restart_handoff_lock(instance: Instance):
+    """Serialise supervisor handoffs for one instance.
+
+    Yields True when the lock was taken, False when another handoff is
+    already in progress. Uses O_CREAT|O_EXCL because it is the one primitive
+    that is atomic on both POSIX and Windows; a lock whose recorded pid is
+    gone is stale (the holder crashed) and is reclaimed.
+    """
+    path = instance.restart_lock_file
+    acquired = False
+    try:
+        for _ in range(2):
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                holder = None
+                try:
+                    holder = int(path.read_text(encoding="utf-8").strip())
+                except (OSError, ValueError):
+                    pass
+                if holder is not None and _pid_alive(holder):
+                    break
+                # Stale: the holder died mid-handoff. Reclaim and retry once.
+                path.unlink(missing_ok=True)
+                continue
+            else:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(str(os.getpid()))
+                acquired = True
+                break
+        yield acquired
+    finally:
+        if acquired:
+            path.unlink(missing_ok=True)
+
+
+def restart_loop(target: str | None) -> int:
+    """Replace an instance's loop supervisor, leaving its session running.
+
+    The supervisor is a long-lived process that imported the operator's code
+    at startup, so it keeps running the code it started with — `operator stop`
+    would pick up new code but takes the Copilot session down with it. This
+    swaps only the supervisor: the old one is asked to detach, and a new one
+    adopts the still-running session.
+    """
+    if not target:
+        print("Usage: operator restart-loop NAME", file=sys.stderr)
+        print("Replaces the loop supervisor (picking up new operator code) "
+              "without stopping the Copilot session.", file=sys.stderr)
+        return 1
+    instance = Instance(target)
+
+    if not MUX.has_session(instance.session):
+        print(f"No running session '{target}'. Nothing to keep alive — "
+              f"start it with: operator --loop --name {target}", file=sys.stderr)
+        return 1
+    if not instance.owns_live_session():
+        print(f"A session named '{instance.session}' is running but was not "
+              f"started by this operator. Refusing to touch it.", file=sys.stderr)
+        print(f"  Drop stale state with: operator forget {instance.display_name}",
+              file=sys.stderr)
+        return 1
+
+    # Everything that can be known to be wrong is checked *before* the old
+    # supervisor is retired, so a rejected restart leaves the instance exactly
+    # as it found it.
+    user_args, recorded_cwd = _load_loop_args(instance)
+    if recorded_cwd is None:
+        print(f"No recorded loop arguments for '{target}'. This instance was "
+              f"started by an operator that predates restart-loop.",
+              file=sys.stderr)
+        print("  Its next session would lose its original arguments, so it is "
+              "safer to restart it yourself:", file=sys.stderr)
+        print(f"    operator stop-loop {instance.display_name}", file=sys.stderr)
+        print(f"    operator --loop --headless --name {instance.display_name} "
+              f"[original args]", file=sys.stderr)
+        return 1
+    if not Path(recorded_cwd).is_dir():
+        # Spawning from the caller's cwd instead would silently point the
+        # instance at a different project.
+        print(f"The directory '{target}' was started in no longer exists:",
+              file=sys.stderr)
+        print(f"  {recorded_cwd}", file=sys.stderr)
+        print("  Refusing to restart it somewhere else. Restore the directory, "
+              "or stop the instance and start it where you want it.",
+              file=sys.stderr)
+        return 1
+
+    with _restart_handoff_lock(instance) as acquired:
+        if not acquired:
+            print(f"Another restart of '{target}' is already in progress.",
+                  file=sys.stderr)
+            return 1
+        return _do_restart_loop(instance, user_args, recorded_cwd)
+
+
+def _do_restart_loop(instance: Instance, user_args: list[str],
+                     recorded_cwd: str) -> int:
+    """The handoff itself. Runs holding the per-instance restart lock."""
+    target = instance.display_name
+    pid = _running_loop_pid(instance)
+    if pid is not None:
+        instance.detach_marker.touch()
+        log(f"Restart requested for loop '{target}' (pid {pid})")
+        # Budget derived from how long the supervisor can take to look at the
+        # marker, so tuning the poll interval cannot silently break this.
+        budget = SESSION_ID_WAIT + POLL_INTERVAL * 2 + 15
+        deadline = time.time() + budget
+        while time.time() < deadline:
+            if _running_loop_pid(instance) is None:
+                break
+            time.sleep(0.5)
+        else:
+            instance.detach_marker.unlink(missing_ok=True)
+            print(f"Loop supervisor for '{target}' did not stop within "
+                  f"{budget}s. Session left untouched; no new supervisor "
+                  f"started.", file=sys.stderr)
+            return 1
+
+        # The supervisor is gone, but *why* it went matters. If the detach
+        # marker is still sitting there it never consumed our request, so it
+        # exited for its own reasons — most likely a concurrent `operator
+        # stop`, which also takes the session down. Spawning an adopting
+        # supervisor now would resurrect a session the user just stopped.
+        if instance.detach_marker.exists():
+            instance.detach_marker.unlink(missing_ok=True)
+            print(f"The supervisor for '{target}' exited without taking the "
+                  f"restart request — something else stopped it.",
+                  file=sys.stderr)
+            print("  Not starting a replacement.", file=sys.stderr)
+            return 1
+        print(f"Old supervisor (pid {pid}) stopped.")
+    else:
+        print(f"No supervisor was running for '{target}' — starting one.")
+
+    # Re-check rather than trust the check from before the handoff: `operator
+    # stop` may have killed the session while we waited.
+    if not MUX.has_session(instance.session):
+        print(f"Session '{target}' disappeared during the restart — it was "
+              f"stopped by something else. Not starting a replacement.",
+              file=sys.stderr)
+        return 1
+
+    try:
+        _spawn_background_loop(instance, user_args, is_fresh=False, adopt=True,
+                               cwd=recorded_cwd)
+    except OSError as exc:
+        # The old supervisor is already gone, so failing here is the one
+        # outcome worth shouting about: the session is alive and unwatched.
+        print(f"Could not start a replacement supervisor for '{target}': {exc}",
+              file=sys.stderr)
+        print(f"  The Copilot session is still running but is NOT supervised.",
+              file=sys.stderr)
+        print(f"  Retry: operator restart-loop {target}", file=sys.stderr)
+        return 1
+
+    # Confirm it actually came up: a supervisor that died on startup would
+    # otherwise leave the session unsupervised while we report success. Wait
+    # for the pid *file*, not the spawned pid — on Windows sys.executable is
+    # often a launcher shim that exits once the real interpreter is running,
+    # so the pid Popen hands back may be dead while the supervisor is fine.
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        new_pid = _running_loop_pid(instance)
+        if new_pid is not None:
+            print(f"✅ Loop supervisor for '{target}' replaced "
+                  f"(pid {new_pid}); session kept running.")
+            print(f"  Attach: operator join {target}")
+            return 0
+        time.sleep(0.5)
+    print(f"New supervisor for '{target}' did not come up. The Copilot session "
+          f"is still running but is no longer supervised.", file=sys.stderr)
+    print(f"  Check the log for details: {LOG_FILE}", file=sys.stderr)
+    print(f"  Retry: operator restart-loop {target}", file=sys.stderr)
     return 1
 
 
@@ -1669,7 +1899,15 @@ def run_single_session(instance: Instance, copilot_args: list[str],
     return 0
 
 
-def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> int:
+def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
+                  adopt: bool = False) -> int:
+    """Supervise an instance, restarting Copilot until asked to stop.
+
+    ``adopt`` takes over a session that is already running instead of
+    launching one. That is what lets a supervisor be replaced — to pick up new
+    operator code, say — without disturbing the Copilot session it was
+    watching. Everything after the initial launch is identical either way.
+    """
     copilot_args = ["--yolo", "--autopilot", "--no-ask-user", "--effort", "high"]
     agent = extract_agent_from_args(user_args)
     if not has_agent_flag(user_args):
@@ -1684,13 +1922,19 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
     if not is_fresh:
         state = instance.load_state()
         if state:
-            start_session_num = int(state.get("SESSION_NUM", 0) or 0) + 1
+            # Adoption joins the session that is already running, so it keeps
+            # that session's number. Only a launch moves to the next one.
+            start_session_num = int(state.get("SESSION_NUM", 0) or 0) + (0 if adopt else 1)
             run_started = state.get("RUN_STARTED", run_started)
             candidate = state.get("COPILOT_SESSION_ID", "")
             if UUID_RE.match(candidate or ""):
                 resume_id = candidate
                 log(f"  Will resume Copilot CLI session: {resume_id}")
             log(f"Continuing from session #{start_session_num} (run started {run_started})")
+    if adopt:
+        start_session_num = max(1, start_session_num)
+        # Nothing is being launched, so there is nothing to resume into.
+        resume_id = ""
 
     # A resume id with no handoff file for this project means the previous
     # session ended without ever calling `handoff` — most likely a crash
@@ -1713,7 +1957,25 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
 
     preamble = build_preamble(agent, instance, crash_recovery=crash_recovery)
 
-    handle_existing_session(instance)
+    if adopt:
+        # Refuse to "adopt" anything we do not own or that is not there: the
+        # supervisor would otherwise sit polling a session it cannot manage,
+        # or immediately relaunch over somebody else's.
+        if not MUX.has_session(instance.session):
+            die(f"No running session '{instance.display_name}' to adopt.")
+        if not instance.owns_live_session():
+            die(f"A session named '{instance.session}' is running but was not "
+                f"started by this operator. Refusing to adopt it.\n"
+                f"  Drop stale state with: operator forget {instance.display_name}")
+        # Last line of defence against two supervisors watching one session:
+        # they would relaunch over each other's sessions indefinitely. The
+        # handoff lock makes this unlikely; this makes it survivable.
+        other = _running_loop_pid(instance)
+        if other is not None and other != os.getpid():
+            die(f"Another loop supervisor (pid {other}) is already running for "
+                f"'{instance.display_name}'. Refusing to start a second one.")
+    else:
+        handle_existing_session(instance)
 
     shutdown = {"requested": False}
 
@@ -1754,61 +2016,73 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
     launch_failures = 0
     crash_failures = 0
     resume_id_used = ""
+    adopting = adopt
     instance.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    # Recorded so this supervisor can be replaced later without guessing how
+    # it was started. Written every time, so it tracks the live invocation.
+    _save_loop_args(instance, user_args)
     try:
         try:
             while session_num <= MAX_SESSIONS:
-                launch_args = list(copilot_args)
-                if resume_id:
-                    if args_have_explicit_session(launch_args):
-                        log("  Skipping automatic --resume; user args already choose a session")
-                    else:
-                        launch_args.append(f"--resume={resume_id}")
-                        resume_id_used = resume_id
-                    resume_id = ""
+                if adopting:
+                    # Take over the session already running: no launch, no
+                    # preamble, no resume. Only the first pass adopts; every
+                    # session after this one is launched normally.
+                    adopting = False
+                    log(f"Session #{session_num}: adopting the running session")
+                    last_launched = session_num
+                else:
+                    launch_args = list(copilot_args)
+                    if resume_id:
+                        if args_have_explicit_session(launch_args):
+                            log("  Skipping automatic --resume; user args already choose a session")
+                        else:
+                            launch_args.append(f"--resume={resume_id}")
+                            resume_id_used = resume_id
+                        resume_id = ""
 
-                # Messages that arrived while no session was running are
-                # handed over here, per launch rather than once: the base
-                # preamble is built before the loop starts, so mail that
-                # arrives during session #3 must still reach session #4.
-                # Read now, archive only once the session is really up.
-                launch_preamble = preamble
-                waiting = operator_mail.pending(OPERATOR_HOME, instance.id)
-                if waiting:
-                    senders = ", ".join(sorted({m.get("from", "?") for m in waiting}))
-                    log(f"  Delivering {len(waiting)} queued message(s) from {senders}")
-                    launch_preamble += operator_mail.render_for_agent(waiting)
+                    # Messages that arrived while no session was running are
+                    # handed over here, per launch rather than once: the base
+                    # preamble is built before the loop starts, so mail that
+                    # arrives during session #3 must still reach session #4.
+                    # Read now, archive only once the session is really up.
+                    launch_preamble = preamble
+                    waiting = operator_mail.pending(OPERATOR_HOME, instance.id)
+                    if waiting:
+                        senders = ", ".join(sorted({m.get("from", "?") for m in waiting}))
+                        log(f"  Delivering {len(waiting)} queued message(s) from {senders}")
+                        launch_preamble += operator_mail.render_for_agent(waiting)
 
-                # Persist the pending resume id too: if the launch fails or the
-                # process dies here, the id must survive on disk rather than being
-                # cleared by a pre-launch write.
-                instance.save_state(session_num, run_started, resume_id_used)
-                try:
-                    start_session(instance, launch_args, session_num,
-                                  remain_on_exit=True, preamble=launch_preamble)
-                except MuxError as exc:
-                    # A launch failure must not kill an unattended loop. Back off
-                    # and retry the same session number rather than exiting.
-                    launch_failures += 1
-                    log(f"  Launch failed ({exc}) — attempt {launch_failures}")
-                    if launch_failures >= MAX_LAUNCH_FAILURES:
-                        log(f"  Giving up after {launch_failures} consecutive launch failures")
-                        raise
-                    if resume_id_used:
-                        # Put the resume id back so a failed launch does not lose it.
-                        resume_id = resume_id_used
-                    backoff = min(60, LAUNCH_BACKOFF_BASE * launch_failures)
-                    log(f"  Retrying in {backoff}s...")
-                    _sleep(backoff)
-                    if shutdown["requested"]:
-                        raise KeyboardInterrupt
-                    continue
-                launch_failures = 0
-                if waiting:
-                    operator_mail.archive(OPERATOR_HOME, instance.id,
-                                          [m["id"] for m in waiting])
-                resume_id_used = ""
-                last_launched = session_num
+                    # Persist the pending resume id too: if the launch fails or the
+                    # process dies here, the id must survive on disk rather than being
+                    # cleared by a pre-launch write.
+                    instance.save_state(session_num, run_started, resume_id_used)
+                    try:
+                        start_session(instance, launch_args, session_num,
+                                      remain_on_exit=True, preamble=launch_preamble)
+                    except MuxError as exc:
+                        # A launch failure must not kill an unattended loop. Back off
+                        # and retry the same session number rather than exiting.
+                        launch_failures += 1
+                        log(f"  Launch failed ({exc}) — attempt {launch_failures}")
+                        if launch_failures >= MAX_LAUNCH_FAILURES:
+                            log(f"  Giving up after {launch_failures} consecutive launch failures")
+                            raise
+                        if resume_id_used:
+                            # Put the resume id back so a failed launch does not lose it.
+                            resume_id = resume_id_used
+                        backoff = min(60, LAUNCH_BACKOFF_BASE * launch_failures)
+                        log(f"  Retrying in {backoff}s...")
+                        _sleep(backoff)
+                        if shutdown["requested"]:
+                            raise KeyboardInterrupt
+                        continue
+                    launch_failures = 0
+                    if waiting:
+                        operator_mail.archive(OPERATOR_HOME, instance.id,
+                                              [m["id"] for m in waiting])
+                    resume_id_used = ""
+                    last_launched = session_num
 
                 # Record the CLI session id once the runner discovers it.
                 for _ in range(SESSION_ID_WAIT):
@@ -1818,6 +2092,13 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
                         break
                     if not is_copilot_running(instance):
                         break
+                    if instance.detach_marker.exists() or instance.stop_marker.exists():
+                        # A stop/detach request must not wait out session-id
+                        # discovery: `operator restart-loop` blocks on this
+                        # supervisor exiting, and a session that never reports
+                        # an id would hold it for the full SESSION_ID_WAIT on
+                        # top of the poll interval.
+                        break
                     _sleep(1)
                     if shutdown["requested"]:
                         raise KeyboardInterrupt
@@ -1826,9 +2107,10 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
                 while True:
                     if shutdown["requested"]:
                         raise KeyboardInterrupt
-                    _sleep(POLL_INTERVAL)
-                    if shutdown["requested"]:
-                        raise KeyboardInterrupt
+                    # Checked before sleeping, not after: `operator stop` and
+                    # `operator restart-loop` both block waiting for this
+                    # supervisor to act, so a whole poll interval of latency
+                    # is paid by a human (or an agent) every time.
                     if instance.stop_marker.exists():
                         # `operator stop NAME` asked us to shut down and take the
                         # session with us — same as Ctrl+C, just triggered
@@ -1843,13 +2125,17 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool) -> i
                         return 0
                     if instance.detach_marker.exists():
                         # `operator stop-loop NAME` asked us to stop supervising
-                        # but leave the session running untouched.
+                        # but leave the session running untouched. Also how
+                        # `operator restart-loop` retires the old supervisor.
                         instance.detach_marker.unlink(missing_ok=True)
                         sid = instance.read_session_id()
                         instance.save_state(session_num, run_started, sid)
                         log(f"Session #{session_num}: detach requested — leaving "
                             f"session running, supervisor exiting")
                         return 0
+                    _sleep(POLL_INTERVAL)
+                    if shutdown["requested"]:
+                        raise KeyboardInterrupt
                     if not is_copilot_running(instance):
                         if instance.restart_marker.exists():
                             log(f"Session #{session_num}: restart signal detected!")
@@ -1927,6 +2213,7 @@ USAGE
     operator list                                              Show running instances
     operator stop [NAME]                                       Stop instance(s) — loop + session
     operator stop-loop NAME                                    Stop only the background loop
+    operator restart-loop NAME                                 Replace the loop supervisor (new code), keep session
     operator stop-session NAME                                 Stop only the Copilot session
     operator forget NAME                                       Drop operator state only
     operator report [type]                                     View usage reports
@@ -1983,6 +2270,12 @@ LOOP VS. SESSION
 
         operator stop-loop NAME       Stop the supervisor; session keeps running.
                                       Re-attach any time with `operator join NAME`.
+        operator restart-loop NAME    Replace the supervisor with a fresh one,
+                                      leaving the session running. The supervisor
+                                      is a long-lived process that imported the
+                                      operator's code when it started, so this is
+                                      how a running instance picks up an updated
+                                      operator without losing its session.
         operator stop-session NAME    Stop the session; if a supervisor is still
                                       running it relaunches a fresh one shortly.
         operator stop NAME            Stop both, cleanly, with no relaunch.
@@ -2150,7 +2443,8 @@ def default_instance_name() -> str:
 
 
 def _spawn_background_loop(instance: Instance, copilot_args: list[str],
-                           is_fresh: bool) -> int:
+                           is_fresh: bool, adopt: bool = False,
+                           cwd: str | None = None) -> int:
     """Launch the loop supervisor as a detached background OS process.
 
     Re-execs this same script with --_supervise so the child runs
@@ -2170,9 +2464,12 @@ def _spawn_background_loop(instance: Instance, copilot_args: list[str],
            "--_supervise", "--loop", "--name", instance.display_name]
     if is_fresh:
         cmd.append("--fresh")
+    if adopt:
+        cmd.append("--adopt")
     cmd += copilot_args
     kwargs: dict = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, close_fds=True, cwd=str(Path.cwd()))
+                       stderr=subprocess.DEVNULL, close_fds=True,
+                       cwd=cwd or str(Path.cwd()))
     if IS_WINDOWS:
         kwargs["creationflags"] = (
             subprocess.CREATE_NEW_PROCESS_GROUP
@@ -2613,6 +2910,8 @@ def main(argv: list[str] | None = None) -> int:
         return stop_operator(args[1] if len(args) > 1 else None)
     if head == "stop-loop":
         return stop_loop_only(args[1] if len(args) > 1 else None)
+    if head == "restart-loop":
+        return restart_loop(args[1] if len(args) > 1 else None)
     if head == "stop-session":
         return stop_session_only(args[1] if len(args) > 1 else None)
     if head == "join":
@@ -2653,6 +2952,7 @@ def run_dispatch(args: list[str]) -> int:
     is_fresh = False
     supervise = False
     headless = False
+    adopt = False
     name = ""
     copilot_args: list[str] = []
 
@@ -2665,6 +2965,11 @@ def run_dispatch(args: list[str]) -> int:
             is_fresh = True
         elif arg in ("--headless", "--detached"):
             headless = True
+        elif arg == "--adopt":
+            # Internal: set by `operator restart-loop` on the replacement
+            # supervisor so it takes over the running session instead of
+            # launching a new one. Not for interactive use.
+            adopt = True
         elif arg == "--_supervise":
             # Internal: marks the re-exec'd background supervisor process so
             # it runs run_loop_mode directly instead of spawning yet another
@@ -2688,7 +2993,7 @@ def run_dispatch(args: list[str]) -> int:
     try:
         if loop_mode:
             if supervise:
-                return run_loop_mode(instance, copilot_args, is_fresh)
+                return run_loop_mode(instance, copilot_args, is_fresh, adopt=adopt)
             if headless:
                 return start_loop_headless(instance, copilot_args, is_fresh)
             return start_and_attach_loop(instance, copilot_args, is_fresh)
