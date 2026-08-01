@@ -196,8 +196,8 @@ hits a genuine false positive can act without hunting.
 
 | File | What it is |
 |---|---|
-| `extension.mjs` | SDK wiring, per-session state and the three hook bodies |
-| `guard.mjs` | Every decision the guard makes, and all checkout inspection |
+| `extension.mjs` | SDK wiring and the three hook bodies |
+| `guard.mjs` | Every decision the guard makes, its per-session state, and all checkout inspection |
 | `guard.test.mjs` | `node --test` suite, no live session required |
 
 ```bash
@@ -206,18 +206,27 @@ node --test extensions/checkout-guard/guard.test.mjs
 
 The split is deliberate and load-bearing, but it is a split by *testability*,
 not by size. `extension.mjs` calls `joinSession` at import, so importing it has
-a side effect and the test suite cannot reach it at all: everything it holds —
-the tracked-path maps, `observe`, the bodies of `onSessionStart` /
-`onPreToolUse` / `onPostToolUse` — is covered by `node --check` and by nothing
-else. The untestability is structural, not incidental.
+a side effect and the test suite cannot reach it at all: everything it holds is
+covered by `node --check` and by nothing else. The untestability is structural,
+not incidental.
 
 That makes the line a real budget rather than a style preference: **anything
-moved into `guard.mjs` gains 80 tests, and anything that stays gains a parse
-check.** `extension.mjs` is 293 lines against `guard.mjs`'s 1116, and some of
-those 293 — `MAX_TRACKED`, the `lastSeen` / `outstanding` / `authored` /
-`primaryRoots` maps, `relativeToCheckout` — are pure data and pure functions
-with no reason to sit on the uncovered side. Logic accumulating in
-`extension.mjs` is a debt, not a convenience.
+moved into `guard.mjs` gains the node suite, and anything that stays gains a
+parse check.** So `extension.mjs` holds SDK wiring and the three hook bodies
+and nothing else — 179 lines against `guard.mjs`'s 1314. The per-session
+tracking state, `observe`, `noteAuthored`, `otherRootToWatch`,
+`relativeToCheckout`, `MAX_TRACKED`, the scratch-directory name, the
+disable-flag reading and the tool-name sets all live in `guard.mjs`, where they
+are tested. Logic accumulating in `extension.mjs` is a debt, not a convenience.
+
+The state is a factory — `createGuardState()` returning fresh `lastSeen` /
+`outstanding` / `authored` / `primaryRoots` maps — rather than four
+module-level bindings, and that is not a style choice either. A module binding
+is shared by every importer for the life of the process, so the moment those
+maps live in the tested file they would be shared across every case in
+`guard.test.mjs`, and the failures that produces are order-dependent and
+intermittent. The extension creates exactly one state, so nothing is lost by
+making the lifetime explicit.
 
 Because `guard.mjs` is where the decisions live, `setup_tools.py` parses every
 `.mjs` in a deployed extension rather than just the entrypoint: `node --check`

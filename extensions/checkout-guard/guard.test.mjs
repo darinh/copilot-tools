@@ -18,28 +18,42 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   addIsBlanket,
   blockReason,
+  bound,
   checkoutRoot,
+  createGuardState,
   emptyDirCandidates,
   formatPathList,
   git,
   gitInvocations,
   gitSubcommand,
+  guardDisabled,
   holdsNoFiles,
   invisibleDirStrays,
   newEntries,
+  noteAuthored,
+  observe,
+  otherRootToWatch,
   parseStatusPaths,
   parseUntracked,
   nestedWorktreePrefixes,
   primaryCheckoutRoot,
+  relativeToCheckout,
   rootToWatch,
+  scratchDirFor,
+  setFor,
+  AUTHORING_TOOLS,
+  MAX_TRACKED,
+  SHELL_TOOLS,
+  SUBAGENT_TOOLS,
   UNKNOWN_ROOT,
   inheritedStrayReport,
   primaryStrayReport,
@@ -1525,6 +1539,291 @@ test("the worktree exclusion applies to the tree the agent is working in too", a
     assert.ok((await scanCheckoutTree(primary)).includes("probe.py"),
       "control: the filtered scan is not simply blind");
   });
+});
+
+// ---------------------------------------------------------------------------
+// Per-session tracking state.
+//
+// All of this lived in extension.mjs, where `joinSession` runs at import and
+// no test could reach it. Everything below was covered by `node --check` and
+// nothing else until it moved.
+// ---------------------------------------------------------------------------
+
+/** A `scanCheckoutTree` double: yields each listing in turn, then repeats. */
+function scanner(...listings) {
+  let i = 0;
+  return async () => listings[Math.min(i++, listings.length - 1)];
+}
+
+test("createGuardState hands out fresh state, never a shared module binding", () => {
+  const a = createGuardState();
+  const b = createGuardState();
+  a.lastSeen.set("/repo", ["probe.py"]);
+  setFor(a.outstanding, "/repo").add("probe.py");
+  setFor(a.authored, "/repo").add("src.js");
+  a.primaryRoots.set("/repo", null);
+  // The trap the factory exists to avoid. As module-level Maps these would be
+  // shared by every importer for the life of the process, so each test in this
+  // file would inherit the previous one's state -- and the failures that
+  // produces are order-dependent and intermittent, the most expensive shape a
+  // test failure has.
+  assert.equal(b.lastSeen.size, 0);
+  assert.equal(b.outstanding.size, 0);
+  assert.equal(b.authored.size, 0);
+  assert.equal(b.primaryRoots.size, 0);
+  // Control: the writes above really did land somewhere, so the emptiness of
+  // `b` is isolation and not four writes that were no-ops.
+  assert.deepEqual(a.lastSeen.get("/repo"), ["probe.py"]);
+  assert.deepEqual([...setFor(a.outstanding, "/repo")], ["probe.py"]);
+  assert.deepEqual([...setFor(a.authored, "/repo")], ["src.js"]);
+  assert.equal(a.primaryRoots.get("/repo"), null);
+});
+
+test("setFor creates one set per root and keeps returning it", () => {
+  const map = new Map();
+  const first = setFor(map, "/repo");
+  first.add("a.py");
+  assert.equal(setFor(map, "/repo"), first, "the same root gets the same set, not a fresh one");
+  assert.deepEqual([...setFor(map, "/repo")], ["a.py"]);
+  // Control: two roots do not share a set, which is what makes the identity
+  // above a statement about keying rather than about there being only one set.
+  assert.notEqual(setFor(map, "/other"), first);
+  assert.deepEqual([...setFor(map, "/other")], []);
+});
+
+test("bound drops the oldest entries and leaves a set within the limit alone", () => {
+  const over = new Set(["a", "b", "c", "d"]);
+  bound(over, 2);
+  assert.deepEqual([...over], ["c", "d"], "insertion order decides: the oldest go first");
+  // Control: a set already within the limit is untouched, so the trimming
+  // above is the limit acting rather than the function always deleting.
+  const under = new Set(["x", "y"]);
+  bound(under, 2);
+  assert.deepEqual([...under], ["x", "y"]);
+  // And the default is the limit the extension actually runs with.
+  const many = new Set(Array.from({ length: MAX_TRACKED + 5 }, (_, i) => `p${i}`));
+  bound(many);
+  assert.equal(many.size, MAX_TRACKED);
+  assert.ok(!many.has("p0"), "the oldest is gone");
+  assert.ok(many.has(`p${MAX_TRACKED + 4}`), "the newest is kept");
+});
+
+test("relativeToCheckout reports checkout-relative posix paths, and null outside", () => {
+  const root = join(tmpdir(), "cg-rel-root");
+  assert.equal(relativeToCheckout(root, join(root, "sub", "probe.py")), "sub/probe.py",
+    "posix separators, because that is the form git reports and the sets hold");
+  assert.equal(relativeToCheckout(root, join("sub", "probe.py"), root), "sub/probe.py",
+    "a relative path resolves against the cwd it is given");
+  // Paired negatives. Both must be null rather than a `../` path: a file
+  // outside the checkout is not this checkout's artifact, and folding one in
+  // would record an authored path that no scan of this root can ever match.
+  assert.equal(relativeToCheckout(root, join(tmpdir(), "elsewhere", "probe.py")), null);
+  assert.equal(relativeToCheckout(root, root), null, "the root is not a path inside itself");
+});
+
+test("only an exact 1 disables the guard", () => {
+  assert.equal(guardDisabled({ COPILOT_CHECKOUT_GUARD_DISABLE: "1" }), true);
+  // The values someone types meaning "leave it on". A truthiness test would
+  // disable the guard on the first two -- in the one case where the operator
+  // believed it was running.
+  assert.equal(guardDisabled({ COPILOT_CHECKOUT_GUARD_DISABLE: "0" }), false);
+  assert.equal(guardDisabled({ COPILOT_CHECKOUT_GUARD_DISABLE: "false" }), false);
+  assert.equal(guardDisabled({}), false);
+});
+
+test("scratchDirFor names a per-process directory under the temp dir", () => {
+  assert.equal(scratchDirFor(4242), join(tmpdir(), "copilot-scratch", "session-4242"));
+  // Control: it is per process, so two sessions on one machine are never
+  // handed the same scratch directory to write into.
+  assert.notEqual(scratchDirFor(4243), scratchDirFor(4242));
+  assert.ok(scratchDirFor().endsWith(`session-${process.pid}`), "defaults to this process");
+});
+
+test("the tool sets keep shell, subagent and authoring tools apart", () => {
+  for (const name of ["bash", "powershell", "shell"]) {
+    assert.ok(SHELL_TOOLS.has(name), `${name} runs arbitrary commands`);
+  }
+  assert.ok(SUBAGENT_TOOLS.has("task"),
+    "the only call at which a subagent's writes can still be attributed");
+  for (const name of ["create", "edit"]) assert.ok(AUTHORING_TOOLS.has(name));
+  // The separations, each of which changes what a hook does. `task` in
+  // SHELL_TOOLS would have the pre-hook read a subagent PROMPT as a git
+  // command line; an authoring tool in either set would have the agent's own
+  // deliberate writes rescanned and reported back to it as strays.
+  assert.ok(!SHELL_TOOLS.has("task"));
+  assert.ok(!SHELL_TOOLS.has("edit") && !SUBAGENT_TOOLS.has("edit"));
+  assert.ok(!AUTHORING_TOOLS.has("bash"));
+});
+
+test("observe establishes a baseline before it calls anything new", async () => {
+  const state = createGuardState();
+  const scan = scanner(["old.py"], ["old.py", "probe.py"]);
+  assert.deepEqual(await observe(state, "/repo", { scan }), [],
+    "first sight: reporting here would blame this agent for every earlier artifact");
+  // Control through the SAME call: the mechanism can fire at all, so the empty
+  // result above is the baseline rule and not a scan double that never works.
+  assert.deepEqual(await observe(state, "/repo", { scan }), ["probe.py"]);
+});
+
+test("a scan that failed is not a checkout that is clean", async () => {
+  const state = createGuardState();
+  const scan = scanner(["old.py"], null, ["old.py", "probe.py"]);
+  await observe(state, "/repo", { scan });
+  assert.deepEqual(await observe(state, "/repo", { scan }), [],
+    "a failed scan reports nothing, because it measured nothing");
+  // And it must not have overwritten the baseline with that nothing, or the
+  // pre-existing file returns as this agent's new artifact on the next command.
+  assert.deepEqual(await observe(state, "/repo", { scan }), ["probe.py"],
+    "the surviving baseline still knows old.py was already there");
+});
+
+test("observe never reports a path the agent authored deliberately", async () => {
+  const state = createGuardState();
+  const scan = scanner(["old.py"], ["old.py", "written.py", "probe.py"]);
+  await observe(state, "/repo", { scan });
+  setFor(state.authored, "/repo").add("written.py");
+  // Paired inside one call: both paths are new by the same measurement, and
+  // only the authored one is dropped.
+  assert.deepEqual(await observe(state, "/repo", { scan }), ["probe.py"]);
+});
+
+test("only the checkout the agent works in accumulates blocking artifacts", async () => {
+  const state = createGuardState();
+  const here = scanner(["a"], ["a", "mine.py"]);
+  await observe(state, "/repo", { scan: here });
+  assert.deepEqual(await observe(state, "/repo", { scan: here }), ["mine.py"]);
+  assert.deepEqual([...setFor(state.outstanding, "/repo")], ["mine.py"],
+    "an artifact here can deny this agent's own blanket stage");
+
+  const there = scanner(["b"], ["b", "peer.py"]);
+  await observe(state, "/primary", { blocking: false, scan: there });
+  assert.deepEqual(await observe(state, "/primary", { blocking: false, scan: there }),
+    ["peer.py"], "still reported: it is worth telling the agent about");
+  assert.deepEqual([...setFor(state.outstanding, "/primary")], [],
+    "but it cannot block -- refusing this agent's commit over a peer's artifact "
+    + "lands the cost on the wrong asset");
+});
+
+test("an artifact that was cleaned up stops blocking", async () => {
+  const state = createGuardState();
+  const scan = scanner(["a"], ["a", "probe.py"], ["a"]);
+  await observe(state, "/repo", { scan });
+  await observe(state, "/repo", { scan });
+  assert.deepEqual([...setFor(state.outstanding, "/repo")], ["probe.py"],
+    "premise: it is outstanding, or the next assertion proves nothing");
+  await observe(state, "/repo", { scan });
+  assert.deepEqual([...setFor(state.outstanding, "/repo")], [],
+    "an agent that cleans up is not then blocked by the memory of a deleted file");
+});
+
+test("the outstanding set stays bounded however long an agent ignores it", async () => {
+  const state = createGuardState();
+  const many = Array.from({ length: MAX_TRACKED + 10 }, (_, i) => `p${i}.py`);
+  const scan = scanner([], many);
+  await observe(state, "/repo", { scan });
+  const fresh = await observe(state, "/repo", { scan });
+  assert.equal(fresh.length, many.length, "premise: every one of them really is new");
+  assert.equal(setFor(state.outstanding, "/repo").size, MAX_TRACKED,
+    "the report is complete; only the memory of it is capped");
+});
+
+test("noteAuthored folds a deliberate write into the baseline and clears the block", async () => {
+  const state = createGuardState();
+  const root = join(tmpdir(), "cg-authored-root");
+  const scan = scanner(["a"], ["a", "written.py", "unrelated.py"]);
+  await observe(state, root, { scan });
+  setFor(state.outstanding, root).add("written.py");
+
+  assert.equal(noteAuthored(state, root, join(root, "written.py")), "written.py");
+  assert.deepEqual([...setFor(state.outstanding, root)], [],
+    "a path the agent adopted with create/edit no longer denies its own stage");
+  assert.ok(state.lastSeen.get(root).includes("written.py"),
+    "folded into the baseline rather than rescanned: a five-file edit would "
+    + "otherwise fire five concurrent whole-tree traversals");
+  // The suppression and a positive control THROUGH THE SAME CALL. Both paths
+  // are new by the same measurement; asserting only that the authored one is
+  // absent would pass just as happily against an `observe` that had stopped
+  // reporting anything at all.
+  assert.deepEqual(await observe(state, root, { scan }), ["unrelated.py"],
+    "the next observation does not hand the agent back its own writing, and is "
+    + "not simply blind: a real stray in the same call is still reported");
+});
+
+test("noteAuthored ignores a write outside the checkout", () => {
+  const state = createGuardState();
+  const root = join(tmpdir(), "cg-authored-root2");
+  assert.equal(noteAuthored(state, root, join(tmpdir(), "elsewhere.py")), null);
+  assert.equal(state.authored.size, 0, "nothing recorded against a checkout it is not in");
+  // Control: the same call with a path inside the checkout does record, so the
+  // null above is the boundary check and not the function doing nothing at all.
+  assert.equal(noteAuthored(state, root, join(root, "inside.py")), "inside.py");
+  assert.deepEqual([...setFor(state.authored, root)], ["inside.py"]);
+});
+
+test("otherRootToWatch remembers a real answer and retries a failed lookup", async () => {
+  const state = createGuardState();
+  const worktree = "/repo/.worktrees/x";
+  const failed = [];
+  const failing = async (arg) => { failed.push(arg); return UNKNOWN_ROOT; };
+  assert.equal(await otherRootToWatch(state, worktree, { lookup: failing }), null);
+  assert.equal(await otherRootToWatch(state, worktree, { lookup: failing }), null);
+  assert.equal(failed.length, 2,
+    "a failure is an unanswered question: caching it blinds the whole session, "
+    + "and the result looks exactly like a session with nothing to watch");
+  assert.deepEqual(failed, [worktree, worktree],
+    "asked about the root being watched, never about the process cwd");
+
+  const answered = [];
+  const answering = async (arg) => { answered.push(arg); return "/repo"; };
+  assert.equal(await otherRootToWatch(state, worktree, { lookup: answering }), "/repo");
+  assert.equal(await otherRootToWatch(state, worktree, { lookup: answering }), "/repo");
+  assert.equal(answered.length, 1,
+    "control: a real answer IS remembered, so the retry above is about failure "
+    + "and not about caching being broken");
+});
+
+test("an agent already in the primary has no second checkout to watch", async () => {
+  const state = createGuardState();
+  let calls = 0;
+  const lookup = async () => { calls++; return "/repo"; };
+  assert.equal(await otherRootToWatch(state, "/repo", { lookup }), null,
+    "the two roots are never scanned as if they were separate places");
+  assert.equal(await otherRootToWatch(state, "/repo", { lookup }), null);
+  assert.equal(calls, 1,
+    "and that negative answer is cached -- it cannot change within a session, "
+    + "and an agent in the primary would otherwise pay for the lookup forever");
+  // Control: the cache is keyed by root, so a different root is asked afresh.
+  assert.equal(await otherRootToWatch(state, "/repo/.worktrees/x", { lookup }), "/repo");
+  assert.equal(calls, 2);
+});
+
+test("every name extension.mjs imports from guard.mjs is really exported", async () => {
+  // The one property of extension.mjs reachable from here. A named ESM import
+  // that does not resolve is a link error raised when the module is FIRST
+  // imported -- which for extension.mjs is inside a live Copilot session, at
+  // which point the failure is a `Failed to load extension` line in a log
+  // nobody is reading and a session that silently has no guard. `node --check`
+  // does not catch it: it parses one file and resolves nothing.
+  const source = await readFile(join(dirname(fileURLToPath(import.meta.url)), "extension.mjs"), "utf8");
+  const block = source.match(/import\s*\{([^}]*)\}\s*from\s*"\.\/guard\.mjs"/);
+  assert.ok(block, "premise: extension.mjs still imports from guard.mjs by name");
+  const imported = block[1]
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  // Premise, because a regex that matched an empty list would satisfy every
+  // assertion below without checking anything.
+  assert.ok(imported.length > 5, `premise: names were extracted: ${imported.length}`);
+  assert.ok(imported.includes("observe"), "premise: the extracted list is the real one");
+
+  const exported = Object.keys(await import("./guard.mjs"));
+  const missing = imported.filter((name) => !exported.includes(name));
+  assert.deepEqual(missing, [], `extension.mjs imports names guard.mjs does not export`);
+  // Control: the comparison can fail at all. Without this, an `exported` list
+  // that somehow held everything -- or a `missing` computed from an empty
+  // `imported` -- passes identically.
+  assert.ok(!exported.includes("noSuchExport"),
+    "control: the export list is a real list, not a set that answers yes");
 });
 
 
