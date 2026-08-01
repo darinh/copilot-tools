@@ -611,4 +611,71 @@ test("holdsNoFiles distinguishes an empty tree from one with content", async () 
   });
 });
 
+test("holdsNoFiles finds a file buried several levels down", async () => {
+  await withRepo(async (root) => {
+    // The walk must join each child against the directory it was just read
+    // from. Rebuilding deep paths against the original root instead makes
+    // every descendant path nonexistent, the readdir throws, and the function
+    // returns false -- suppressing a real stray while looking like a careful
+    // answer. Three levels is the shallowest depth that catches it.
+    await mkdir(join(root, "deep", "a", "b", "c"), { recursive: true });
+    assert.equal(holdsNoFiles(join(root, "deep")), true, "control: still no files anywhere");
+    await writeFile(join(root, "deep", "a", "b", "c", "buried.txt"), "x\n");
+    assert.equal(holdsNoFiles(join(root, "deep")), false,
+      "a file four levels down must still be found");
+  });
+});
+
+// --- regressions found by adversarial review, round 2 -------------------
+
+test("shell grouping syntax cannot disguise a blanket add", () => {
+  const strays = ["probe.py"];
+  // `)` used to survive as an argument, which the pathspec-scoping rule then
+  // read as a deliberately narrowed command and allowed straight through --
+  // a bypass introduced by the round-1 fix for a different bypass.
+  assert.deepEqual(tokenizeCommand("( git add -A )"), [["git", "add", "-A"]]);
+  assert.ok(sweepDecision("( git add -A )", strays), "grouped blanket add must block");
+  assert.ok(sweepDecision("{ git add -A ; }", strays), "brace grouping too");
+  assert.ok(sweepDecision("$(git add -A)", strays),
+    "command substitution containing a real git invocation must block");
+  assert.equal(sweepDecision("( git add probe.py )", strays), null,
+    "control: grouping does not turn a named pathspec into a blanket add");
+});
+
+test("git only counts in executable position", () => {
+  const strays = ["probe.py"];
+  assert.equal(sweepDecision("echo git add -A", strays), null,
+    "a command that prints the words does not run them");
+  assert.equal(sweepDecision('echo "run git add -A to stage"', strays), null);
+  assert.deepEqual(gitInvocations("echo git add -A"), []);
+  // Controls: the forms that really do put git in executable position.
+  assert.deepEqual(gitInvocations("git add -A"), [["add", "-A"]]);
+  assert.deepEqual(gitInvocations("FOO=1 BAR=2 git add -A"), [["add", "-A"]],
+    "an environment assignment prefix keeps executable position");
+  assert.deepEqual(gitInvocations("sudo git add -A"), [["add", "-A"]]);
+  assert.deepEqual(gitInvocations("/usr/bin/env git add -A"), [["add", "-A"]]);
+  for (const command of ["FOO=1 git add -A", "sudo git add -A", "nohup git add -A"]) {
+    assert.ok(sweepDecision(command, strays), `${command} must still block`);
+  }
+});
+
+test("a shell runner's -c string is inspected", () => {
+  const strays = ["probe.py"];
+  assert.deepEqual(gitInvocations('sh -c "git add -A"'), [["add", "-A"]]);
+  assert.ok(sweepDecision('bash -c "git add -A"', strays));
+  assert.ok(sweepDecision("sh -c 'git stash -u'", strays));
+  assert.equal(sweepDecision('sh -c "git add probe.py"', strays), null,
+    "control: the escape hatch still works through a shell runner");
+  assert.equal(sweepDecision('sh -c "echo hello"', strays), null,
+    "control: a -c string with no git in it is not blocked");
+});
+
+test("recursion into -c strings is depth-bounded and terminates", () => {
+  // A pathological nest must not hang the hook that runs before every shell
+  // command in the session.
+  const nested = 'sh -c "sh -c \'sh -c "git add -A"\'"';
+  assert.doesNotThrow(() => gitInvocations(nested));
+  assert.ok(Array.isArray(gitInvocations(nested)));
+});
+
 

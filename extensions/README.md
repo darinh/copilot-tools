@@ -44,10 +44,11 @@ Writing it down did not work, so this extension enforces it:
   still known. Attribution is the point: an artifact found later fits every
   explanation equally well.
 - **A blanket `git add -A`, or a `git stash` taking untracked files, is denied**
-  while artifacts are outstanding. Staging a path by name is always allowed.
-  The aim is not to stop an artifact being committed, it is to stop one being
-  committed *unnoticed* — so the escape hatch is to name the file, which is
-  what turns it into a decision.
+  while artifacts are outstanding. Staging a path by name is always allowed —
+  including `git add -A keep.txt`, because git itself scopes `-A` to the
+  pathspec and leaves the stray untracked. The aim is not to stop an artifact
+  being committed, it is to stop one being committed *unnoticed* — so the
+  escape hatch is to name the file, which is what turns it into a decision.
 
 Two things it does deliberately:
 
@@ -56,13 +57,27 @@ Two things it does deliberately:
   conventional build output; `target/` was one of the two real artifacts in
   this repository at the time. A guard that holds its own opinion about what
   counts as noise will disagree with the project silently.
-- **It scans for empty directories**, which `git status` cannot see at all —
-  git does not track empty directories. Both real artifacts found in this
-  repository were empty directories sitting in a tree git called clean.
+- **It scans for directories holding no files at any depth**, which `git
+  status` cannot see at all — git does not track empty directories. Both real
+  artifacts found in this repository were empty directories sitting in a tree
+  git called clean. A directory holding only *ignored* files is not reported:
+  git is silent about that one on purpose, and reading the two silences the
+  same way made the guard complain about the project's own build cache.
 
 Files written with the `create`/`edit` tools are never treated as artifacts.
 Those are the sanctioned way to author content, and that is the discriminator
 between a file the agent decided to write and a shell command's side effect.
+
+**What it does not catch.** The command inspection is static: it reads the
+command string, it does not evaluate it. `$(echo git) add -A` runs git and is
+not detected, and cannot be without executing the substitution. Literal
+invocations are covered, including through `sudo`/`env` wrappers, environment
+assignment prefixes, shell grouping, command substitution and a shell runner's
+`-c` string — but an agent determined to evade this can. That is the correct
+trade: the guard is aimed at inattention, not evasion. Nobody reaches for
+command substitution by accident, and guessing costs a blocked command that
+was legitimate. The report on `onPostToolUse` has no such hole — it observes
+the filesystem after the fact, whatever produced the change.
 
 It fails open everywhere. A guard that breaks a session is worse than the
 artifacts it prevents.

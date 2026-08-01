@@ -175,6 +175,21 @@ export function tokenizeCommand(command) {
       endSegment();
       continue;
     }
+    if (ch === "$" && source[i + 1] === "(") {
+      // Command substitution. Its contents are a command in their own right,
+      // so they become their own segment: `$(git add -A)` must be seen.
+      i++;
+      endSegment();
+      continue;
+    }
+    if (ch === "(" || ch === ")" || ch === "`") {
+      // Grouping and legacy substitution are syntax, not arguments. Leaving
+      // the closing paren in the token stream made `( git add -A )` parse as
+      // an add with a pathspec of `)`, which the scoping rule then read as a
+      // deliberately narrowed command and allowed through.
+      endSegment();
+      continue;
+    }
     if (ch === ";" || ch === "\n" || ch === "\r") {
       endSegment();
       continue;
@@ -190,6 +205,22 @@ export function tokenizeCommand(command) {
   return segments;
 }
 
+// Commands that run another command, so the real executable is further along.
+// `env` and `xargs` also take options, but an option to them is never `git`,
+// so skipping non-git leading tokens is enough.
+const TRANSPARENT_WRAPPERS = new Set([
+  "sudo", "command", "env", "nohup", "time", "nice", "xargs", "exec", "builtin",
+]);
+
+// Shells whose `-c` argument is a command string in its own right.
+const SHELL_RUNNERS = new Set([
+  "sh", "bash", "zsh", "dash", "ksh", "busybox",
+  "pwsh", "powershell", "pwsh.exe", "powershell.exe", "cmd", "cmd.exe",
+]);
+
+const isGitBinary = (token) => /(?:^|[\\/])git(?:\.exe)?$/i.test(token);
+const basename = (token) => token.replace(/^.*[\\/]/, "").toLowerCase();
+
 /**
  * Split a shell command into the argument runs of its `git` invocations.
  *
@@ -197,15 +228,46 @@ export function tokenizeCommand(command) {
  * so matching the string as a whole would attribute one subcommand's flags to
  * another. Splitting on the shell operators that separate commands keeps each
  * invocation's arguments to itself.
+ *
+ * `git` counts only in executable position -- first token of a segment, or
+ * after an environment assignment or a wrapper that runs another command.
+ * Matching it anywhere in the token list blocked `echo git add -A`, a command
+ * that prints a string and touches nothing. A guard that blocks the sentence
+ * describing an action, as though it were the action, teaches an agent that
+ * its warnings are noise.
+ *
+ * A shell runner's `-c` string is recursed into, because `bash -c "git add
+ * -A"` is a real invocation with a real effect. What is deliberately NOT
+ * attempted is evaluation: `$(echo git) add -A` runs git and is not detected,
+ * and cannot be without executing the substitution. That limit is stated in
+ * the README. This guard is aimed at inattention, not evasion -- nobody
+ * reaches for command substitution by accident, and the cost of guessing is
+ * blocking legitimate work.
  */
-export function gitInvocations(command) {
+export function gitInvocations(command, depth = 0) {
   const found = [];
   for (const tokens of tokenizeCommand(command)) {
     for (let i = 0; i < tokens.length; i++) {
-      // `git`, `/usr/bin/git`, `C:\Program Files\Git\cmd\git.exe` -- but not
-      // `github` or `mygit`. Quotes are already gone by this point.
-      if (!/(?:^|[\\/])git(?:\.exe)?$/i.test(tokens[i])) continue;
-      found.push(tokens.slice(i + 1));
+      const token = tokens[i];
+      if (isGitBinary(token)) {
+        found.push(tokens.slice(i + 1));
+        break;
+      }
+      const name = basename(token);
+      // Brace grouping is syntax in executable position. It is skipped here
+      // rather than split in the tokenizer so that brace *expansion*
+      // (`file{1,2}.txt`), which is glued to its token, is left intact.
+      if (token === "{" || token === "}" || token === "!") continue;
+      // `FOO=bar git add -A` -- an assignment prefix keeps executable position.
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) continue;
+      if (TRANSPARENT_WRAPPERS.has(name)) continue;
+      if (SHELL_RUNNERS.has(name) && depth < 2) {
+        const flag = tokens.indexOf("-c", i + 1);
+        if (flag !== -1 && tokens[flag + 1] !== undefined) {
+          found.push(...gitInvocations(tokens[flag + 1], depth + 1));
+        }
+      }
+      // Anything else in executable position means this segment is not git.
       break;
     }
   }
@@ -569,9 +631,10 @@ export function holdsNoFiles(dir, budget = 512) {
   let visited = 0;
   while (stack.length) {
     if (++visited > budget) return false;
+    const current = stack.pop();
     let entries;
     try {
-      entries = readdirSync(stack.pop(), { withFileTypes: true });
+      entries = readdirSync(current, { withFileTypes: true });
     } catch {
       // Unreadable is not empty, and guessing either way would be a claim the
       // filesystem declined to support.
@@ -579,7 +642,11 @@ export function holdsNoFiles(dir, budget = 512) {
     }
     for (const entry of entries) {
       if (!entry.isDirectory()) return false;
-      stack.push(join(entry.parentPath ?? entry.path ?? dir, entry.name));
+      // Joined from the directory just read, never from `Dirent.parentPath`:
+      // that property is absent on older Node runtimes, and the fallback
+      // silently rebuilt every deep path against the original root, walking a
+      // tree that does not exist and reporting a real stray as absent.
+      stack.push(join(current, entry.name));
     }
   }
   return true;
