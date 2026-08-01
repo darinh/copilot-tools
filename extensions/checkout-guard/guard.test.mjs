@@ -242,6 +242,15 @@ test("message pluralisation is correct at one and many", () => {
   assert.match(primaryStrayReport(["a", "b"], "/tmp/s", "/repo"), /2 new untracked paths /);
 });
 
+/**
+ * The first line of a report, which is the only part of it no stray path can
+ * author. Everything below the headline is `formatPathList` output, and that
+ * interpolates names raw -- so a file named after the marker puts the marker
+ * in the report. `includes` over the whole string is therefore not an
+ * attribution, and the test that used one was green while the property it
+ * claimed was false.
+ */
+const headline = (report) => report.split("\n")[0];
 test("the primary-checkout report names the other tree and does not order a deletion", () => {
   const report = primaryStrayReport(["test_order.py"], "/tmp/scratch", "/repo/primary");
   assert.match(report, /test_order\.py/);
@@ -252,12 +261,49 @@ test("the primary-checkout report names the other tree and does not order a dele
   // from here. Telling the agent to delete on that evidence is the exact
   // destroy-on-a-guess move this toolkit exists to remove from code.
   assert.match(report, /ask the other agents before/i);
-  // Control: the working-checkout report is a different message, so a wiring
-  // mistake that returned the wrong one cannot pass the assertions above.
-  assert.ok(
-    !strayReport(["test_order.py"], "/tmp/scratch").includes("PRIMARY"),
-    "the two reports must not be the same text",
-  );
+  // Control, through THE SAME call. The working-checkout report is a
+  // different message, so a wiring mistake that returned the wrong one cannot
+  // pass the assertions above. The positive is required: the assertions in
+  // this test so far all go through `primaryStrayReport`, and an absence
+  // asserted about `strayReport` proves nothing until something establishes
+  // that `strayReport` produces text at all.
+  const working = strayReport(["test_order.py"], "/tmp/scratch");
+  assert.match(working, /test_order\.py/, "control: the working report does report the path");
+  assert.match(working, /appeared in the checkout/, "control: and has its own wording");
+  assert.ok(!headline(working).includes("PRIMARY"), "the two reports must not be the same text");
+});
+
+
+test("PRIMARY in the headline is a marker only the primary report can produce", () => {
+  // This is what lets a caller -- or a test -- attribute a line in the
+  // combined context to one report rather than the other. Both are joined
+  // into a single `additionalContext` string, so without an exclusive marker
+  // any assertion of the form `context.includes(file)` has two possible
+  // authors and cannot tell a working-tree report from a primary one. A
+  // wiring probe of mine asserted exactly that and passed while the
+  // primary-watching path did nothing at all.
+  //
+  // The exclusivity is HEADLINE-scoped and that qualifier is the whole point.
+  // An earlier version of this test claimed the phrase was exclusive to the
+  // report anywhere in its text. That was false: stray names are interpolated
+  // raw, so a path can put any string into the body. The first line is the
+  // only region a path cannot reach, because the header is prepended before
+  // any name is formatted.
+  const withPrimary = primaryStrayReport(["a.py"], "/tmp/s", "/repo/primary");
+  const withoutPrimary = strayReport(["a.py"], "/tmp/s");
+  assert.ok(headline(withPrimary).includes("PRIMARY checkout"), headline(withPrimary));
+  assert.ok(!headline(withoutPrimary).includes("PRIMARY checkout"), headline(withoutPrimary));
+
+  // The forgery the earlier test was too weak to catch. Asserting that a
+  // stray named "PRIMARY checkout" cannot forge the marker was true and
+  // useless -- the marker relied on is the longer phrase, and a name carrying
+  // THAT does land in the body. So the forged input has to be the exact
+  // substring the attribution keys off, not a shorter relative of it.
+  const forgery = "in the PRIMARY checkout (";
+  const forged = strayReport([forgery], "/tmp/s");
+  assert.ok(forged.includes(forgery), "premise: the forged name really does reach the report body");
+  assert.ok(!headline(forged).includes("PRIMARY checkout"),
+    "a path reaches the body, never the headline");
 });
 
 // --- integration: a real git binary against a real repository ------------
