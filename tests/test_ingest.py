@@ -469,20 +469,51 @@ def _legacy_row(db_path, name, *, started_at="1970-01-01T00:00:00Z",
         conn.commit()
 
 
-def test_a_pre_existing_row_is_rekeyed_on_its_recorded_mtime(tmp_path, db_path):
+def test_a_legacy_row_is_not_adopted_on_a_matching_mtime_alone(
+        tmp_path, db_path):
+    """The witness that looks like corroboration and is not.
+
+    An earlier version of this gate accepted ``started_at = ? OR
+    log_file_mtime = ?``, on the reasoning that each fact covered the other's
+    blind spot. It does not: an mtime says only when a file stopped changing,
+    to the second, and two different logs sharing a basename can trivially
+    share one -- the same equal-mtime coincidence this whole change exists to
+    stop merging silently. Accepting it re-admitted the destructive case
+    through the gate built to close it, so a log could still take over a
+    different session's row and the upsert that follows would delete that
+    session's ``model_usage`` breakdown.
+    """
+    log = make_log(tmp_path / "process-1700000000000-4.log")
+    _legacy_row(db_path, log.name,
+                mtime=operator_ingest._iso(log.stat().st_mtime),
+                started_at="2001-01-01T00:00:00Z",
+                work_dir="/a/different/session/that/shares/an/mtime")
+
+    assert operator_ingest.ingest_file(log, db_path).startswith("OK")
+    rows = _sessions(db_path)
+    assert len(rows) == 2, "a row was adopted on its mtime alone"
+    legacy = [r for r in rows if r["log_file"] == log.name]
+    assert legacy and legacy[0]["work_dir"].endswith("shares/an/mtime"), (
+        "the older session's row was overwritten by an unrelated log"
+    )
+
+
+def test_a_pre_existing_row_is_rekeyed_on_the_logs_own_start_time(
+        tmp_path, db_path):
     """Databases written before this change key on the basename.
 
     Left alone they would never match again, so the first ingest after the
     change would insert a second row for the same log and every historical
     session would be counted twice in every report -- a silent doubling of the
-    user's recorded spend. The mtime the previous ingest recorded is evidence
-    that the row was written from this file, and it is the evidence that
-    survives a parser whose timestamps this one need not reproduce -- rows
-    written by the bash ingester.
+    user's recorded spend. The start time is parsed from the log's own first
+    line, so it identifies the session even when the log was appended to since
+    its last ingest -- the common case for a session ingested while it was
+    still running, and the one a test on the recorded mtime fails.
     """
-    log = make_log(tmp_path / "process-1700000000000-4.log")
+    log = make_log(tmp_path / "process-1700000000000-14.log")
     _legacy_row(db_path, log.name,
-                mtime=operator_ingest._iso(log.stat().st_mtime))
+                started_at=_parsed_started_at(log, tmp_path),
+                mtime="a mtime from before the log grew")
 
     assert operator_ingest.ingest_file(log, db_path).startswith("OK")
     rows = _sessions(db_path)
@@ -494,26 +525,6 @@ def test_a_pre_existing_row_is_rekeyed_on_its_recorded_mtime(tmp_path, db_path):
     )
 
 
-def test_a_pre_existing_row_is_rekeyed_on_the_logs_own_start_time(
-        tmp_path, db_path):
-    """The other half of the evidence, and the half that survives growth.
-
-    A log that was appended to since its last ingest no longer has the mtime
-    the row recorded -- the common case for a session ingested while it was
-    still running. Its first line does not change, so the start time parsed
-    from the log still identifies the row as this file's.
-    """
-    log = make_log(tmp_path / "process-1700000000000-14.log")
-    _legacy_row(db_path, log.name,
-                started_at=_parsed_started_at(log, tmp_path),
-                mtime="a mtime from before the log grew")
-
-    assert operator_ingest.ingest_file(log, db_path).startswith("OK")
-    rows = _sessions(db_path)
-    assert len(rows) == 1
-    assert rows[0]["log_file"] == operator_ingest.log_key(log)
-
-
 def test_a_legacy_row_for_a_different_session_is_not_adopted(tmp_path, db_path):
     """The failure the collision fix would otherwise reintroduce.
 
@@ -521,8 +532,8 @@ def test_a_legacy_row_for_a_different_session_is_not_adopted(tmp_path, db_path):
     ambiguity being removed. Re-keying on the name alone lets a log inherit a
     different session's row, and the upsert that follows overwrites it and
     deletes its ``model_usage`` breakdown -- destroying history rather than
-    merely mixing it. When neither the start time nor the recorded mtime says
-    the row is this file's, it must be left exactly as it is.
+    merely mixing it. When the start time parsed from the log does not say the
+    row is this file's, it must be left exactly as it is.
     """
     log = make_log(tmp_path / "process-1700000000000-15.log")
     _legacy_row(db_path, log.name, work_dir="/some/other/session")
@@ -605,7 +616,7 @@ def test_the_log_is_parsed_without_holding_the_write_lock(
     )
 
 
-def test_a_key_does_not_change_when_the_path_stops_resolving(
+def test_a_key_does_not_drift_in_case_when_the_path_stops_resolving(
         tmp_path, db_path, monkeypatch):
     """``resolved_str`` is not total, and its fallback normalises less.
 
@@ -614,6 +625,13 @@ def test_a_key_does_not_change_when_the_path_stops_resolving(
     ingested once while its path would not resolve and again once it would
     then produced two keys for one file, two rows, and its credits counted
     twice.
+
+    Case is the whole of what ``normcase`` closes, and this test claims no
+    more than that. ``resolve`` also expands symlinks, junctions and 8.3 short
+    names, and the fallback expands none of them; a path with such a component
+    ingested across a resolve failure still yields two keys. That is the
+    accepted cost of keeping the expansion in the runs that do resolve -- see
+    :func:`operator_ingest.log_key`.
     """
     if os.path.normcase("A") != "a":
         pytest.skip("case-insensitive paths only")

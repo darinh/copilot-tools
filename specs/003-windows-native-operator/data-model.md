@@ -181,7 +181,16 @@ whether a log has been captured and may be deleted.
 
 Rows written before that change hold a basename. `operator_ingest._adopt_legacy_row` re-keys such a
 row onto the full path the next time its log is ingested, rather than inserting a second row — which
-would count every historical session twice. Rows whose log is gone keep their basename; both
+would count every historical session twice. It re-keys only when the row's `started_at` equals the
+start time parsed from the log's first line: a basename is exactly the ambiguity being removed, so
+adopting on the name alone would let a log take over a different session's row and the upsert that
+follows would delete that session's `model_usage` rows. `log_file_mtime` is deliberately not accepted
+as a second witness — it records only when a file stopped changing, to the second, and two
+same-basename logs sharing an mtime is the very collision this design removes. When the evidence does
+not match, the legacy row is left alone and the log gets a row of its own: a duplicate count is a
+wrong number, but overwriting the older row is a wrong number and the loss of the only record that
+could correct it. Adoption runs after the log is parsed, so the write transaction it opens is not
+held across the read. Rows whose log is gone keep their basename; both
 `manage_logs` and `backfill_unknown_metrics` still resolve them, the latter because joining a
 directory onto an absolute path yields the absolute path, so one expression reads both spellings.
 The schema itself is unchanged, so the legacy bash ingester's `ON CONFLICT(log_file)` still applies.
