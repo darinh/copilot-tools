@@ -52,6 +52,7 @@ from project_paths import (                                   # noqa: E402
     primary_repo_root,
     project_dir,
     projects_root,
+    resolved_str,
 )
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -99,29 +100,6 @@ def state_dir() -> Path:
 def die(msg: str) -> "NoReturn":  # type: ignore[valid-type]
     print(f"Error: {msg}", file=sys.stderr)
     sys.exit(1)
-
-
-def resolved_str(path) -> str:
-    """``str`` of ``path`` resolved, falling back to a lexical absolute path.
-
-    ``Path.resolve`` is not total. A symlink loop raises ``RuntimeError`` on
-    every interpreter this project supports, and a component that cannot be
-    traversed raises ``OSError``. Both used to be unreachable from here
-    because ``main`` refused an unexaminable root before either could be
-    called. Now that it proceeds -- deliberately, so a transient denial does
-    not cost the session its handoff -- they are reachable, and a traceback on
-    this path throws away the very text the tool exists to bank.
-
-    The fallback does not follow links, so it can only be *less* resolved than
-    the real answer, never differently resolved. Both sides of the catalog
-    comparison go through this same function, so a path that will not resolve
-    is matched literally or not at all; it cannot come to name a different
-    project.
-    """
-    try:
-        return str(Path(path).resolve())
-    except (OSError, RuntimeError, ValueError):
-        return os.path.abspath(str(path))
 
 
 def normalize(path) -> str:
