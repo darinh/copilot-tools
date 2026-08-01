@@ -5,17 +5,24 @@
 codepage — cp1252 here — while every tool this repository shells out to emits
 UTF-8. The two agree on ASCII and nowhere else.
 
-**The failure mode is the reason this is a scan and not a style rule.** When
-the decode fails it does not raise at the call. With ``capture_output=True``
-the decode happens on a reader thread, so ``subprocess.run`` returns
-*normally*, ``returncode`` is **0**, and ``stdout`` is **None**. Measured on
-this repo, 2026-08-01, with a U+0401 in a repository path (UTF-8 ``d0 81``;
-0x81 is undefined in cp1252)::
+**The failure mode is the reason this is a scan and not a style rule.** On
+Windows the decode does not raise at the call. With ``capture_output=True``
+``Popen._communicate`` reads its pipes on reader threads, and an exception
+there is lost: ``subprocess.run`` returns *normally*, ``returncode`` is **0**,
+and ``stdout`` is **None**. Measured on this repo, 2026-08-01, with a U+0401
+in a repository path (UTF-8 ``d0 81``; 0x81 is undefined in cp1252)::
 
     Exception in thread Thread-9 (_readerthread):
     UnicodeDecodeError: 'charmap' codec can't decode byte 0x81 ...
     returncode: 0
     stdout is None: True
+
+POSIX reads the same pipes in the calling thread through ``selectors``, so
+there the ``UnicodeDecodeError`` comes straight out of ``subprocess.run``
+(measured the same day under WSL: ``'utf-8' codec can't decode byte 0x81``).
+That is the loud version of the same bug, and it is *not* the one that shipped
+undetected for months. Both are fixed by naming a codec; only the Windows one
+needed a scan to find.
 
 Every guard in this repository is written as ``if proc.returncode != 0``, and
 that guard passes. The error arrives later and somewhere else, as an
