@@ -231,24 +231,45 @@ load_instance_state() {
     return 0
 }
 
+# ── Sets, without associative arrays ────────────────────────────
+#
+# `/bin/bash` on macOS is 3.2 and always will be — Apple froze it at the last
+# GPLv2 release — and bash 3.2 has no associative arrays at all. `local -A x`
+# there is not a subtly different array, it is `declare: -A: invalid option`,
+# and under this script's `set -e` that ends the run. Three places wanted a
+# set, all of them for the same question: is this name one of the ones I
+# collected? So a set is a newline-delimited string, and membership is a
+# substring test on it.
+#
+# The delimiter is safe rather than merely convenient: every producer here is
+# already line-based — `while IFS= read -r` over `tmux list-sessions` output or
+# over basenames — so a value containing a newline cannot reach the set in the
+# first place. Adding a member is a plain `set+="$member"$'\n'` at the call
+# site; only the test needs to be shared.
+set_contains() {
+    # Both operands are quoted inside the pattern, so a name containing `*` or
+    # `?` is matched literally instead of globbing against its neighbours.
+    [[ $'\n'"$1" == *$'\n'"$2"$'\n'* ]]
+}
+
 list_instances() {
     echo "═══ Running Operator Instances ═══"
     echo
     local found=false
     # Collect names of sessions managed by operator (have a .managed or .state marker)
-    local -A managed_sessions
+    local managed_sessions=""
     for f in "${RESTART_DIR}"/*.state "${RESTART_DIR}"/*.managed; do
         [[ -e "$f" ]] || continue
         local base
         base=$(basename "$f")
         base="${base%.state}"
         base="${base%.managed}"
-        managed_sessions["$base"]=1
+        managed_sessions+="$base"$'\n'
     done
     while IFS= read -r line; do
         local name
         name=$(echo "$line" | cut -d: -f1)
-        if [[ -n "${managed_sessions[$name]+x}" ]]; then
+        if set_contains "$managed_sessions" "$name"; then
             echo "  $line"
             found=true
         fi
@@ -799,17 +820,17 @@ stop_operator() {
     else
         local count=0
         # Find all operator-managed sessions via .managed and .state markers
-        local -A managed_sessions
+        local managed_sessions=""
         for f in "${RESTART_DIR}"/*.managed "${RESTART_DIR}"/*.state; do
             [[ -e "$f" ]] || continue
             local base
             base=$(basename "$f")
             base="${base%.managed}"
             base="${base%.state}"
-            managed_sessions["$base"]=1
+            managed_sessions+="$base"$'\n'
         done
         while IFS= read -r name; do
-            if [[ -n "${managed_sessions[$name]+x}" ]]; then
+            if set_contains "$managed_sessions" "$name"; then
                 tmux kill-session -t "$name"
                 rm -f "${RESTART_DIR}/${name}" "${RESTART_DIR}/${name}.state" "${RESTART_DIR}/${name}.managed"
                 log "Stopped: $name"
@@ -923,14 +944,14 @@ start_copilot_in_tmux() {
         log "     ${SCRIPT_DIR:-<your copilot-tools checkout>}/diagnose-restart-deleter.sh"
         mkdir -p "$RESTART_DIR"
         if (( ${#PRE_LAUNCH_MARKERS[@]} > 0 )); then
-            local -A _live_sessions=()
+            local _live_sessions=""
             local _s
             while IFS= read -r _s; do
-                [[ -n "$_s" ]] && _live_sessions["$_s"]=1
+                [[ -n "$_s" ]] && _live_sessions+="$_s"$'\n'
             done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
             local _name
             for _name in "${PRE_LAUNCH_MARKERS[@]}"; do
-                if [[ -n "${_live_sessions[$_name]+x}" ]]; then
+                if set_contains "$_live_sessions" "$_name"; then
                     touch "${RESTART_DIR}/${_name}.managed"
                     log "  Restored marker for live instance: $_name"
                 else
