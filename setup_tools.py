@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -1045,6 +1046,54 @@ def _discard(path: Path) -> None:
         pass
 
 
+#: Windows rename failures that say "someone else has this open *right now*"
+#: rather than "you may not do this": ``ERROR_ACCESS_DENIED`` and
+#: ``ERROR_SHARING_VIOLATION``. A scanner opening a directory reports the first.
+_RENAME_RETRY_WINERRORS = frozenset({5, 32})
+_RENAME_RETRY_ATTEMPTS = 5
+_RENAME_RETRY_DELAY = 0.1
+
+
+def _transient_rename_error(exc: OSError) -> bool:
+    """True when ``exc`` is a Windows lock that is worth waiting out.
+
+    POSIX is excluded deliberately rather than incidentally. ``EACCES`` on a
+    rename there means the permissions do not allow it, which no amount of
+    waiting changes, so retrying would convert a clear refusal into a slow one.
+    On Windows the same numeric error is returned for a third party holding a
+    handle, which is a state that ends on its own.
+    """
+    if not IS_WINDOWS:
+        return False
+    return getattr(exc, "winerror", None) in _RENAME_RETRY_WINERRORS
+
+
+def _replace_retrying(src: Path, dest: Path) -> None:
+    """``os.replace`` that waits out a transient Windows lock.
+
+    Only for renames whose source is scratch this module wrote moments ago.
+    ``shutil.copytree`` finishes and the antivirus scanner that woke up to read
+    the new files still has them open, so the very next rename fails with
+    ``ERROR_ACCESS_DENIED`` — an error about someone else's handle, not about
+    the caller's permissions or the state of the destination.
+
+    Bounded on purpose: this narrows the "stop when something is open" rule in
+    :func:`_replace_tree` to "stop when something is *still* open half a second
+    later", and a lock that outlives the retries still raises the original
+    error. A rename is atomic, so a failed attempt moved nothing and the next
+    one starts from the same state — which is what makes retrying safe here and
+    would not be true of a copy.
+    """
+    for remaining in range(_RENAME_RETRY_ATTEMPTS - 1, -1, -1):
+        try:
+            os.replace(src, dest)
+            return
+        except OSError as exc:
+            if not remaining or not _transient_rename_error(exc):
+                raise
+            time.sleep(_RENAME_RETRY_DELAY)
+
+
 def _replace_tree(staged: Path, dest: Path, *, expect_absent: bool = False) -> None:
     """Move ``staged`` onto ``dest``, keeping ``dest`` recoverable throughout.
 
@@ -1056,6 +1105,16 @@ def _replace_tree(staged: Path, dest: Path, *, expect_absent: bool = False) -> N
     replaced. A rename either happens or does not, and on Windows it is also
     the operation that fails when something inside is still open, which is
     precisely when stopping is the right answer.
+
+    That rule holds for moving the user's copy aside — a handle on *their*
+    tree is exactly the signal to leave it alone, so that rename is not
+    retried. It does not hold for moving scratch this module wrote seconds ago
+    onto a name nothing occupies: there the only handle that can exist belongs
+    to a scanner reacting to setup's own writes, the destination has already
+    been vacated, and refusing means a skill silently fails to install for a
+    lock that was over before the message was printed. Those two renames go
+    through :func:`_replace_retrying`, which stops on anything that outlasts a
+    short wait.
 
     ``expect_absent`` says the caller never asked the user about ``dest``,
     because at the moment it classified there was nothing there to ask about.
@@ -1082,10 +1141,10 @@ def _replace_tree(staged: Path, dest: Path, *, expect_absent: bool = False) -> N
         os.replace(dest, previous)
         moved = True
     try:
-        os.replace(staged, dest)
+        _replace_retrying(staged, dest)
     except OSError:
         if moved:
-            os.replace(previous, dest)
+            _replace_retrying(previous, dest)
         raise
     _discard(previous)
 
@@ -1125,7 +1184,7 @@ def _reconcile_scratch(dest: Path) -> None:
         return
     if not dest_present:
         try:
-            os.replace(previous, dest)
+            _replace_retrying(previous, dest)
         except OSError:
             # The aside copy is the only one; leaving it named oddly beats
             # discarding it because it could not be renamed back.
