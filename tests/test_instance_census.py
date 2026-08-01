@@ -32,6 +32,7 @@ census.
 """
 from __future__ import annotations
 
+import csv
 import os
 from pathlib import Path
 
@@ -39,6 +40,7 @@ import pytest
 
 import copilot_operator as op
 import operator_mail
+from project_paths import catalog_rows
 
 
 @pytest.fixture(autouse=True)
@@ -378,3 +380,52 @@ def test_a_broken_row_does_not_shadow_a_registered_project(tmp_path,
     found = op.project_handoff_file(project)
     assert isinstance(found, Path), found
     assert "guid-real" in str(found), found
+
+
+# ── the row parser itself, on every interpreter ─────────────────
+#
+# The NUL cases above only reach the unparseable-line branch on Python 3.10
+# and older, because 3.11 taught `csv` to accept a NUL and hand the row back.
+# On 3.12 they pass through the *resolve* branch instead, so the isolation
+# this parser exists to provide would be untested there -- green, and
+# vacuously so. An over-long field raises `csv.Error` on every supported
+# version, so these two pin the contract everywhere CI runs.
+
+
+def _tiny_field_limit():
+    """Make one specific line unparseable on any interpreter.
+
+    ``field_size_limit(new)`` returns the previous limit, so the restore is
+    the value it hands back and no monkeypatching is involved -- patching the
+    setter would stop the limit ever changing, and the tests would pass
+    against a parser that was never provoked.
+    """
+    was = csv.field_size_limit(24)
+    return lambda: csv.field_size_limit(was)
+
+
+def test_a_line_that_will_not_parse_yields_none():
+    restore = _tiny_field_limit()
+    try:
+        rows = list(catalog_rows(iter(['"' + "x" * 400 + '",guid\n'])))
+    finally:
+        restore()
+    assert rows == [None], rows
+
+
+def test_an_unparseable_line_does_not_stop_the_rows_after_it():
+    """The whole point. `csv.reader(fh)` aborts the iteration on the bad
+    line; one bad row must cost one row, not every row below it."""
+    restore = _tiny_field_limit()
+    try:
+        rows = list(catalog_rows(iter([
+            '"C:\\before",guid-before\n',
+            '"' + "x" * 400 + '",guid-broken\n',
+            '"C:\\after",guid-after\n',
+        ])))
+    finally:
+        restore()
+    assert len(rows) == 3, rows
+    assert rows[0] == ["C:\\before", "guid-before"], rows[0]
+    assert rows[1] is None, rows[1]
+    assert rows[2] == ["C:\\after", "guid-after"], rows[2]

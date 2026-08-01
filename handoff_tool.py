@@ -20,7 +20,6 @@ Differences from the bash predecessor:
 from __future__ import annotations
 
 import argparse
-import csv
 import os
 import platform
 import stat
@@ -48,6 +47,7 @@ from install_manifest import (                                # noqa: E402
 from operator_console import enable_utf8_output               # noqa: E402
 from operator_mux import Mux, MuxError, safe_instance_id      # noqa: E402
 from project_paths import (                                   # noqa: E402
+    catalog_rows,
     guid_is_usable,
     primary_repo_root,
     project_dir,
@@ -540,8 +540,8 @@ def resolve_guid(project_root) -> str:
     target = normalize(project_root)
     try:
         with open(CATALOG, "r", encoding="utf-8", errors="replace", newline="") as fh:
-            for row in csv.reader(fh):
-                if len(row) < 2:
+            for row in catalog_rows(fh):
+                if row is None or len(row) < 2:
                     continue
                 path, guid = row[0].strip().strip('"'), row[1].strip().strip('"')
                 if not path:
