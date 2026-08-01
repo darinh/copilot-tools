@@ -331,9 +331,14 @@ def test_operator_sh_injects_experimental_ahead_of_the_user_args(function):
         f"{function}() should build copilot_args with --experimental exactly "
         f"once, found {[lines[i].strip() for i in injected]}")
 
+    # Matched on `copilot_args+=(` plus a mention of the user's arguments
+    # rather than on one exact spelling: the bash 3.2 guard makes the loop's
+    # line `copilot_args+=(${user_args[@]+"${user_args[@]}"})`, and a matcher
+    # pinned to the unguarded form would have reported "no forwarding at all"
+    # for a line that forwards perfectly well.
     forwarded = [i for i, line in enumerate(lines)
                  if 'copilot_args+=("$@")' in line
-                 or 'copilot_args+=("${user_args[@]}")' in line]
+                 or ("copilot_args+=(" in line and "user_args[@]" in line)]
     assert len(forwarded) == 1, (
         f"{function}() should append the user's arguments exactly once, "
         f"found {[lines[i].strip() for i in forwarded]}")
@@ -414,6 +419,93 @@ def _run_loop(monkeypatch, args: list[str]) -> list[str]:
     op.run_loop_mode(op.Instance("exp-shape-loop"), list(args), is_fresh=True)
     assert seen, "the loop never launched, so nothing about its args was tested"
     return seen[0]
+
+
+def _shell_dispatch(argv: list[str], tmp_path: Path) -> tuple[str, list[str]]:
+    """Which session function `operator.sh` calls, and with what.
+
+    Runs `main()`'s real body -- argument parsing and all -- and captures the
+    hand-off to `run_single_session` / `run_loop_mode`. `_shell_launch_argv`
+    above starts *inside* those functions, so the dispatch itself was the one
+    part of the launch path with no coverage at all, and it is where a bare
+    `operator` with no arguments of its own is decided.
+
+    `tmux`, `sqlite3` and `python3` are stubbed as shell functions rather than
+    installed: `command -v` finds a function, so main's dependency checks pass
+    on a machine that has none of them.
+    """
+    stubs = "\n".join(f"{name}() {{ return 0; }}"
+                      for name in _shell_helper_names() if name != "main")
+    script = tmp_path / "dispatch.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        'IS_FRESH=false\nSTATE_FILE=state\n'
+        f"{stubs}\n"
+        'tmux() { return 1; }\nsqlite3() { return 0; }\npython3() { return 0; }\n'
+        'sanitize_session_name() { printf "%s\\n" "probe"; }\n'
+        # `printf "%s\n" "$@"` with no arguments still prints one empty line,
+        # which would read back as a forwarded empty string and make "no
+        # arguments" indistinguishable from "one blank argument".
+        f'run_single_session() {{ printf "single\\n"; [ "$#" -eq 0 ] || printf "%s\\n" "$@"; exit {_LAUNCHED}; }}\n'
+        f'run_loop_mode() {{ printf "loop\\n"; [ "$#" -eq 0 ] || printf "%s\\n" "$@"; exit {_LAUNCHED}; }}\n'
+        f"main() {{\n{_shell_function('main')}}}\n"
+        'main "$@"\n',
+        encoding="utf-8", newline="\n")
+    proc = subprocess.run([_bash_executable(), "dispatch.sh", *argv], cwd=tmp_path,
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == _LAUNCHED, (
+        f"main() never reached a session function (exit {proc.returncode}), so "
+        f"nothing about its dispatch was tested:\n{proc.stderr}")
+    lines = proc.stdout.splitlines()
+    return lines[0], lines[1:]
+
+
+@bash
+@pytest.mark.parametrize("argv, expected_mode", [
+    ([], "single"),
+    (["--loop"], "loop"),
+])
+def test_operator_sh_starts_a_session_when_given_no_arguments_of_its_own(
+        argv, expected_mode, tmp_path):
+    """A bare `operator` and a bare `operator --loop` must actually start.
+
+    This looks like it cannot fail, and on bash 4.4 and later it cannot. On
+    the bash 3.2 that macOS still ships, an empty array is *unset* rather than
+    set-and-empty, so the `"${copilot_args[@]}"` these two dispatch lines used
+    to carry was an unbound-variable error under `set -u` -- not zero words.
+    The plainest invocation the script has died before starting a session, on
+    the platform `operator.sh` exists to serve, and nothing caught it because
+    every existing shell test passed arguments.
+
+    Parametrised over the two dispatch lines because they are separate
+    expansions: fixing one and not the other would leave `operator --loop`
+    broken while `operator` worked, which is exactly the kind of half-repair a
+    single-case test blesses.
+    """
+    mode, forwarded = _shell_dispatch(argv, tmp_path)
+
+    assert mode == expected_mode, (
+        f"operator.sh {argv} started a {mode} session, expected {expected_mode}")
+    assert forwarded == [], (
+        f"operator.sh {argv} invented arguments the user did not pass: {forwarded}")
+
+
+@bash
+def test_operator_sh_forwards_its_unrecognised_arguments_to_the_session(tmp_path):
+    """The other half of the guarded expansion: it must still pass things on.
+
+    A guard written as `${a[@]:-}` instead of `${a[@]+"${a[@]}"}` would fix the
+    empty case and quietly substitute an empty *word* -- so this asserts the
+    non-empty case still arrives intact, and intact means unsplit: the second
+    argument here contains a space precisely because an unquoted guard would
+    tear it in two.
+    """
+    mode, forwarded = _shell_dispatch(
+        ["--agent", "anvil:anvil", "--model", "claude opus"], tmp_path)
+
+    assert mode == "single"
+    assert forwarded == ["--agent", "anvil:anvil", "--model", "claude opus"], (
+        f"operator.sh mangled the arguments it forwards: {forwarded}")
 
 
 @bash
