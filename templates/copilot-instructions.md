@@ -464,14 +464,19 @@ operator --loop --headless --name payments-api --agent anvil
 
 # Talk to it. --from and --to are required so it knows who to answer:
 operator send --from <your-instance> --to payments-api "the contract is ..."
-operator inbox          # read your own messages
+operator inbox <your-instance>   # read your own messages
 ```
 
 Your instance name is in your session preamble ("Operator instance: ...").
+**Always pass it to `operator inbox`.** With no name the mailbox is named after
+the *directory*, which in a shared checkout is nobody in particular — and
+reading consumes, so a nameless read eats a peer's mail and leaves a mailbox
+that looks exactly like an empty one. `--peek` and `--history` are safe;
+`--json` is not, it consumes like a plain read.
 Messages reach a running agent immediately and a sleeping one at the start of
-its next session. **Check `operator inbox` when you start work and before you
-write a handoff**, and answer what you are asked — a peer blocked on your reply
-is burning sessions doing nothing.
+its next session. **Check `operator inbox <your-instance>` when you start work
+and before you write a handoff**, and answer what you are asked — a peer
+blocked on your reply is burning sessions doing nothing.
 
 Full reference, including when *not* to spin one up and message etiquette:
 the **`operator-agents` skill**.

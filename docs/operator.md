@@ -92,7 +92,7 @@ operator --loop --headless --name project-c --agent=anvil:anvil
 
 # Messaging between instances
 operator send --from project-a --to project-b "schema is frozen"
-operator inbox                       # read this directory's instance mail
+operator inbox <your-instance>       # read your own mail (marks it read)
 operator inbox project-b --peek      # read without marking read
 operator inbox project-b --history   # already-delivered messages
 
@@ -478,7 +478,8 @@ operator send --from alpha --to beta "the schema is frozen"
 operator send --from alpha --to beta --queue "pick this up at a break"
 operator send --from alpha --to gamma --force "for an instance not started yet"
 
-operator inbox                    # this directory's instance, marks read
+operator inbox alpha              # read alpha's mail, marks it read
+operator inbox                    # only with no other instance live here
 operator inbox beta --peek        # leave them unread
 operator inbox beta --history     # already-delivered messages
 operator inbox beta --json        # machine-readable
@@ -489,6 +490,33 @@ what, so an unattributed message is one it cannot answer; every delivered
 message carries a ready-made reply command. A `--to` naming no known instance
 is refused and the known names are listed, because a typo would otherwise queue
 a message into a mailbox nobody ever reads.
+
+**With no NAME the mailbox is named after the directory, which is nobody in
+particular.** The default comes from the same function that names a session you
+are *starting* — it answers "what would a session started here be called", not
+"who am I". In a checkout two agents share, `operator inbox` typed by either of
+them resolves to the folder's name and consumes whichever peer happens to hold
+it. So a nameless *destructive* read is refused when any of these is true:
+
+- another instance is live in this directory or under it — a worktree is inside
+  the checkout, so a peer in `.worktrees/x` counts;
+- the derived name belongs to a live session that is *not* working here, which
+  is what two checkouts sharing a folder name look like;
+- the multiplexer cannot be asked who is live. "I could not look" must not read
+  the same as "nobody is here", so an unanswerable census refuses. A machine
+  with no multiplexer installed is not that case: with no backend there are no
+  sessions, and the read proceeds.
+
+The refusal exits 2, names every instance live here, and reads nothing. An
+explicit name always works, and `--peek`/`--history` change nothing so they are
+never refused. `--json` **is** refused: the mailbox is consumed before the
+output is formatted, so JSON is a destructive read too.
+
+What the guard cannot see is a *sleeping* peer — an instance with mail waiting
+and no live session leaves nothing to detect, so a nameless read in an empty
+checkout still consumes the folder's mailbox. Read mail is archived rather than
+deleted, so `operator inbox NAME --history` recovers it, but nothing announces
+that it happened. Pass your own name.
 
 **An option either command does not recognize is refused, never ignored.**
 Reading an inbox archives what it shows, so a typo'd `--peek` that fell through
