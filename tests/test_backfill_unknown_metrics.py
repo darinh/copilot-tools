@@ -165,6 +165,46 @@ def test_unreadable_log_is_treated_as_measured(db_path, logs):
     assert read_row(db_path, "process-gone.log")["lines_added"] == 0
 
 
+def test_missing_logs_flag_clears_rows_with_no_log_left(db_path, logs):
+    """Opt-in: an all-zero row claims a zero session duration, which is not a
+    thing a measured session has, so the row is fabricated on its own evidence
+    even though the log that would prove it is gone."""
+    add_session(db_path, "process-gone.log")
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply",
+         "--missing-logs"])
+
+    assert rc == 0
+    row = read_row(db_path, "process-gone.log")
+    assert row["lines_added"] is None
+    assert row["session_time_seconds"] is None
+    assert "Total code changes: unknown" in row["raw_metrics"]
+
+
+def test_missing_logs_flag_still_spares_measured_sessions(db_path, logs):
+    """The flag widens which *unmeasured* rows are cleared, nothing else."""
+    add_session(db_path, "process-kept.log")
+    (logs / "process-kept.log").write_text(
+        '{"kind": "session_shutdown"}', encoding="utf-8")
+
+    backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply",
+         "--missing-logs"])
+
+    assert read_row(db_path, "process-kept.log")["lines_added"] == 0
+
+
+def test_missing_logs_flag_still_spares_partly_measured_rows(db_path, logs):
+    add_session(db_path, "process-gone.log", sess=1800)
+
+    backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply",
+         "--missing-logs"])
+
+    assert read_row(db_path, "process-gone.log")["session_time_seconds"] == 1800
+
+
 def test_partial_zeros_are_not_touched(db_path, logs):
     """Only all-four-zero rows match the fabrication pattern."""
     add_session(db_path, "process-3.log", added=4)

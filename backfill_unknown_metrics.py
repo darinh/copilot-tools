@@ -12,8 +12,11 @@ backed by a real shutdown event are left untouched.
 
 Usage:
     python backfill_unknown_metrics.py [--db PATH] [--logs PATH] [--apply]
+                                       [--missing-logs]
 
 Without --apply it reports what it would change and touches nothing.
+Rows whose log has since been deleted are skipped unless --missing-logs is
+given, because without the log there is nothing left to check them against.
 """
 from __future__ import annotations
 
@@ -45,14 +48,31 @@ def log_has_shutdown_event(path: Path) -> bool:
         return True  # Unreadable log: assume measured, change nothing.
 
 
-def find_fabricated(conn: sqlite3.Connection, log_dir: Path) -> list[int]:
-    """Rows whose four fields are all 0 and whose log has no shutdown event."""
+def find_fabricated(conn: sqlite3.Connection, log_dir: Path,
+                    missing_logs: bool = False) -> list[int]:
+    """Rows whose four fields are all 0 and whose log has no shutdown event.
+
+    With ``missing_logs``, rows whose log has since been deleted also count.
+    They are provably fabricated on their own evidence: an all-zero row claims
+    a session duration of zero, and no session a shutdown event actually
+    measured lasted no time at all. Without the flag they are left alone,
+    because "cannot check" is not "know it is wrong".
+    """
     zeros = " AND ".join(f"{c} = 0" for c in COLUMNS)
     rows = conn.execute(
         f"SELECT id, log_file FROM sessions WHERE {zeros}").fetchall()
-    return [row["id"] for row in rows
-            if row["log_file"]
-            and not log_has_shutdown_event(log_dir / row["log_file"])]
+    fabricated = []
+    for row in rows:
+        if not row["log_file"]:
+            continue
+        path = log_dir / row["log_file"]
+        if not path.exists():
+            if missing_logs:
+                fabricated.append(row["id"])
+            continue
+        if not log_has_shutdown_event(path):
+            fabricated.append(row["id"])
+    return fabricated
 
 
 def write_backup(conn: sqlite3.Connection, dest: Path) -> None:
@@ -78,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
                         type=Path)
     parser.add_argument("--apply", action="store_true",
                         help="write the change (otherwise report only)")
+    parser.add_argument("--missing-logs", action="store_true",
+                        help="also clear all-zero rows whose log file is gone "
+                             "(they claim a zero session duration, which no "
+                             "measured session has)")
     args = parser.parse_args(argv)
 
     if not args.db.exists():
@@ -87,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
     try:
-        ids = find_fabricated(conn, args.logs)
+        ids = find_fabricated(conn, args.logs, args.missing_logs)
         if not ids:
             print("No fabricated zeros found.")
             return 0

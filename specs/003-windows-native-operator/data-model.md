@@ -139,7 +139,9 @@ absent, `raw_metrics` says `unknown` rather than `0s`/`+0 -0`, and both report r
 aggregates report totals over measured sessions only.
 
 `backfill_unknown_metrics.py` repairs rows written before this rule existed, clearing zeros only
-for sessions whose log genuinely lacks a shutdown event.
+for sessions whose log genuinely lacks a shutdown event. Rows whose log has since been deleted are
+skipped unless `--missing-logs` is passed: an all-zero row claims a zero session duration, which no
+measured session has, so the row is fabricated on its own evidence even with the log gone.
 
 The legacy bash ingester `operator-ingest.py` is deliberately unchanged. It refuses a log with no
 shutdown event (exit 2, recorded as `no_op`), so it cannot produce the fabricated zeros in the first
