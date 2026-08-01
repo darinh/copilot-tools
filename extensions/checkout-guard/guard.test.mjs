@@ -2086,11 +2086,109 @@ test("a session outside any checkout is left alone", async () => {
 
 // --- the budget on extension.mjs -----------------------------------------
 
-/** Source with comments removed, for asking what a file actually DOES. */
-function withoutComments(source) {
-  return source
-    .replace(/(^|[^:])\/\/[^\n]*/gm, "$1")
-    .replace(/\/\*[\s\S]*?\*\//g, " ");
+/**
+ * Whether a `/` at this point begins a regex literal rather than a division.
+ *
+ * Decided by the previous significant character, which is the standard
+ * heuristic: after a value -- identifier, `)`, `]`, digit -- a slash divides;
+ * anywhere else it opens a regex.
+ */
+function canStartRegex(last) {
+  return last === "" || !/[\w$)\]]/.test(last);
+}
+
+/**
+ * Source with comments removed and every string, template and regex literal
+ * blanked, so a token scan below sees code and only code.
+ *
+ * A regex-based stripper was written first and had a real bypass, found by
+ * adversarial review: in `const s = "x//y"; if (danger) { run(); }` the `//`
+ * inside the string literal ate the rest of the line, `if` included, and the
+ * file was reported clean. A detector that a string literal can silence is
+ * precisely the failure this extension exists to prevent -- silence with two
+ * causes -- so this is a character scanner instead.
+ *
+ * Its one known limit: a `}` inside a string inside a `${...}` substitution
+ * would end the substitution early. That is a scan of a scan, and the controls
+ * below fix the shapes that actually bypass it.
+ */
+function codeOnly(source) {
+  const out = [];
+  let last = "";
+  let i = 0;
+  const push = (ch) => {
+    out.push(ch);
+    if (ch.trim()) last = ch;
+  };
+
+  while (i < source.length) {
+    const c = source[i];
+    const d = source[i + 1];
+
+    if (c === "/" && d === "/") {
+      while (i < source.length && source[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && d === "*") {
+      i += 2;
+      while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++;
+      i += 2;
+      push(" ");
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      const quote = c;
+      i++;
+      while (i < source.length && source[i] !== quote) {
+        i += source[i] === "\\" ? 2 : 1;
+      }
+      i++;
+      push("S");
+      continue;
+    }
+    if (c === "`") {
+      i++;
+      while (i < source.length) {
+        if (source[i] === "\\") { i += 2; continue; }
+        if (source[i] === "`") { i++; break; }
+        if (source[i] === "$" && source[i + 1] === "{") {
+          i += 2;
+          const start = i;
+          let depth = 1;
+          while (i < source.length && depth > 0) {
+            if (source[i] === "{") depth++;
+            else if (source[i] === "}") depth--;
+            if (depth > 0) i++;
+          }
+          // A substitution is code again, and a ternary hides there happily.
+          out.push(codeOnly(source.slice(start, i)));
+          i++;
+          continue;
+        }
+        i++;
+      }
+      push("S");
+      continue;
+    }
+    if (c === "/" && canStartRegex(last)) {
+      i++;
+      let inClass = false;
+      while (i < source.length) {
+        if (source[i] === "\\") { i += 2; continue; }
+        if (source[i] === "\n") break;
+        if (source[i] === "[") inClass = true;
+        else if (source[i] === "]") inClass = false;
+        else if (source[i] === "/" && !inClass) { i++; break; }
+        i++;
+      }
+      while (i < source.length && /[a-z]/.test(source[i])) i++;
+      push("R");
+      continue;
+    }
+    push(c);
+    i++;
+  }
+  return out.join("");
 }
 
 const DECISION_TOKENS = [
@@ -2104,20 +2202,21 @@ const DECISION_TOKENS = [
   [/&&/, "&&"],
   [/\|\|/, "||"],
   [/\?\?/, "??"],
-  [/\?(?!\.)/, "ternary"],
+  [/\?\./, "optional chaining"],
+  [/\?[^?.]/, "ternary"],
 ];
 
 function decisionsIn(source) {
-  const code = withoutComments(source);
+  const code = codeOnly(source);
   return DECISION_TOKENS.filter(([pattern]) => pattern.test(code)).map(([, name]) => name);
 }
 
 test("extension.mjs holds no decisions, because nothing can test one there", async () => {
   const source = await readFile(
     join(dirname(fileURLToPath(import.meta.url)), "extension.mjs"), "utf8");
-  const code = withoutComments(source);
-  // Premises: the stripper left the code behind. Without these, a stripper
-  // that returned "" would report the file gloriously free of decisions.
+  const code = codeOnly(source);
+  // Premises: the scanner left the code behind. Without these, a stripper that
+  // returned "" would report the file gloriously free of decisions.
   assert.ok(code.includes("joinSession"), "premise: the SDK call survived stripping");
   assert.ok(code.includes("createGuard"), "premise: and the wiring under test");
 
@@ -2130,21 +2229,50 @@ test("extension.mjs holds no decisions, because nothing can test one there", asy
   assert.ok(codeLines.length <= 25,
     `extension.mjs is ${codeLines.length} lines of code and the budget is 25: `
     + "untestable code is spent, not written");
+});
 
+test("the decision scan cannot be silenced by a comment, a string or a regex", () => {
   // Positive control, one per detector. A scan that matches nothing calls the
   // file clean in exactly the words it uses when the file really is clean --
   // which is the failure this whole extension exists to make impossible.
   const sample = "if (a) {} else {}\nfor (;;) {}\nwhile (a) {}\nswitch (a) {}\n"
-    + "try {} catch {}\na && b;\na || b;\na ?? b;\na ? b : c;";
+    + "try {} catch {}\na && b;\na || b;\na ?? b;\na?.b;\na ? b : c;";
   assert.deepEqual(
     decisionsIn(sample).sort(),
     DECISION_TOKENS.map(([, name]) => name).sort(),
-    "control: every detector fires against source that has the construct");
-  // And the negative half: the same constructs inside comments are not code,
-  // so a file full of prose about `if` is not condemned by it.
+    "every detector fires against source that has the construct");
+
+  // The negative half: prose about `if` is not code, or the scan would
+  // condemn a file for its own explanation of itself.
   assert.deepEqual(
     decisionsIn("// if (a) {} else {}\n/* while (b) {} */\nexport const x = 1;"), [],
-    "control: the stripper distinguishes a construct from a word about one");
+    "the same constructs inside comments are not code");
+
+  // The bypasses. Each of these hid a real `if` from the regex-based stripper
+  // this replaced -- reported by an adversarial reviewer for the first, which
+  // is how the other two came to be looked for at all.
+  assert.deepEqual(decisionsIn('const s = "x//y"; if (danger) { run(); }'), ["if"],
+    "a `//` inside a string literal must not eat the rest of the line");
+  assert.deepEqual(decisionsIn("const s = `x//y`; if (danger) { run(); }"), ["if"],
+    "nor inside a template literal");
+  assert.deepEqual(decisionsIn("const re = /\\/\\//; if (danger) { run(); }"), ["if"],
+    "nor inside a regex literal");
+  assert.deepEqual(decisionsIn('const s = "/* still code */"; if (danger) {}'), ["if"],
+    "a block comment opened inside a string is not a block comment");
+
+  // And division is not a regex: mistaking it for one would swallow code up
+  // to the next slash and silence the scan the other way round.
+  assert.deepEqual(decisionsIn("const x = a / b; const y = c / d; if (e) {}"), ["if"],
+    "a `/` after a value divides; only after an operator does it open a regex");
+
+  // A ternary inside a template substitution is still a ternary.
+  assert.deepEqual(decisionsIn("const s = `${a ? b : c}`;"), ["ternary"],
+    "a substitution is code again");
+
+  // Control on the controls: source with none of the constructs reports none,
+  // so the lists above are the detectors firing rather than a function that
+  // always returns its whole vocabulary.
+  assert.deepEqual(decisionsIn("export const x = 1;\nconst y = f(x);"), []);
 });
 
 

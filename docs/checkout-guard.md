@@ -255,12 +255,18 @@ per-session tracking state, `observe`, `noteAuthored`, `otherRootToWatch`,
 disable-flag reading and the tool-name sets live there as well.
 
 The budget is spent as one rather than merely written down: `guard.test.mjs`
-parses `extension.mjs`, strips its comments and fails if a single `if`, `else`,
-`for`, `while`, `switch`, `try`, `catch`, `&&`, `||`, `??` or ternary has
-reappeared, or if the file has grown past 25 lines of code. The detector has a
-positive control per token and a negative control proving prose about `if` is
-not code, because a scan that matches nothing reports the file clean in exactly
-the words it uses when the file really is clean.
+scans `extension.mjs` and fails if a single `if`, `else`, `for`, `while`,
+`switch`, `try`, `catch`, `&&`, `||`, `??`, `?.` or ternary has reappeared, or
+if the file has grown past 25 lines of code. The scan reads the file character
+by character rather than by regex, because a regex stripper was written first
+and two independent reviewers found the same hole in it: a `//` inside a string
+literal ate the rest of its line, and a real `if` sitting there vanished with
+it. That is silence with two causes — a clean file and a silenced detector
+reading identically — which is the failure this whole extension exists to
+prevent, arriving inside the thing meant to prevent it. Every token has a
+positive control, prose about `if` has a negative one, and each bypass shape
+(string, template, regex literal, a `/` that divides rather than opening a
+regex) has a control of its own asserting the `if` behind it is still found.
 
 Every environment touch in the hook bodies — `mkdirSync`, `process.cwd`, the
 root lookup, the scan — is a `createGuard` parameter with the production
