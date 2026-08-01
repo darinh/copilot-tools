@@ -24,14 +24,39 @@ import argparse
 import sqlite3
 from pathlib import Path
 
+from operator_ingest import BUSY_TIMEOUT
+
 COLUMNS = ("api_time_seconds", "session_time_seconds",
            "lines_added", "lines_removed")
+
+ZERO_GUARD = " AND ".join(f"{c} = 0" for c in COLUMNS)
 
 REPLACEMENTS = (
     ("API time spent: 0s", "API time spent: unknown"),
     ("Total session time: 0m 0s", "Total session time: unknown"),
     ("Total code changes: +0 -0", "Total code changes: unknown"),
 )
+
+
+def connect(db: Path) -> sqlite3.Connection:
+    """Open the metrics database the way every other writer opens it.
+
+    ``sqlite3.connect`` defaults to a 5-second busy timeout, so an unqualified
+    connection here is not merely impatient -- it is the *first* participant to
+    give up, because every other writer in this system waits ``BUSY_TIMEOUT``
+    (15s). The operator keeps this database open from a live loop, and the
+    failure lands on the ``--apply`` run, after the dry run has already told
+    the user the repair is safe. ``BUSY_TIMEOUT`` is imported rather than
+    redeclared so tuning it in one place cannot leave this script behind.
+
+    Autocommit (``isolation_level=None``) is deliberate: the repair drives its
+    own ``BEGIN IMMEDIATE`` so the decision and the write land as one unit.
+    """
+    conn = sqlite3.connect(db, timeout=BUSY_TIMEOUT)
+    conn.row_factory = sqlite3.Row
+    conn.isolation_level = None
+    conn.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT * 1000)}")
+    return conn
 
 
 def log_has_shutdown_event(path: Path) -> bool:
@@ -58,7 +83,7 @@ def find_fabricated(conn: sqlite3.Connection, log_dir: Path,
     measured lasted no time at all. Without the flag they are left alone,
     because "cannot check" is not "know it is wrong".
     """
-    zeros = " AND ".join(f"{c} = 0" for c in COLUMNS)
+    zeros = ZERO_GUARD
     rows = conn.execute(
         f"SELECT id, log_file FROM sessions WHERE {zeros}").fetchall()
     fabricated = []
@@ -125,8 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No metrics database at {args.db}")
         return 1
 
-    conn = sqlite3.connect(args.db)
-    conn.row_factory = sqlite3.Row
+    conn = connect(args.db)
     try:
         ids = find_fabricated(conn, args.logs, args.missing_logs)
         if not ids:
@@ -144,14 +168,33 @@ def main(argv: list[str] | None = None) -> int:
 
         placeholders = ",".join("?" * len(ids))
         sets = ", ".join(f"{c} = NULL" for c in COLUMNS)
-        conn.execute(
-            f"UPDATE sessions SET {sets} WHERE id IN ({placeholders})", ids)
-        for old, new in REPLACEMENTS:
-            conn.execute(
-                f"UPDATE sessions SET raw_metrics = replace(raw_metrics, ?, ?) "
-                f"WHERE id IN ({placeholders})", (old, new, *ids))
-        conn.commit()
-        print(f"Cleared {len(ids)} row(s). Backup: {backup}")
+        # The scan above reads log files, which takes long enough that a live
+        # operator can re-ingest one of these sessions in the meantime -- and a
+        # re-ingest is precisely the event that replaces the zeros with real
+        # measurements. Re-testing the all-zero guard inside the write means a
+        # row that just acquired real data is skipped rather than erased, and
+        # doing both statements in one transaction keeps raw_metrics from
+        # disagreeing with the columns it describes. The text edit runs first
+        # because the guard stops matching once the columns are NULL.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for old, new in REPLACEMENTS:
+                conn.execute(
+                    f"UPDATE sessions SET raw_metrics = replace(raw_metrics, ?, ?) "
+                    f"WHERE id IN ({placeholders}) AND {ZERO_GUARD}",
+                    (old, new, *ids))
+            cur = conn.execute(
+                f"UPDATE sessions SET {sets} "
+                f"WHERE id IN ({placeholders}) AND {ZERO_GUARD}", ids)
+            cleared = cur.rowcount
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        skipped = len(ids) - cleared
+        note = (f" {skipped} row(s) gained real metrics while this ran and "
+                f"were left alone." if skipped else "")
+        print(f"Cleared {cleared} row(s). Backup: {backup}{note}")
         return 0
     finally:
         conn.close()

@@ -140,6 +140,129 @@ def test_backup_captures_rows_still_in_the_wal(db_path, logs):
         holder.close()
 
 
+def test_connect_waits_as_long_as_every_other_writer(db_path):
+    """The operator holds this database open from a live loop.
+
+    ``sqlite3.connect``'s own default is 5000ms, so "has a busy timeout" is
+    not the property worth asserting -- the script had one. The property is
+    that it waits as long as ``operator_ingest`` does, because a repair that
+    gives up first is a repair that fails on ``--apply``, after the dry run
+    has already told the user it is safe.
+    """
+    add_session(db_path, "process-1.log")
+    conn = backfill_unknown_metrics.connect(db_path)
+    try:
+        timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    finally:
+        conn.close()
+    assert timeout_ms == int(operator_ingest.BUSY_TIMEOUT * 1000)
+    assert timeout_ms > 5000, "stdlib default; the whole point is to beat it"
+
+
+def test_apply_waits_out_a_concurrent_writer(db_path, logs):
+    """A held write lock must delay the repair, not defeat it.
+
+    This is a regression guard, not proof of the timeout fix -- it passes
+    against the old 5000ms default too, because the lock here is held for
+    well under 5s. What it pins is that the repair survives contention at all
+    rather than aborting half-applied.
+
+    The elapsed-time assertion is what stops it being vacuous: without it this
+    passes just as happily when the lock was never held.
+    """
+    import threading
+    import time
+
+    add_session(db_path, "process-1.log")
+    (logs / "process-1.log").write_text("no shutdown here", encoding="utf-8")
+
+    hold = 0.75
+    holder = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("UPDATE sessions SET session_num = 99")
+    released = threading.Event()
+
+    def release():
+        holder.commit()
+        released.set()
+
+    timer = threading.Timer(hold, release)
+    started = time.monotonic()
+    timer.start()
+    try:
+        rc = backfill_unknown_metrics.main(
+            ["--db", str(db_path), "--logs", str(logs), "--apply"])
+    finally:
+        elapsed = time.monotonic() - started
+        timer.cancel()
+        if not released.is_set():
+            holder.commit()
+        holder.close()
+
+    assert rc == 0
+    assert elapsed >= hold, (
+        f"finished in {elapsed:.2f}s, so the write lock was never contended "
+        f"and this test proves nothing")
+    assert read_row(db_path, "process-1.log")["lines_added"] is None
+
+
+def test_a_row_remeasured_mid_run_is_not_erased(db_path, logs, capsys,
+                                                monkeypatch):
+    """Scanning logs takes long enough for a live operator to re-ingest one of
+    these sessions -- and a re-ingest is exactly the event that replaces the
+    zeros with real measurements. Clearing on the strength of a stale scan
+    would destroy the only copy of data that had just arrived.
+
+    The backup runs between the scan and the write, so it is the honest place
+    to simulate the interleaving.
+    """
+    add_session(db_path, "process-1.log")
+    (logs / "process-1.log").write_text("no shutdown here", encoding="utf-8")
+
+    original = backfill_unknown_metrics.write_backup
+
+    def remeasure(conn, dest):
+        original(conn, dest)
+        other = sqlite3.connect(db_path, timeout=10)
+        try:
+            other.execute(
+                "UPDATE sessions SET api_time_seconds = 12, "
+                "session_time_seconds = 340, lines_added = 7, "
+                "lines_removed = 2, raw_metrics = ? WHERE log_file = ?",
+                ("API time spent: 12s", "process-1.log"))
+            other.commit()
+        finally:
+            other.close()
+
+    monkeypatch.setattr(backfill_unknown_metrics, "write_backup", remeasure)
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert rc == 0
+    row = read_row(db_path, "process-1.log")
+    assert row["api_time_seconds"] == 12, "erased a real measurement"
+    assert row["lines_added"] == 7
+    assert row["raw_metrics"] == "API time spent: 12s"
+    assert "Cleared 0 row(s)" in capsys.readouterr().out
+
+
+def test_raw_metrics_never_disagrees_with_the_columns(db_path, logs):
+    """The text summary and the columns describe the same session. If only one
+    of the two writes lands, the report shows 'unknown' next to a 0 -- or a 0
+    next to a NULL -- and there is no way to tell which is true."""
+    add_session(db_path, "process-1.log")
+    (logs / "process-1.log").write_text("no shutdown here", encoding="utf-8")
+
+    backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    row = read_row(db_path, "process-1.log")
+    assert row["api_time_seconds"] is None
+    assert "API time spent: unknown" in row["raw_metrics"]
+    assert "API time spent: 0s" not in row["raw_metrics"]
+
+
 def test_measured_zeros_are_left_alone(db_path, logs):
     """A session that really did change nothing keeps its zeros."""
     add_session(db_path, "process-2.log")
