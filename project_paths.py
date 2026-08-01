@@ -10,6 +10,7 @@ unregistered project and mints a duplicate GUID.
 """
 from __future__ import annotations
 
+import csv
 import platform
 import subprocess
 from pathlib import Path
@@ -103,6 +104,42 @@ def project_dir(guid: str) -> Path:
     against a retyped literal.
     """
     return projects_root() / guid
+
+
+def catalog_rows(fh):
+    """Yield one parsed row per line, or ``None`` for a line that will not parse.
+
+    This lives here for the same reason :func:`guid_is_usable` does: both the
+    writer (``handoff_tool``) and the reader (``copilot_operator``) read this
+    file, and two definitions of "what the catalog says" that drift apart is
+    the defect, not the inconvenience.
+
+    ``csv.reader`` given the file object aborts the *whole* iteration on the
+    first line it refuses, and before Python 3.11 an embedded NUL is exactly
+    such a line -- ``_csv.Error: line contains NUL``. Two things follow, and
+    both are wrong for a hand-edited file. The error escapes a caller whose
+    entire job is to answer "registered or not", and every row *after* the bad
+    one is never compared, so one mistyped character silently unregisters
+    every project below it.
+
+    Parsing each line on its own keeps the damage the size of the mistake: a
+    line that will not parse costs that line and nothing else. ``None`` says
+    "this row could not be read", which is not the same as a row that read
+    cleanly and did not match -- the caller counts it as undecided rather than
+    as evidence of absence.
+
+    The cost is that a quoted field containing a newline is no longer joined
+    across lines. The catalog is one entry per line by construction -- the
+    format the instructions template documents, and nothing in this repository
+    rewrites the file -- and a project path containing a newline cannot
+    round-trip through it whichever reader is used, so nothing that works
+    today stops working.
+    """
+    for line in fh:
+        try:
+            yield next(csv.reader([line]), None)
+        except csv.Error:
+            yield None
 
 
 def guid_is_usable(guid: str) -> bool:
