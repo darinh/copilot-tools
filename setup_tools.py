@@ -1402,7 +1402,13 @@ def extension_mode(settings: Path | None = None) -> ExtensionMode:
         return ExtensionMode(UNDETERMINED, f"{path} does not exist")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        # RecursionError is in that list because `json.loads` raises it, not a
+        # ValueError, on deeply nested input, and it is the one failure here
+        # that would otherwise escape as a crash. A read that cannot be
+        # completed has to arrive as UNDETERMINED like every other one; a
+        # traceback out of a status command is the loudest possible way of
+        # refusing to answer the question.
         return ExtensionMode(UNDETERMINED, f"{path} could not be read: {exc}")
     if not isinstance(data, dict):
         return ExtensionMode(UNDETERMINED, f"{path} does not hold a JSON object")
@@ -1430,13 +1436,48 @@ def _syntax_error_line(stderr: str) -> str:
     and the exit code cannot: a failing extension exits 1 whether it was
     unparsable or was denied permission, so the message and not the code is
     what gets reported.
+
+    The *last* match is taken, not the first. The source excerpt is echoed
+    before the diagnosis, so a line of the file under test that happens to
+    begin ``SyntaxError:`` — a string literal, a comment, a thrown message —
+    looks exactly like node's own verdict and comes first. Node's real error
+    line is always the later one.
     """
     lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
-    for line in lines:
+    for line in reversed(lines):
         head = line.split(":", 1)[0]
         if head.endswith("Error") and head[:1].isupper():
             return line
     return lines[-1] if lines else "node --check gave no reason"
+
+
+def _entry_modules(dest: Path, entry: Path) -> list[Path] | None:
+    """Every ``.mjs`` file the deployed extension is made of, entrypoint first.
+
+    ``node --check`` parses the file it is given and does not resolve its
+    imports, so checking only the entrypoint asks nothing at all about the
+    modules it pulls in. ``checkout-guard`` is the extension this whole check
+    exists to protect and it is the one extension here that is not a single
+    file: every *decision* it makes lives in the imported ``guard.mjs``,
+    deliberately, because ``extension.mjs`` calls ``joinSession`` at import
+    and so cannot be reached by a test at all. A truncated deployed
+    ``guard.mjs`` therefore leaves the entrypoint parsing perfectly and the
+    guard dead in every session — the exact silent absence this feature was
+    built to end, one file to the left of where it was looking.
+
+    ``node_modules`` is excluded. Vendored dependencies are not ours, are
+    resolved by the CLI rather than by us, and one unparsable file in a
+    package that is never imported would condemn a healthy extension.
+
+    Returns ``None`` if the directory could not be walked, which is
+    ``UNCHECKED`` and not an all-clear.
+    """
+    try:
+        found = sorted(p for p in dest.rglob("*.mjs")
+                       if "node_modules" not in p.parts and p.is_file())
+    except OSError:
+        return None
+    return [entry] + [p for p in found if p != entry]
 
 
 def extension_health(dest: Path, key: str | None = None) -> ExtensionHealth:
@@ -1462,6 +1503,10 @@ def extension_health(dest: Path, key: str | None = None) -> ExtensionHealth:
     perfectly *healthy* extension fails with ``MODULE_NOT_FOUND``. Parsing
     without resolving imports is exactly the part that is ours to verify.
 
+    Because ``node --check`` does not follow imports, every ``.mjs`` in the
+    deployment is checked and not just the entrypoint — see
+    :func:`_entry_modules` for why that distinction had teeth.
+
     ``tests/test_extensions.py`` already parses every ``.mjs`` in this
     repository. This checks the copy on the destination machine, which is a
     different file whenever a link could not be made and setup fell back to
@@ -1476,19 +1521,29 @@ def extension_health(dest: Path, key: str | None = None) -> ExtensionHealth:
         return ExtensionHealth(key, NO_ENTRYPOINT, f"nothing at {entry}")
     if which("node") is None:
         return ExtensionHealth(key, UNCHECKED, "node is not on PATH")
-    try:
-        proc = subprocess.run(["node", "--check", str(entry)],
-                              capture_output=True, text=True,
-                              env=_clean_env(), timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        # `capture` is not reused here on purpose. It returns (False, "") both
-        # when node could not be started and when node ran and rejected the
-        # file — the two answers this function must keep apart — and it drops
-        # stderr, where the reason actually is.
-        return ExtensionHealth(key, UNCHECKED, f"node --check did not run: {exc}")
-    if proc.returncode == 0:
-        return ExtensionHealth(key, LOADABLE)
-    return ExtensionHealth(key, UNPARSABLE, _syntax_error_line(proc.stderr))
+    modules = _entry_modules(dest, entry)
+    if modules is None:
+        return ExtensionHealth(key, UNCHECKED, f"{dest} could not be listed")
+    for module in modules:
+        try:
+            proc = subprocess.run(["node", "--check", str(module)],
+                                  capture_output=True, text=True,
+                                  env=_clean_env(), timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            # `capture` is not reused here on purpose. It returns (False, "")
+            # both when node could not be started and when node ran and
+            # rejected the file — the two answers this function must keep
+            # apart — and it drops stderr, where the reason actually is.
+            return ExtensionHealth(key, UNCHECKED,
+                                   f"node --check did not run: {exc}")
+        if proc.returncode != 0:
+            reason = _syntax_error_line(proc.stderr)
+            if module != entry:
+                # Naming the file matters when it is not the one the reader
+                # would assume: the entrypoint is what they know is loaded.
+                reason = f"{module.name}: {reason}"
+            return ExtensionHealth(key, UNPARSABLE, reason)
+    return ExtensionHealth(key, LOADABLE)
 
 
 def extension_report(
@@ -1727,9 +1782,18 @@ def report_status() -> int:
     # to be affected by it. On a machine with no extensions it is not this
     # report's business what mode the CLI is in.
     inert = bool(health) and mode.state == DISABLED
-    if health and mode.state != ENABLED:
+    if inert:
         warn("Until experimental mode is on, every extension above is inert "
              "and silent, whatever its state says.")
+    elif health and mode.state == UNDETERMINED:
+        # Read from a failed read, this sentence would be a verdict: the
+        # extensions above may be loading perfectly. Saying they are inert
+        # because the setting could not be read is the same collapse of
+        # "no answer" into "no" that made the original outage invisible,
+        # committed by the code written to expose it.
+        warn("Whether the extensions above load could not be determined, so "
+             "this report cannot promise they do. Start the CLI with "
+             "--experimental to be sure.")
 
     pending = install_manifest.pending_migrations(installed, TOOLKIT_VERSION)
     if pending:

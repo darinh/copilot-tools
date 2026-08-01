@@ -31,6 +31,11 @@ flip it out from under every other one.
 python setup_tools.py --status
 ```
 
+Call it directly, as above. `./setup.sh --status` and `./setup.ps1 --status`
+forward the flag but relabel any non-zero exit as `Python setup failed`, which
+is wrong here in both directions: nothing failed, and setup cannot fix it —
+this toolkit never writes `settings.json`.
+
 reports both halves of the question, and exits non-zero if either fails:
 
 ```
@@ -50,6 +55,38 @@ Three states, kept apart on purpose. `experimental mode is on` and
 load` means the settings file was absent, unreadable, or held no `experimental`
 key. The CLI documents no default for the key, so an absent one is not read as
 either answer.
+
+Two limits on that answer, both deliberate:
+
+**It is a snapshot, not a guarantee.** The setting is global and sticky, so it
+can change the moment after the check reads it. During the session that wrote
+this file it was observed going `true` → `false` → `true` inside eight minutes,
+because another agent on the same machine was reproducing the outage.
+
+Two things bound how much that matters. Passing `--experimental` does not just
+apply to the process you pass it to — the CLI writes it back to
+`settings.json` — so every `operator` launch repairs the value as a side
+effect, and an operator-launched session cannot come up guardless whatever the
+file said a moment earlier. The exposed population is bare `copilot` in a
+terminal, which takes whatever the last writer left. Conflicting spellings are
+not an error: last one wins, so `operator` can inject `--experimental` ahead of
+your arguments and a deliberate `--no-experimental` still overrides it.
+
+The other bound is the one worth remembering, because it is invisible: flipping
+the setting does **not** unload extensions that are already running. A machine
+can sit in a state where every live session has a guard and every new session
+silently does not, and no live session can see it. That is this same
+silence-with-two-causes, spread across time instead of across processes. If you
+need to know what actually happened in a session that has already started, use
+the logs below rather than `--status`.
+
+**`could not tell` exits 0.** Only a measured `OFF`, or an extension that
+cannot parse, exits non-zero. An absent settings file is the normal state of a
+machine where the CLI has not run yet, and failing there would make the check
+cry wolf on every fresh install. The cost is real and worth naming: if the
+CLI's own default turns out to be experimental-off, a machine with no
+`experimental` key is inert and this command will not say so. It says `could
+not tell` instead, which is the true statement available.
 
 ### Other ways to tell, from outside a session
 
@@ -152,18 +189,26 @@ hits a genuine false positive can act without hunting.
 
 | File | What it is |
 |---|---|
-| `extension.mjs` | Hook wiring and the SDK import — nothing else |
-| `guard.mjs` | All decision logic and checkout inspection |
+| `extension.mjs` | SDK wiring, per-session state and the three hook bodies |
+| `guard.mjs` | Every decision the guard makes, and all checkout inspection |
 | `guard.test.mjs` | `node --test` suite, no live session required |
 
 ```bash
 node --test extensions/checkout-guard/guard.test.mjs
 ```
 
-The split is deliberate and load-bearing. `extension.mjs` calls `joinSession`
-at import, so the test suite cannot import it at all — anything composed there
-is covered by `node --check` and nothing else. Wiring that fails silently must
-live in `guard.mjs`, where a test can reach it.
+The split is deliberate and load-bearing, but it is a split by *testability*,
+not by size. `extension.mjs` calls `joinSession` at import, so the test suite
+cannot import it at all: everything it holds — the tracked-path maps, `observe`,
+the bodies of `onSessionStart` / `onPreToolUse` / `onPostToolUse` — is covered
+by `node --check` and by nothing else. That is the reason every *decision* is
+pushed into `guard.mjs`, where a test can reach it, and why logic accumulating
+in `extension.mjs` is a smell rather than a convenience.
+
+Because `guard.mjs` is where the decisions live, `setup_tools.py` parses every
+`.mjs` in a deployed extension rather than just the entrypoint: `node --check`
+does not follow imports, so a truncated `guard.mjs` leaves `extension.mjs`
+parsing perfectly while the guard is dead in every session.
 
 For the same reason, `setup_tools.py` verifies the deployed extension with
 `node --check` and never by importing it: the CLI injects its own bundled

@@ -120,6 +120,11 @@ def test_a_missing_settings_file_is_undetermined_not_disabled(tmp_path):
     mode = setup_tools.extension_mode(tmp_path / "nothing-here.json")
     assert mode.state == setup_tools.UNDETERMINED
     assert mode.state != setup_tools.DISABLED
+    # The reason is asserted, not just the state. Deleting the absence branch
+    # entirely leaves `read_text` raising FileNotFoundError into the same
+    # `except OSError` and returning UNDETERMINED too — so a test that checked
+    # only the state would pass with the branch it is named for removed.
+    assert "does not exist" in mode.detail
 
 
 def test_an_unreadable_settings_file_is_undetermined(tmp_path, monkeypatch):
@@ -189,6 +194,74 @@ def test_check_rejects_broken_javascript(tmp_path):
                           capture_output=True, text=True, timeout=60)
     assert proc.returncode != 0
     assert "SyntaxError" in proc.stderr
+
+
+@node
+def test_check_does_not_read_the_files_the_entrypoint_imports(tmp_path):
+    """The premise of the whole multi-file probe, asserted against node.
+
+    If this ever fails — if some future node parses imports — checking every
+    module becomes redundant rather than load-bearing, and whoever sees this
+    break should know that before deciding what to delete.
+    """
+    dest = _extension(tmp_path, "two-file",
+                      "import { x } from './guard.mjs';\nexport const y = x;\n")
+    (dest / "guard.mjs").write_text(BROKEN, encoding="utf-8")
+    proc = subprocess.run(["node", "--check", str(dest / "extension.mjs")],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, (
+        "node --check now follows imports; the per-module loop can be revisited")
+
+
+@node
+def test_a_broken_imported_module_is_unparsable(tmp_path):
+    """checkout-guard's decisions all live in the file it imports.
+
+    ``extension.mjs`` is hook wiring around ``import "./guard.mjs"``. Checking
+    only the entrypoint calls this extension healthy while the half that does
+    the work cannot parse — the outage the module was written to catch, moved
+    one file to the left.
+    """
+    dest = _extension(tmp_path, "guarded",
+                      "import { x } from './guard.mjs';\nexport const y = x;\n")
+    (dest / "guard.mjs").write_text(BROKEN, encoding="utf-8")
+
+    health = setup_tools.extension_health(dest)
+
+    assert health.state == setup_tools.UNPARSABLE
+    assert health.broken
+    assert "guard.mjs" in health.detail, \
+        "the reader needs the file named; it is not the one they assume"
+
+
+@node
+def test_a_sound_multi_file_extension_is_loadable(tmp_path):
+    """The positive half: checking every module must not condemn a healthy one."""
+    dest = _extension(tmp_path, "sound",
+                      "import { x } from './guard.mjs';\nexport const y = x;\n")
+    (dest / "guard.mjs").write_text("export const x = 1;\n", encoding="utf-8")
+    (dest / "nested").mkdir()
+    (dest / "nested" / "helper.mjs").write_text("export const z = 2;\n",
+                                                encoding="utf-8")
+
+    assert setup_tools.extension_health(dest).state == setup_tools.LOADABLE
+
+
+@node
+def test_vendored_dependencies_are_not_ours_to_condemn(tmp_path):
+    """One unparsable file inside node_modules must not fail the extension.
+
+    Those files are not written here, are resolved by the CLI rather than by
+    us, and may never be imported at all. Failing on them would make the
+    check fire on healthy machines, which is the fastest way to teach someone
+    to ignore it.
+    """
+    dest = _extension(tmp_path, "vendored")
+    junk = dest / "node_modules" / "left-pad"
+    junk.mkdir(parents=True)
+    (junk / "index.mjs").write_text(BROKEN, encoding="utf-8")
+
+    assert setup_tools.extension_health(dest).state == setup_tools.LOADABLE
 
 
 def test_without_node_the_answer_is_unchecked_not_loadable(tmp_path, monkeypatch):
@@ -262,8 +335,42 @@ def test_the_reason_line_survives_node_stderr(tmp_path):
 
 def test_a_reason_is_given_even_when_node_says_nothing():
     """Silence from the probe must not become silence in the report."""
-    assert setup_tools._syntax_error_line("")
-    assert setup_tools._syntax_error_line("something unrecognised")
+    assert setup_tools._syntax_error_line("") == "node --check gave no reason"
+    assert setup_tools._syntax_error_line("something unrecognised") \
+        == "something unrecognised"
+
+
+def test_the_error_line_wins_over_a_source_line_that_imitates_one():
+    """node echoes the offending source before diagnosing it.
+
+    A file with a line that *begins* ``SyntaxError:`` — a template literal, a
+    thrown message, a fixture like the ones in this very file — is reproduced
+    in the excerpt above node's own verdict. Taking the first match would
+    quote the file back at the reader as though it were the diagnosis.
+    """
+    stderr = ("/tmp/x.mjs:3\n"
+              "SyntaxError: not the real one`);\n"
+              "^\n\n"
+              "SyntaxError: Unexpected end of input\n"
+              "    at checkSyntax (node:internal/main/check_syntax:69:3)\n\n"
+              "Node.js v24.18.0\n")
+    assert setup_tools._syntax_error_line(stderr) \
+        == "SyntaxError: Unexpected end of input"
+
+
+def test_deeply_nested_settings_are_undetermined_and_do_not_crash(tmp_path):
+    """`json.loads` raises RecursionError, which is not a ValueError.
+
+    It is the one malformed input that escapes the read as an exception
+    instead of arriving as a state, which would take the whole status command
+    down with it — a failed read that does not merely lie but refuses to
+    return at all.
+    """
+    settings = _settings(
+        tmp_path, '{"experimental":' + "[" * 20000 + "]" * 20000 + "}")
+    mode = setup_tools.extension_mode(settings)
+    assert mode.state == setup_tools.UNDETERMINED
+    assert "could not be read" in mode.detail
 
 
 # ── the report ───────────────────────────────────────────────────
@@ -362,6 +469,26 @@ def test_status_does_not_call_an_undetermined_machine_broken(deployed, capsys):
 
     assert "could not tell" in out
     assert code == 0
+    # A failed read must not be reported as a finding. Asserting only the
+    # state above leaves the wording free to say the opposite of it, which is
+    # exactly what it used to do.
+    assert "inert and silent" not in out, \
+        "a failed read was reported as a verdict about the extensions"
+    assert "could not be determined" in out
+
+
+def test_a_disabled_machine_is_told_plainly_that_nothing_runs(deployed, capsys):
+    """The counterpart: where the answer IS known, hedging would be its own lie."""
+    _repo, home, _operator = deployed
+    (home / "settings.json").write_text(json.dumps({"experimental": False}),
+                                        encoding="utf-8")
+
+    code = setup_tools.report_status()
+    out = capsys.readouterr().out
+
+    assert "inert and silent" in out
+    assert "could not be determined" not in out
+    assert code == 1
 
 
 @node
