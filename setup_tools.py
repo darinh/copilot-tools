@@ -892,6 +892,22 @@ def _dirs_match(a: Path, b: Path) -> bool:
     return True
 
 
+def _present(path: Path) -> bool:
+    """True when anything occupies ``path``, including something unreadable.
+
+    The tri-state answer comes from :func:`install_manifest.path_present`; this
+    folds "cannot tell" into *present* because every caller here is asking
+    whether the way is clear to create or rename something onto that name. The
+    cost of being wrong is asymmetric: treating an occupied path as free
+    overwrites whatever was there, while treating a free path as occupied costs
+    an ``os.replace`` that fails loudly and changes nothing.
+
+    ``lstat``-based, so a link is seen without being followed — a link with a
+    deleted target still occupies the name.
+    """
+    return install_manifest.path_present(path) is not False
+
+
 def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
                     may_replace: bool = False) -> str:
     """Link src -> dest, preferring a link and falling back to a copy.
@@ -917,7 +933,7 @@ def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
                 "rather than the repository copy. Replace it?", assume_yes):
             return "skipped (kept existing)"
         _remove_dest(dest)
-    elif dest.exists():
+    elif _present(dest):
         if dest.is_dir() and _dirs_match(src, dest):
             return "already up to date"
         if not may_replace and not ask(
@@ -968,8 +984,22 @@ def _is_link(path: Path) -> bool:
     resolve, which is deliberate: a link whose target has been deleted is still
     a link, and treating it as absent leaves it to be discovered by whatever
     tries to write over it.
+
+    A path that cannot be examined answers False, and the answer is a guess —
+    ``Path.is_symlink`` re-raises a permission denial on every interpreter this
+    project supports (verified on 3.11 and 3.12), so without the ``except``
+    one unreadable artifact aborts the whole setup run. False is the harmless
+    guess here because every caller uses True only to take *more* care; a
+    caller that must not guess about a path asks
+    :func:`install_manifest.path_present`, which keeps "cannot tell" as its own
+    answer.
     """
-    return path.is_symlink() or (IS_WINDOWS and _is_junction(path))
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        return False
+    return IS_WINDOWS and _is_junction(path)
 
 
 def _remove_dest(path: Path) -> None:
@@ -1035,7 +1065,7 @@ def _replace_tree(staged: Path, dest: Path) -> None:
     previous = dest.with_name(f".{dest.name}.previous")
     _discard(previous)
     moved = False
-    if _is_link(dest) or dest.exists():
+    if _present(dest):
         os.replace(dest, previous)
         moved = True
     try:
@@ -1060,9 +1090,17 @@ def _reconcile_scratch(dest: Path) -> None:
     """
     _discard(dest.with_name(f".{dest.name}.installing"))
     previous = dest.with_name(f".{dest.name}.previous")
-    if not (previous.exists() or _is_link(previous)):
+    if install_manifest.path_present(previous) is not True:
+        # Absent, or there but unexaminable — either way there is nothing here
+        # that can be safely moved back.
         return
-    if dest.exists() or _is_link(dest):
+    dest_present = install_manifest.path_present(dest)
+    if dest_present is None:
+        # Something may or may not be at the destination. Restoring over it
+        # could destroy a finished install, and discarding the aside copy could
+        # destroy the only one. Leave both and let the caller report.
+        return
+    if dest_present:
         _discard(previous)
         return
     try:
@@ -1136,13 +1174,30 @@ def detect_tool_versions() -> dict[str, str]:
     return versions
 
 
+def _warn_unreadable(label: str, dest: Path) -> None:
+    """Say why an artifact was left alone, in one wording everywhere.
+
+    Silence here would be the worst outcome of the conservative choice: a
+    machine that quietly stops receiving updates and never says so.
+    """
+    warn(f"{label} at {dest} exists but could not be examined "
+         "(permission, a lock, or an unreachable mount) — not touching it")
+
+
 def _resolve_overwrite(state: str, label: str, dest: Path, assume_yes: bool) -> bool:
     """Decide whether to write over an existing artifact.
 
     The manifest is what makes this more than a byte comparison: ``STALE``
     means the bytes on disk are the bytes setup wrote, so the user has nothing
     invested in them and the update is not a question worth asking.
+
+    ``UNREADABLE`` is refused before ``assume_yes`` is consulted. ``--yes``
+    answers questions about known contents; it is not consent to overwrite
+    something nobody could look at.
     """
+    if state == install_manifest.UNREADABLE:
+        _warn_unreadable(label, dest)
+        return False
     if state == install_manifest.STALE:
         info(f"{label}: updating (your copy was unmodified)")
         return True
@@ -1168,6 +1223,11 @@ def install_extensions(assume_yes: bool = False, manifest: dict | None = None) -
         key = f"extensions/{src.name}"
         state = install_manifest.classify(manifest, key, dest,
                                           install_manifest.tree_digest(src))
+        if state == install_manifest.UNREADABLE:
+            # _link_directory would read the destination as free and try to
+            # create a link over it. Nothing here is worth finding out that way.
+            _warn_unreadable(f"extension '{src.name}'", dest)
+            continue
         try:
             result = _link_directory(src, dest, assume_yes,
                                      may_replace=install_manifest.may_overwrite(state))
@@ -1244,6 +1304,11 @@ def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> No
         label = f"skill '{src.name}'"
         source_digest = install_manifest.tree_digest(src)
         state = install_manifest.classify(manifest, key, dest, source_digest)
+        if state == install_manifest.UNREADABLE:
+            # Asked before the link question below, which cannot be answered
+            # about a path nobody can examine and would only guess at.
+            _warn_unreadable(label, dest)
+            continue
         if _is_link(dest) and not (install_manifest.entry(manifest, key) or {}).get("linked"):
             # Every digest here is taken *through* the link, so it describes
             # whatever the user pointed at, not the destination — it cannot
@@ -1329,7 +1394,7 @@ def apply_upgrades(manifest: dict, assume_yes: bool = False) -> None:
     ``~/.copilot`` would be noise at best.
     """
     installed = manifest.get("package_version")
-    fresh = not any(dest.exists() for _key, _kind, _src, dest in deployed_artifacts())
+    fresh = not any(_present(dest) for _key, _kind, _src, dest in deployed_artifacts())
     pending = install_manifest.pending_migrations(installed, TOOLKIT_VERSION)
     if fresh or not pending:
         return

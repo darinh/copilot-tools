@@ -1124,3 +1124,182 @@ def test_every_imported_local_module_is_packaged():
                 if dep not in declared:
                     missing[dep] = f"imported by {name}.py"
     assert not missing, f"add these to pyproject py-modules: {missing}"
+
+
+# ── an unreadable destination is not an empty one ────────────────
+def _deny_lstat(monkeypatch, target: Path) -> None:
+    """Make ``target`` look present-but-unexaminable, as a permission denial,
+    an exclusive lock or a dropped network mount does.
+
+    Staged by patching the syscalls the presence probe makes, because the real
+    condition cannot be produced portably: POSIX permission bits do not
+    restrain root, which is how CI containers run, and Windows needs ACL edits
+    a runner will not reliably grant. Both ``lstat`` and ``stat`` are denied,
+    as a real denial denies both. Every other path passes straight through.
+    """
+    real_lstat, real_stat = os.lstat, os.stat
+    resolved = str(target)
+
+    def denied(real):
+        def fake(path, *args, **kwargs):
+            if str(path) == resolved:
+                raise PermissionError(13, "Permission denied")
+            return real(path, *args, **kwargs)
+        return fake
+
+    monkeypatch.setattr(os, "lstat", denied(real_lstat))
+    monkeypatch.setattr(os, "stat", denied(real_stat))
+
+
+def test_unreadable_template_is_not_overwritten_even_with_yes(install_env,
+                                                              monkeypatch):
+    """The failure this guards against: a transient denial makes the
+    destination read as absent, absent is the state that needs no consent, and
+    the user's instructions file is replaced by the repository's.
+
+    ``assume_yes`` does not license it. ``--yes`` answers questions about
+    contents somebody could look at; nobody could look at these.
+    """
+    repo, home, _ = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    dest = home / "copilot-instructions.md"
+    dest.write_text("MY CAREFULLY EDITED INSTRUCTIONS", encoding="utf-8")
+    (repo / "templates" / "copilot-instructions.md").write_text("v2",
+                                                                encoding="utf-8")
+    _deny_lstat(monkeypatch, dest)
+
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_templates(assume_yes=True, manifest=manifest)
+
+    assert dest.read_text(encoding="utf-8") == "MY CAREFULLY EDITED INSTRUCTIONS"
+    assert "templates/copilot-instructions.md" not in manifest["artifacts"], \
+        "an artifact nobody could examine must not be recorded as installed"
+
+
+def test_unreadable_template_is_reported_not_silently_skipped(install_env,
+                                                              monkeypatch,
+                                                              capsys):
+    """Leaving it alone is only right if the user is told, or a machine quietly
+    never receives an update and nothing ever says why."""
+    _repo, home, _ = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    dest = home / "copilot-instructions.md"
+    dest.write_text("mine", encoding="utf-8")
+    _deny_lstat(monkeypatch, dest)
+
+    setup_tools.install_templates(assume_yes=True,
+                                  manifest=install_manifest.empty_manifest())
+
+    assert "could not be examined" in capsys.readouterr().out
+
+
+def test_unreadable_skill_destination_is_left_alone(install_env, monkeypatch):
+    _repo, home, _ = install_env
+    dest = home / "skills" / "demo"
+    dest.mkdir(parents=True)
+    (dest / "SKILL.md").write_text("the user's copy", encoding="utf-8")
+    _deny_lstat(monkeypatch, dest)
+
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_skills(assume_yes=True, manifest=manifest)
+
+    assert (dest / "SKILL.md").read_text(encoding="utf-8") == "the user's copy"
+    assert "skills/demo" not in manifest["artifacts"]
+    assert not (home / "skills" / ".demo.previous").exists()
+    assert not (home / "skills" / ".demo.installing").exists()
+
+
+def test_unreadable_extension_destination_is_left_alone(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / "extensions" / "guard").mkdir(parents=True)
+    (repo / "extensions" / "guard" / "index.js").write_text("v2", encoding="utf-8")
+    home = tmp_path / "copilot"
+    dest = home / "extensions" / "guard"
+    dest.mkdir(parents=True)
+    (dest / "index.js").write_text("the user's copy", encoding="utf-8")
+    monkeypatch.setattr(setup_tools, "REPO_ROOT", repo)
+    monkeypatch.setattr(setup_tools, "COPILOT_DIR", home)
+    _deny_lstat(monkeypatch, dest)
+
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_extensions(assume_yes=True, manifest=manifest)
+
+    assert (dest / "index.js").read_text(encoding="utf-8") == "the user's copy"
+    assert "extensions/guard" not in manifest["artifacts"]
+
+
+def test_a_machine_with_an_unreadable_artifact_is_not_treated_as_fresh(
+        install_env, monkeypatch):
+    """``apply_upgrades`` skips migrations on a fresh machine, on the grounds
+    that there is no old state to migrate. A machine whose deployed artifact
+    could not be examined is not fresh — it is a machine carrying exactly the
+    old state migrations exist to fix, and skipping them there is silent."""
+    _repo, home, _ = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    dest = home / "copilot-instructions.md"
+    dest.write_text("mine", encoding="utf-8")
+    _deny_lstat(monkeypatch, dest)
+
+    ran = []
+    monkeypatch.setattr(install_manifest, "pending_migrations",
+                        lambda *_a, **_k: [("1.0.0", "1.1.0", lambda ctx: None)])
+    monkeypatch.setattr(install_manifest, "run_migrations",
+                        lambda ctx, *a, **k: ran.append(ctx) or [])
+    setup_tools.apply_upgrades(install_manifest.empty_manifest(), assume_yes=True)
+
+    assert ran, "migrations were skipped on a machine that is not fresh"
+
+
+def test_reconcile_leaves_both_copies_when_the_destination_is_unknown(
+        tmp_path, monkeypatch):
+    """The aside copy may be the user's only one. Restoring it over a
+    destination that might be a finished install, or discarding it when the
+    destination might be missing, each destroy a copy on a guess."""
+    dest = tmp_path / "demo"
+    previous = tmp_path / ".demo.previous"
+    previous.mkdir()
+    (previous / "SKILL.md").write_text("the only copy", encoding="utf-8")
+    _deny_lstat(monkeypatch, dest)
+
+    setup_tools._reconcile_scratch(dest)
+
+    assert (previous / "SKILL.md").read_text(encoding="utf-8") == "the only copy"
+
+
+def test_is_link_does_not_raise_on_a_path_it_cannot_examine(tmp_path,
+                                                            monkeypatch):
+    """``Path.is_symlink`` re-raises a permission denial on every interpreter
+    in the CI matrix (verified on 3.11 and 3.12), so unguarded this aborts
+    setup with a traceback rather than skipping one artifact."""
+    dest = tmp_path / "skill"
+    dest.mkdir()
+    _deny_lstat(monkeypatch, dest)
+    assert setup_tools._is_link(dest) is False
+
+
+def test_a_dangling_link_at_a_destination_is_not_written_through(install_env,
+                                                                 monkeypatch):
+    """Real condition, no mocking. ``Path.exists`` follows the link, finds
+    nothing and reports the destination absent — the one state that needs no
+    consent — and ``shutil.copyfile`` then follows the same link and lands the
+    repository's copy wherever the user pointed it, silently and somewhere
+    they never named. The name is occupied, so setup must ask."""
+    repo, home, _ = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    elsewhere = home.parent / "elsewhere.md"
+    dest = home / "copilot-instructions.md"
+    try:
+        os.symlink(elsewhere, dest)
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("this platform will not create symlinks")
+    (repo / "templates" / "copilot-instructions.md").write_text("v2",
+                                                                encoding="utf-8")
+
+    assert dest.exists() is False, "precondition: the primitive says absent"
+    asked = []
+    monkeypatch.setattr(setup_tools, "ask",
+                        lambda q, *_a, **_k: asked.append(q) or False)
+    setup_tools.install_templates(manifest=install_manifest.empty_manifest())
+
+    assert asked, "setup wrote through a link into a path the user never named"
+    assert not elsewhere.exists()
