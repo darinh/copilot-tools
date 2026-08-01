@@ -70,6 +70,27 @@ Every detector has a positive control asserting it fires and a negative
 control asserting the portable spelling still passes. A detector broken into
 matching nothing reports the whole tree clean, which reads exactly like
 success.
+
+**What this cannot do, stated plainly because a scan is trusted.** The
+registry is *curated*. Nothing here discovers a post-floor API that nobody
+thought to add, so this file cannot catch the next ``follow_symlinks``
+incident — only the next recurrence of one already listed.
+
+That limit is worth naming precisely, because the machinery around it
+disguises how narrow it is. Identity-pinning, positive controls and
+interpreter-checked versions all defend against the registry *rotting*; not
+one of them notices it having been incomplete on the day it was written. The
+scan's failure mode is therefore not a wrong answer but a confident silence,
+and silence from a tool with this much apparatus behind it reads like
+coverage.
+
+So: a green run here means "none of the constructs listed below is
+unguarded", never "this tree runs on 3.10". The distinction is the whole
+honest content of the result. (No count appears in that sentence on purpose
+— a number in prose that nothing executes is the exact defect this file was
+built out of, and it would be a poor place to reintroduce it.) The way to
+add an entry is to find a defect the hard way and register it, which is how
+every entry below got here, ``follow_symlinks`` included.
 """
 import ast
 import hashlib
@@ -178,13 +199,18 @@ def _importable(module: str, attr: str | None = None) -> Callable[[], bool]:
 #: the top of the file — an import that fails, fails on every leg and gets
 #: noticed. ``follow_symlinks`` is the whole reason the file exists.
 #:
-#: *Syntax* is deliberately absent — ``except*`` (3.11), ``match`` (3.10),
-#: PEP 695 type parameters (3.12). Those are ``SyntaxError`` on the floor, so
-#: the module does not import and pytest does not collect: every 3.10 leg
-#: goes red at collection, which is the loudest failure CI has. This registry
-#: is for the constructs that let the file parse and wait. A positive control
-#: for a syntax construct could not be written here either — the control's own
+#: *Syntax* is deliberately absent — ``except*`` (3.11) and PEP 695 type
+#: parameters (3.12). Those are ``SyntaxError`` on the floor, so the module
+#: does not import and pytest does not collect: every 3.10 leg goes red at
+#: collection, which is the loudest failure CI has. This registry is for the
+#: constructs that let the file parse and wait. A positive control for a
+#: syntax construct could not be written here either — the control's own
 #: source would have to be parsed by the interpreter that rejects it.
+#: (``match`` is *not* an example: PEP 634 landed in 3.10, which is the floor
+#: itself, and ``tests/test_unreachable_code_conformance.py`` already uses
+#: it. It is named here only because listing it as post-floor is the obvious
+#: mistake to make, and this file has already been bitten once by a version
+#: number written from memory.)
 CONSTRUCTS: dict[str, Construct] = {
     "pathlib.Path.exists(follow_symlinks=)": Construct(
         (3, 12),
@@ -335,24 +361,89 @@ def _guards_absence(handler: ast.ExceptHandler) -> bool:
 
 
 def _is_version_test(node: ast.expr) -> bool:
-    """Whether an ``if`` test asks what this interpreter can do.
+    """Whether an ``if`` test asks what interpreter this is.
 
-    ``hasattr(...)``, three-argument ``getattr(...)`` (which is a feature test
-    with a fallback, where the two-argument form is ordinary attribute
-    access), ``sys.version_info``, and anything built out of them with
-    ``and`` / ``or`` / ``not``.
+    ``sys.version_info`` only. It is construct-agnostic on purpose: a version
+    comparison is a statement about the whole interpreter, so it can license
+    any post-floor call in its branches.
+
+    ``hasattr`` is deliberately *not* here. It is a feature test for one
+    named attribute, and treating it as a general licence let an unrelated
+    probe silence a real violation — ``if hasattr(obj, 'x'):
+    hashlib.file_digest(...)`` passed the first version of this scan. That is
+    handled by :func:`_feature_test_names` instead, which only licenses the
+    construct actually being probed.
     """
     for child in ast.walk(node):
-        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
-            if child.func.id == "hasattr":
-                return True
-            if child.func.id == "getattr" and len(child.args) == 3:
-                return True
         if isinstance(child, ast.Attribute) and child.attr == "version_info":
             return True
         if isinstance(child, ast.Name) and child.id == "version_info":
             return True
     return False
+
+
+def _feature_test_names(node: ast.expr) -> set[str]:
+    """The attribute names an ``if`` test probes for existence.
+
+    ``hasattr(hashlib, "file_digest")`` yields ``{"file_digest", "hashlib"}``
+    — the attribute and the object it is asked about, since either can be the
+    thing that is missing. Three-argument ``getattr`` counts too: it is a
+    feature test with a fallback, where the two-argument form is ordinary
+    attribute access.
+
+    Only these names are licensed in the guarded branch. A ``hasattr`` about
+    something else guards nothing, which is the difference between a feature
+    test and a blanket exemption.
+    """
+    names: set[str] = set()
+    for child in ast.walk(node):
+        if not (isinstance(child, ast.Call) and isinstance(child.func, ast.Name)):
+            continue
+        if child.func.id == "hasattr" and len(child.args) == 2:
+            pass
+        elif child.func.id == "getattr" and len(child.args) == 3:
+            pass
+        else:
+            continue
+        target, attribute = child.args[0], child.args[1]
+        if isinstance(attribute, ast.Constant) and isinstance(attribute.value, str):
+            names.add(attribute.value)
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+        elif isinstance(target, ast.Attribute):
+            names.add(target.attr)
+    return names
+
+
+def _is_type_checking_test(node: ast.expr) -> bool:
+    """Whether an ``if`` test is ``TYPE_CHECKING``.
+
+    ``typing.TYPE_CHECKING`` is ``False`` at runtime and ``True`` only to a
+    type checker, so the body never executes on any interpreter. A
+    ``from typing import Self`` there is correct code on 3.10, and flagging it
+    is the kind of false positive that gets a scan switched off. The ``else``
+    branch of such an ``if`` *is* runtime code and is not licensed.
+    """
+    if isinstance(node, ast.Name):
+        return node.id == "TYPE_CHECKING"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "TYPE_CHECKING"
+    return False
+
+
+def _guard_names(construct: str) -> set[str]:
+    """The names a ``hasattr`` would use to feature-test ``construct``.
+
+    Derived from the registry key rather than listed again, so a new entry
+    cannot arrive without them: ``pathlib.Path.is_dir(follow_symlinks=)``
+    yields ``{"follow_symlinks", "is_dir", "Path", "pathlib"}`` and
+    ``hashlib.file_digest`` yields ``{"file_digest", "hashlib"}``.
+    """
+    head, _, keyword = construct.partition("(")
+    names = {part for part in head.split(".") if part}
+    if keyword:
+        names.add(keyword.rstrip("=)"))
+    return names
 
 
 def _is_pathlib_receiver(node: ast.expr) -> bool:
@@ -378,26 +469,80 @@ def _header_span(node: ast.stmt) -> tuple[int, int]:
 class _FloorFinder(ast.NodeVisitor):
     """Collect ``(lineno, construct_id, span)`` for unguarded post-floor uses.
 
-    Guarding is lexical, like the presence-probe scan's: the use sits inside
-    the body of a ``try`` that catches the absence, or inside either branch of
-    an ``if`` that tests ``hasattr`` or ``sys.version_info``.
+    Guarding is lexical, like the presence-probe scan's, and comes in two
+    strengths.
 
-    *Either* branch, deliberately. ``if sys.version_info >= (3, 11):`` puts
-    the new API in the body and ``if sys.version_info < (3, 11):`` puts it in
-    the ``else``, and deciding which by reading the comparison is the start of
-    writing a type checker. What the guard is really evidence of is that the
-    author thought about the version at all, and that is true in both
-    branches. The cost is that an inverted guard passes; the benefit is that
-    the rule stays a rule rather than a partial evaluator.
+    *Construct-agnostic*: a ``try`` that catches the absence, either branch of
+    an ``if sys.version_info ...``, or the body of ``if TYPE_CHECKING:``.
+    These license anything inside them, because each is a statement about the
+    interpreter rather than about one name.
+
+    Either branch of a version test, deliberately. ``if sys.version_info >=
+    (3, 11):`` puts the new API in the body and ``if sys.version_info < (3,
+    11):`` puts it in the ``else``, and deciding which by reading the
+    comparison is the start of writing a type checker. What the guard is
+    really evidence of is that the author thought about the version at all,
+    and that is true in both branches. The cost is that an inverted guard
+    passes; the benefit is that the rule stays a rule rather than a partial
+    evaluator.
+
+    *Construct-specific*: ``hasattr(hashlib, "file_digest")`` and
+    three-argument ``getattr`` license only the construct they name. This
+    used to be construct-agnostic too, and a reviewer showed that ``if
+    hasattr(obj, 'x'): hashlib.file_digest(...)`` therefore passed — a probe
+    for an unrelated attribute silencing a real violation. The version-test
+    argument does not carry over: ``hasattr`` is a claim about one name, so
+    it can only be evidence about that name.
+
+    Alias spellings are resolved, because a scan with a one-token bypass is a
+    scan whose next violation is deliberate: ``import os.path as osp`` then
+    ``osp.splitroot(...)``, ``from hashlib import file_digest as fd`` then
+    ``fd(...)``, and ``exists(**{"follow_symlinks": False})``. Rebinding
+    through an ordinary variable (``h = hashlib``) is *not* resolved — that is
+    name resolution, which is a type checker, and the sibling probe scan
+    records the same limit for aliases of ``Path``.
     """
 
     def __init__(self) -> None:
         self.depth = 0
+        self.licensed: list[set[str]] = []
         self.span: tuple[int, int] | None = None
         self.hits: list[tuple[int, str, tuple[int, int]]] = []
+        self.module_alias: dict[str, str] = {}
+        self.symbol_alias: dict[str, str] = {}
+
+    def scan(self, tree: ast.AST) -> None:
+        """Collect aliases across the whole module, then walk it.
+
+        Two passes because an import can sit below its use — inside a
+        function defined earlier in the file, or after a conditional import
+        block. A single pass would resolve aliases only for code that happens
+        to appear later in the source, which is a property of layout rather
+        than of the program.
+        """
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        self.module_alias[alias.asname] = alias.name
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                for alias in node.names:
+                    if not alias.asname:
+                        continue
+                    construct = IMPORT_GATED.get((module, alias.name))
+                    if construct is None:
+                        tail = module.split(".")[-1]
+                        construct = ATTRIBUTE_GATED.get((tail, alias.name))
+                    if construct is not None:
+                        self.symbol_alias[alias.asname] = construct
+        self.visit(tree)
 
     def _record(self, node: ast.AST, construct: str) -> None:
         if self.depth:
+            return
+        names = _guard_names(construct)
+        if any(names & scope for scope in self.licensed):
             return
         lineno = getattr(node, "lineno", 0)
         span = self.span or (lineno, lineno)
@@ -417,15 +562,31 @@ class _FloorFinder(ast.NodeVisitor):
     visit_TryStar = visit_Try
 
     def visit_If(self, node: ast.If) -> None:
-        guarded = _is_version_test(node.test)
+        broad = _is_version_test(node.test)
+        typing_only = _is_type_checking_test(node.test)
+        named = _feature_test_names(node.test)
         outer = self.span
         self.span = _header_span(node)
         self.visit(node.test)
         self.span = outer
-        self.depth += bool(guarded)
-        for stmt in [*node.body, *node.orelse]:
+
+        self.depth += bool(broad or typing_only)
+        if named:
+            self.licensed.append(named)
+        for stmt in node.body:
             self.visit(stmt)
-        self.depth -= bool(guarded)
+        if named:
+            self.licensed.pop()
+        self.depth -= bool(broad or typing_only)
+
+        # The `else` of a version test is still a version-aware branch; the
+        # `else` of `if TYPE_CHECKING:` is ordinary runtime code and the
+        # `else` of a hasattr is the fallback, which must not use the thing
+        # that was found to be missing.
+        self.depth += bool(broad)
+        for stmt in node.orelse:
+            self.visit(stmt)
+        self.depth -= bool(broad)
 
     def generic_visit(self, node: ast.AST) -> None:
         if isinstance(node, ast.stmt) and not isinstance(node, (ast.Try, ast.If)):
@@ -436,13 +597,31 @@ class _FloorFinder(ast.NodeVisitor):
             return
         super().generic_visit(node)
 
+    def _keyword_names(self, node: ast.Call) -> set[str]:
+        """Keyword argument names, including literal ``**{...}`` unpacking.
+
+        ``f(**{"follow_symlinks": False})`` is the same call as
+        ``f(follow_symlinks=False)`` and fails identically on the floor. A
+        non-literal unpack (``f(**opts)``) is invisible here and always will
+        be; a literal one is a spelling, not a computation.
+        """
+        names = set()
+        for keyword in node.keywords:
+            if keyword.arg is not None:
+                names.add(keyword.arg)
+            elif isinstance(keyword.value, ast.Dict):
+                for key in keyword.value.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        names.add(key.value)
+        return names
+
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
         if isinstance(func, ast.Attribute):
             gated = KEYWORD_GATED.get(func.attr, {})
-            for keyword in node.keywords:
-                if keyword.arg in gated:
-                    self._record(node, gated[keyword.arg])
+            for name in self._keyword_names(node):
+                if name in gated:
+                    self._record(node, gated[name])
             construct = METHOD_GATED.get(func.attr)
             if construct is not None and _is_pathlib_receiver(func.value):
                 self._record(node, construct)
@@ -452,7 +631,7 @@ class _FloorFinder(ast.NodeVisitor):
         parent = node.value
         name = None
         if isinstance(parent, ast.Name):
-            name = parent.id
+            name = self.module_alias.get(parent.id, parent.id).split(".")[-1]
         elif isinstance(parent, ast.Attribute):
             name = parent.attr
         if name is not None:
@@ -462,7 +641,7 @@ class _FloorFinder(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
-        construct = BUILTIN_GATED.get(node.id)
+        construct = BUILTIN_GATED.get(node.id) or self.symbol_alias.get(node.id)
         if construct is not None:
             self._record(node, construct)
         self.generic_visit(node)
@@ -543,7 +722,7 @@ def floor_violations(source: str) -> list[tuple[int, str]]:
     """Every post-floor construct in ``source`` that is neither guarded nor annotated."""
     comments, standalone = _annotation_context(source)
     finder = _FloorFinder()
-    finder.visit(ast.parse(source))
+    finder.scan(ast.parse(source))
     return [(lineno, construct) for lineno, construct, span in finder.hits
             if _above_floor(construct)
             and _annotation_in(comments, standalone, span) is None]
@@ -553,7 +732,7 @@ def annotated_uses(source: str) -> list[tuple[int, str]]:
     """Every ``(lineno, reason)`` where a post-floor use was annotated."""
     comments, standalone = _annotation_context(source)
     finder = _FloorFinder()
-    finder.visit(ast.parse(source))
+    finder.scan(ast.parse(source))
     out = []
     for lineno, construct, span in finder.hits:
         if not _above_floor(construct):
@@ -902,6 +1081,47 @@ FIRES = {
         "        return hashlib.file_digest(fh, 'sha256')\n"
         "    return inner\n"
     ),
+    # The four below are alias and guard bypasses. Every one of them passed
+    # the first version of this scan, and a reviewer found them by running
+    # them rather than by reading the visitor. They are the reason `scan()`
+    # takes an alias pass and `_feature_test_names` exists.
+    "reached through a module alias": (
+        # `import os.path` is not itself gated, so nothing fires at the
+        # import line: this control can only be satisfied by resolving the
+        # alias at the use site. Written that way on purpose - a control
+        # whose subject is already flagged for another reason proves nothing
+        # about the mechanism it is named after.
+        "import os.path as osp\n"
+        "head, root, tail = osp.splitroot('/a/b')\n"
+    ),
+    "imported under an alias inside a guard, then used outside it": (
+        # The realistic shape of this bug: the import is version-guarded and
+        # the use is not, so the module loads on the floor and dies at the
+        # call. The import line is correctly silent, which again leaves the
+        # use site as the only thing this control can be detecting.
+        "import sys\n"
+        "if sys.version_info >= (3, 11):\n"
+        "    from hashlib import file_digest as fd\n"
+        "digest = fd(fh, 'sha256')\n"
+    ),
+    "a gated keyword passed as a literal ** unpack": (
+        "from pathlib import Path\n"
+        "Path('x').exists(**{'follow_symlinks': False})\n"
+    ),
+    "under a hasattr about something unrelated": (
+        # A feature test is evidence about the name it probes and nothing
+        # else. Treating any hasattr as a blanket licence let this pass.
+        "import hashlib\n"
+        "if hasattr(config, 'fast_mode'):\n"
+        "    hashlib.file_digest(fh, 'sha256')\n"
+    ),
+    "in the else of a TYPE_CHECKING block, which is runtime code": (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    pass\n"
+        "else:\n"
+        "    from typing import Self\n"
+    ),
 }
 
 #: Source that must NOT trip it. Each is a spelling this repo can actually run.
@@ -918,6 +1138,33 @@ PASSES = {
         "import sys\n"
         "if sys.version_info >= (3, 11):\n"
         "    hashlib.file_digest(fh, 'sha256')\n"
+    ),
+    "a typing-only import under TYPE_CHECKING, which never runs": (
+        # `typing.TYPE_CHECKING` is False at runtime, so this body is correct
+        # code on the floor. Flagging it was a false positive, and false
+        # positives are how a scan gets switched off rather than fixed.
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from typing import Self\n"
+    ),
+    "a typing-only import under the qualified typing.TYPE_CHECKING": (
+        "import typing\n"
+        "if typing.TYPE_CHECKING:\n"
+        "    from typing import Never\n"
+    ),
+    "a hasattr naming the construct, which still licenses it": (
+        # The negative half of "under a hasattr about something unrelated".
+        # Tightening the guard must not break the spelling install_manifest
+        # actually uses, so both directions are pinned.
+        "import itertools\n"
+        "if hasattr(itertools, 'batched'):\n"
+        "    groups = itertools.batched(range(9), 3)\n"
+    ),
+    "an aliased module whose attribute is not gated": (
+        # Alias resolution must not start inventing violations either: the
+        # alias is followed, and `os.path.join` is as old as os.path.
+        "import os.path as osp\n"
+        "target = osp.join('a', 'b')\n"
     ),
     "behind an inverted sys.version_info test": (
         "import hashlib\n"
