@@ -8,6 +8,7 @@
 
 import { execFile } from "node:child_process";
 import { readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve, join, relative, isAbsolute } from "node:path";
 
 // The only directories excluded on this extension's own authority. Everything
@@ -1113,4 +1114,201 @@ export async function scanCheckout(root, { ignoreFilter = withoutIgnored } = {})
   // ones.
   const dirs = await ignoreFilter(root, topLevelDirs(root));
   return [...untracked, ...invisibleDirStrays(dirs, known, root)];
+}
+
+// ---------------------------------------------------------------------------
+// Per-session tracking state.
+//
+// This lives here rather than in extension.mjs for one reason: extension.mjs
+// calls `joinSession` at import, so importing it has a side effect and no test
+// can reach anything it holds. Everything below is reachable by `node --test`;
+// the same code sitting a file away would be covered by `node --check` and
+// nothing else. See docs/checkout-guard.md.
+// ---------------------------------------------------------------------------
+
+/** Tools whose commands can run arbitrary code in the checkout. */
+export const SHELL_TOOLS = new Set(["bash", "powershell", "shell"]);
+/**
+ * A subagent runs its own shell in this same checkout, so its artifacts land
+ * here. The parent never sees those commands, only the `task` call, which is
+ * therefore the only point at which they can be attributed at all.
+ */
+export const SUBAGENT_TOOLS = new Set(["task", "agent"]);
+/** Tools that author content deliberately, so never produce a stray. */
+export const AUTHORING_TOOLS = new Set(["create", "edit"]);
+
+/**
+ * An agent that ignores the report would otherwise accumulate an unbounded
+ * list and be told about the same artifacts after every command it runs.
+ */
+export const MAX_TRACKED = 200;
+
+/** The scratch directory this session's agent is told to write into. */
+export function scratchDirFor(pid = process.pid) {
+  return join(tmpdir(), "copilot-scratch", `session-${pid}`);
+}
+
+/**
+ * Whether the guard has been switched off for this process.
+ *
+ * Exactly `"1"`, not truthiness: `COPILOT_CHECKOUT_GUARD_DISABLE=0` is
+ * something a person types meaning "off", and a guard that disabled itself on
+ * that would be disabled in the one case where the operator believed it was
+ * running.
+ */
+export function guardDisabled(env = process.env) {
+  return env.COPILOT_CHECKOUT_GUARD_DISABLE === "1";
+}
+
+/**
+ * Fresh per-session tracking state.
+ *
+ * A FACTORY, deliberately, rather than four module-level Maps. Module bindings
+ * are shared by every importer for the life of the process, so the moment this
+ * file is the one holding them, `guard.test.mjs` would be sharing one set of
+ * maps across all of its cases -- and the failures that produces are
+ * order-dependent and intermittent, which is the most expensive shape a test
+ * failure has. The extension creates exactly one of these, so nothing is lost
+ * by making the lifetime explicit.
+ *
+ * - `lastSeen`     untracked paths at the last observation, by checkout root.
+ * - `outstanding`  artifacts reported and not yet cleaned up, by root.
+ * - `authored`     paths written deliberately with create/edit, by root.
+ * - `primaryRoots` the primary checkout to also watch, by working root.
+ *   Cached because it costs a `git worktree list` and cannot change for a
+ *   given root within a session. Negative results are cached too -- an agent
+ *   working in the primary checkout would otherwise pay for the lookup on
+ *   every command to be told the same "there is nothing else to watch" each
+ *   time.
+ */
+export function createGuardState() {
+  return {
+    lastSeen: new Map(),
+    outstanding: new Map(),
+    authored: new Map(),
+    primaryRoots: new Map(),
+  };
+}
+
+/** The Set stored under `root`, created on first use. */
+export function setFor(map, root) {
+  let value = map.get(root);
+  if (!value) {
+    value = new Set();
+    map.set(root, value);
+  }
+  return value;
+}
+
+/** Drop oldest-inserted members until the set is within `limit`. */
+export function bound(set, limit = MAX_TRACKED) {
+  if (set.size <= limit) return;
+  const it = set.values();
+  while (set.size > limit) set.delete(it.next().value);
+}
+
+/**
+ * A create/edit path in the checkout-relative posix form git reports.
+ *
+ * `cwd` is a parameter rather than a `process.cwd()` read inside, so the
+ * relative-path case can be tested without a chdir. The default is evaluated
+ * per call, so callers that omit it see the process's cwd at the moment of the
+ * call exactly as before.
+ */
+export function relativeToCheckout(root, filePath, cwd = process.cwd()) {
+  const absolute = isAbsolute(filePath) ? filePath : resolve(cwd, filePath);
+  const rel = relative(root, absolute).replace(/\\/g, "/");
+  return rel && !rel.startsWith("../") ? rel : null;
+}
+
+/**
+ * The primary checkout, when it is a different tree from the one in use.
+ *
+ * Returns null when the agent is already working in the primary, so the two
+ * roots are never scanned as if they were separate places.
+ *
+ * A lookup that FAILED is not cached. `primaryCheckoutRoot` reports that case
+ * as `UNKNOWN_ROOT` rather than as null precisely so this can tell the two
+ * apart: caching an answer derived from one timed-out `git worktree list`
+ * would disable primary-root watching for the whole session, silently, and the
+ * session would look exactly like one that had nothing to watch.
+ *
+ * The lookup is resolved from `root`, not from `process.cwd()`. They are
+ * normally the same repository -- `root` was derived from the cwd -- but
+ * asking about the root being watched is the question actually being answered,
+ * and it cannot drift into reporting on some unrelated repository the process
+ * happens to sit in.
+ */
+export async function otherRootToWatch(state, root, { lookup = primaryCheckoutRoot } = {}) {
+  if (state.primaryRoots.has(root)) return state.primaryRoots.get(root);
+  const { watch, cache } = rootToWatch(root, await lookup(root));
+  if (cache) state.primaryRoots.set(root, watch);
+  return watch;
+}
+
+/**
+ * Refresh the record of what is in the checkout and return anything new.
+ *
+ * Artifacts that no longer exist are dropped from the outstanding set, so an
+ * agent that cleans up is not then blocked by the memory of a file it has
+ * already deleted.
+ *
+ * `blocking` is false for a checkout the agent is not working in. Such a path
+ * is worth telling them about, but it must not deny a `git add -A` here: the
+ * file may belong to a peer, and refusing this agent's commit over another
+ * agent's artifact is a refusal whose cost lands on the wrong asset -- and on
+ * work that has nothing to do with the thing being protected.
+ */
+export async function observe(state, root, { blocking = true, scan = scanCheckoutTree } = {}) {
+  const current = await scan(root);
+  if (current === null) return [];
+  const seen = state.lastSeen.get(root);
+  state.lastSeen.set(root, current);
+  // No baseline yet means nothing can honestly be called new. Reporting the
+  // whole checkout on first sight would blame this agent for every artifact
+  // any previous one left, which is the misattribution the guard exists to
+  // prevent.
+  if (seen === undefined) return [];
+
+  const alive = new Set(current);
+  const pending = setFor(state.outstanding, root);
+  for (const path of [...pending]) {
+    if (!alive.has(path)) pending.delete(path);
+  }
+
+  const deliberate = setFor(state.authored, root);
+  const fresh = newEntries(seen, current).filter((p) => !deliberate.has(p));
+  if (blocking) {
+    for (const path of fresh) pending.add(path);
+    bound(pending);
+  }
+  return fresh;
+}
+
+/**
+ * Record a create/edit write as deliberate, and return its checkout-relative
+ * form (null when the path is outside the checkout).
+ *
+ * The authored path is folded straight into the baseline instead of
+ * rescanning. A full `git status -uall` walks the entire working tree, and the
+ * CLI issues parallel edit calls in a single response, so a five-file edit
+ * would have fired five concurrent whole-tree traversals -- the guard becoming
+ * the most expensive thing in the session. The answer a rescan would give for
+ * this path is already known: the agent just wrote it.
+ *
+ * It is also removed from the outstanding set. An agent that ran a shell
+ * command producing a path and then adopted it with `create`/`edit` has
+ * authored it, and continuing to block a stage over it would be blocking over
+ * a file the agent deliberately wrote.
+ */
+export function noteAuthored(state, root, filePath, { cwd = process.cwd() } = {}) {
+  const rel = relativeToCheckout(root, filePath, cwd);
+  if (!rel) return null;
+  const deliberate = setFor(state.authored, root);
+  deliberate.add(rel);
+  bound(deliberate);
+  setFor(state.outstanding, root).delete(rel);
+  const seen = state.lastSeen.get(root);
+  if (seen && !seen.includes(rel)) state.lastSeen.set(root, [...seen, rel]);
+  return rel;
 }
