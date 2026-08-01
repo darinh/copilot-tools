@@ -185,6 +185,33 @@ def test_live_delivery_failure_falls_back_to_queueing(live_recipient, monkeypatc
     assert operator_mail.pending_count(op.OPERATOR_HOME, inst.id) == 1
 
 
+def test_a_backend_that_fails_the_keystroke_queues_rather_than_loses(monkeypatch):
+    """End to end with the real Mux, because the fallback above is only as
+    good as `send_keys` actually raising. A session can die between the
+    liveness check and the keystroke; if the backend's failure is swallowed
+    the message is filed to the archive as delivered and never shown to
+    anyone -- silently lost mail rather than late mail."""
+    import subprocess
+
+    import operator_mux
+
+    inst = op.Instance("beta")
+    inst.claim("tok")
+
+    def fake_run(cmd, **_kwargs):
+        rc = 1 if cmd[1] == "send-keys" else 0
+        return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="lost pane")
+
+    monkeypatch.setattr(operator_mux.subprocess, "run", fake_run)
+    monkeypatch.setattr(op, "MUX", operator_mux.Mux(binary="tmux"))
+    monkeypatch.setattr(op, "is_copilot_running", lambda i: i.id == inst.id)
+
+    assert op.send_message(["--from", "a", "--to", "beta", "important"]) == 0
+    (queued,) = operator_mail.pending(op.OPERATOR_HOME, inst.id)
+    assert queued["text"] == "important"
+    assert operator_mail.history(op.OPERATOR_HOME, inst.id) == []
+
+
 # ── inbox ───────────────────────────────────────────────────────
 def test_inbox_reads_and_marks_read(idle_recipient, capsys):
     op.send_message(["--from", "alpha", "--to", "beta", "hello there"])

@@ -493,7 +493,9 @@ a message into a mailbox nobody ever reads.
 **Delivery.** If the recipient's Copilot process is running, the message is
 typed into its session and lands immediately. If it is between sessions (or the
 pane is dead), the message is queued and handed over in the next session's
-preamble. `--queue` forces the queued path.
+preamble. `--queue` forces the queued path. A session can die between the
+liveness check and the keystroke, so a keystroke the backend rejects counts as
+undelivered and falls back to the queue: mail is late rather than lost.
 
 Queued mail is read when a session launches but only archived once that session
 is actually up, so a launch that fails and retries does not swallow it. Live

@@ -313,16 +313,34 @@ class Mux:
         Ctrl-C to the program in the pane.
 
         ``-l`` does not accept a trailing key name, so Enter is a second call.
+
+        A failed keystroke is raised, like every other state-changing verb
+        here. This is the delivery path for agent-to-agent mail, and its
+        caller queues the message for the next session when this raises --
+        so swallowing the backend's exit code does not merely lose an error,
+        it files an undelivered message to the archive as already read and
+        nobody ever sees it. The session dying between the liveness check and
+        the keystroke is a real window, not a theoretical one.
         """
         if literal:
-            self._run("send-keys", "-t", session, "-l", text)
+            self._send_keys(session, "send-keys", "-t", session, "-l", text)
             if enter:
-                self._run("send-keys", "-t", session, "Enter")
+                # Text that was typed but never submitted has not been
+                # delivered either, so this call is checked too.
+                self._send_keys(session, "send-keys", "-t", session, "Enter")
             return
         args = ["send-keys", "-t", session, text]
         if enter:
             args.append("Enter")
-        self._run(*args)
+        self._send_keys(session, *args)
+
+    def _send_keys(self, session: str, *args: str) -> None:
+        _, err, rc = self._run(*args)
+        if rc != 0:
+            raise MuxSessionError(
+                f"Failed to send keys to session {session!r}: "
+                f"{err or f'exit {rc}'}"
+            )
 
     def pane_pid(self, session: str) -> int | None:
         """PID of the pane's direct child.
