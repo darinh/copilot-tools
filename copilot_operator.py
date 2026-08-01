@@ -2615,7 +2615,15 @@ def show_inbox(args: list[str]) -> int:
 
 def run_single_session(instance: Instance, copilot_args: list[str],
                        headless: bool = False) -> int:
-    args = [*with_experimental(["--yolo", "--autopilot", "--effort", "high"]),
+    # No `--yolo` here, deliberately, and `operator.sh` does not inject it
+    # either -- the two must agree, because the same command on two platforms
+    # granting an agent different authority is a difference nobody reads the
+    # source to discover. Loop mode does inject it: there the agent runs
+    # unattended, so a permission prompt would simply hang forever. A single
+    # session attaches your terminal, so a human is there to answer one. A
+    # user who wants it anyway just passes `--yolo`, which lands after these
+    # and is honoured.
+    args = [*with_experimental(["--autopilot", "--effort", "high"]),
             *copilot_args]
     handle_existing_session(instance)
     operator_ingest.init_db(METRICS_DB)
@@ -3024,7 +3032,9 @@ MODES
     Single session (default)
         Launches copilot in a multiplexer session and auto-attaches. A
         supervisor inside the session captures usage metrics when copilot
-        exits — including when you have detached. Always runs with --yolo.
+        exits — including when you have detached. Adds --autopilot --effort
+        high --experimental. Not --yolo: your terminal is attached, so you
+        are there to approve. Pass --yolo yourself if you want it.
 
     Loop mode (--loop)
         Adds --yolo --autopilot --no-ask-user --effort high automatically.

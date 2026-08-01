@@ -135,7 +135,7 @@ token and cost figures come from a different source and are always present.
 
 ### Single Session (default)
 
-Launches copilot in a tmux session, auto-attaches your terminal. Always runs with `--yolo` and `--experimental`. When copilot exits, metrics are parsed from its process log and stored in the database.
+Launches copilot in a tmux session, auto-attaches your terminal. Adds `--autopilot --effort high --experimental`. It does **not** add `--yolo` — your terminal is attached, so you are present to approve; pass `--yolo` yourself if you want it. When copilot exits, metrics are parsed from its process log and stored in the database.
 
 ```bash
 operator --agent=anvil:anvil
