@@ -292,13 +292,17 @@ def _bash_executable() -> str | None:
     coverage of 3.2 this repository has would leave without a failing test
     anywhere. Naming the path makes the choice a decision rather than a
     coincidence, and `test_macos_runs_these_tests_under_the_bash_apple_ships`
-    makes its loss loud.
+    makes its loss loud. The executability probe is not ceremony: a path that
+    exists but cannot be run would be returned as "a bash that can actually
+    run a script" and turn every test in that file into a spawn error, where
+    falling through to PATH gets the suite a working interpreter instead.
     """
     if os.name == "nt":
         program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
         git_bash = program_files / "Git" / "bin" / "bash.exe"
         return str(git_bash) if git_bash.is_file() else None
-    if sys.platform == "darwin" and MACOS_SYSTEM_BASH.is_file():
+    if (sys.platform == "darwin" and MACOS_SYSTEM_BASH.is_file()
+            and os.access(MACOS_SYSTEM_BASH, os.X_OK)):
         return str(MACOS_SYSTEM_BASH)
     return shutil.which("bash")
 

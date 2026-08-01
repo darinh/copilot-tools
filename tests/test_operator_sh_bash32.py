@@ -299,6 +299,37 @@ def test_operator_sh_uses_no_bash_4_only_declarations():
 # So: choose the interpreter explicitly, and make the loss of it loud.
 
 
+def _recording_which(calls, answer):
+    """A `shutil.which` stub that remembers what it was asked for.
+
+    `lambda name: answer` would answer every lookup identically, so a
+    production mutation from `which("bash")` to `which("sh")` -- which on a
+    POSIX box returns a shell that is not bash, or None -- satisfies the
+    assertions below unchanged. If it returned None, `bash =
+    pytest.mark.skipif(_bash_executable() is None, ...)` would silently skip
+    every real shell-execution test in this file at import time, which is the
+    same disappearance-without-a-failure this whole change exists to prevent.
+    Recording the argument makes the lookup itself assertable.
+    """
+    def which(name, *args, **kwargs):
+        calls.append(name)
+        return answer
+    return which
+
+
+def _executable(path):
+    """A file that `os.access(..., X_OK)` accepts on POSIX as well as Windows.
+
+    Writing a temp file gets 0o644 on Linux and macOS, so a test that merely
+    creates one and expects it to be chosen as an interpreter passes on this
+    Windows box (where X_OK is true for any existing file) and fails on both
+    other CI platforms.
+    """
+    path.write_text("#!/bin/sh\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
 def test_macos_prefers_the_system_bash_over_whatever_path_offers(monkeypatch,
                                                                  tmp_path):
     """The darwin branch, exercised on every platform rather than only macOS.
@@ -310,14 +341,19 @@ def test_macos_prefers_the_system_bash_over_whatever_path_offers(monkeypatch,
     offers a Homebrew-shaped path, `/bin/bash` is a file that exists, and the
     answer says which one was consulted.
     """
-    system_bash = tmp_path / "system-bash"
-    system_bash.write_text("", encoding="utf-8")
+    system_bash = _executable(tmp_path / "system-bash")
+    calls = []
     monkeypatch.setattr(os, "name", "posix")
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(test_operator, "MACOS_SYSTEM_BASH", system_bash)
-    monkeypatch.setattr(shutil, "which", lambda name: "/opt/homebrew/bin/bash")
+    monkeypatch.setattr(shutil, "which", _recording_which(calls, "/opt/homebrew/bin/bash"))
 
     assert _bash_executable() == str(system_bash)
+    # Preferring /bin/bash means not consulting PATH at all. Without this the
+    # test also passes against an implementation that asks PATH first and then
+    # discards the answer -- same result today, and a different one the moment
+    # anyone reorders the branches.
+    assert calls == []
 
 
 def test_macos_falls_back_to_path_when_there_is_no_system_bash(monkeypatch,
@@ -328,15 +364,45 @@ def test_macos_falls_back_to_path_when_there_is_no_system_bash(monkeypatch,
     implementation that ignores PATH entirely and always returns
     `MACOS_SYSTEM_BASH` -- including when nothing is there, which would turn
     every bash test into a mysterious `FileNotFoundError` instead of a skip.
-    The same call with `/bin/bash` absent must reach `shutil.which`.
+    The same call with `/bin/bash` absent must reach `shutil.which`, and must
+    reach it asking for bash.
     """
+    calls = []
     monkeypatch.setattr(os, "name", "posix")
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(test_operator, "MACOS_SYSTEM_BASH",
                         tmp_path / "does-not-exist")
-    monkeypatch.setattr(shutil, "which", lambda name: "/opt/homebrew/bin/bash")
+    monkeypatch.setattr(shutil, "which", _recording_which(calls, "/opt/homebrew/bin/bash"))
 
     assert _bash_executable() == "/opt/homebrew/bin/bash"
+    assert calls == ["bash"]
+
+
+@pytest.mark.skipif(os.name == "nt",
+                    reason="Windows has no execute bit; os.access(X_OK) is true "
+                           "for any existing file, so the case cannot be built here")
+def test_macos_falls_back_when_the_system_bash_cannot_be_executed(monkeypatch,
+                                                                  tmp_path):
+    """Present is not the same as runnable.
+
+    `is_file()` alone would hand back a path that cannot be spawned, and every
+    test in this file would then die with an OSError naming an interpreter
+    that is sitting right there -- a failure that reads like a broken test
+    rather than an unusable /bin/bash. Falling through to PATH keeps the suite
+    running on a working bash and loses only the 3.2 guarantee, which the
+    canary reports.
+    """
+    system_bash = tmp_path / "system-bash"
+    system_bash.write_text("#!/bin/sh\n", encoding="utf-8")
+    system_bash.chmod(0o644)
+    calls = []
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(test_operator, "MACOS_SYSTEM_BASH", system_bash)
+    monkeypatch.setattr(shutil, "which", _recording_which(calls, "/opt/homebrew/bin/bash"))
+
+    assert _bash_executable() == "/opt/homebrew/bin/bash"
+    assert calls == ["bash"]
 
 
 def test_linux_still_uses_path_even_though_bin_bash_exists(monkeypatch,
@@ -347,14 +413,15 @@ def test_linux_still_uses_path_even_though_bin_bash_exists(monkeypatch,
     is what keeps this a statement about Apple's frozen interpreter rather
     than a global "always /bin/bash" that happens to read the same.
     """
-    system_bash = tmp_path / "system-bash"
-    system_bash.write_text("", encoding="utf-8")
+    system_bash = _executable(tmp_path / "system-bash")
+    calls = []
     monkeypatch.setattr(os, "name", "posix")
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(test_operator, "MACOS_SYSTEM_BASH", system_bash)
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/bash")
+    monkeypatch.setattr(shutil, "which", _recording_which(calls, "/usr/bin/bash"))
 
     assert _bash_executable() == "/usr/bin/bash"
+    assert calls == ["bash"]
 
 
 @bash
