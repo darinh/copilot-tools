@@ -37,11 +37,22 @@ def primary_repo_root(start=None) -> Path:
     Returns ``start`` unchanged when git is missing, the call fails, or the
     path is not inside a repository, so callers outside a repo keep their
     previous behaviour.
+
+    A path that cannot be *examined* is not one of those cases. ``is_dir()``
+    raises on EACCES rather than answering, and treating that as "not a
+    repository" hands a worktree path back as though it were a project root --
+    which is exactly the duplicate-identity failure this module exists to
+    prevent. So the probe is guarded and an unexaminable path still gets the
+    git call, which either answers or fails on its own terms. See
+    :func:`install_manifest.path_present` for the full polarity argument.
     """
     base = Path(start) if start is not None else Path.cwd()
     try:
         if not base.is_dir():
             return base
+    except OSError:
+        pass
+    try:
         proc = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
             cwd=str(base), capture_output=True, text=True, timeout=10,

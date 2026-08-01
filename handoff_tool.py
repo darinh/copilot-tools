@@ -40,7 +40,11 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from install_manifest import path_present                     # noqa: E402
+from install_manifest import (                                # noqa: E402
+    dir_present,
+    file_present,
+    path_present,
+)
 from operator_console import enable_utf8_output               # noqa: E402
 from operator_mux import Mux, MuxError, safe_instance_id      # noqa: E402
 from project_paths import (                                   # noqa: E402
@@ -493,7 +497,12 @@ def preserve_prior_handoff(handoff_file: Path) -> Path | None:
 
 
 def resolve_guid(project_root) -> str:
-    if not CATALOG.is_file():
+    if file_present(CATALOG) is False:
+        # False, and only False. "Cannot tell" gets no branch of its own here
+        # because the open below already reports the real errno, and its
+        # message ("cannot read") is the true one; sending the operator off to
+        # create a catalog that is sitting right there behind a denied parent
+        # directory is the wrong instruction delivered confidently.
         die(f"Catalog not found: {CATALOG}")
     target = normalize(project_root)
     try:
@@ -522,12 +531,38 @@ def resolve_guid(project_root) -> str:
         f"Add it with a line such as:\n  \"{Path(project_root).resolve()}\",<guid>")
 
 
+class StateUnreadable(Exception):
+    """The set of managed instances could not be determined.
+
+    Distinct from "there are none", and raised rather than returned so that no
+    caller can spend it as an empty set. A census that could not be taken is
+    the failure mode that removes a live peer from a list.
+    """
+
+
 def managed_ids() -> set[str]:
     found: set[str] = set()
     d = state_dir()
-    if not d.is_dir():
-        return found
-    for path in d.iterdir():
+    kind = dir_present(d)
+    if kind is None:
+        raise StateUnreadable(f"cannot examine {d}")
+    if kind is False:
+        # Not usable as a directory -- but that covers two different worlds.
+        # `dir_present` follows symlinks and reports a dangling one as False,
+        # and an exception type describes what the call did, not what is on
+        # disk. Only a path with nothing at it at all is an empty population;
+        # anything else is a restart directory we failed to read.
+        if path_present(d) is False:
+            return found
+        raise StateUnreadable(f"{d} exists but is not a usable directory")
+    try:
+        entries = list(d.iterdir())
+    except OSError as exc:
+        # Listing can fail after the probe said "directory" -- a revoked
+        # permission, a disconnected network home. Returning what we had read
+        # so far would report a partial census as a complete one.
+        raise StateUnreadable(f"cannot list {d}: {exc}") from exc
+    for path in entries:
         if path.suffix in (".managed", ".state"):
             found.add(path.name.rsplit(".", 1)[0])
     return found
@@ -535,7 +570,13 @@ def managed_ids() -> set[str]:
 
 def infer_instance(project_root, mux: Mux) -> str | None:
     target = str(Path(project_root).resolve())
-    managed = managed_ids()
+    try:
+        managed = managed_ids()
+    except StateUnreadable as exc:
+        die(f"Cannot tell which operator instances are managed: {exc}\n"
+            f"Guessing here would either invent an instance or declare that "
+            f"none is running, and both write the restart marker to the "
+            f"wrong name.\nName it explicitly with --instance NAME")
     matches = []
     try:
         sessions = mux.list_sessions()
@@ -603,8 +644,19 @@ def main(argv: list[str] | None = None) -> int:
         die("Missing required: --next")
 
     project_root = Path(args.project_root or Path.cwd())
-    if not project_root.is_dir():
+    root = dir_present(project_root)
+    if root is False:
         die(f"Directory not found: {project_root}")
+    if root is None:
+        # Unexaminable, which is not the same as missing. Refusing here would
+        # discard this session's context for certain, and that is the one
+        # outcome this tool spends the rest of its length avoiding. Proceeding
+        # cannot misfile the handoff: the destination comes from an exact
+        # catalog match, so an unusable root fails the lookup instead of
+        # matching the wrong row.
+        print(f"Warning: cannot examine {project_root}; continuing on the "
+              f"assumption it is there. If the catalog lookup below fails, "
+              f"this is why.", file=sys.stderr)
 
     mux = Mux()
     instance_name = args.instance

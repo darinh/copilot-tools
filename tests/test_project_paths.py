@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from conftest import denied
 
 import copilot_operator as op
 import handoff_tool as ho
