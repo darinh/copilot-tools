@@ -2,12 +2,49 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 import install_manifest
 import setup_tools
+
+
+def _make_dir_link(target: Path, link: Path) -> None:
+    """Create a directory link at ``link`` -> ``target``, or skip the test.
+
+    Tries a real symlink first and falls back to a junction, because Windows
+    refuses ``os.symlink`` without Developer Mode or elevation while ``mklink
+    /J`` needs neither. A platform that will do neither cannot exercise the
+    behaviour under test at all, so skipping is honest where xfail would not be.
+    """
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError, AttributeError):
+        pass
+    if os.name == "nt":
+        proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                              capture_output=True, text=True)
+        if proc.returncode == 0:
+            return
+    pytest.skip("this platform will not create directory links")
+
+
+def _link_destination(link: Path) -> str | None:
+    """Where ``link`` points, or None when it is not a link.
+
+    Deliberately a local copy rather than an import of the production helper:
+    these tests must be able to fail against the *unfixed* module, and a test
+    that errors because a new symbol does not exist yet proves nothing about
+    behaviour.
+    """
+    try:
+        return os.readlink(str(link))
+    except OSError:
+        return None
 
 
 def test_dirs_match_identical(tmp_path):
@@ -96,6 +133,127 @@ def test_link_directory_creates_link_when_absent(tmp_path):
     result = setup_tools._link_directory(src, dest)
     assert result in ("junction created", "symlink created",
                       "copied (junction unavailable)")
+    assert (dest / "f.mjs").read_text(encoding="utf-8") == "x"
+
+
+def test_link_directory_keeps_a_user_link_without_consent(tmp_path, monkeypatch):
+    """A link the user pointed somewhere else is theirs, exactly as much as a
+    directory of edits is. Refusing must leave the link *and its target* alone,
+    not merely return the right string after already unlinking."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "extension.mjs").write_text("repo version", encoding="utf-8")
+
+    mine = tmp_path / "my-working-copy"
+    mine.mkdir()
+    (mine / "extension.mjs").write_text("MY LOCAL EDITS", encoding="utf-8")
+
+    dest = tmp_path / "dest"
+    _make_dir_link(mine, dest)
+
+    monkeypatch.setattr(setup_tools, "ask", lambda *a, **k: False)
+    result = setup_tools._link_directory(src, dest)
+
+    assert "skipped" in result
+    assert _link_destination(dest) is not None, "the user's link was destroyed"
+    assert Path(os.path.realpath(dest)) == mine.resolve(), \
+        "the link survived but no longer points where the user pointed it"
+    assert (dest / "extension.mjs").read_text(encoding="utf-8") == "MY LOCAL EDITS"
+    assert (mine / "extension.mjs").read_text(encoding="utf-8") == "MY LOCAL EDITS"
+
+
+def test_link_directory_replacing_a_link_does_not_delete_through_it(tmp_path, monkeypatch):
+    """With consent the link is replaced — but the directory it pointed at is
+    the user's data and must survive. Removing a link by walking it would take
+    the target's contents with it."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "extension.mjs").write_text("repo version", encoding="utf-8")
+
+    mine = tmp_path / "my-working-copy"
+    mine.mkdir()
+    (mine / "extension.mjs").write_text("MY LOCAL EDITS", encoding="utf-8")
+    (mine / "notes.txt").write_text("keep me", encoding="utf-8")
+
+    dest = tmp_path / "dest"
+    _make_dir_link(mine, dest)
+
+    monkeypatch.setattr(setup_tools, "ask", lambda *a, **k: True)
+    setup_tools._link_directory(src, dest)
+
+    assert (dest / "extension.mjs").read_text(encoding="utf-8") == "repo version"
+    assert (mine / "extension.mjs").read_text(encoding="utf-8") == "MY LOCAL EDITS"
+    assert (mine / "notes.txt").read_text(encoding="utf-8") == "keep me"
+
+
+def test_link_directory_replaces_a_user_link_when_the_manifest_permits(tmp_path, monkeypatch):
+    """``may_replace`` is the manifest saying it already wrote this. No prompt."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "extension.mjs").write_text("repo version", encoding="utf-8")
+    mine = tmp_path / "elsewhere"
+    mine.mkdir()
+    dest = tmp_path / "dest"
+    _make_dir_link(mine, dest)
+
+    def refuse(*a, **k):
+        raise AssertionError("must not prompt when the manifest permits replacement")
+
+    monkeypatch.setattr(setup_tools, "ask", refuse)
+    setup_tools._link_directory(src, dest, may_replace=True)
+
+    assert (dest / "extension.mjs").read_text(encoding="utf-8") == "repo version"
+    assert mine.is_dir()
+
+
+def test_link_directory_does_not_prompt_when_the_link_is_already_ours(tmp_path, monkeypatch):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f.mjs").write_text("x", encoding="utf-8")
+    dest = tmp_path / "dest"
+    _make_dir_link(src, dest)
+
+    def refuse(*a, **k):
+        raise AssertionError("must not prompt for a link that already points at src")
+
+    monkeypatch.setattr(setup_tools, "ask", refuse)
+    assert setup_tools._link_directory(src, dest) == "already linked"
+
+
+def test_link_directory_keeps_a_broken_user_link_without_consent(tmp_path, monkeypatch):
+    """A link whose target is gone is still the user's link. Treating it as
+    absent would silently overwrite the one thing it records."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f.mjs").write_text("x", encoding="utf-8")
+
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    dest = tmp_path / "dest"
+    _make_dir_link(gone, dest)
+    gone.rmdir()
+
+    monkeypatch.setattr(setup_tools, "ask", lambda *a, **k: False)
+    result = setup_tools._link_directory(src, dest)
+
+    assert "skipped" in result
+    assert _link_destination(dest) is not None, \
+        "the user's broken link was destroyed"
+
+
+def test_link_directory_replaces_a_plain_file_at_the_destination(tmp_path, monkeypatch):
+    """A regular file where a directory belongs must still be replaceable —
+    ``rmtree`` cannot remove one, so the copy that follows would collide."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f.mjs").write_text("x", encoding="utf-8")
+    dest = tmp_path / "dest"
+    dest.write_text("i am a file", encoding="utf-8")
+
+    monkeypatch.setattr(setup_tools, "ask", lambda *a, **k: True)
+    result = setup_tools._link_directory(src, dest)
+
+    assert "replaced" in result
     assert (dest / "f.mjs").read_text(encoding="utf-8") == "x"
 
 
@@ -498,6 +656,167 @@ def test_directory_without_a_skill_file_is_not_installed(skill_repo):
     (repo / "skills" / "notaskill").mkdir()
     setup_tools.install_skills(assume_yes=True)
     assert not (home / "skills" / "notaskill").exists()
+
+
+def test_skill_subdirectories_are_installed(skill_repo):
+    """A skill that bundles references or scripts is one artifact. Half of it
+    deployed is not a working skill."""
+    repo, home = skill_repo
+    (repo / "skills" / "demo" / "reference").mkdir()
+    (repo / "skills" / "demo" / "reference" / "guide.md").write_text(
+        "the details", encoding="utf-8")
+    (repo / "skills" / "demo" / "scripts" / "deep").mkdir(parents=True)
+    (repo / "skills" / "demo" / "scripts" / "deep" / "run.py").write_text(
+        "print('hi')", encoding="utf-8")
+
+    setup_tools.install_skills(assume_yes=True)
+
+    assert (home / "skills" / "demo" / "reference" / "guide.md").read_text(
+        encoding="utf-8") == "the details"
+    assert (home / "skills" / "demo" / "scripts" / "deep" / "run.py").read_text(
+        encoding="utf-8") == "print('hi')"
+
+
+def test_skill_with_subdirectories_converges(skill_repo, capsys):
+    """Reinstalling must reach a fixed point. A copy that omits subdirectories
+    can never match the digest setup compares against, so setup would rewrite
+    the skill on every run for the life of the machine and never say why."""
+    repo, home = skill_repo
+    (repo / "skills" / "demo" / "reference").mkdir()
+    (repo / "skills" / "demo" / "reference" / "guide.md").write_text(
+        "the details", encoding="utf-8")
+
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_skills(assume_yes=True, manifest=manifest)
+    capsys.readouterr()
+    setup_tools.install_skills(assume_yes=True, manifest=manifest)
+
+    assert "already up to date" in capsys.readouterr().out
+    assert install_manifest.classify(
+        manifest, "skills/demo", home / "skills" / "demo",
+        install_manifest.tree_digest(repo / "skills" / "demo"),
+    ) == install_manifest.CURRENT
+
+
+def test_skill_file_deleted_upstream_is_removed_on_reinstall(skill_repo):
+    """Stale files left behind are the same convergence failure wearing the
+    other hat: the deployed tree keeps content the repository no longer has."""
+    repo, home = skill_repo
+    (repo / "skills" / "demo" / "old.md").write_text("obsolete", encoding="utf-8")
+    setup_tools.install_skills(assume_yes=True)
+    assert (home / "skills" / "demo" / "old.md").exists()
+
+    (repo / "skills" / "demo" / "old.md").unlink()
+    (repo / "skills" / "demo" / "SKILL.md").write_text("v2", encoding="utf-8")
+    setup_tools.install_skills(assume_yes=True)
+
+    assert not (home / "skills" / "demo" / "old.md").exists()
+    assert (home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8") == "v2"
+
+
+def test_user_link_at_a_skill_destination_is_not_replaced_without_consent(
+        skill_repo, tmp_path, monkeypatch):
+    """A digest taken through a link describes the target, not the destination.
+    It can never prove setup wrote what is there, so STALE must not license
+    deleting a link setup never created."""
+    repo, home = skill_repo
+    manifest = install_manifest.empty_manifest()
+    setup_tools.install_skills(assume_yes=True, manifest=manifest)
+
+    mine = tmp_path / "my-skill"
+    mine.mkdir()
+    (mine / "SKILL.md").write_text("v1", encoding="utf-8")
+    dest = home / "skills" / "demo"
+    shutil.rmtree(dest)
+    _make_dir_link(mine, dest)
+
+    (repo / "skills" / "demo" / "SKILL.md").write_text("v2", encoding="utf-8")
+    monkeypatch.setattr(setup_tools, "ask", lambda *a, **k: False)
+    setup_tools.install_skills(manifest=manifest)
+
+    assert _link_destination(dest) is not None, "the user's link was destroyed"
+    assert Path(os.path.realpath(dest)) == mine.resolve()
+    assert (mine / "SKILL.md").read_text(encoding="utf-8") == "v1"
+
+
+def test_failed_skill_copy_leaves_the_installed_skill_intact(skill_repo, monkeypatch):
+    """Staging exists for this: a copy that dies part-way must not take the
+    working skill with it."""
+    repo, home = skill_repo
+    setup_tools.install_skills(assume_yes=True)
+    assert (home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8") == "v1"
+
+    (repo / "skills" / "demo" / "SKILL.md").write_text("v2", encoding="utf-8")
+
+    def explode(*_a, **_k):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(setup_tools.shutil, "copytree", explode)
+    setup_tools.install_skills(assume_yes=True)
+
+    assert (home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8") == "v1", \
+        "a failed copy destroyed the skill that was already installed"
+
+
+def test_failed_skill_copy_leaves_no_staging_directory_behind(skill_repo, monkeypatch):
+    repo, home = skill_repo
+
+    def explode(*_a, **_k):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(setup_tools.shutil, "copytree", explode)
+    setup_tools.install_skills(assume_yes=True)
+
+    assert list((home / "skills").iterdir()) == [], \
+        "staging scratch was left in the skills directory"
+
+
+def test_undeletable_destination_does_not_abort_the_whole_install(skill_repo, monkeypatch):
+    """A locked file under the destination is the real Windows failure. The
+    installed skill must survive it whole — a partial delete followed by a
+    warning is still the user's data gone."""
+    repo, home = skill_repo
+    setup_tools.install_skills(assume_yes=True)
+    (repo / "skills" / "demo" / "reference").mkdir()
+    (repo / "skills" / "demo" / "reference" / "guide.md").write_text("new", encoding="utf-8")
+    (repo / "skills" / "demo" / "SKILL.md").write_text("v2", encoding="utf-8")
+
+    real_replace = setup_tools.os.replace
+
+    def locked(source, target, *args, **kwargs):
+        if Path(source).name == "demo":
+            raise OSError("the directory is in use by another process")
+        return real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(setup_tools.os, "replace", locked)
+    setup_tools.install_skills(assume_yes=True)
+
+    assert (home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8") == "v1"
+
+
+def test_a_failed_swap_puts_the_original_skill_back(skill_repo, monkeypatch):
+    """The old copy is renamed aside, not deleted, so the window in which the
+    user has nothing must close again even when the swap itself fails."""
+    repo, home = skill_repo
+    setup_tools.install_skills(assume_yes=True)
+    (repo / "skills" / "demo" / "SKILL.md").write_text("v2", encoding="utf-8")
+
+    real_replace = setup_tools.os.replace
+    calls = {"n": 0}
+
+    def fail_on_the_second_move(source, target, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("interrupted between the two renames")
+        return real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(setup_tools.os, "replace", fail_on_the_second_move)
+    setup_tools.install_skills(assume_yes=True)
+
+    assert calls["n"] >= 2, "the swap never reached the second rename"
+    assert (home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8") == "v1"
+    assert [p.name for p in (home / "skills").iterdir()] == ["demo"], \
+        "scratch was left behind after the rollback"
 
 
 def test_missing_skills_directory_is_not_an_error(tmp_path, monkeypatch):

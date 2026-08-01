@@ -896,20 +896,27 @@ def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
                     may_replace: bool = False) -> str:
     """Link src -> dest, preferring a link and falling back to a copy.
 
-    A real directory at ``dest`` may contain edits the user made in place, so it
-    is never removed without consent — unless ``may_replace`` says the manifest
-    has already proved its contents are the ones setup wrote.
+    Anything already at ``dest`` may be the user's: a real directory can hold
+    edits made in place, and a link can point at a working copy they maintain
+    somewhere else. Neither is removed without consent — unless ``may_replace``
+    says the manifest has already proved the contents are the ones setup wrote.
+
+    A link is only self-evidently ours when it already resolves to ``src``; a
+    link anywhere else carries exactly as much of the user's intent as a
+    directory full of edits, and destroying it silently loses the one piece of
+    information it holds — where they pointed it.
     """
-    if dest.is_symlink() or (IS_WINDOWS and dest.is_dir() and _is_junction(dest)):
+    if _is_link(dest):
         try:
             if Path(os.path.realpath(dest)) == src.resolve():
                 return "already linked"
         except OSError:
             pass
-        try:
-            dest.unlink()
-        except OSError:
-            shutil.rmtree(dest, ignore_errors=True)
+        if not may_replace and not ask(
+                f"{dest} is a link to {_link_target(dest) or 'somewhere else'} "
+                "rather than the repository copy. Replace it?", assume_yes):
+            return "skipped (kept existing)"
+        _remove_dest(dest)
     elif dest.exists():
         if dest.is_dir() and _dirs_match(src, dest):
             return "already up to date"
@@ -917,7 +924,7 @@ def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
                 f"{dest} exists and differs from the repository copy. Replace it?",
                 assume_yes):
             return "skipped (kept existing)"
-        shutil.rmtree(dest, ignore_errors=True)
+        _remove_dest(dest)
         shutil.copytree(src, dest)
         return "replaced with a copy"
 
@@ -936,11 +943,103 @@ def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
     return "symlink created"
 
 
-def _is_junction(path: Path) -> bool:
+def _link_target(path: Path) -> str | None:
+    """Where ``path`` points, or None when it is not a link at all.
+
+    ``os.readlink`` is the one call that answers this for both kinds of
+    Windows reparse point and for POSIX symlinks, so every link question in
+    this module is asked through here rather than re-derived.
+    """
     try:
-        return bool(os.readlink(str(path)))
+        return os.readlink(str(path))
     except OSError:
-        return False
+        return None
+
+
+def _is_junction(path: Path) -> bool:
+    return _link_target(path) is not None
+
+
+def _is_link(path: Path) -> bool:
+    """True when ``path`` is a symlink or a Windows junction.
+
+    ``Path.is_symlink`` returns False for a junction (verified on Windows), so
+    the junction probe is not redundant. Neither test requires the link to
+    resolve, which is deliberate: a link whose target has been deleted is still
+    a link, and treating it as absent leaves it to be discovered by whatever
+    tries to write over it.
+    """
+    return path.is_symlink() or (IS_WINDOWS and _is_junction(path))
+
+
+def _remove_dest(path: Path) -> None:
+    """Remove whatever is at ``path``, never following a link out of it.
+
+    ``shutil.rmtree`` is a silent no-op on a junction and on a symlink to a
+    directory — it removes nothing and, with ``ignore_errors``, says nothing —
+    so using it to clear a link leaves the link in place and makes the caller's
+    replacement fail later for no visible reason. ``unlink`` removes the link
+    itself and leaves the target alone, which is what is wanted in every case
+    here.
+
+    Failures raise rather than being swallowed. ``ignore_errors=True`` turns a
+    single locked file on Windows into a half-deleted directory that still
+    reports success, and the copy that follows then fails on a destination
+    which was supposed to be gone — destroying the user's data and aborting
+    the run for reasons neither of them can see. A caller that cannot clear a
+    destination needs to be told while it can still leave the original alone.
+    """
+    if _is_link(path):
+        try:
+            path.unlink()
+        except OSError:
+            # Some link kinds are directories to the API that refuses unlink.
+            os.rmdir(path)
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
+    path.unlink(missing_ok=True)
+
+
+def _discard(path: Path) -> None:
+    """Best-effort cleanup of scratch this module created itself.
+
+    The distinction from :func:`_remove_dest` is whose data it is: nothing here
+    was ever the user's, so failing to remove it is untidy rather than
+    dangerous, and reporting it would bury the real error that led here.
+    """
+    try:
+        _remove_dest(path)
+    except OSError:
+        pass
+
+
+def _replace_tree(staged: Path, dest: Path) -> None:
+    """Move ``staged`` onto ``dest``, keeping ``dest`` recoverable throughout.
+
+    The old copy is renamed aside rather than deleted, because deletion is the
+    step that cannot be taken back. ``shutil.rmtree`` walking a tree that turns
+    out to hold a locked file removes everything up to it and then raises,
+    which leaves the user with neither their old copy nor a new one — a fix for
+    "the destination was not cleared" that destroys more than the bug it
+    replaced. A rename either happens or does not, and on Windows it is also
+    the operation that fails when something inside is still open, which is
+    precisely when stopping is the right answer.
+    """
+    previous = dest.with_name(f".{dest.name}.previous")
+    _discard(previous)
+    moved = False
+    if _is_link(dest) or dest.exists():
+        os.replace(dest, previous)
+        moved = True
+    try:
+        os.replace(staged, dest)
+    except OSError:
+        if moved:
+            os.replace(previous, dest)
+        raise
+    _discard(previous)
 
 
 #: Files copied from ``templates/`` into ``~/.copilot``.
@@ -1090,6 +1189,16 @@ def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> No
     project on the machine. A project-level copy under ``.github/skills/``
     would only reach agents working in that one repository, and the operator
     skill is specifically about work that spans projects.
+
+    The whole tree is copied, not just its top-level files. A skill that
+    bundles ``reference/`` or ``scripts/`` is one artifact, and half of it is
+    not a working skill; a partial copy would also never match the digest the
+    manifest compares against, so setup would re-copy it on every run forever
+    while still reporting it as installed.
+
+    The copy is staged beside the destination and swapped in, and the copy it
+    replaces is renamed aside rather than deleted, so nothing that goes wrong
+    part-way through can leave the user with no skill at all.
     """
     skills = _skill_sources()
     if not skills:
@@ -1105,6 +1214,12 @@ def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> No
         label = f"skill '{src.name}'"
         source_digest = install_manifest.tree_digest(src)
         state = install_manifest.classify(manifest, key, dest, source_digest)
+        if _is_link(dest) and not (install_manifest.entry(manifest, key) or {}).get("linked"):
+            # Every digest here is taken *through* the link, so it describes
+            # whatever the user pointed at, not the destination — it cannot
+            # show that setup wrote what is there, and STALE would otherwise
+            # license deleting a link setup never created.
+            state = install_manifest.UNTRACKED
         if state == install_manifest.CURRENT:
             info(f"{label} already up to date")
             install_manifest.record(manifest, key, dest, kind="skill",
@@ -1113,10 +1228,15 @@ def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> No
         if not _resolve_overwrite(state, label, dest, assume_yes):
             warn(f"Skipped {label} (kept existing)")
             continue
-        dest.mkdir(parents=True, exist_ok=True)
-        for item in src.iterdir():
-            if item.is_file():
-                shutil.copyfile(item, dest / item.name)
+        staged = dest.with_name(f".{src.name}.installing")
+        try:
+            _discard(staged)
+            shutil.copytree(src, staged)
+            _replace_tree(staged, dest)
+        except OSError as exc:
+            warn(f"{label}: not installed ({exc})")
+            _discard(staged)
+            continue
         install_manifest.record(manifest, key, dest, kind="skill",
                                 digest=install_manifest.tree_digest(dest))
         info(f"Installed {label}")
