@@ -267,6 +267,7 @@ copilot-tools/
     ├── operator.md                # Operator documentation
     ├── skills.md                  # Skills reference
     ├── versioning.md              # Install manifest and upgrade strategies
+    ├── checkout-guard.md          # Stray-artifact guard, and how to tell it is running
     └── spec-kit.md                # GitHub spec-kit documentation
 ```
 
