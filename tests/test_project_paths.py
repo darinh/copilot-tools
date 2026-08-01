@@ -93,7 +93,10 @@ def test_primary_root_of_a_missing_path_is_unchanged(tmp_path, monkeypatch):
 
     def spy(cmd, **kwargs):
         calls.append(kwargs.get("cwd"))
-        return real_run(cmd, **kwargs)
+        # the decode policy is the one project_paths named, and that call
+        # site is scanned; this forwards it verbatim.
+        return real_run(  # decode-ok: forwards the caller's own kwargs
+            cmd, **kwargs)
 
     monkeypatch.setattr(project_paths.subprocess, "run", spy)
     assert primary_repo_root(gone) == gone
@@ -131,7 +134,10 @@ def test_primary_root_of_a_worktree_it_cannot_examine_is_still_the_root(
 
     def spy(cmd, **kwargs):
         calls.append(kwargs.get("cwd"))
-        return real_run(cmd, **kwargs)
+        # the decode policy is the one project_paths named, and that call
+        # site is scanned; this forwards it verbatim.
+        return real_run(  # decode-ok: forwards the caller's own kwargs
+            cmd, **kwargs)
 
     monkeypatch.setattr(project_paths.subprocess, "run", spy)
     with denied(monkeypatch, wt) as seen:

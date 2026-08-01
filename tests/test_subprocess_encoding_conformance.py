@@ -50,11 +50,14 @@ reason; the presence-probe scan excludes tests because "cannot tell" is not a
 state a fixture can be in, and that argument does not transfer — a fixture
 path can absolutely contain a byte cp1252 has no glyph for.
 
-**Escape hatch.** ``# decode-ok: <reason>`` on any line of the call. It must
-be a real comment — the annotation is read from Python's own token stream,
-not matched against the raw line, so a string *containing* the marker cannot
-silence anything — and it must carry a reason, because an annotation with no
-reason is an exemption nobody has to defend.
+**Escape hatch.** ``# decode-ok: <reason>`` on any line of the call *itself*,
+and nowhere else. It must be a real comment — the annotation is read from
+Python's own token stream, not matched against the raw line, so a string
+*containing* the marker cannot silence anything — and it must carry a reason,
+because an annotation with no reason is an exemption nobody has to defend.
+An earlier version also honoured a comment on the line above a call, which a
+reviewer showed exempts the *next* call when the comment was written to
+explain the one above it; the allowance is gone rather than guessed at.
 
 **Anti-vacuity.** Every detector in :data:`DETECTORS` is pinned to a control
 that declares *which* detector it exercises, and the pinning is by identity:
@@ -63,9 +66,9 @@ assertion cannot see. :func:`test_every_detector_has_a_control` fails when a
 detector is added without one. The repository population is asserted
 non-empty and asserted to contain named files, because a filter bug that
 empties it passes every per-file test above it. The annotation rules are
-exercised against synthetic sources rather than the tree, because there are
-no annotations in the tree today and a loop over none of them is green no
-matter what it asserts.
+exercised against synthetic sources rather than the tree, because the three
+annotations in the tree today are all correct and a loop over three correct
+things is green no matter what it asserts.
 """
 import ast
 import io
@@ -85,6 +88,19 @@ SUBPROCESS_FUNCS = frozenset(
     {"run", "Popen", "call", "check_call", "check_output", "getoutput",
      "getstatusoutput"})
 
+#: Two of those decode whether you ask them to or not: ``getoutput`` and
+#: ``getstatusoutput`` return ``str``, always, and before 3.11 they took no
+#: ``encoding``/``errors`` at all -- so on this repository's declared floor
+#: (``requires-python = ">=3.10"``) they cannot be made safe and the scan
+#: rejects every spelling of them. Measured 2026-08-01::
+#:
+#:     subprocess.getstatusoutput('<child emitting 0x81>')
+#:     UnicodeDecodeError: 'charmap' codec can't decode byte 0x81
+#:
+#: -- and note it raises *at the call* there rather than on a reader thread,
+#: which is the one merciful thing about it.
+ALWAYS_DECODING = frozenset({"getoutput", "getstatusoutput"})
+
 #: Keywords that put a call into text mode. Any one of them is enough --
 #: ``encoding=`` and ``errors=`` imply text mode on their own, which is why
 #: "no ``text=True``" is not the same question as "does not decode".
@@ -101,6 +117,18 @@ DETECTORS = {
         "names an encoding but no errors= policy, so the codec is strict and "
         "an undecodable byte still kills the reader thread; pass "
         "errors='replace'"
+    ),
+    "unknown-decode-policy": (
+        "expands a mapping this scan cannot read, so whether it decodes "
+        "cannot be told from the source; name encoding= and errors= "
+        "explicitly (a duplicate key from the mapping then raises TypeError "
+        "rather than overriding them), or annotate with # decode-ok:"
+    ),
+    "unsafe-by-construction": (
+        "subprocess.getoutput/getstatusoutput always decode, and took no "
+        "encoding=/errors= before Python 3.11 -- below this repository's "
+        "declared floor of 3.10, so no spelling of them is safe here; use "
+        "subprocess.run(..., encoding='utf-8', errors='replace')"
     ),
 }
 
@@ -121,44 +149,112 @@ def _python_sources() -> list[Path]:
     return sorted(out)
 
 
-def _annotated_lines(source: str) -> tuple[set[int], set[int]]:
-    """``(every annotated line, those whose line holds nothing else)``.
+def _annotated_lines(source: str) -> set[int]:
+    """Line numbers carrying a well-formed ``# decode-ok: <reason>``.
 
     Read from the token stream on purpose. A regex over raw lines cannot tell
     a comment from a string that contains the same characters, so any file
-    could silence the scan by mentioning the marker in a docstring -- this
-    one included.
+    could silence the scan by mentioning the marker in a docstring -- this one
+    included.
 
-    The two sets are kept apart because they license different things. A
-    comment sharing a line with code annotates that code. A comment sitting on
-    its own line annotates what follows it, and only then -- otherwise the
-    last line of one call could exempt the call that starts on the next.
+    The annotation must sit *within* the call it exempts. An earlier version
+    also honoured one on the line above, and a reviewer showed what that
+    costs: a comment written to explain the call it follows silently exempts
+    the *next* call, which is a live unsafe call inheriting an annotation
+    nobody wrote for it. There is no reading of the source that recovers the
+    author's intent there, so the ambiguity is removed rather than guessed at.
     """
-    every: set[int] = set()
-    own: set[int] = set()
+    lines: set[int] = set()
     try:
         tokens = tokenize.generate_tokens(io.StringIO(source).readline)
         for token in tokens:
-            if token.type != tokenize.COMMENT:
-                continue
-            if not _ANNOTATION.search(token.string):
-                continue
-            line = token.start[0]
-            every.add(line)
-            if not token.line[:token.start[1]].strip():
-                own.add(line)
+            if token.type == tokenize.COMMENT and _ANNOTATION.search(
+                    token.string):
+                lines.add(token.start[0])
     except (tokenize.TokenError, IndentationError, SyntaxError):
-        return set(), set()
-    return every, own
+        return set()
+    return lines
+
+
+def _mapping_keys(node: ast.AST, constants: dict[str, set[str] | None]):
+    """The keys a ``**`` expansion contributes, or None when unknowable.
+
+    Only shapes whose keys are conclusive from the syntax count: a dict
+    literal with constant string keys, a ``dict(a=1)`` call, a conditional
+    between two such (both branches, unioned -- a key set by either branch is
+    a key the call may carry), and a module-level name bound to one of those.
+    Anything else -- a parameter, a dict built up by statements, a comprehension
+    -- returns None, and the caller reports it rather than assuming it is
+    empty. Assuming empty is how ``**{"text": True}`` reads as a call that
+    does not decode.
+    """
+    if isinstance(node, ast.Dict):
+        keys = set()
+        for key in node.keys:
+            if key is None:  # ``{**other}`` nested inside
+                return None
+            if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                return None
+            keys.add(key.value)
+        return keys
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+            and node.func.id == "dict":
+        if any(kw.arg is None for kw in node.keywords) or node.args:
+            return None
+        return {kw.arg for kw in node.keywords}
+    if isinstance(node, ast.IfExp):
+        left = _mapping_keys(node.body, constants)
+        right = _mapping_keys(node.orelse, constants)
+        if left is None or right is None:
+            return None
+        return left | right
+    if isinstance(node, ast.Name):
+        return constants.get(node.id) if node.id in constants else None
+    return None
+
+
+def _module_mappings(tree: ast.AST) -> dict[str, set[str] | None]:
+    """Module-level names bound once to a statically readable mapping.
+
+    A name assigned more than once is dropped: two bindings mean the one in
+    force at the call is a question about control flow, not about syntax.
+    """
+    found: dict[str, set[str] | None] = {}
+    seen: set[str] = set()
+    body = getattr(tree, "body", [])
+    for node in body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            # ``NO_WINDOW_KWARGS: dict = {...}`` is the same binding as the
+            # unannotated form, and this repository annotates its module
+            # constants. A resolver that reads only ``ast.Assign`` calls the
+            # annotated ones unreadable and demands an exemption comment on
+            # four provably-safe call sites -- which teaches the next reader
+            # that the comment is paperwork.
+            target, value = node.target, node.value
+        else:
+            continue
+        if not isinstance(target, ast.Name):
+            continue
+        if target.id in seen:
+            found.pop(target.id, None)
+            continue
+        seen.add(target.id)
+        keys = _mapping_keys(value, found)
+        if keys is not None:
+            found[target.id] = keys
+    return found
 
 
 def _subprocess_names(tree: ast.AST) -> tuple[set[str], dict[str, str]]:
     """``(module aliases, {local name: subprocess function})``.
 
-    ``import subprocess as sp`` and ``from subprocess import run`` are the
-    same call wearing different clothes. A scan that only knows the
-    ``subprocess.run`` spelling reports the loud form and permits the quiet
-    one, which is worse than not scanning: it certifies the quiet one.
+    ``import subprocess as sp``, ``from subprocess import run``, ``sp =
+    subprocess`` and ``launch = subprocess.run`` are the same call wearing
+    different clothes. A scan that only knows the ``subprocess.run`` spelling
+    reports the loud form and permits the quiet one, which is worse than not
+    scanning: it certifies the quiet one.
     """
     modules: set[str] = set()
     funcs: dict[str, str] = {}
@@ -172,6 +268,34 @@ def _subprocess_names(tree: ast.AST) -> tuple[set[str], dict[str, str]]:
                 for alias in node.names:
                     if alias.name in SUBPROCESS_FUNCS:
                         funcs[alias.asname or alias.name] = alias.name
+
+    # Rebindings can chain (``sp = subprocess`` then ``go = sp.run``), and the
+    # assignment that creates an alias can be written after the call that uses
+    # it. Iterate to a fixed point rather than assuming source order.
+    assigns = [node for node in ast.walk(tree)
+               if isinstance(node, ast.Assign) and len(node.targets) == 1
+               and isinstance(node.targets[0], ast.Name)]
+    for _ in range(len(assigns) + 1):
+        changed = False
+        for node in assigns:
+            name = node.targets[0].id
+            value = node.value
+            if isinstance(value, ast.Name):
+                if value.id in modules and name not in modules:
+                    modules.add(name)
+                    changed = True
+                elif value.id in funcs and name not in funcs:
+                    funcs[name] = funcs[value.id]
+                    changed = True
+            elif isinstance(value, ast.Attribute) \
+                    and isinstance(value.value, ast.Name) \
+                    and value.value.id in modules \
+                    and value.attr in SUBPROCESS_FUNCS \
+                    and name not in funcs:
+                funcs[name] = value.attr
+                changed = True
+        if not changed:
+            break
     return modules, funcs
 
 
@@ -219,19 +343,55 @@ def undecoded_calls(source: str) -> list[tuple[int, str, str]]:
     ``errors=`` (else ``strict-codec``). At most one finding per call: the
     missing encoding is the finding a reader needs first, and reporting both
     for one call would double-count it in every coverage sum.
+
+    Two shapes are decided before that. :data:`ALWAYS_DECODING` calls carry no
+    decoding keyword yet decode anyway, so their kwargs say nothing; and a
+    ``**`` expansion this scan cannot read leaves the whole question open,
+    which is reported rather than resolved in the call's favour. Naming both
+    ``encoding=`` and ``errors=`` explicitly settles it even under an
+    unreadable ``**``: a mapping that repeats either one raises
+    ``TypeError`` at the call rather than quietly overriding it, so the
+    written spelling is the one that runs or nothing runs at all.
     """
     tree = ast.parse(source)
-    annotated, own_line = _annotated_lines(source)
+    annotated = _annotated_lines(source)
+    constants = _module_mappings(tree)
     found = []
     for call, name in _spawn_calls(tree):
-        if all(_is_off(_keyword(call, kw)) for kw in DECODING_KWARGS):
-            continue  # bytes in, bytes out: nothing to decode, nothing to get wrong
         span = set(range(call.lineno, (call.end_lineno or call.lineno) + 1))
-        if (annotated & span) or (call.lineno - 1) in own_line:
+        if annotated & span:
             continue
-        if _is_off(_keyword(call, "encoding")):
+
+        if name in ALWAYS_DECODING:
+            found.append((call.lineno, "unsafe-by-construction", name))
+            continue
+
+        encoding_named = not _is_off(_keyword(call, "encoding"))
+        errors_named = not _is_off(_keyword(call, "errors"))
+        if encoding_named and errors_named:
+            continue
+
+        star_keys: set[str] = set()
+        unreadable = False
+        for kw in call.keywords:
+            if kw.arg is not None:
+                continue
+            keys = _mapping_keys(kw.value, constants)
+            if keys is None:
+                unreadable = True
+            else:
+                star_keys |= keys
+        if unreadable:
+            found.append((call.lineno, "unknown-decode-policy", name))
+            continue
+
+        explicit = any(not _is_off(_keyword(call, kw)) for kw in DECODING_KWARGS)
+        if not explicit and not (star_keys & DECODING_KWARGS):
+            continue  # bytes in, bytes out: nothing to decode, nothing to get wrong
+
+        if not encoding_named and "encoding" not in star_keys:
             found.append((call.lineno, "locale-decoded", name))
-        elif _is_off(_keyword(call, "errors")):
+        elif not errors_named and "errors" not in star_keys:
             found.append((call.lineno, "strict-codec", name))
     return sorted(found)
 
@@ -336,6 +496,52 @@ subprocess.run(["ls"], capture_output=True, text=True, encoding="utf-8")
 import subprocess
 subprocess.run(["ls"], capture_output=True, encoding="utf-8", errors=None)
 """),
+    "getstatusoutput cannot name a codec on the floor": (
+        "unsafe-by-construction", """
+import subprocess
+subprocess.getstatusoutput("git status")
+"""),
+    "getoutput is unsafe even where a codec is accepted": (
+        "unsafe-by-construction", """
+import subprocess
+subprocess.getoutput("git status", encoding="utf-8", errors="replace")
+"""),
+    "a dict literal expansion turning on text mode": ("locale-decoded", """
+import subprocess
+subprocess.run(["ls"], capture_output=True, **{"text": True})
+"""),
+    "a module-level mapping turning on text mode": ("locale-decoded", """
+import subprocess
+OPTS = {"universal_newlines": True}
+subprocess.run(["ls"], capture_output=True, **OPTS)
+"""),
+    "a mapping this scan cannot read": ("unknown-decode-policy", """
+import subprocess
+def go(**kwargs):
+    return subprocess.run(["ls"], capture_output=True, **kwargs)
+"""),
+    "a mapping rebound twice is not one mapping": (
+        "unknown-decode-policy", """
+import subprocess
+OPTS = {"text": True}
+OPTS = {"encoding": "utf-8", "errors": "replace"}
+subprocess.run(["ls"], capture_output=True, **OPTS)
+"""),
+    "the module rebound to a local name": ("locale-decoded", """
+import subprocess
+sp = subprocess
+sp.run(["ls"], capture_output=True, text=True)
+"""),
+    "the function rebound to a local name": ("locale-decoded", """
+import subprocess
+launch = subprocess.run
+launch(["ls"], capture_output=True, text=True)
+"""),
+    "a from-imported function rebound again": ("locale-decoded", """
+from subprocess import run
+go = run
+go(["ls"], capture_output=True, text=True)
+"""),
 }
 
 #: Spellings that are correct and must not be reported.
@@ -372,8 +578,7 @@ runner.run(["ls"], capture_output=True, text=True)
 """,
     "annotated with a reason": """
 import subprocess
-# decode-ok: the callee is a fixture that only ever emits ASCII
-subprocess.run(["ls"], capture_output=True, text=True)
+subprocess.run(["ls"], capture_output=True, text=True)  # decode-ok: ASCII only
 """,
     "annotation on the closing line of a multi-line call": """
 import subprocess
@@ -382,6 +587,31 @@ subprocess.run(
     capture_output=True,
     text=True,  # decode-ok: ASCII-only by construction
 )
+""",
+    "a readable mapping that carries no decoding key": """
+import subprocess
+IS_WINDOWS = True
+NO_WINDOW_KWARGS = {"creationflags": 0x08000000} if IS_WINDOWS else {}
+subprocess.Popen(["ls"], stdout=subprocess.DEVNULL, **NO_WINDOW_KWARGS)
+""",
+    "a readable mapping that names both": """
+import subprocess
+OPTS = dict(encoding="utf-8", errors="replace")
+subprocess.run(["ls"], capture_output=True, **OPTS)
+""",
+    "a readable mapping declared with a type annotation": """
+import subprocess
+IS_WINDOWS = True
+NO_WINDOW_KWARGS: dict = (
+    {"creationflags": 0x08000000} if IS_WINDOWS else {}
+)
+subprocess.run(["ls"], capture_output=True, **NO_WINDOW_KWARGS)
+""",
+    "an unreadable mapping cannot override an explicit codec": """
+import subprocess
+def go(**kwargs):
+    return subprocess.run(["ls"], capture_output=True,
+                          encoding="utf-8", errors="replace", **kwargs)
 """,
 }
 
@@ -429,21 +659,31 @@ subprocess.run(["ls"], capture_output=True, text=True)
 
 
 def test_the_annotation_must_carry_a_reason():
-    """Exercised on synthetic source: the tree holds no annotations today, so
-    a loop over the real ones is green whatever it asserts."""
+    """Exercised on synthetic source: the tree's three annotations are all
+    correct, so a loop over them proves nothing whatever it asserts.
+
+    The well-formed spelling is asserted here too, next to the malformed ones.
+    Without it these two assertions also pass when the scan reports *every*
+    call -- including the annotated ones -- which is the state a broken
+    annotation reader leaves behind.
+    """
     bare = """
 import subprocess
-# decode-ok
-subprocess.run(["ls"], capture_output=True, text=True)
+subprocess.run(["ls"], capture_output=True, text=True)  # decode-ok
 """
     colon_but_empty = """
 import subprocess
-# decode-ok:
-subprocess.run(["ls"], capture_output=True, text=True)
+subprocess.run(["ls"], capture_output=True, text=True)  # decode-ok:
+"""
+    well_formed = """
+import subprocess
+subprocess.run(["ls"], capture_output=True, text=True)  # decode-ok: a reason
 """
     assert undecoded_calls(bare), "a reasonless annotation silenced the scan"
     assert undecoded_calls(colon_but_empty), \
         "an empty reason silenced the scan"
+    assert not undecoded_calls(well_formed), \
+        "no annotation is honoured at all; the assertions above pass vacuously"
 
 
 def test_a_string_containing_the_marker_does_not_silence_the_scan():
@@ -475,10 +715,31 @@ def test_a_string_containing_the_marker_does_not_silence_the_scan():
 def test_an_annotation_silences_only_the_call_it_sits_on():
     source = """
 import subprocess
-# decode-ok: this one is fine
-subprocess.run(["ls"], capture_output=True, text=True)
+subprocess.run(["ls"], capture_output=True, text=True)  # decode-ok: fine
 subprocess.run(["pwd"], capture_output=True, text=True)
 """
     found = undecoded_calls(source)
     assert len(found) == 1, found
-    assert found[0][0] == 5, found
+    assert found[0][0] == 4, found
+
+
+def test_an_annotation_does_not_leak_onto_the_call_below_it():
+    """A comment written about the call above must not exempt the next one.
+
+    Found by a reviewer against the version that also honoured an annotation
+    on the line preceding a call. Read as prose this file is unambiguous --
+    the comment explains the call it follows, which is correct and would not
+    have been reported anyway -- and the cost of the "line above" allowance is
+    that the *next* call, a live unsafe one, inherits an exemption nobody
+    wrote for it. No reading of the source recovers which call the author
+    meant, so the allowance is gone rather than guessed at.
+    """
+    source = """
+import subprocess
+subprocess.run(["ls"], capture_output=True,
+               encoding="utf-8", errors="replace")
+# decode-ok: the call above talks to a fixture that only emits ASCII
+subprocess.run(["pwd"], capture_output=True, text=True)
+"""
+    found = undecoded_calls(source)
+    assert [line for line, _, _ in found] == [6], found

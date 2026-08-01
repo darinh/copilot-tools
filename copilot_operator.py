@@ -3400,7 +3400,7 @@ def _spawn_background_loop(instance: Instance, copilot_args: list[str],
         )
     else:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(cmd, **kwargs)
+    proc = subprocess.Popen(cmd, **kwargs)  # decode-ok: every stream is DEVNULL
     return proc.pid
 
 
