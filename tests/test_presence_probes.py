@@ -471,12 +471,178 @@ def test_managed_instances_survives_an_unreadable_state_directory(monkeypatch):
 
 
 # ── catalog and launch spec ─────────────────────────────────────
-def test_handoff_lookup_survives_an_unexaminable_catalog(tmp_path, monkeypatch):
+def test_a_catalog_it_cannot_stat_still_resolves_a_registered_project(
+        tmp_path, monkeypatch):
+    """A denied ``stat`` is not a denied ``read``.
+
+    The lookup gated its ``open`` on ``file_present(catalog)``, so a catalog
+    sitting behind an unsearchable parent made a registered project look
+    unregistered -- while ``open`` would have handed the bytes over. Measured:
+    ``file_present`` returns None on the same catalog whose 61 bytes ``open``
+    reads out. A clause that can only ever subtract a lookup that would have
+    succeeded is not a guard. The sibling reader of this very file,
+    ``handoff_tool.resolve_guid``, already spends the probe on ``is False``
+    and only False, with a comment saying why; this is the twin that did not.
+
+    The test that used to stand here denied the same catalog but looked up a
+    project that was never in it, so ``None`` came back whether the denial
+    fired or not. It proved the call did not raise -- a true thing about the
+    call, spent as though it established the answer.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
     catalog = tmp_path / "catalog.csv"
-    catalog.write_text('"/somewhere",abc\n', encoding="utf-8")
+    catalog.write_text(f'"{project}",guid-eacces\n', encoding="utf-8")
     monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
-    with denied(monkeypatch, catalog):
-        assert op.project_handoff_file(tmp_path) is None
+
+    expected = op.project_handoff_file(project)
+    assert expected is not None, \
+        "the row does not resolve even when readable; the test proves nothing"
+
+    with denied(monkeypatch, catalog) as seen:
+        found = op.project_handoff_file(project)
+
+    assert seen["n"], "the denial never fired; the test proves nothing"
+    assert found == expected, (
+        f"a registered project came back as {found!r} because the catalog's "
+        f"stat was denied, though the read would have succeeded")
+
+
+def test_a_catalog_that_will_not_open_is_not_an_unregistered_project(
+        tmp_path, monkeypatch):
+    """The two answers must not share a return value.
+
+    ``restart_loop`` spends ``None`` as "this project is not registered, so no
+    handoff file is expected here" -- a claim about what the catalog contains.
+    A read that failed has not established it.
+
+    The sharp part is downstream: the loop *already* refuses to call an
+    unexaminable handoff file crash recovery. Laundering the catalog failure
+    into ``None`` one layer up meant that deliberate handling was never
+    reached, because the value arrived indistinguishable from a real answer.
+
+    Asserted as "not None" rather than against the sentinel by name, so this
+    file stays runnable unmodified against revisions that predate it -- the
+    control it is also used as.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_text(f'"{project}",guid-unopenable\n', encoding="utf-8")
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+
+    import builtins
+    real_open = builtins.open
+    seen = {"n": 0}
+
+    def open_denied(path, *args, **kwargs):
+        if str(path) == str(catalog):
+            seen["n"] += 1
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *args, **kwargs)
+
+    builtins.open = open_denied
+    try:
+        found = op.project_handoff_file(project)
+    finally:
+        builtins.open = real_open
+
+    assert builtins.open is real_open, "the real open was not restored"
+    assert seen["n"], "the open was never attempted; the test proves nothing"
+    assert found is not None, (
+        "a catalog that could not be opened was reported as 'no entry for "
+        "this project', which is a claim about its contents")
+
+
+def test_a_row_that_cannot_be_compared_is_not_a_missing_entry(
+        tmp_path, monkeypatch):
+    """"No row matched" is only an answer if every row was compared.
+
+    A row whose path will not resolve is skipped, which is right. Returning
+    ``None`` afterwards is not: the verdict rests on rows that were never
+    examined.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_text('"C:\\\\elsewhere\\\\other",guid-other\n', encoding="utf-8")
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+
+    assert op.project_handoff_file(project) is None, \
+        "a readable catalog with a comparable non-matching row must say None"
+
+    real_resolve = Path.resolve
+    seen = {"n": 0}
+
+    def resolve_denied(self, *args, **kwargs):
+        if "elsewhere" in str(self):
+            seen["n"] += 1
+            raise PermissionError(13, "Permission denied")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_denied)
+    found = op.project_handoff_file(project)
+    monkeypatch.setattr(Path, "resolve", real_resolve)
+
+    assert seen["n"], "the resolve never failed; the test proves nothing"
+    assert found is not None, (
+        "a catalog whose only row could not be compared was reported as "
+        "'not registered'")
+
+
+def test_the_loop_does_not_call_an_unreadable_catalog_unregistered(
+        tmp_path, monkeypatch, capsys):
+    """The claim that actually reaches the agent.
+
+    Everything above is about a return value; this is about what the operator
+    tells the session. "Project is not registered in the catalog" is a
+    confident statement, and a catalog that would not open cannot support it.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_text(f'"{project}",guid-loop\n', encoding="utf-8")
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+    monkeypatch.chdir(project)
+
+    seen_preambles = []
+
+    def capture(instance, args, session_num, remain_on_exit=False, preamble=""):
+        seen_preambles.append(preamble)
+        instance.exit_file.write_text("0", encoding="utf-8")
+        instance.stop_marker.touch()
+
+    monkeypatch.setattr(op, "start_session", capture)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+
+    inst = op.Instance("denied-catalog")
+    inst.save_state(1, "2026-07-27T10:00:00Z",
+                    "3f2a9c1e-1111-2222-3333-444455556666")
+
+    import builtins
+    real_open = builtins.open
+    seen = {"n": 0}
+
+    def open_denied(path, *args, **kwargs):
+        if str(path) == str(catalog):
+            seen["n"] += 1
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *args, **kwargs)
+
+    builtins.open = open_denied
+    try:
+        op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+    finally:
+        builtins.open = real_open
+
+    assert builtins.open is real_open, "the real open was not restored"
+    assert seen["n"], "the catalog was never opened; the test proves nothing"
+    err = capsys.readouterr().err
+    assert "not registered in the catalog" not in err, (
+        f"the loop told the session this project is unregistered on the "
+        f"strength of a catalog it could not read: {err!r}")
+    assert "crash" not in seen_preambles[0].lower(), \
+        "an unreadable catalog was reported to the agent as crash recovery"
 
 
 def test_reload_refuses_to_rewrite_a_spec_it_could_not_read(tmp_path, monkeypatch):
