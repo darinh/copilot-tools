@@ -163,6 +163,11 @@ def _rooted_at_file(node: ast.expr) -> bool:
     and then leave it, so the thing being resolved is whatever the argument
     said. Exempting those would have made the exemption a two-token bypass of
     the whole scan.
+    A pathlib constructor is walked through its first argument, and **only
+    when that is its only argument**. ``Path(__file__, user)`` joins a
+    component onto the module's location, so what gets resolved is again not
+    the module's location; exempting it would be the same hole as the one
+    above wearing a comma.
     """
     for _ in range(_CHAIN_LIMIT):
         if isinstance(node, ast.Name):
@@ -175,7 +180,8 @@ def _rooted_at_file(node: ast.expr) -> bool:
             if isinstance(func, ast.Attribute) and not node.args:
                 node = func.value
                 continue
-            if _is_pathlib_class(func) and node.args:
+            if (_is_pathlib_class(func) and len(node.args) == 1
+                    and not node.keywords):
                 node = node.args[0]
                 continue
         return False
@@ -211,8 +217,18 @@ def _resolve_call(func: ast.expr, call: ast.Call) -> ast.expr | None:
     if isinstance(func, ast.Attribute) and func.attr == "resolve":
         if not call.args:
             return func.value
-        if len(call.args) == 1 and _is_pathlib_class(func.value):
+        # `Path.resolve(p)` and `Path.resolve(p, True)`: the unbound form,
+        # whose first positional argument is the receiver.
+        if _is_pathlib_class(func.value):
             return call.args[0]
+        # `p.resolve(True)`: the bound form with `strict` passed positionally.
+        # Keying on "no arguments" missed it, and `strict=True` -- the same
+        # call, spelled with a keyword -- was already caught, so the rule was
+        # enforced against a spelling rather than against the call. The cost
+        # of the wider net is a method named `resolve` on something that is
+        # not a path; nothing in this repository has one, and the annotation
+        # is there for the day something does.
+        return func.value
     return None
 
 
@@ -229,11 +245,19 @@ class _ResolveFinder(ast.NodeVisitor):
     sibling scan's ``_header_span`` so that a reason written about an ``if``
     cannot silently license a call several lines inside it.
 
-    A ``def`` or ``lambda`` nested in a guarded body clears the stack for its
-    own body, because a function body does not run inside the ``try`` that
-    lexically encloses it -- it runs wherever it is called, which is
-    somewhere this scan cannot see. A comprehension deliberately does not
-    clear it: that one really does execute inline.
+    A ``def``, ``lambda`` or generator expression nested in a guarded body
+    clears the stack for its *deferred* part only, because that part does not
+    run inside the ``try`` that lexically encloses it -- it runs wherever it
+    is called or iterated, which is somewhere this scan cannot see. What is
+    deferred is narrower than the node: a function's decorators, annotations
+    and argument defaults all run at ``def`` time and are genuinely guarded,
+    and a generator expression's outermost iterable is evaluated eagerly.
+    Clearing the stack for the whole node would flag correct code, and a scan
+    that flags correct code teaches people to silence it.
+
+    ``ListComp``, ``SetComp`` and ``DictComp`` deliberately do not clear it.
+    They look like a generator expression and they are not: they run to
+    completion where they are written.
     """
 
     def __init__(self) -> None:
@@ -260,22 +284,51 @@ class _ResolveFinder(ast.NodeVisitor):
     # `try/except*` is a different node with the same shape.
     visit_TryStar = visit_Try
 
-    def _visit_deferred(self, node: ast.AST) -> None:
+    def _deferred(self, nodes) -> None:
+        """Visit ``nodes`` as though no enclosing ``try`` were in effect."""
         outer = self.stack
         self.stack = []
-        super().generic_visit(node)
+        for child in nodes:
+            self.visit(child)
         self.stack = outer
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
-        self._visit_deferred(node)
+        # Argument defaults are evaluated where the lambda is written.
+        self.visit(node.args)
+        self._deferred([node.body])
 
     def visit_FunctionDef(self, node) -> None:
         outer = self.span
         self.span = _header_span(node)
-        self._visit_deferred(node)
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        # `ast.arguments` carries the defaults and the annotations, all of
+        # which are evaluated at def time and are therefore guarded.
+        self.visit(node.args)
+        if node.returns is not None:
+            self.visit(node.returns)
+        self._deferred(node.body)
         self.span = outer
 
     visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        """A genexp is a lambda that looks like a comprehension.
+
+        Its body runs when something iterates it, which may be after the
+        ``try`` it was written in has exited -- so ``(p.resolve() for p in
+        ps)`` inside a guarded body is not guarded. The one part that *is* is
+        the outermost iterable, which the expression evaluates eagerly.
+        """
+        deferred = [node.elt]
+        for index, comp in enumerate(node.generators):
+            if index == 0:
+                self.visit(comp.iter)
+            else:
+                deferred.append(comp.iter)
+            deferred.append(comp.target)
+            deferred.extend(comp.ifs)
+        self._deferred(deferred)
 
     def generic_visit(self, node: ast.AST) -> None:
         if isinstance(node, ast.stmt) and not isinstance(node, ast.Try):
@@ -458,6 +511,18 @@ FIRES = {
     "reached through getattr": (
         _IMPORT + "q = Path('x')\np = getattr(q, 'resolve')()\n"
     ),
+    "strict passed positionally, bound": (
+        _IMPORT + "q = Path('x')\np = q.resolve(True)\n"
+    ),
+    "strict passed positionally, unbound": (
+        _IMPORT + "q = Path('x')\np = Path.resolve(q, True)\n"
+    ),
+    "strict passed by keyword": (
+        _IMPORT + "q = Path('x')\np = q.resolve(strict=True)\n"
+    ),
+    "a component joined on in the constructor": (
+        _IMPORT + "p = Path(__file__, user).resolve()\n"
+    ),
     "in the handler, not the body": (
         _IMPORT
         + "try:\n    pass\nexcept (OSError, RuntimeError, ValueError):\n"
@@ -486,6 +551,16 @@ FIRES = {
         _IMPORT
         + "try:\n    def later(p):\n        return Path(p).resolve()\n"
         + "except (OSError, RuntimeError, ValueError):\n    later = None\n"
+    ),
+    "a generator expression body is iterated later": (
+        _IMPORT
+        + "try:\n    g = (Path(p).resolve() for p in ps)\n"
+        + "except (OSError, RuntimeError, ValueError):\n    g = iter([])\n"
+    ),
+    "a generator expression's inner iterable is deferred too": (
+        _IMPORT
+        + "try:\n    g = (q for p in ps for q in Path(p).resolve().parts)\n"
+        + "except (OSError, RuntimeError, ValueError):\n    g = iter([])\n"
     ),
     "an annotation two lines up does not reach": (
         _IMPORT
@@ -533,6 +608,32 @@ PASSES = {
         _IMPORT
         + "def later(p):\n    try:\n        return Path(p).resolve()\n"
         + "    except (OSError, RuntimeError, ValueError):\n        return None\n"
+    ),
+    "a nested def's argument default runs at def time": (
+        _IMPORT
+        + "try:\n    def later(p=Path(x).resolve()):\n        return p\n"
+        + "except (OSError, RuntimeError, ValueError):\n    later = None\n"
+    ),
+    "a nested def's keyword-only default runs at def time": (
+        _IMPORT
+        + "try:\n    def later(*, p=Path(x).resolve()):\n        return p\n"
+        + "except (OSError, RuntimeError, ValueError):\n    later = None\n"
+    ),
+    "a nested def's decorator runs at def time": (
+        _IMPORT
+        + "try:\n    @register(Path(x).resolve())\n"
+        + "    def later(p):\n        return p\n"
+        + "except (OSError, RuntimeError, ValueError):\n    later = None\n"
+    ),
+    "a lambda's argument default runs where it is written": (
+        _IMPORT
+        + "try:\n    f = lambda p=Path(x).resolve(): p\n"
+        + "except (OSError, RuntimeError, ValueError):\n    f = None\n"
+    ),
+    "a generator expression's outermost iterable is eager": (
+        _IMPORT
+        + "try:\n    g = (p for p in Path(x).resolve().parts)\n"
+        + "except (OSError, RuntimeError, ValueError):\n    g = iter([])\n"
     ),
     "annotated with a reason": (
         _IMPORT

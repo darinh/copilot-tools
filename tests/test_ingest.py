@@ -337,12 +337,23 @@ def test_a_real_log_behind_an_unresolvable_path_is_still_ingested(
     Refusing here would trade a traceback for silently dropped usage data,
     which is the more expensive half: ``resolve`` is being used to name the
     file, and an absolute path that does not follow links names the same one.
+
+    The simulated failure is an ``OSError`` and the choice is not arbitrary.
+    The other two failure modes cannot reach this branch on a *readable*
+    file: a genuine symlink loop makes the open fail with ``ELOOP`` as well,
+    and a path with an embedded NUL cannot name a file that exists. Only the
+    denial family can plausibly fail canonicalisation while leaving the file
+    readable -- ``resolve`` calls ``os.path.realpath``, which on Windows asks
+    the filesystem for the final path and can be refused on a share that
+    still serves reads. Writing the loop here instead would have made the
+    test assert something the OS would never hand it, which is a test that
+    passes for the wrong reason.
     """
     logs = tmp_path / "logs"
     logs.mkdir()
     log = logs / "process-1700000000000-1.log"
     make_log(log)
-    _resolve_raises(monkeypatch, log, RuntimeError("Symlink loop"))
+    _resolve_raises(monkeypatch, log, OSError("cannot canonicalise"))
     result = operator_ingest.ingest_file(log, db_path)
     assert result.startswith("OK "), result
     with operator_ingest.connect(db_path) as conn:
