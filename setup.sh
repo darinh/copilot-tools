@@ -88,6 +88,41 @@ fi
 info "Using $PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
 echo ""
 
+# ── Query-only modes: report, never migrate ─────────────────────
+# --status, --check-only and --help ask setup_tools.py a question; they
+# install nothing. Everything below this point is an install: it moves the
+# user's ~/.local/bin/{operator,handoff} aside and only puts them back on
+# evidence that an install happened. Running that machinery for a question
+# is not merely noisy, it is destructive -- a --status on a machine whose
+# report exits non-zero was relabelled "Python setup failed" and rolled
+# back, and a --status on a machine that already had `operator` elsewhere on
+# PATH DELETED ~/.local/bin/operator outright while reporting a successful
+# migration.
+#
+# So the question is answered without touching anything, and setup_tools.py's
+# exit code is forwarded verbatim: --status returns 1 for a machine that is
+# merely out of date or has inert extensions, and that is a report, not a
+# failure of setup -- which could not fix it in any case, since this toolkit
+# never writes the CLI settings file that governs it.
+QUERY_ONLY=0
+# `$#` is checked first because bash 3.2 -- still the system bash on macOS --
+# treats "$@" as unset under `set -u` when there are no positional parameters.
+if (( $# > 0 )); then
+    for arg in "$@"; do
+        case "$arg" in
+            --status|--check-only|--help|-h) QUERY_ONLY=1 ;;
+        esac
+    done
+fi
+
+if (( QUERY_ONLY )); then
+    set +e
+    "$PYTHON_BIN" "${SCRIPT_DIR}/setup_tools.py" "$@"
+    status=$?
+    set -e
+    exit "$status"
+fi
+
 canon() { "$PYTHON_BIN" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || true; }
 
 # ── Step 2: Set aside anything currently at ~/.local/bin/{operator,handoff} ──
@@ -209,9 +244,29 @@ for name in operator handoff; do
     command -v "$name" &>/dev/null || { err "'${name}' does not resolve on PATH after setup."; (( missing++ )) || true; }
 done
 
+# `command -v` answers "does SOME `operator` resolve on PATH?", which is a
+# narrower question than the one the finalization below turns on: "did this
+# install put one where the original was set aside?". A user who already has
+# an `operator` further along PATH answers the first question yes while
+# ~/.local/bin/operator does not exist at all -- and the legacy branch of the
+# finalization deletes the backup on that answer, destroying the only
+# remaining copy while reporting a successful migration.
+#
+# So the stashed paths are checked directly. -e alone is not enough: a
+# symlink whose target is gone is not -e, and it is still something that has
+# to be treated as installed rather than silently overwritten.
+for name in operator handoff; do
+    if [[ "$name" == "operator" ]]; then backup="$OPERATOR_BACKUP"; else backup="$HANDOFF_BACKUP"; fi
+    [[ -n "$backup" ]] || continue
+    if [[ ! -e "${LOCAL_BIN}/${name}" && ! -L "${LOCAL_BIN}/${name}" ]]; then
+        err "'${name}' was set aside but setup installed nothing at ${LOCAL_BIN}/${name}."
+        (( missing++ )) || true
+    fi
+done
+
 if (( missing > 0 )); then
-    restore_legacy_links "new install isn't resolvable on PATH yet"
-    err "Fix PATH (see warnings above from setup_tools.py) and re-run ./setup.sh."
+    restore_legacy_links "the new install isn't in place yet"
+    err "Fix the problem reported above, then re-run ./setup.sh."
     exit 1
 fi
 

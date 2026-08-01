@@ -114,11 +114,29 @@ Write-Info "Using '$PythonExe $($PythonArgs -join ' ')' ($versionString)"
 Write-Host ""
 
 # ── Hand off to the cross-platform Python installer ─────────────
-Write-Host "Running Python setup (package, extensions, templates)..."
+# --status, --check-only and --help ask setup_tools.py a question rather than
+# asking it to install anything, and a non-zero answer to a question is a
+# report, not a failure. --status returns 1 for a machine that is out of date
+# or whose extensions are inert; calling that "Python setup failed" is wrong
+# in both directions -- nothing failed, and setup could not fix it in any
+# case, since this toolkit never writes the CLI settings file that governs
+# extension loading. So the code is forwarded verbatim and unlabelled.
+$queryOnly = @($SetupArgs) -contains '--status' -or
+             @($SetupArgs) -contains '--check-only' -or
+             @($SetupArgs) -contains '--help' -or
+             @($SetupArgs) -contains '-h'
+
+if (-not $queryOnly) {
+    Write-Host "Running Python setup (package, extensions, templates)..."
+}
 $setupToolsPath = Join-Path $ScriptDir 'setup_tools.py'
 & $PythonExe @PythonArgs $setupToolsPath @SetupArgs
 $status = $LASTEXITCODE
 Write-Host ""
+
+if ($queryOnly) {
+    exit $status
+}
 
 if ($status -ne 0) {
     Write-ErrMsg "Python setup failed (exit $status)."
