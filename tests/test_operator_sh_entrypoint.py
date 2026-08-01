@@ -69,14 +69,22 @@ TMUX_STUB = "#!/bin/bash\nexit 0\n"
 # `C:/...` path contains the colon that PATH uses as its separator and silently
 # fails to take effect -- which looks exactly like a shim that was never
 # consulted, i.e. like the bug being absent.
+#
+# `$BASH` is the interpreter running this driver, which is `_bash_executable()`
+# -- the one deliberately chosen to be Apple's 3.2 on macOS. A bare `bash -x`
+# here would be a PATH lookup, reintroducing in this file the exact accidental
+# -interpreter problem that `_bash_executable` exists to abolish: on a runner
+# with Homebrew bash ahead of /bin these tests would quietly assert nothing
+# about the interpreter operator.sh actually runs under.
 DRIVER = """#!/bin/bash
 here="$(cd "$(dirname "$0")" && pwd)"
 echo "HERE=$here"
+echo "INTERPRETER=$BASH"
 export PATH="$here/bin:$PATH"
 export HOME="$here/home"
 export COPILOT_OPERATOR_HOME="$here/home/.operator"
 cd "$here/elsewhere" || exit 9
-bash -x "$here/$1" list >"$here/stdout.txt" 2>"$here/trace.txt"
+"$BASH" -x "$here/$1" list >"$here/stdout.txt" 2>"$here/trace.txt"
 echo "EXIT=$?"
 """
 
@@ -184,6 +192,33 @@ def test_entrypoint_agrees_with_itself_under_a_real_readlink(tmp_path):
 
 
 @bash
+def test_the_harness_runs_operator_sh_under_the_chosen_interpreter(tmp_path):
+    """The driver must not do a PATH lookup for bash.
+
+    This file is about a macOS-only defect, so it is worth nothing if the
+    script under test is executed by whatever bash happens to be first on
+    PATH. `_bash_executable()` exists precisely to stop that -- see
+    `tests/test_operator_sh_bash32.py` -- and a bare `bash -x` inside the
+    driver would have thrown the guarantee away one layer down, where nothing
+    was looking. Asserted rather than commented because it is invisible in the
+    result: the tests pass either way.
+    """
+    _checkout(tmp_path, bsd_readlink=True)
+    proc, _, _ = _run_entrypoint(tmp_path, "checkout/operator.sh")
+
+    match = re.search(r"^INTERPRETER=(.*)$", proc.stdout, re.MULTILINE)
+    assert match, proc.stdout
+    reported = match.group(1).strip()
+    chosen = _bash_executable()
+    # Compared by basename and existence rather than string equality: bash
+    # reports $BASH in its own spelling, which on Windows is a POSIX path for
+    # an interpreter Python names with drive letters and backslashes.
+    assert reported, proc.stdout
+    assert os.path.basename(reported).startswith("bash"), reported
+    assert os.path.basename(chosen).startswith("bash"), chosen
+
+
+@bash
 def test_entrypoint_still_follows_a_symlink_to_the_real_checkout(tmp_path):
     """`readlink -f` was there for a reason; dropping it must not cost that.
 
@@ -216,6 +251,10 @@ def test_entrypoint_still_follows_a_symlink_to_the_real_checkout(tmp_path):
 
 
 GNU_READLINK = re.compile(r"\breadlink\s+(-\w*\s+)*-\w*f")
+# The exemption is anchored to the OPERAND, not to the line. Testing the whole
+# line for "/proc/" excused `readlink -f "$HOME/thing"  # see /proc/ for why`,
+# so any real use could hide behind a passing mention in a trailing comment.
+PROC_READLINK = re.compile(r"""\breadlink\s+(-\w*\s+)*-\w*f\s+["']?/proc/""")
 
 
 def _gnu_readlink_lines(text: str) -> list[str]:
@@ -226,12 +265,12 @@ def _gnu_readlink_lines(text: str) -> list[str]:
     and the one in `setup.sh` that documented the hazard years before anyone
     acted on it. A detector that fires on its own documentation gets deleted.
 
-    Lines naming `/proc/` are exempt. `diagnose-restart-deleter.sh` resolves
-    `/proc/$pid/exe`, which is a Linux kernel interface that does not exist on
-    macOS in any form: the whole line is unreachable there, so GNU readlink is
-    not an assumption it is making. Narrow and stated beats a file-level
-    exemption, which would also excuse a future line in that script that had
-    nothing to do with /proc.
+    Calls whose operand is a `/proc/` path are exempt.
+    `diagnose-restart-deleter.sh` resolves `/proc/$pid/exe`, a Linux kernel
+    interface that does not exist on macOS in any form: the line is
+    unreachable there, so GNU readlink is not an assumption it is making.
+    Narrow and stated beats a file-level exemption, which would also excuse a
+    future line in that script that had nothing to do with /proc.
     """
     out = []
     for line in text.splitlines():
@@ -240,7 +279,7 @@ def _gnu_readlink_lines(text: str) -> list[str]:
             continue
         if not GNU_READLINK.search(stripped):
             continue
-        if "/proc/" in stripped:
+        if PROC_READLINK.search(stripped):
             continue
         out.append(stripped)
     return out
@@ -304,6 +343,12 @@ def test_the_readlink_detector_can_actually_fire():
     # line that is not about /proc, which is what keeps the exemption narrow.
     assert not _gnu_readlink_lines('exe=$(readlink -f "/proc/$pid/exe")')
     assert _gnu_readlink_lines('exe=$(readlink -f "$HOME/thing")')
+
+    # The exemption is anchored to the operand. Anchoring it to the line let a
+    # real call hide behind a trailing comment that merely mentioned /proc,
+    # which is a detector with a documented bypass rather than a detector.
+    assert _gnu_readlink_lines('x=$(readlink -f "$HOME/t")  # see /proc/ for why')
+    assert _gnu_readlink_lines('x=$(readlink -f "$dir/proc/thing")')
 
 
 @bash
