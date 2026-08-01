@@ -42,7 +42,7 @@ and non-ASCII characters (FR-007).
 
 | Mode | Injected |
 |---|---|
-| Single session | `--autopilot --effort high --experimental`, plus `--yolo` when `--headless` |
+| Single session | `--autopilot --effort high --experimental`, plus `--yolo --no-ask-user` when `--headless` (`--detached`) |
 | Loop mode | `--yolo --autopilot --no-ask-user --effort high --experimental`, plus `--agent <name>` when absent, plus the autonomous preamble via `-i` |
 | Both | `--log-level debug`, unless the user set `--log-level` or `COPILOT_OPERATOR_NO_DEBUG_LOG=1`. Required because Copilot only writes usage data at debug level. |
 
@@ -55,22 +55,34 @@ cannot tell a flag from a value: `-p --no-experimental` is a prompt, not a rulin
 In loop mode with saved state, `--resume=<session-id>` is appended **exactly once**, and is suppressed
 when the user already specified a session argument (FR-012).
 
-`--yolo` is granted only where nobody can be asked. It waives every approval prompt for the life of
-the session, so the question is whether a human is watching, and both implementations must answer it
-the same way. **Loop mode**: granted — unattended, so a prompt would hang forever. **Attached single
-session**: not granted — the invoking terminal is attached and the human who typed the command is
-sitting at it. **Headless single session**: granted, because nothing attaches; `operator join` is an
-invitation the user may never accept, and a blocked session is indistinguishable from a working one
-(live process, live pane, no error). `operator.sh` has no headless mode, so that branch exists only
-in `copilot_operator.py`.
+`--yolo` is granted only where nobody can be asked, and it never travels alone: it is always paired
+with `--no-ask-user`, because the two close different mouths. `--yolo` waives the approvals the CLI
+raises before acting; `--no-ask-user` stops the agent asking a question of its own accord. Granting
+only the first still leaves an unattended session able to hang forever on `ask_user`.
+
+The question in every mode is whether a human is watching, and both implementations must answer it
+the same way. **Loop mode**: granted — unattended, so a question would hang forever. **Attached
+single session**: not granted — the invoking terminal is attached and the human who typed the command
+is sitting at it. **Headless single session** (`--headless`, or its synonym `--detached`): granted,
+because nothing attaches; `operator join` is an invitation the user may never accept, and a blocked
+session is indistinguishable from a working one (live process, live pane, no error).
+
+`operator.sh` has no headless mode, so that branch exists only in `copilot_operator.py`. Note what
+that does and does not mean. The shell's single session attaches best-effort (`tmux attach ... ||
+true`), so where there is no TTY — a wrapper, CI, a nested tmux — the attach fails and the session
+keeps running unattended. That is the environment removing the terminal, not a mode anyone asked
+for, and `copilot_operator.py` does the identical thing on the identical path; neither grants
+`--yolo` there, so the two still agree. What would be a genuine divergence is the shell gaining a
+*deliberate* unattended launch, which is why the test suite asserts, by running the real shell
+function, both that it always reaches its attach and that only loop mode grants blanket approval.
 
 Where the two operators disagreed — `copilot_operator.py` injected `--yolo` into attached single
 sessions and `operator.sh` did not — the disparity was resolved by converging on the **lower**
 authority, because the same command on two platforms granting an agent different powers is a
 difference nobody reads the source to discover. Note the asymmetry is not "prompts versus no
 prompts": the headless branch goes the other way precisely because there the lower-authority option
-is the one that fails silently and unrecoverably. A user who wants it in any mode passes `--yolo`
-themselves; it lands after the injected defaults and is honoured.
+is the one that fails silently and unrecoverably. A user who wants any of these in any mode passes
+them themselves; they land after the injected defaults and are honoured.
 
 ### Report types
 

@@ -443,21 +443,99 @@ def test_both_operators_inject_identical_single_session_defaults(tmp_path,
         f"  copilot_operator.py:  {python_argv}")
 
 
-def test_operator_sh_has_no_headless_mode():
-    """The premise under `run_single_session`'s headless `--yolo` branch.
+@bash
+def test_operator_sh_grants_blanket_approval_only_in_loop_mode(tmp_path):
+    """The property itself, run rather than read.
 
-    That branch is defensible as a Python-only difference *only* because there
-    is no shell counterpart to diverge from. If `operator.sh` ever grows a
-    headless single session, the identity test above will not notice -- it
-    drives the attached path -- and the platforms would quietly disagree about
-    blanket approval again, which is the exact bug this whole change exists to
-    close. Fail here instead, while it is still cheap.
+    This is the invariant `run_single_session`'s headless branch has to not
+    break: on the shell side, blanket approval belongs to loop mode and
+    nowhere else. Asserting it directly is better than asserting the premise
+    it used to rest on -- "operator.sh has no headless mode" is true of that
+    script's vocabulary but not of its behaviour, since a single session whose
+    `tmux attach` fails (no TTY: a wrapper, CI, a nested tmux) keeps running
+    with nobody attached. That path grants no `--yolo`, and neither does
+    `copilot_operator.py` on the same path, so the two still agree; what this
+    refuses is the shell quietly starting to grant it somewhere else.
     """
-    assert "headless" not in OPERATOR_SH.read_text(encoding="utf-8").lower(), (
-        "operator.sh now mentions headless. If it has gained a headless "
-        "single session, decide deliberately whether it grants --yolo and "
-        "assert that against copilot_operator.py -- do not just delete this "
-        "test.")
+    single = _shell_launch_argv("run_single_session", [], tmp_path)
+    loop = _shell_launch_argv("run_loop_mode", [], tmp_path)
+
+    assert "--yolo" not in single, single
+    assert "--no-ask-user" not in single, single
+    assert "--yolo" in loop, loop
+    assert "--no-ask-user" in loop, loop
+
+
+_ATTACHED = 9
+
+
+@bash
+def test_operator_sh_always_attaches_its_single_session(tmp_path):
+    """Why the headless branch is Python-only, asserted as behaviour.
+
+    Granting blanket approval when headless is defensible as a difference the
+    shell does not have to match *because the shell cannot express the
+    request*: it has no mode that deliberately launches a single session and
+    leaves it running with nobody attached. This runs the shell function's
+    real body and asserts it always reaches `tmux attach`. A reviewer was
+    right that grepping for the word "headless" tests a word, not a behaviour
+    -- a `--detached` mode (which is precisely the spelling
+    `copilot_operator.py` accepts as a synonym) would sail past it.
+
+    Note what this deliberately does NOT claim. The attach is best-effort
+    (`|| true`), so it can fail and leave a live unattended session -- but
+    that is an environment removing the terminal, not a mode, and
+    `copilot_operator.py` does the identical thing there (`MUX.attach` returns
+    a code rather than raising, and the next branch prints "Detached from
+    copilot session."). Neither grants `--yolo` on that path, so it is a
+    shared property. What would be a real divergence is the shell gaining a
+    deliberate unattended launch, and that is what this refuses.
+    """
+    stubs = "\n".join(f"{name}() {{ return 0; }}"
+                      for name in _shell_helper_names()
+                      if name != "run_single_session")
+    script = tmp_path / "attach.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        'INSTANCE_NAME=probe\nTMUX_SESSION=probe\nRUN_SCRIPT=run\n'
+        'RESTART_DIR=.\nOPERATOR_RUN_STARTED=""\nSCRIPT_PREAMBLE=""\n'
+        f"{stubs}\n"
+        # Shadow the real binary: a shell function wins over PATH lookup.
+        # Exiting here cannot be swallowed by the `|| true` on the attach,
+        # because `exit` leaves the shell rather than returning a status.
+        'tmux() { if [ "${1:-}" = "attach" ]; then exit '
+        f'{_ATTACHED}; fi; return 0; }}\n'
+        f"run_single_session() {{\n{_shell_function('run_single_session')}}}\n"
+        'run_single_session\n',
+        encoding="utf-8", newline="\n")
+    proc = subprocess.run([_bash_executable(), "attach.sh"], cwd=tmp_path,
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == _ATTACHED, (
+        "operator.sh's run_single_session did not reach `tmux attach` (exit "
+        f"{proc.returncode}). If it has gained a way to launch a single "
+        "session and leave it unattended, decide deliberately whether that "
+        "mode grants --yolo and assert it against copilot_operator.py's "
+        f"headless branch -- do not just delete this test.\n{proc.stderr}")
+
+
+def test_operator_sh_does_not_mention_an_unattended_single_session_mode():
+    """A tripwire, not a control -- and worth having as long as it is labelled.
+
+    The two tests above are the real guarantees; this one runs even where no
+    bash does, and catches the cheapest way the premise could rot: someone
+    adding a deliberate unattended mode, or a comment planning one, in a CI
+    lane where the behavioural probes are skipped rather than run. Both
+    spellings, because `copilot_operator.py` accepts `--detached` as a synonym
+    for `--headless` and a port would plausibly use either.
+    """
+    text = OPERATOR_SH.read_text(encoding="utf-8").lower()
+    found = [word for word in ("headless", "--detached") if word in text]
+    assert not found, (
+        f"operator.sh now mentions {found}. If it has gained a way to launch "
+        "a single session and leave it unattended, decide deliberately "
+        "whether that mode grants --yolo and --no-ask-user, and assert it "
+        "against copilot_operator.py's headless branch -- do not just delete "
+        "this test.")
 
 
 @bash
@@ -637,20 +715,30 @@ def test_attached_single_session_does_not_grant_yolo(monkeypatch):
     the terminal goes straight back to the human who typed the command, so
     granting it buys nothing and spends the one control this mode still has.
     """
-    assert "--yolo" not in _run_single(monkeypatch, [])
+    argv = _run_single(monkeypatch, [])
+    assert "--yolo" not in argv, argv
+    assert "--no-ask-user" not in argv, argv
 
 
-def test_headless_single_session_does_grant_yolo(monkeypatch):
-    """Nothing attaches, so there is nobody to answer a prompt.
+def test_headless_single_session_grants_yolo_and_no_ask_user(monkeypatch):
+    """Nothing attaches, so there is nobody to answer anything.
 
-    `operator join` is an invitation the user may never accept. Without
-    `--yolo` a headless session does not degrade to "more prompts" -- it
-    blocks on the first approval indefinitely, while looking exactly like a
-    session doing long work: live process, live pane, no error anywhere. The
-    lower-authority option is the one that fails silently here, which is why
-    the ruling goes the other way from the attached case.
+    `operator join` is an invitation the user may never accept. Without these
+    a headless session does not degrade to "more prompts" -- it blocks on the
+    first question indefinitely, while looking exactly like a session doing
+    long work: live process, live pane, no error anywhere. The lower-authority
+    option is the one that fails silently here, which is why the ruling goes
+    the other way from the attached case.
+
+    Both flags, because they close different mouths: `--yolo` waives the
+    approvals the CLI asks for before acting, `--no-ask-user` stops the agent
+    asking a question of its own accord. Granting only the first leaves the
+    identical hang reachable through `ask_user` -- which is why loop mode, the
+    other unattended mode, has always injected both.
     """
-    assert "--yolo" in _run_single(monkeypatch, [], headless=True)
+    argv = _run_single(monkeypatch, [], headless=True)
+    assert "--yolo" in argv, argv
+    assert "--no-ask-user" in argv, argv
 
 
 def test_headless_and_attached_single_sessions_do_not_agree_about_yolo(monkeypatch):
@@ -663,8 +751,9 @@ def test_headless_and_attached_single_sessions_do_not_agree_about_yolo(monkeypat
     """
     attached = _run_single(monkeypatch, [])
     headless = _run_single(monkeypatch, [], headless=True)
-    assert ("--yolo" in headless) and ("--yolo" not in attached), (
-        f"attached={attached}\nheadless={headless}")
+    for flag in ("--yolo", "--no-ask-user"):
+        assert (flag in headless) and (flag not in attached), (
+            f"{flag}\nattached={attached}\nheadless={headless}")
 
 
 def test_an_attached_single_session_still_honours_a_user_asking_for_yolo(monkeypatch):

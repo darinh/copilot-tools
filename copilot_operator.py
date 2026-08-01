@@ -2626,19 +2626,26 @@ def run_single_session(instance: Instance, copilot_args: list[str],
     # authority. `operator.sh` has no headless mode at all, so the branch
     # below is Python-only by construction and cannot re-open that gap.
     #
-    # HEADLESS: `--yolo`, and the `headless` condition is load-bearing --
-    # do not fold this back into one list. Nothing attaches a terminal here;
-    # `operator join` is an invitation the user may never accept. Without it
-    # the session does not degrade to "more prompts", it blocks on the first
-    # approval forever, and it does so while looking exactly like a session
-    # doing long work: live process, live pane, no error anywhere. The safer-
-    # looking option is the one that fails silently and unrecoverably, which
-    # is why the asymmetry decides it the other way round from the attached
-    # case. Same reasoning keeps `--yolo` in loop mode.
+    # HEADLESS: `--yolo` AND `--no-ask-user`, and the `headless` condition is
+    # load-bearing -- do not fold this back into one list. Nothing attaches a
+    # terminal here; `operator join` is an invitation the user may never
+    # accept. Without them the session does not degrade to "more prompts", it
+    # blocks on the first question forever, and it does so while looking
+    # exactly like a session doing long work: live process, live pane, no
+    # error anywhere. The safer-looking option is the one that fails silently
+    # and unrecoverably, which is why the asymmetry decides it the other way
+    # round from the attached case.
     #
-    # Either way a user who passes `--yolo` themselves is honoured: their
+    # The two flags close two different mouths and both are needed. `--yolo`
+    # waives approval prompts the CLI raises before acting; `--no-ask-user`
+    # stops the agent choosing to ask a question of its own accord. Granting
+    # only the first leaves the identical hang reachable through `ask_user`,
+    # which is exactly why loop mode -- the other unattended mode -- has
+    # always injected both.
+    #
+    # Either way a user who passes these themselves is honoured: their
     # arguments land after these, and the CLI resolves last-wins.
-    grants = ["--yolo"] if headless else []
+    grants = ["--yolo", "--no-ask-user"] if headless else []
     args = [*with_experimental([*grants, "--autopilot", "--effort", "high"]),
             *copilot_args]
     handle_existing_session(instance)
@@ -3051,8 +3058,9 @@ MODES
         exits — including when you have detached. Adds --autopilot --effort
         high --experimental. Not --yolo: your terminal is attached, so you
         are there to approve. Pass --yolo yourself if you want it. With
-        --headless, --yolo IS added, because nothing attaches and an
-        unanswerable prompt would hang the session silently.
+        --headless, --yolo and --no-ask-user ARE added, because nothing
+        attaches and an unanswerable question would hang the session
+        silently.
 
     Loop mode (--loop)
         Adds --yolo --autopilot --no-ask-user --effort high --experimental
