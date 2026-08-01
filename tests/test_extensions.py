@@ -54,7 +54,8 @@ def test_extension_sources_are_discovered():
 def test_extension_parses(path: Path):
     """`node --check` on every shipped .mjs file."""
     proc = subprocess.run(["node", "--check", str(path)],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=60)
     assert proc.returncode == 0, f"{path.name} does not parse:\n{proc.stderr}"
 
 
@@ -69,7 +70,8 @@ def test_check_rejects_broken_javascript(tmp_path: Path):
     broken = tmp_path / "broken.mjs"
     broken.write_text("function ( { unclosed\n", encoding="utf-8")
     proc = subprocess.run(["node", "--check", str(broken)],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=60)
     assert proc.returncode != 0
 
 
@@ -85,7 +87,8 @@ def test_checkout_guard_unit_tests_pass():
     assert suite.is_file()
     proc = subprocess.run(
         ["node", "--test", "--test-reporter=tap", str(suite)],
-        capture_output=True, text=True, timeout=300, cwd=str(REPO_ROOT),
+        capture_output=True, encoding="utf-8", errors="replace",
+        timeout=300, cwd=str(REPO_ROOT),
     )
     assert proc.returncode == 0, f"guard tests failed:\n{proc.stdout}\n{proc.stderr}"
     assert "# fail 0" in proc.stdout
@@ -106,7 +109,8 @@ def test_checkout_guard_leaves_no_artifacts_in_the_checkout():
     suite = EXTENSIONS_DIR / "checkout-guard" / "guard.test.mjs"
     before = {p.name for p in REPO_ROOT.iterdir()}
     subprocess.run(["node", "--test", str(suite)],
-                   capture_output=True, text=True, timeout=300, cwd=str(REPO_ROOT))
+                   capture_output=True, encoding="utf-8", errors="replace",
+                   timeout=300, cwd=str(REPO_ROOT))
     after = {p.name for p in REPO_ROOT.iterdir()}
     assert after - before == set()
 

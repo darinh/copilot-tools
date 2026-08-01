@@ -15,7 +15,23 @@ from datetime import datetime, timezone
 
 
 def run_cmd(cmd, timeout=30):
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    """Run a command and return (stdout, returncode).
+
+    The encoding is named rather than inherited. `text=True` alone decodes
+    with the locale's preferred encoding -- cp1252 on Windows -- and this
+    program's whole input is copilot's UTF-8 telemetry log. A byte outside the
+    codepage raises UnicodeDecodeError inside subprocess's reader thread,
+    which leaves `r.stdout` as None while the process still exits 0; callers
+    here do `out.strip()` and `json.loads(out)`, so a log line with an
+    accented path would have surfaced as an AttributeError rather than as a
+    parse failure. `errors="replace"` cannot raise. A None stdout is reported
+    as a non-zero return so that "the read failed" never reads as "the command
+    found nothing".
+    """
+    r = subprocess.run(cmd, capture_output=True,
+                       encoding="utf-8", errors="replace", timeout=timeout)
+    if r.stdout is None:
+        return "", r.returncode or 1
     return r.stdout, r.returncode
 
 
@@ -228,8 +244,9 @@ def main():
     if work_dir:
         try:
             r = subprocess.run(['git', '-C', work_dir, 'rev-parse', '--abbrev-ref', 'HEAD'],
-                               capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
+                               capture_output=True,
+                               encoding="utf-8", errors="replace", timeout=5)
+            if r.returncode == 0 and r.stdout is not None:
                 git_branch = r.stdout.strip()
         except:
             pass

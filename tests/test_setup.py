@@ -28,7 +28,8 @@ def _make_dir_link(target: Path, link: Path) -> None:
         pass
     if os.name == "nt":
         proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                              capture_output=True, text=True)
+                              capture_output=True,
+                              encoding="utf-8", errors="replace")
         if proc.returncode == 0:
             return
     pytest.skip("this platform will not create directory links")
