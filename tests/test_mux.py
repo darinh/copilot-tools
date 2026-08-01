@@ -426,3 +426,43 @@ def test_send_keys_can_still_send_key_names_when_asked(monkeypatch):
     monkeypatch.setattr(operator_mux.subprocess, "run", rec)
     mux.send_keys("sess", "C-c", literal=False, enter=False)
     assert rec.calls == [["tmux", "send-keys", "-t", "sess", "C-c"]]
+
+
+# ── send-keys failure reporting ─────────────────────────────────
+#
+# `send_keys` is how an agent-to-agent message reaches a live session. Its
+# caller queues the message instead when this raises, so a swallowed failure
+# is not a cosmetic loss: the message is filed as delivered and nobody ever
+# sees it. Every other state-changing verb here already reports failure.
+def test_send_keys_raises_when_the_backend_reports_failure(monkeypatch):
+    mux = Mux(binary="tmux")
+    rec = FakeRunner({"send-keys": ("", 1, "no such session: sess")})
+    monkeypatch.setattr(operator_mux.subprocess, "run", rec)
+    with pytest.raises(operator_mux.MuxSessionError) as excinfo:
+        mux.send_keys("sess", "hello")
+    assert "sess" in str(excinfo.value)
+    assert "no such session" in str(excinfo.value)
+
+
+def test_send_keys_raises_when_only_the_enter_keystroke_fails(monkeypatch):
+    """Text typed but never submitted has not been delivered. The session dying
+    between the two calls is exactly the window this covers."""
+    def result(cmd):
+        return ("", 0) if "-l" in cmd else ("", 1, "session ended")
+
+    mux = Mux(binary="tmux")
+    rec = FakeRunner({"send-keys": (result, 0)})
+    monkeypatch.setattr(operator_mux.subprocess, "run", rec)
+    with pytest.raises(operator_mux.MuxSessionError):
+        mux.send_keys("sess", "hello")
+
+
+def test_send_keys_does_not_send_enter_after_the_text_failed(monkeypatch):
+    """Submitting an empty line into a live agent session would be a stray
+    keystroke in someone's UI."""
+    mux = Mux(binary="tmux")
+    rec = FakeRunner({"send-keys": ("", 1)})
+    monkeypatch.setattr(operator_mux.subprocess, "run", rec)
+    with pytest.raises(operator_mux.MuxSessionError):
+        mux.send_keys("sess", "hello")
+    assert rec.calls == [["tmux", "send-keys", "-t", "sess", "-l", "hello"]]

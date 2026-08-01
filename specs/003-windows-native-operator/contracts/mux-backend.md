@@ -36,7 +36,7 @@ SC-009):
 | `pane_pid(name)` | `display-message -t NAME -p '#{pane_pid}'` | `int \| None` | Informational only — see below. |
 | `pane_dead(name)` | `display-message -t NAME -p '#{pane_dead}'` | `bool` | Informational only — see below. |
 | `set_remain_on_exit(name, on)` | `set-option -t NAME remain-on-exit on\|off` | `None` | |
-| `send_keys(name, text, enter=True, literal=True)` | `send-keys -t NAME -l TEXT` then `send-keys -t NAME Enter` | `None` | Delivers `/exit` and agent-to-agent messages. MUST default to `-l`: without it the backend resolves whitespace-separated tokens in TEXT as key names, so message text is an injection vector (verified psmux 3.3.7 — an embedded `Enter` submits early and truncates, `C-c` interrupts the pane). `-l` takes no trailing key name, hence the second call. |
+| `send_keys(name, text, enter=True, literal=True)` | `send-keys -t NAME -l TEXT` then `send-keys -t NAME Enter` | `None`, raises on failure | Delivers `/exit` and agent-to-agent messages. MUST default to `-l`: without it the backend resolves whitespace-separated tokens in TEXT as key names, so message text is an injection vector (verified psmux 3.3.7 — an embedded `Enter` submits early and truncates, `C-c` interrupts the pane). `-l` takes no trailing key name, hence the second call. Both calls MUST be checked: mail delivery treats the exception as "not delivered" and queues the message instead, so a swallowed exit code files an undelivered message to the archive as read and loses it. |
 | `pane_current_path(name)` | `display-message -t NAME -p '#{pane_current_path}'` | `str \| None` | Used by handoff instance inference. |
 | `attach(name)` | `attach -t NAME` | exit code | Returns when the user detaches. |
 

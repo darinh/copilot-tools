@@ -1279,7 +1279,15 @@ def stop_session_gracefully(instance: Instance) -> None:
     """
     if not MUX.has_session(instance.session):
         return
-    MUX.send_keys(instance.session, "/exit")
+    try:
+        MUX.send_keys(instance.session, "/exit")
+    except MuxError as exc:
+        # Asking politely is best-effort: the session can die between the
+        # check above and the keystroke, and a backend that refuses the
+        # keystroke has told us nothing except that this route is closed.
+        # Fall through to the wait-then-kill path, which is what already
+        # happened when the failure went unreported.
+        log(f"  Could not send /exit ({exc}) — falling back to the kill path")
     if wait_for_exit(instance, EXIT_GRACE_SECONDS):
         return
     log("  Copilot did not exit within the grace period — terminating session")
@@ -2138,7 +2146,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     launch_preamble = preamble
                     waiting = operator_mail.pending(OPERATOR_HOME, instance.id)
                     if waiting:
-                        senders = ", ".join(sorted({m.get("from", "?") for m in waiting}))
+                        senders = ", ".join(operator_mail.sender_names(waiting))
                         log(f"  Delivering {len(waiting)} queued message(s) from {senders}")
                         launch_preamble += operator_mail.render_for_agent(waiting)
 

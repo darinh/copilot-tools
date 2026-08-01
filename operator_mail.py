@@ -44,6 +44,7 @@ __all__ = [
     "flatten",
     "reply_hint",
     "render_line",
+    "sender_names",
     "render_for_agent",
     "render_for_terminal",
 ]
@@ -53,7 +54,13 @@ __all__ = [
 # is pushed through the multiplexer's input path at once.
 LIVE_TEXT_LIMIT = 2000
 
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# C1 (\x80-\x9f) is here as well as C0: a terminal reading UTF-8 may treat
+# U+009B as CSI, so "\x9b2J" clears the screen with no ESC anywhere in it.
+# The bidirectional overrides go too -- they cannot run anything, but they
+# reorder what a human sees, so a message can be made to read as the
+# opposite of what it says.
+_CONTROL = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
 class MailError(Exception):
@@ -92,13 +99,33 @@ def new_message(sender: str, recipient: str, recipient_id: str,
     }
 
 
-def _write(directory: Path, msg: dict) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{msg['id']}.json"
-    tmp = path.with_suffix(".json.tmp")
+def _write_json(path: Path, msg: dict) -> None:
+    """Replace `path` with `msg` in one indivisible step.
+
+    Readers of a mailbox are other processes, and two of them archiving the
+    same message at once is ordinary rather than exotic. A truncating write
+    lets one of them observe half a file and discard it as corrupt, which for
+    mail means a message that was sent and is now gone. The temp name carries
+    a uuid because a fixed one would let two writers interleave into the very
+    file this is meant to keep whole.
+    """
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         tmp.write_text(json.dumps(msg, indent=2), encoding="utf-8")
         os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _write(directory: Path, msg: dict) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{msg['id']}.json"
+    try:
+        _write_json(path, msg)
     except OSError as exc:
         raise MailError(f"could not write message: {exc}") from exc
     return path
@@ -176,9 +203,17 @@ def consume(root: Path, instance_id: str) -> list[dict]:
             continue
         data["read_at"] = read_at
         try:
-            (archive / path.name).write_text(
-                json.dumps(data, indent=2), encoding="utf-8")
+            _write_json(archive / path.name, data)
+        except OSError as exc:
+            raise MailError(f"could not archive message: {exc}") from exc
+        try:
             path.unlink()
+        except FileNotFoundError:
+            # Another consumer archived and removed it between the glob and
+            # here -- `operator inbox` and a session start can land together.
+            # Its archive copy is the same message, so there is nothing to
+            # undo and no reason to abandon the rest of the batch.
+            pass
         except OSError as exc:
             raise MailError(f"could not archive message: {exc}") from exc
         taken.append(data)
@@ -194,35 +229,125 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
     in the inbox. Only once a session is actually running is it archived --
     and only the ids that went into that preamble, so a message that arrived
     in the meantime is not silently swallowed.
+
+    The ids are read out of the message files, so they are exactly as
+    trustworthy as those files are: hand-edited, written by an older version,
+    or half-written by something that crashed. Resolving one back into a
+    filename therefore does two bad things at once. A separator or a ``..``
+    escapes the inbox entirely and moves an unrelated JSON file into the
+    archive. Far more likely, an id that simply disagrees with the name of the
+    file holding it matches nothing, so the message is never archived and the
+    loop puts it in the *next* session's preamble too, and the one after that.
+    Matching against the files themselves is both safer and more forgiving:
+    nothing outside the inbox can be named, and a message is found by the id
+    it carries or by the name it is stored under. Names are settled first
+    because everything this module writes stores a message under its own id,
+    so in the ordinary case nothing but the matched files is ever opened --
+    an inbox that has built up does not turn every archive call into a parse
+    of all of it.
+
+    Returns the number of messages that are in the archive once this call
+    returns, which is not always the number of files it moved: if a
+    concurrent reader archives one first, it still counts, because the
+    caller's question is whether the message is read, not who moved it.
     """
     inbox = inbox_dir(root, instance_id)
     destination = archive_dir(root, instance_id)
     if not inbox.is_dir() or not ids:
         return 0
-    read_at = _utcnow()
-    moved = 0
-    destination.mkdir(parents=True, exist_ok=True)
-    for ident in ids:
-        path = inbox / f"{ident}.json"
-        if not path.is_file():
+    wanted = {i for i in ids if isinstance(i, str)}
+    if not wanted:
+        return 0
+    files = sorted(inbox.glob("*.json"))
+    chosen: set[Path] = set()
+    found: set[str] = set()
+    for path in files:
+        if path.stem not in wanted:
             continue
+        ident = _message_id(path)
+        # A name is a claim, not proof. Accept it only when the file agrees
+        # with it, or when the file claims no id at all and so contradicts
+        # nothing. A file named for one message while holding another is a
+        # lie about which message it is, and believing it archives the wrong
+        # message *and* leaves the requested one to be re-delivered for ever.
+        if ident is None or ident == path.stem:
+            chosen.add(path)
+            found.add(path.stem)
+    if found != wanted:
+        # The names did not account for every id, so the rest can only be
+        # found by reading. Start over rather than adding to the name
+        # matches: a name that lost its claim above must not survive here.
+        chosen = set()
+        found = set()
+        for path in files:
+            ident = _message_id(path)
+            if ident is not None:
+                if ident in wanted:
+                    chosen.add(path)
+                    found.add(ident)
+            elif path.stem in wanted:
+                chosen.add(path)
+                found.add(path.stem)
+    if not chosen:
+        return 0
+    read_at = _utcnow()
+    destination.mkdir(parents=True, exist_ok=True)
+    return sum(_archive_one(path, destination, read_at)
+               for path in files if path in chosen)
+
+
+def _message_id(path: Path) -> str | None:
+    """The id a message file claims, or None if it does not claim a usable one."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    ident = data.get("id")
+    return ident if isinstance(ident, str) else None
+
+
+def _archive_one(path: Path, destination: Path, read_at: str) -> int:
+    """Move one inbox file into `destination`, stamping it read if it parses."""
+    target = destination / path.name
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        data["read_at"] = read_at
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                data["read_at"] = read_at
-                (destination / path.name).write_text(
-                    json.dumps(data, indent=2), encoding="utf-8")
-                path.unlink()
-                moved += 1
-                continue
-        except (OSError, ValueError):
-            pass
-        try:
-            os.replace(path, destination / path.name)
-            moved += 1
+            _write_json(target, data)
         except OSError:
             pass
-    return moved
+        else:
+            try:
+                path.unlink()
+                return 1
+            except FileNotFoundError:
+                # Another reader took it between the scan and here. Its copy
+                # of the archive file says the same thing, and the message is
+                # archived either way, which is what the count means.
+                return 1
+            except OSError:
+                # The stamped copy is written but the inbox copy will not go.
+                # Falling through to the move below would overwrite the
+                # stamped copy with an unstamped one and, when it failed too,
+                # leave the message in the archive AND the inbox -- read and
+                # pending at once. Undo the write and report nothing
+                # archived: the message stays pending, which is a state the
+                # caller can act on, and it will be offered again.
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+                return 0
+    try:
+        os.replace(path, target)
+        return 1
+    except OSError:
+        return 0
 
 
 def history(root: Path, instance_id: str, limit: int = 20) -> list[dict]:
@@ -241,8 +366,42 @@ def flatten(text: str) -> str:
     return " ".join(_CONTROL.sub(" ", text).split())
 
 
+def _field(msg: dict, key: str, fallback: str) -> str:
+    """One safe, single-line rendering of `msg[key]`.
+
+    Every field here came off disk, where some other process wrote it, so it
+    is not guaranteed to be present, to be a string, or to be free of control
+    characters -- and each of those is a separate failure.
+
+    Control characters are the dangerous one. The body has been flattened
+    since this module was written, because the multiplexer submits the line at
+    the first newline and would drop the rest. The *names* travel that same
+    keystroke path and never got the same treatment: ``--from`` is taken
+    verbatim from the command line (only ``--to`` is checked against known
+    instances), so a sender called ``"\\n/exit"`` ends the line early and types
+    a command into the recipient's session.
+
+    JSON null is the quiet one. The key is present, so ``.get(key, default)``
+    hands back None and every string operation downstream raises -- on the
+    session-preamble path, which means one bad file stops sessions starting
+    and nothing can clear the mailbox.
+    """
+    value = msg.get(key)
+    if not isinstance(value, str):
+        value = "" if value is None else str(value)
+    return flatten(value) or fallback
+
+
 def reply_hint(msg: dict) -> str:
-    return (f'operator send --from {msg["to"]} --to {msg["from"]} "your reply"')
+    """The exact command that answers `msg`.
+
+    A missing name becomes a visible placeholder rather than a guess. Filling
+    one in would produce a command that runs happily and sends the reply to
+    the wrong agent.
+    """
+    sender = _field(msg, "from", "<sender>")
+    recipient = _field(msg, "to", "<your-instance>")
+    return f'operator send --from {recipient} --to {sender} "your reply"'
 
 
 def render_line(msg: dict) -> str:
@@ -252,11 +411,22 @@ def render_line(msg: dict) -> str:
     starts with '/' or '@', which a terminal UI would read as a slash command
     or a mention rather than as a message.
     """
-    text = flatten(msg.get("text", ""))
+    text = _field(msg, "text", "")
     if len(text) > LIVE_TEXT_LIMIT:
         text = text[:LIVE_TEXT_LIMIT] + " […truncated, see: operator inbox --history]"
-    return (f'[operator message from "{msg["from"]}"] {text} '
+    return (f'[operator message from "{_field(msg, "from", "?")}"] {text} '
             f'(To reply, run: {reply_hint(msg)})')
+
+
+def sender_names(msgs: list[dict]) -> list[str]:
+    """The distinct sender names in `msgs`, rendered safely and sorted.
+
+    Callers summarising a batch need this rather than a raw set comprehension
+    over ``m["from"]``: a null name makes ``sorted`` raise on comparing None
+    with a string, and a name carrying control characters would go straight
+    into a log line or a terminal.
+    """
+    return sorted({_field(m, "from", "?") for m in msgs})
 
 
 def render_for_agent(msgs: list[dict]) -> str:
@@ -264,7 +434,7 @@ def render_for_agent(msgs: list[dict]) -> str:
     no session was running."""
     if not msgs:
         return ""
-    senders = sorted({m.get("from", "?") for m in msgs})
+    senders = sender_names(msgs)
     lines = [
         f" You have {len(msgs)} operator message(s) waiting from "
         f"{', '.join(repr(s) for s in senders)}. These are from other agents, "
@@ -273,8 +443,8 @@ def render_for_agent(msgs: list[dict]) -> str:
     ]
     for i, msg in enumerate(msgs, 1):
         lines.append(
-            f' [{i}] from "{msg.get("from", "?")}" at {msg.get("sent_at", "?")}: '
-            f'{flatten(msg.get("text", ""))} '
+            f' [{i}] from "{_field(msg, "from", "?")}" at '
+            f'{_field(msg, "sent_at", "?")}: {_field(msg, "text", "")} '
             f'(To reply: {reply_hint(msg)})')
     return " ".join(lines)
 
@@ -284,10 +454,17 @@ def render_for_terminal(msgs: list[dict]) -> str:
         return "No messages."
     out: list[str] = []
     for msg in msgs:
-        state = msg.get("delivery", "queued")
-        out.append(f'  from "{msg.get("from", "?")}" · {msg.get("sent_at", "?")} · {state}')
-        for line in str(msg.get("text", "")).splitlines() or [""]:
-            out.append(f"      {line}")
+        state = _field(msg, "delivery", "queued")
+        out.append(f'  from "{_field(msg, "from", "?")}" · '
+                   f'{_field(msg, "sent_at", "?")} · {state}')
+        body = msg.get("text")
+        body = "" if body is None else str(body)
+        # Printed for a human, so the line structure is kept and so is the
+        # indentation inside each line -- a body is often a code snippet, and
+        # flattening it here would make it unreadable. Control characters
+        # still go: an escape sequence would repaint the reader's screen.
+        for line in body.splitlines() or [""]:
+            out.append(f"      {_CONTROL.sub(' ', line)}")
         out.append(f"      reply: {reply_hint(msg)}")
         out.append("")
     return "\n".join(out).rstrip()
