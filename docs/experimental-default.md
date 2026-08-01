@@ -17,7 +17,7 @@ deliberately does not restate it.
 
 `copilot --help` documents `--experimental` and `--no-experimental` and **no
 default**, so the CLI's built-in behaviour was never ours to assert.
-`setup_tools.extension_mode()` therefore reports an absent key as
+`setup_tools.extension_mode()` therefore reported an absent key as
 `UNDETERMINED` rather than guessing, and `docs/checkout-guard.md` carried a
 hedge naming the cost of that in advance — retired by this measurement, so do
 not expect to find it there now:

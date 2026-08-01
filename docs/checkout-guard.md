@@ -67,7 +67,10 @@ at evaluation time never ran with the key absent, and ran with the same seeded
 settings plus `--experimental`. The negative is only worth anything because of
 that matched positive: identical settings, identical probe, only the flag
 differing, and the flag deciding. Without it, "the extension did not load" is
-explained just as well by the harness having broken the loader.
+explained just as well by the harness having broken the loader. The method, the
+full result table and a reproduction are in
+[experimental-default.md](experimental-default.md); what the result *means* is
+here, and that file deliberately does not restate it.
 
 Two limits on that answer, both deliberate:
 
