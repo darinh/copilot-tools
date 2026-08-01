@@ -103,6 +103,7 @@ operator inbox --peek          # read without marking
 operator inbox --history       # what was already delivered
 operator inbox --json          # machine-readable
 operator inbox payments-api    # read a specific instance's mailbox
+operator send --from a --to b -- "--peek is the flag"   # dash-leading text
 ```
 
 ### Rules that matter
@@ -116,6 +117,11 @@ operator inbox payments-api    # read a specific instance's mailbox
   names are listed. That is deliberate: a typo'd name would otherwise sit in a
   mailbox nobody reads. Use `--force` only for an instance you are about to
   start.
+- **A flag either command does not recognize is refused, not ignored.** Reading
+  an inbox archives what it shows, so a typo'd `--peek` would otherwise eat the
+  mail it was meant to leave alone, and a typo'd flag on `send` would be
+  delivered as message text by a sender who believed nothing was sent. If your
+  message — or an instance name — starts with a dash, put it after `--`.
 
 ### Delivery
 

@@ -70,28 +70,26 @@ def _listed_top_level(block: str) -> set[str]:
     }
 
 
-def _tracked_top_level() -> set[str]:
-    """First path segment of every file git tracks: the real root inventory."""
-    # ``.git`` is a directory in a primary checkout and a file in a worktree;
-    # exists() covers both. Its absence means an unpacked sdist, where there is
-    # nothing to compare against. A missing git binary is a different thing
-    # entirely -- skipping there would quietly disarm the gate.
+def _git_ls_files(*args: str) -> list[str]:
+    """Tracked paths, as git reports them, or a failure of the check itself."""
     if not (REPO / ".git").exists():
         pytest.skip("not a git checkout; no tracked file list to compare against")
     if shutil.which("git") is None:
         pytest.fail("git is required to verify the README structure tree")
     proc = subprocess.run(
-        ["git", "ls-files", "-z"],
+        ["git", "ls-files", "-z", *args],
         cwd=str(REPO), capture_output=True, check=True,
     )
     # -z suppresses git's path quoting, so the bytes are the path verbatim.
     # Decoding them with the platform's preferred encoding, as text=True would,
     # mangles any non-ASCII name on a Windows runner.
-    entries = {
-        path.split("/", 1)[0]
-        for path in proc.stdout.decode("utf-8", "surrogateescape").split("\0")
-        if path
-    }
+    return [p for p in proc.stdout.decode("utf-8", "surrogateescape").split("\0")
+            if p]
+
+
+def _tracked_top_level() -> set[str]:
+    """First path segment of every file git tracks: the real root inventory."""
+    entries = {path.split("/", 1)[0] for path in _git_ls_files()}
     # An empty inventory is not "the repository is empty", it is "the question
     # was not answered". Left alone it would make the omission check below pass
     # against nothing at all -- a green gate reporting on a repository it never
@@ -174,3 +172,89 @@ def test_the_tree_is_identified_by_content_not_by_position():
         "```\n"
     )
     assert _listed_top_level(_tree_block(readme)) == {"LICENSE", "docs"}
+
+
+# ── the map table's extension list ──────────────────────────────
+# The tree above says only that ``extensions/`` exists. The map table above it
+# enumerates the extensions by name, and that list is what a reader uses to
+# decide whether the thing they want is already here. It had drifted: the
+# checkout-guard extension shipped, with a CI job of its own, and the row still
+# named six.
+_EXTENSIONS_ROW = re.compile(
+    r"^\|\s*\[`extensions/`\][^|]*\|(?P<cell>[^|]*)\|", re.MULTILINE)
+
+
+def _listed_extensions(text: str) -> set[str]:
+    rows = _EXTENSIONS_ROW.findall(text)
+    # Exactly one, for the same reason ``_tree_block`` insists on one tree: the
+    # first match wins otherwise, so a row added above this one -- in an
+    # example, a second table, a fenced block -- would be parsed instead, and
+    # the gate would report on a row nobody maintains.
+    assert len(rows) == 1, (
+        f"expected exactly one `extensions/` row in README.md, found "
+        f"{len(rows)}"
+    )
+    _, sep, names = rows[0].partition(":")
+    assert sep, (
+        "the `extensions/` row no longer lists the extensions by name, so "
+        "there is nothing to check it against: " + rows[0].strip()
+    )
+    return {name.strip() for name in names.split(",") if name.strip()}
+
+
+def _tracked_extensions() -> set[str]:
+    """Directories under ``extensions/`` that git actually tracks."""
+    found = {path.split("/")[1] for path in _git_ls_files("extensions")
+             if path.count("/") >= 2}
+    assert found, (
+        "git tracks no directories under extensions/. The comparison below "
+        "would be vacuous, so this is a failure of the check itself."
+    )
+    return found
+
+
+def test_the_map_table_names_every_extension():
+    listed = _listed_extensions(README.read_text(encoding="utf-8"))
+    missing = sorted(_tracked_extensions() - listed)
+    assert not missing, (
+        "README.md's `extensions/` row does not name:\n  "
+        + "\n  ".join(missing)
+        + "\nA reader uses that list to decide whether an extension already "
+          "exists, so an omission is an invitation to write it twice."
+    )
+
+
+def test_the_map_table_names_no_extension_that_was_removed():
+    listed = _listed_extensions(README.read_text(encoding="utf-8"))
+    stale = sorted(listed - _tracked_extensions())
+    assert not stale, (
+        "README.md's `extensions/` row names extensions that no longer "
+        f"exist:\n  " + "\n  ".join(stale)
+    )
+
+
+def test_the_extension_row_parser_reads_the_names_and_not_the_prose():
+    """Guard the guard.
+
+    A parser that returned the whole cell would make both tests above pass
+    against any row containing the right substrings, and one that returned an
+    empty set would make the omission test pass against everything. The
+    description before the colon is prose and must not become a name.
+    """
+    row = ("| [`extensions/`](extensions/README.md) | Copilot CLI runtime "
+           "extensions: alpha, beta-two, gamma |\n")
+    assert _listed_extensions(row) == {"alpha", "beta-two", "gamma"}
+
+
+def test_a_second_extensions_row_is_refused_rather_than_silently_preferred():
+    """The first match must not win.
+
+    A reviewer put a decoy row above the real one and the parser read the
+    decoy, which would have graded the repository against a line nobody
+    maintains -- green while the row a reader actually sees was wrong.
+    """
+    decoy = ("| [`extensions/`](elsewhere) | runtime extensions: decoy-one |\n"
+             "| [`extensions/`](extensions/README.md) | Copilot CLI runtime "
+             "extensions: alpha, beta |\n")
+    with pytest.raises(AssertionError, match="exactly one"):
+        _listed_extensions(decoy)

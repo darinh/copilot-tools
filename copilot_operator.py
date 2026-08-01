@@ -1856,8 +1856,37 @@ def _can_receive_live(instance: Instance) -> bool:
     return is_copilot_running(instance)
 
 
+SEND_FLAGS = ("--from", "--to", "--force", "--queue")
+INBOX_FLAGS = ("--peek", "--history", "--json")
+HELP_FLAGS = ("-h", "--help", "-?")
+
+
+def _send_usage(stream=None) -> None:
+    stream = sys.stderr if stream is None else stream
+    print('Usage: operator send --from NAME --to NAME "message"', file=stream)
+    print("  --from and --to are both required so the recipient knows who "
+          "wrote and who to reply to.", file=stream)
+    print("  --queue  leave it for the next session even if one is running",
+          file=stream)
+    print("  --force  send to a name the operator does not recognize",
+          file=stream)
+    print("  --       everything after it is message text, flags and all",
+          file=stream)
+
+
 def send_message(args: list[str]) -> int:
-    """``operator send --from NAME --to NAME "message"``."""
+    """``operator send --from NAME --to NAME "message"``.
+
+    An option this function does not recognize is refused rather than folded
+    into the message body. Silently treating ``--dry-run`` as text delivers a
+    message to a sender who believes nothing was sent, which is worse than
+    not sending at all. Use ``--`` when the text really does start with a
+    dash.
+    """
+    if args[:1] and args[0] in HELP_FLAGS:
+        _send_usage(sys.stdout)
+        return 0
+
     sender = ""
     recipient = ""
     force = False
@@ -1867,6 +1896,19 @@ def send_message(args: list[str]) -> int:
     i = 0
     while i < len(args):
         arg = args[i]
+        if arg == "--":
+            body.extend(args[i + 1:])
+            break
+        if arg.startswith("-") and not (
+                arg in SEND_FLAGS or arg.startswith(("--from=", "--to="))):
+            print(f"operator send: unknown option '{arg}'", file=sys.stderr)
+            print("  If it belongs to the message, put it after --:",
+                  file=sys.stderr)
+            print('    operator send --from a --to b -- '
+                  f'"{arg} ..."', file=sys.stderr)
+            print("  Nothing was sent.", file=sys.stderr)
+            _send_usage()
+            return 2
         if arg in ("--from", "--to"):
             if i + 1 >= len(args) or not args[i + 1]:
                 print(f"{arg} requires a value", file=sys.stderr)
@@ -1890,14 +1932,7 @@ def send_message(args: list[str]) -> int:
 
     text = " ".join(body).strip()
     if not sender or not recipient or not text:
-        print('Usage: operator send --from NAME --to NAME "message"',
-              file=sys.stderr)
-        print("  --from and --to are both required so the recipient knows who "
-              "wrote and who to reply to.", file=sys.stderr)
-        print("  --queue  leave it for the next session even if one is running",
-              file=sys.stderr)
-        print("  --force  send to a name the operator does not recognize",
-              file=sys.stderr)
+        _send_usage()
         return 2
 
     target = Instance(recipient)
@@ -1931,12 +1966,76 @@ def send_message(args: list[str]) -> int:
     return 0
 
 
+def _inbox_usage(stream=None) -> None:
+    stream = sys.stderr if stream is None else stream
+    print("Usage: operator inbox [NAME] [--peek|--history|--json]",
+          file=stream)
+    print("  --peek     show unread mail without marking it read",
+          file=stream)
+    print("  --history  show mail that was already read", file=stream)
+    print("  --json     machine-readable output", file=stream)
+    print("  --         the next argument is a mailbox name, dash or not",
+          file=stream)
+    print("  With no NAME, reads the mailbox for this directory's instance.",
+          file=stream)
+
+
 def show_inbox(args: list[str]) -> int:
-    """``operator inbox [NAME]`` — read messages addressed to an instance."""
-    peek = "--peek" in args
-    as_json = "--json" in args
-    want_history = "--history" in args
-    names = [a for a in args if not a.startswith("--")]
+    """``operator inbox [NAME]`` — read messages addressed to an instance.
+
+    Reading is destructive by default: it archives everything it shows. So an
+    argument this function does not understand is refused rather than
+    ignored — a typo'd ``--peek`` that fell through to the default would
+    consume the mailbox it was asked to leave alone, and the next reader
+    could not tell that from an empty inbox.
+
+    Nothing stops an instance being named ``-beta``, so ``--`` ends the
+    options and makes what follows a name.
+    """
+    flags: list[str] = []
+    names: list[str] = []
+    end_of_options = False
+    for arg in args:
+        if end_of_options:
+            names.append(arg)
+        elif arg == "--":
+            end_of_options = True
+        elif arg.startswith("-"):
+            flags.append(arg)
+        else:
+            names.append(arg)
+
+    if any(f in HELP_FLAGS for f in flags):
+        _inbox_usage(sys.stdout)
+        return 0
+
+    unknown = [f for f in flags if f not in INBOX_FLAGS]
+    if unknown:
+        print(f"operator inbox: unknown option '{unknown[0]}'",
+              file=sys.stderr)
+        if unknown[0].startswith("-") and not unknown[0].startswith("--"):
+            print("  If it is a mailbox name, put it after --:",
+                  file=sys.stderr)
+            print(f"    operator inbox -- {unknown[0]}", file=sys.stderr)
+        print("  No mail was read.", file=sys.stderr)
+        _inbox_usage()
+        return 2
+
+    peek = "--peek" in flags
+    as_json = "--json" in flags
+    want_history = "--history" in flags
+
+    if len(names) > 1:
+        print("operator inbox reads one mailbox at a time, got: "
+              f"{', '.join(repr(n) for n in names)}", file=sys.stderr)
+        print("  No mail was read.", file=sys.stderr)
+        _inbox_usage()
+        return 2
+    if names and not names[0].strip():
+        print("operator inbox: the mailbox name is empty.", file=sys.stderr)
+        print("  No mail was read.", file=sys.stderr)
+        _inbox_usage()
+        return 2
 
     if names:
         name = names[0]
@@ -2391,6 +2490,14 @@ MESSAGING
     exact reply command. A --to that names no known instance is refused
     rather than queued into a mailbox nobody reads (--force overrides, for
     an instance that has not started yet).
+
+    An option neither command recognizes is refused, never ignored. Reading
+    an inbox archives what it shows, so a typo'd --peek that fell through to
+    the default would eat the mail it was meant to leave alone; and a typo'd
+    flag on send would be delivered as message text by a sender who believed
+    nothing was sent. Put message text that starts with a dash after --:
+
+        operator send --from alpha --to beta -- "--force is the flag you want"
 
     Delivery depends on what the recipient is doing. If its Copilot session
     is running, the message is typed straight into it. If it is between
