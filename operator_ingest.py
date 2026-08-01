@@ -80,7 +80,12 @@ CREATE TABLE IF NOT EXISTS model_usage (
     tokens_in TEXT,
     tokens_out TEXT,
     tokens_cached TEXT,
-    tokens_cache_write TEXT,
+    -- Deliberately INTEGER where its three siblings are TEXT. Those hold
+    -- fmt_tokens() output ("32.4k"), which SUM() silently reads as 32. This
+    -- column exists so a user can audit where their credits went, and
+    -- cache-write is the dearest token type per million, so it has to stay
+    -- summable. Symmetry is not worth a wrong number.
+    tokens_cache_write INTEGER,
     premium_requests INTEGER,
     nano_aiu INTEGER NOT NULL DEFAULT 0
 );
@@ -99,7 +104,7 @@ _ADDED_COLUMNS = {
     },
     "model_usage": {
         "nano_aiu": "INTEGER NOT NULL DEFAULT 0",
-        "tokens_cache_write": "TEXT",
+        "tokens_cache_write": "INTEGER",
     },
 }
 
@@ -645,7 +650,7 @@ def ingest_file(
                     fmt_tokens(md.get("input_tokens", 0)),
                     fmt_tokens(md.get("output_tokens", 0)),
                     fmt_tokens(md.get("cache_read_tokens", 0)),
-                    fmt_tokens(md.get("cache_write_tokens", 0)),
+                    int(md.get("cache_write_tokens", 0) or 0),
                     int(md.get("request_cost", 0) or 0),
                     int(md.get("nano_aiu", 0) or 0),
                 ),

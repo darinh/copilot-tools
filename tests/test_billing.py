@@ -203,8 +203,25 @@ def test_ingest_stores_per_model_cache_write_tokens(tmp_path, db_path):
         rows = {r["model_name"]: r["tokens_cache_write"] for r in
                 conn.execute(
                     "SELECT model_name, tokens_cache_write FROM model_usage")}
-    assert rows["claude-opus-5"] == "32.4k"
-    assert rows["gpt-5.4"] == "1.5M"
+    assert rows["claude-opus-5"] == 32371
+    assert rows["gpt-5.4"] == 1_500_000
+
+
+def test_per_model_cache_write_stays_summable(tmp_path, db_path):
+    """Its three sibling columns hold fmt_tokens() output, where SUM() reads
+    "32.4k" as 32 and reports a plausible, wrong total. This column is for
+    auditing spend, so it stores the integer."""
+    log = tmp_path / "process-1700000000000-5.log"
+    log.write_text(
+        usage_response(model="claude-opus-5", cache_write=32371)
+        + usage_response(model="gpt-5.4", cache_write=1_500_000),
+        encoding="utf-8",
+    )
+    operator_ingest.ingest_file(log, db_path)
+    with operator_ingest.connect(db_path) as conn:
+        total = conn.execute(
+            "SELECT SUM(tokens_cache_write) FROM model_usage").fetchone()[0]
+    assert total == 1_532_371
 
 
 def test_per_model_cache_write_is_not_confused_with_cache_read(tmp_path, db_path):
@@ -221,7 +238,7 @@ def test_per_model_cache_write_is_not_confused_with_cache_read(tmp_path, db_path
             "SELECT tokens_cached, tokens_cache_write FROM model_usage"
         ).fetchone()
     assert row["tokens_cached"] == "4.0k"
-    assert row["tokens_cache_write"] == "7.0k"
+    assert row["tokens_cache_write"] == 7000
 
 
 def test_legacy_premium_logs_still_ingest(tmp_path, db_path):
@@ -304,7 +321,7 @@ def test_migrated_database_accepts_a_per_model_insert(tmp_path):
 
     with operator_ingest.connect(db) as c:
         assert c.execute(
-            "SELECT tokens_cache_write FROM model_usage").fetchone()[0] == "9.0k"
+            "SELECT tokens_cache_write FROM model_usage").fetchone()[0] == 9000
 
 
 # ── launch behavior ─────────────────────────────────────────────

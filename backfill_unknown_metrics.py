@@ -73,9 +73,36 @@ def log_has_shutdown_event(path: Path) -> bool:
         return True  # Unreadable log: assume measured, change nothing.
 
 
+def log_fingerprint(path: Path) -> tuple[int, int] | None:
+    """What the log looked like when the scan trusted it, or None if absent.
+
+    The scan's verdict rests on the *contents* of this file, and the scan can
+    run for a long time. Re-reading every log inside the write transaction
+    would hold a write lock across arbitrary file I/O; a stat is cheap enough
+    to redo.
+
+    Size is part of the fingerprint because mtime alone is not enough: the
+    system clock ticks far more coarsely than a file can be rewritten, so two
+    writes can share a timestamp. A log that gained a shutdown event gained
+    bytes, so the pair catches it. Not a hash -- this decides only whether to
+    *skip* a row, so the failure it must avoid is a missed change, and a
+    change that preserves both size and timestamp is not one a growing log
+    makes.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 def find_fabricated(conn: sqlite3.Connection, log_dir: Path,
-                    missing_logs: bool = False) -> list[int]:
+                    missing_logs: bool = False
+                    ) -> list[tuple[int, tuple[int, int] | None]]:
     """Rows whose four fields are all 0 and whose log has no shutdown event.
+
+    Returns ``(row_id, log_fingerprint)`` pairs so the write can confirm the
+    evidence it is acting on has not moved underneath it.
 
     With ``missing_logs``, rows whose log has since been deleted also count.
     They are provably fabricated on their own evidence: an all-zero row claims
@@ -83,9 +110,8 @@ def find_fabricated(conn: sqlite3.Connection, log_dir: Path,
     measured lasted no time at all. Without the flag they are left alone,
     because "cannot check" is not "know it is wrong".
     """
-    zeros = ZERO_GUARD
     rows = conn.execute(
-        f"SELECT id, log_file FROM sessions WHERE {zeros}").fetchall()
+        f"SELECT id, log_file FROM sessions WHERE {ZERO_GUARD}").fetchall()
     fabricated = []
     for row in rows:
         if not row["log_file"]:
@@ -93,10 +119,10 @@ def find_fabricated(conn: sqlite3.Connection, log_dir: Path,
         path = log_dir / row["log_file"]
         if not path.exists():
             if missing_logs:
-                fabricated.append(row["id"])
+                fabricated.append((row["id"], None))
             continue
         if not log_has_shutdown_event(path):
-            fabricated.append(row["id"])
+            fabricated.append((row["id"], log_fingerprint(path)))
     return fabricated
 
 
@@ -124,12 +150,81 @@ def write_backup(conn: sqlite3.Connection, dest: Path) -> None:
     so committed rows can still live in ``metrics.db-wal`` and a copy of the
     main file alone would restore to a state that never existed. ``backup()``
     reads through the WAL and produces a single consistent file.
+
+    Note what this backup is and is not. It is a point-in-time copy of the
+    whole database, so restoring it on a machine where the operator has kept
+    running discards every session ingested since. It is an undo for this
+    repair, not a general safety net -- stop the operator before restoring.
     """
     dst = sqlite3.connect(dest)
     try:
         conn.backup(dst)
     finally:
         dst.close()
+
+
+def clear_rows(conn: sqlite3.Connection,
+               found: list[tuple[int, tuple[int, int] | None]],
+               log_dir: Path) -> tuple[int, int]:
+    """Clear the scanned rows, re-checking each one's evidence as it goes.
+
+    The scan reads every candidate log from disk, which takes long enough for
+    a live operator to re-ingest one of these sessions in the meantime -- and
+    a re-ingest is precisely the event that replaces the zeros with real
+    measurements. So the write does not trust the scan's list. Per row it
+    re-confirms *both* halves of the original verdict, because either half
+    alone is not evidence:
+
+    * the four columns are still all zero (in SQL, inside the transaction);
+    * the log still looks the way it did when the scan read it -- a log that
+      grew a shutdown event, or came back from the dead, changes its
+      fingerprint.
+
+    All-zero on its own would be the wrong test. A short session really can
+    measure 0s of API time, a 0-second duration and no line changes, which is
+    exactly the case ``find_fabricated`` uses the log to rule out.
+
+    Rows are updated one at a time rather than through a single
+    ``WHERE id IN (...)``: it keeps the parameter count flat instead of
+    scaling with the number of damaged rows -- SQLite's limit is 999 before
+    3.32 -- and it is what makes a per-row re-check possible at all.
+
+    Returns ``(cleared, skipped)``.
+    """
+    sets = ", ".join(f"{c} = NULL" for c in COLUMNS)
+    cleared = 0
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for row_id, fingerprint in found:
+            row = conn.execute(
+                "SELECT log_file FROM sessions WHERE id = ?", (row_id,)
+            ).fetchone()
+            if row is None:
+                continue
+            if log_fingerprint(log_dir / row["log_file"]) != fingerprint:
+                continue
+            # The text edit runs first: its guard stops matching the moment
+            # the columns become NULL. Both land in one transaction, so the
+            # summary can never describe a different session than the columns.
+            for old, new in REPLACEMENTS:
+                conn.execute(
+                    "UPDATE sessions SET raw_metrics = replace(raw_metrics, ?, ?) "
+                    f"WHERE id = ? AND {ZERO_GUARD}", (old, new, row_id))
+            cur = conn.execute(
+                f"UPDATE sessions SET {sets} WHERE id = ? AND {ZERO_GUARD}",
+                (row_id,))
+            cleared += cur.rowcount
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            # SQLite rolls back on its own for some errors, and then there is
+            # no transaction left to end. Never let that displace the real
+            # exception -- it is the one that says what went wrong.
+            pass
+        raise
+    return cleared, len(found) - cleared
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -152,11 +247,12 @@ def main(argv: list[str] | None = None) -> int:
 
     conn = connect(args.db)
     try:
-        ids = find_fabricated(conn, args.logs, args.missing_logs)
-        if not ids:
+        found = find_fabricated(conn, args.logs, args.missing_logs)
+        if not found:
             print("No fabricated zeros found.")
             return 0
 
+        ids = [row_id for row_id, _ in found]
         print(f"{len(ids)} row(s) hold zeros with no shutdown event to back "
               f"them: {ids}")
         if not args.apply:
@@ -166,34 +262,9 @@ def main(argv: list[str] | None = None) -> int:
         backup = backup_path(args.db)
         write_backup(conn, backup)
 
-        placeholders = ",".join("?" * len(ids))
-        sets = ", ".join(f"{c} = NULL" for c in COLUMNS)
-        # The scan above reads log files, which takes long enough that a live
-        # operator can re-ingest one of these sessions in the meantime -- and a
-        # re-ingest is precisely the event that replaces the zeros with real
-        # measurements. Re-testing the all-zero guard inside the write means a
-        # row that just acquired real data is skipped rather than erased, and
-        # doing both statements in one transaction keeps raw_metrics from
-        # disagreeing with the columns it describes. The text edit runs first
-        # because the guard stops matching once the columns are NULL.
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for old, new in REPLACEMENTS:
-                conn.execute(
-                    f"UPDATE sessions SET raw_metrics = replace(raw_metrics, ?, ?) "
-                    f"WHERE id IN ({placeholders}) AND {ZERO_GUARD}",
-                    (old, new, *ids))
-            cur = conn.execute(
-                f"UPDATE sessions SET {sets} "
-                f"WHERE id IN ({placeholders}) AND {ZERO_GUARD}", ids)
-            cleared = cur.rowcount
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        skipped = len(ids) - cleared
-        note = (f" {skipped} row(s) gained real metrics while this ran and "
-                f"were left alone." if skipped else "")
+        cleared, skipped = clear_rows(conn, found, args.logs)
+        note = (f" {skipped} row(s) changed under the scan and were left "
+                f"alone." if skipped else "")
         print(f"Cleared {cleared} row(s). Backup: {backup}{note}")
         return 0
     finally:
