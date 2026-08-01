@@ -95,11 +95,18 @@ def _clean_env() -> dict[str, str]:
 
 
 def run(cmd: list[str], *, quiet: bool = False) -> bool:
-    """Run a command, echoing it first. True when it exits 0."""
+    """Run a command, echoing it first. True when it exits 0.
+
+    The encoding is named rather than inherited: ``text=True`` alone decodes
+    with the locale (cp1252 on Windows), and a byte no codepage covers kills
+    subprocess's reader thread. ``errors="replace"`` cannot raise. See
+    :func:`capture` for the full argument.
+    """
     if not quiet:
         print(f"     $ {' '.join(cmd)}")
     try:
-        proc = subprocess.run(cmd, capture_output=quiet, text=True,
+        proc = subprocess.run(cmd, capture_output=quiet,
+                              encoding="utf-8", errors="replace",
                               env=_clean_env())
     except OSError as exc:
         warn(f"could not run {cmd[0]}: {exc}")
@@ -117,13 +124,27 @@ def capture(cmd: list[str], timeout: float | None = None) -> tuple[bool, str]:
 
     ``timeout`` guards the version probes: a wedged tool should cost setup a
     few seconds, not hang it.
+
+    The encoding is named rather than inherited. ``text=True`` alone decodes
+    with the locale's preferred encoding, which on Windows is cp1252, and the
+    tools probed here emit UTF-8 -- a version banner with an accented name, a
+    path with a non-Latin-1 character. A byte outside the codepage (measured:
+    0x81) raises UnicodeDecodeError inside subprocess's reader thread, which
+    leaves ``proc.stdout`` as None while the process still exits 0. That is
+    the worst shape available: the tool would be reported as present and
+    working with no output at all. ``errors="replace"`` cannot raise, and the
+    explicit None check reports the read as a failure rather than as a
+    successful run that said nothing.
     """
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
+        proc = subprocess.run(cmd, capture_output=True,
+                              encoding="utf-8", errors="replace",
                               env=_clean_env(), timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return False, ""
-    return proc.returncode == 0, proc.stdout or ""
+    if proc.stdout is None:
+        return False, ""
+    return proc.returncode == 0, proc.stdout
 
 
 def powershell() -> str | None:
@@ -605,7 +626,8 @@ def pip_install(args: list[str]) -> bool:
         cmd = [sys.executable, "-m", "pip", "install"] + extra + args
         print(f"     $ {' '.join(cmd)}")
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
+            proc = subprocess.run(cmd, capture_output=True,
+                                  encoding="utf-8", errors="replace",
                                   env=_clean_env())
         except OSError as exc:
             warn(f"could not run pip: {exc}")
@@ -994,7 +1016,7 @@ def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
         # Junctions need neither Developer Mode nor elevation.
         proc = subprocess.run(
             ["cmd", "/c", "mklink", "/J", str(dest), str(src)],
-            capture_output=True, text=True,
+            capture_output=True, encoding="utf-8", errors="replace",
         )
         if proc.returncode == 0:
             return "junction created"
@@ -1714,7 +1736,8 @@ def extension_health(dest: Path, key: str | None = None) -> ExtensionHealth:
     for module in modules:
         try:
             proc = subprocess.run(["node", "--check", str(module)],
-                                  capture_output=True, text=True,
+                                  capture_output=True,
+                                  encoding="utf-8", errors="replace",
                                   env=_clean_env(), timeout=60)
         except (OSError, subprocess.TimeoutExpired) as exc:
             # `capture` is not reused here on purpose. It returns (False, "")
@@ -1724,6 +1747,14 @@ def extension_health(dest: Path, key: str | None = None) -> ExtensionHealth:
             return ExtensionHealth(key, UNCHECKED,
                                    f"node --check did not run: {exc}")
         if proc.returncode != 0:
+            if proc.stderr is None:
+                # Belt and braces for the decode above: no stderr object at
+                # all is a read that failed, and reporting UNPARSABLE with an
+                # empty reason would blame the file for it.
+                return ExtensionHealth(
+                    key, UNCHECKED,
+                    f"node --check rejected {module.name} but its output "
+                    "could not be read")
             reason = _syntax_error_line(proc.stderr)
             if module != entry:
                 # Naming the file matters when it is not the one the reader

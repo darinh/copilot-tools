@@ -156,11 +156,18 @@ def _process_parents_posix() -> dict[int, int]:
                 continue
         return parents
     try:
-        out = subprocess.run(
+        # The encoding is named rather than inherited: `text=True` alone
+        # decodes with the locale, and a `ps` line carrying a byte outside it
+        # kills subprocess's reader thread, leaving `.stdout` as None on an
+        # exit-0 process. The AttributeError that followed was not in the
+        # except clause below, so a fallback whose whole job is to keep the
+        # runner alive would have crashed it instead.
+        proc = subprocess.run(
             ["ps", "-eo", "pid=,ppid="],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
-        for line in out.splitlines():
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=5,
+        )
+        for line in (proc.stdout or "").splitlines():
             bits = line.split()
             if len(bits) >= 2:
                 parents[int(bits[0])] = int(bits[1])

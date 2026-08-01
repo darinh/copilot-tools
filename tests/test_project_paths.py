@@ -23,7 +23,7 @@ from project_paths import guid_is_usable, primary_repo_root
 
 def _git(*args, cwd) -> None:
     subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                   capture_output=True, text=True)
+                   capture_output=True, encoding="utf-8", errors="replace")
 
 
 @pytest.fixture

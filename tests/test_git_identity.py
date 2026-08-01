@@ -52,7 +52,8 @@ CORPORATE = "dahoove@microsoft.com"
 
 def _git(*args, cwd) -> str:
     proc = subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                          capture_output=True, text=True)
+                          capture_output=True,
+                          encoding="utf-8", errors="replace")
     return proc.stdout
 
 

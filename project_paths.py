@@ -46,6 +46,18 @@ def primary_repo_root(start=None) -> Path:
     prevent. So the probe is guarded and an unexaminable path still gets the
     git call, which either answers or fails on its own terms. See
     :func:`install_manifest.path_present` for the full polarity argument.
+
+    The encoding is named rather than inherited. ``text=True`` alone decodes
+    with the locale's preferred encoding -- cp1252 on Windows -- and git emits
+    paths as UTF-8 bytes, so a repository whose path contains a character
+    whose UTF-8 encoding includes an undefined cp1252 byte (measured: 0x81,
+    from U+0401) killed subprocess's reader thread with UnicodeDecodeError.
+    The process still exited 0, so the ``returncode`` guard below let it
+    through, and ``proc.stdout`` was None: the failure arrived as an
+    AttributeError from the loop, i.e. "the agent does not know what project
+    it is in" spelled as a crash. ``errors="replace"`` cannot raise, and the
+    explicit None check keeps a read that failed from reading as a repository
+    with no worktrees.
     """
     base = Path(start) if start is not None else Path.cwd()
     try:
@@ -56,12 +68,13 @@ def primary_repo_root(start=None) -> Path:
     try:
         proc = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            cwd=str(base), capture_output=True, text=True, timeout=10,
+            cwd=str(base), capture_output=True,
+            encoding="utf-8", errors="replace", timeout=10,
             **_POPEN_KWARGS,
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return base
-    if proc.returncode != 0:
+    if proc.returncode != 0 or proc.stdout is None:
         return base
     for line in proc.stdout.splitlines():
         if line.startswith("worktree "):

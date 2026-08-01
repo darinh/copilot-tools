@@ -318,7 +318,8 @@ def _bash_version(executable: str) -> tuple[int, int] | None:
         proc = subprocess.run(
             [executable, "-c",
              'printf "%s %s" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}"'],
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
@@ -458,7 +459,8 @@ def _shell_launch_argv(function: str, user_argv: list[str], tmp_path: Path) -> l
         f'{function} "$@"\n',
         encoding="utf-8", newline="\n")
     proc = subprocess.run([_bash_executable(), "argv.sh", *user_argv], cwd=tmp_path,
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=60)
     assert proc.returncode == _LAUNCHED, (
         f"{function}() never reached generate_run_script (exit "
         f"{proc.returncode}), so nothing about its launch args was tested:\n"
@@ -504,7 +506,8 @@ def _shell_dispatch(argv: list[str], tmp_path: Path) -> tuple[str, list[str]]:
         'main "$@"\n',
         encoding="utf-8", newline="\n")
     proc = subprocess.run([_bash_executable(), "dispatch.sh", *argv], cwd=tmp_path,
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=60)
     assert proc.returncode == _LAUNCHED, (
         f"main() never reached a session function (exit {proc.returncode}), so "
         f"nothing about its dispatch was tested:\n{proc.stderr}")
@@ -653,7 +656,8 @@ def test_operator_sh_always_attaches_its_single_session(tmp_path):
         'run_single_session\n',
         encoding="utf-8", newline="\n")
     proc = subprocess.run([_bash_executable(), "attach.sh"], cwd=tmp_path,
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=60)
     assert proc.returncode == _ATTACHED, (
         "operator.sh's run_single_session did not reach `tmux attach` (exit "
         f"{proc.returncode}). If it has gained a way to launch a single "
