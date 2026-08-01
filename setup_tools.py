@@ -1315,6 +1315,26 @@ ENABLED = "enabled"
 DISABLED = "disabled"
 UNDETERMINED = "undetermined"
 
+#: Why an *unset* experimental setting is reported as OFF rather than as "could
+#: not tell". This is measured behaviour, not a documented contract: the CLI
+#: documents both spellings and no default, so the sentence names the
+#: measurement instead of asserting what the CLI promises. Keeping the
+#: provenance in the string is the point -- a future reader who finds this
+#: wrong after a `copilot update` needs to know it was measured on a specific
+#: version and can be re-measured, not that someone read it in the help text.
+#:
+#: The measurement that matters is the *negative with a matched positive*:
+#: identical seeded settings and identical probe extension, differing only in
+#: the flag, with the flag deciding. Without that pair, "the extension did not
+#: load" is equally well explained by the harness having broken the loader.
+#: The method and the reproduction are being written up separately so this
+#: can be re-measured after a CLI update rather than re-argued.
+_UNSET_IS_OFF = (
+    "an unset 'experimental' loads no extensions (measured on CLI 1.0.77; the "
+    "CLI documents no default and never writes one, so this does not resolve "
+    "itself on first run) — start the CLI with --experimental "
+    "(operator passes it for you)")
+
 #: What can be concluded about a *deployed* extension's ability to load.
 LOADABLE = "loadable"
 NO_ENTRYPOINT = "no-entrypoint"
@@ -1385,10 +1405,14 @@ def extension_mode(settings: Path | None = None) -> ExtensionMode:
     the value is sticky global state that any session, on any project, can
     flip out from under every other one.
 
-    Anything that is not a recorded boolean is ``UNDETERMINED``, including an
-    absent key: ``copilot --help`` documents both spellings and no default, so
-    the CLI's built-in behaviour is not ours to assert. Reporting a guess as a
-    verdict is the collapse the rest of this file exists to avoid.
+    An absent setting is ``DISABLED``, not ``UNDETERMINED``, and that is a
+    measurement rather than an inference: with no ``experimental`` key
+    recorded the CLI loads no extensions, and it writes nothing on startup, so
+    the absence never resolves itself. See ``_UNSET_IS_OFF`` for the scope of
+    that claim. A *failed read* is still ``UNDETERMINED`` — not knowing what
+    the file says is a different thing from knowing it says nothing, and only
+    the first of those is a guess. Reporting a guess as a verdict is the
+    collapse the rest of this file exists to avoid.
 
     The path is resolved from ``COPILOT_DIR`` on each call rather than fixed
     at import, so a caller that redirects the home directory is answered about
@@ -1399,7 +1423,9 @@ def extension_mode(settings: Path | None = None) -> ExtensionMode:
     if present is None:
         return ExtensionMode(UNDETERMINED, f"{path} could not be examined")
     if not present:
-        return ExtensionMode(UNDETERMINED, f"{path} does not exist")
+        return ExtensionMode(
+            DISABLED,
+            f"{path} does not exist — {_UNSET_IS_OFF}")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
@@ -1414,9 +1440,8 @@ def extension_mode(settings: Path | None = None) -> ExtensionMode:
         return ExtensionMode(UNDETERMINED, f"{path} does not hold a JSON object")
     if "experimental" not in data:
         return ExtensionMode(
-            UNDETERMINED,
-            f"no 'experimental' key in {path} — the CLI has not been told "
-            "either way and its own default governs")
+            DISABLED,
+            f"no 'experimental' key in {path} — {_UNSET_IS_OFF}")
     value = data["experimental"]
     if value is True:
         return ExtensionMode(ENABLED)
