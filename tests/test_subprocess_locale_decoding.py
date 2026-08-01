@@ -24,11 +24,15 @@ repository whose path contained U+0401::
     stdout is None: True
 
 ``subprocess.run`` returned normally with ``returncode == 0``. The failure was
-on a reader thread, so the only trace of it in the parent was ``stdout is
-None``, and every guard in this repository is spelled ``if proc.returncode !=
-0``. The tests below drive that exact shape through each caller with a fake
-``subprocess.run`` -- ``returncode=0``, ``stdout=None`` -- because it is the
-combination that gets past the guard that exists.
+on a reader thread -- which is a Windows detail: ``Popen._communicate`` uses
+reader threads there and ``selectors`` on POSIX, so the same bytes raise
+``UnicodeDecodeError`` straight out of the call on Linux and macOS. The silent
+shape is the one that shipped, so the tests below drive that exact shape
+through each caller with a fake ``subprocess.run`` -- ``returncode=0``,
+``stdout=None`` -- because it is the combination that gets past the guard that
+exists, and the guard is spelled ``if proc.returncode != 0`` everywhere in
+this repository. Both shapes are demonstrated against real child processes at
+the end of this file.
 
 Those fakes are not a substitute for running something: the round-trip tests
 in this file spawn real child processes that emit real undecodable bytes, on
@@ -158,9 +162,10 @@ def test_capture_round_trips_non_ascii_utf8():
 
 def test_capture_replaces_bytes_nothing_can_decode():
     """The other half of the fix. ``encoding="utf-8"`` alone leaves the codec
-    strict, so an invalid byte still kills the reader thread and still hands
-    back ``stdout is None``; ``errors="replace"`` is what makes this a
-    substitution rather than a loss."""
+    strict, so an invalid byte still fails the decode -- on a reader thread on
+    Windows, handing back ``stdout is None``; at the call on POSIX --
+    and ``errors="replace"`` is what makes this a substitution rather than a
+    loss."""
     ok, out = setup_tools.capture(_emit(b"before" + LONE_CONTINUATION + b"after"))
 
     assert ok, "an undecodable byte must not turn a successful run into a failure"
@@ -304,14 +309,29 @@ def test_pid_alive_still_answers_false_for_no_pid(e2e):
 # ── the premise these tests rest on ─────────────────────────────
 @pytest.mark.filterwarnings(
     "ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_locale_decoding_really_does_raise_on_a_reader_thread():
+def test_locale_decoding_really_does_break_and_how_depends_on_the_platform():
     """The mechanism, demonstrated rather than asserted from documentation.
 
-    If this ever stops being true -- a future Python defaulting to UTF-8 mode,
-    say -- the tests above are guarding a bug that can no longer happen, and
-    that is worth knowing rather than discovering. It is skipped where the
-    locale codec can decode the byte anyway, because there the premise simply
-    does not apply.
+    The *shape* of the failure differs by platform, and the difference is the
+    reason this bug was survivable long enough to ship. On Windows
+    ``Popen._communicate`` reads its pipes on reader threads; a
+    ``UnicodeDecodeError`` raised there is lost, so ``run`` returns normally
+    with ``returncode == 0`` and ``stdout is None`` -- every
+    ``if proc.returncode != 0`` guard in this repository passes and the error
+    resurfaces somewhere else entirely as an ``AttributeError`` on ``None``.
+    On POSIX the same read happens in the calling thread through
+    ``selectors``, so the ``UnicodeDecodeError`` comes straight out of
+    ``subprocess.run``: loud, immediate, and attached to the line that caused
+    it.
+
+    Both are demonstrated because both are true and neither is the whole
+    story. Measured: an earlier version of this test asserted only the
+    Windows shape, passed here, and failed on CI's Linux and macOS legs --
+    where the call raises rather than returning ``None`` -- for a reason that
+    had nothing to do with the bug being guarded.
+
+    It is skipped where the locale codec decodes the byte anyway, because
+    there the premise does not apply.
     """
     import locale
     codec = locale.getpreferredencoding(False)
@@ -322,13 +342,19 @@ def test_locale_decoding_really_does_raise_on_a_reader_thread():
     else:
         pytest.skip(f"{codec} decodes {LONE_CONTINUATION!r} without complaint")
 
-    proc = subprocess.run(_emit(LONE_CONTINUATION), capture_output=True,
-                          text=True, timeout=60)  # decode-ok: this IS the bug
+    if os.name == "nt":
+        proc = subprocess.run(_emit(LONE_CONTINUATION), capture_output=True,
+                              text=True, timeout=60)  # decode-ok: this IS the bug
 
-    assert proc.returncode == 0, "the child exited badly for some other reason"
-    assert proc.stdout is None, (
-        "the decode no longer fails silently on a reader thread; re-read the "
-        "guards this file protects, they may be guarding nothing")
+        assert proc.returncode == 0, \
+            "the child exited badly for some other reason"
+        assert proc.stdout is None, (
+            "the decode no longer fails silently on a reader thread; re-read "
+            "the guards this file protects, they may be guarding nothing")
+    else:
+        with pytest.raises(UnicodeDecodeError):
+            subprocess.run(_emit(LONE_CONTINUATION), capture_output=True,
+                           text=True, timeout=60)  # decode-ok: this IS the bug
 
 
 def test_the_named_encoding_is_what_makes_that_call_safe():
