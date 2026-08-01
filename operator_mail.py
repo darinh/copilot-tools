@@ -54,7 +54,13 @@ __all__ = [
 # is pushed through the multiplexer's input path at once.
 LIVE_TEXT_LIMIT = 2000
 
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# C1 (\x80-\x9f) is here as well as C0: a terminal reading UTF-8 may treat
+# U+009B as CSI, so "\x9b2J" clears the screen with no ESC anywhere in it.
+# The bidirectional overrides go too -- they cannot run anything, but they
+# reorder what a human sees, so a message can be made to read as the
+# opposite of what it says.
+_CONTROL = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
 class MailError(Exception):
@@ -239,6 +245,11 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
     so in the ordinary case nothing but the matched files is ever opened --
     an inbox that has built up does not turn every archive call into a parse
     of all of it.
+
+    Returns the number of messages that are in the archive once this call
+    returns, which is not always the number of files it moved: if a
+    concurrent reader archives one first, it still counts, because the
+    caller's question is whether the message is read, not who moved it.
     """
     inbox = inbox_dir(root, instance_id)
     destination = archive_dir(root, instance_id)
@@ -248,20 +259,35 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
     if not wanted:
         return 0
     files = sorted(inbox.glob("*.json"))
-    chosen = {path for path in files if path.stem in wanted}
-    if len(chosen) < len(wanted):
-        # A name did not settle every id, so whatever is left can only be
-        # found by reading. Note the test is on how many *files* were named,
-        # not on which ids: a file whose name matches one id while its content
-        # claims another satisfies neither on its own, and treating the name
-        # as proof would leave the real message sitting in the inbox to be
-        # re-delivered forever -- the exact fault this function is fixing.
+    chosen: set[Path] = set()
+    found: set[str] = set()
+    for path in files:
+        if path.stem not in wanted:
+            continue
+        ident = _message_id(path)
+        # A name is a claim, not proof. Accept it only when the file agrees
+        # with it, or when the file claims no id at all and so contradicts
+        # nothing. A file named for one message while holding another is a
+        # lie about which message it is, and believing it archives the wrong
+        # message *and* leaves the requested one to be re-delivered for ever.
+        if ident is None or ident == path.stem:
+            chosen.add(path)
+            found.add(path.stem)
+    if found != wanted:
+        # The names did not account for every id, so the rest can only be
+        # found by reading. Start over rather than adding to the name
+        # matches: a name that lost its claim above must not survive here.
+        chosen = set()
+        found = set()
         for path in files:
-            if path in chosen:
-                continue
             ident = _message_id(path)
-            if ident is not None and ident in wanted:
+            if ident is not None:
+                if ident in wanted:
+                    chosen.add(path)
+                    found.add(ident)
+            elif path.stem in wanted:
                 chosen.add(path)
+                found.add(path.stem)
     if not chosen:
         return 0
     read_at = _utcnow()
@@ -305,10 +331,18 @@ def _archive_one(path: Path, destination: Path, read_at: str) -> int:
                 # archived either way, which is what the count means.
                 return 1
             except OSError:
-                # The stamped copy is written but the inbox copy will not go
-                # quietly. Fall through and move it, or the message is
-                # delivered a second time.
-                pass
+                # The stamped copy is written but the inbox copy will not go.
+                # Falling through to the move below would overwrite the
+                # stamped copy with an unstamped one and, when it failed too,
+                # leave the message in the archive AND the inbox -- read and
+                # pending at once. Undo the write and report nothing
+                # archived: the message stays pending, which is a state the
+                # caller can act on, and it will be offered again.
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+                return 0
     try:
         os.replace(path, target)
         return 1

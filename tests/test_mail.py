@@ -173,7 +173,91 @@ def test_archive_reads_only_the_messages_it_was_asked_for(tmp_path, monkeypatch)
 
     monkeypatch.setattr(Path, "read_text", counting_read_text)
     assert operator_mail.archive(tmp_path, "beta", wanted) == 2
-    assert len(reads) == 2, f"read {len(reads)} files to archive 2: {reads}"
+    opened = {name for name in reads}
+    assert opened == {f"{i}.json" for i in wanted}, (
+        f"opened files beyond the two requested: {sorted(opened)}")
+
+
+def test_archive_does_not_believe_a_filename_over_its_contents(tmp_path):
+    """The counting shortcut that made the scan cheap was itself unsound: if
+    the number of name matches happened to equal the number of ids asked
+    for, the content scan was skipped, and a file named for one message
+    while holding another satisfied the count. The requested message stayed
+    pending -- re-delivered on every launch for ever -- and an unrelated
+    message was archived as read in its place. Both halves of the fault this
+    function exists to prevent, reintroduced by its own optimisation."""
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    inbox.mkdir(parents=True, exist_ok=True)
+    a = operator_mail.new_message("alpha", "beta", "beta", "message A")
+    a["id"] = "A"
+    b = operator_mail.new_message("alpha", "beta", "beta", "message B")
+    b["id"] = "B"
+    (inbox / "B.json").write_text(json.dumps(a), encoding="utf-8")
+    (inbox / "real-b-renamed.json").write_text(json.dumps(b), encoding="utf-8")
+
+    operator_mail.archive(tmp_path, "beta", ["B"])
+
+    assert [m["id"] for m in operator_mail.pending(tmp_path, "beta")] == ["A"]
+    assert [m["id"] for m in operator_mail.history(tmp_path, "beta")] == ["B"]
+
+
+def test_a_message_file_with_no_id_is_still_archived_by_its_name(tmp_path):
+    """Confirming names against contents must not make the function less
+    forgiving than it was. A file that claims no id contradicts nothing, so
+    its name is the only evidence there is -- and refusing it would leave a
+    malformed message in the inbox to be re-delivered for ever, which is the
+    failure this function exists to stop."""
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / "no-id-here.json").write_text(
+        json.dumps({"from": "alpha", "text": "hello"}), encoding="utf-8")
+
+    assert operator_mail.archive(tmp_path, "beta", ["no-id-here"]) == 1
+    assert operator_mail.pending(tmp_path, "beta") == []
+
+
+@pytest.mark.parametrize("payload", ["\x9b2J", "\x9bH", "\x9b31m"])
+def test_terminal_rendering_strips_c1_controls(payload):
+    """U+009B is CSI. A terminal decoding UTF-8 can act on it directly, so a
+    body carrying it clears the reader's screen or repaints it without an
+    ESC byte anywhere in the message."""
+    msg = operator_mail.new_message(
+        "alpha", "beta", "beta", f"before{payload}after")
+    out = operator_mail.render_for_terminal([msg])
+    assert "\x9b" not in out
+    assert "before" in out and "after" in out
+
+
+def test_rendering_strips_bidirectional_overrides():
+    """A right-to-left override cannot run anything, but it reverses what a
+    human reads, so a message can be displayed as the opposite of what it
+    says. Mail between agents is acted on; it has to say what it means."""
+    msg = operator_mail.new_message("alpha", "beta", "beta", "safe\u202egnahc")
+    assert "\u202e" not in operator_mail.render_for_terminal([msg])
+    assert "\u202e" not in operator_mail.render_line(msg)
+
+
+def test_a_message_that_cannot_leave_the_inbox_is_not_left_read_and_pending(
+        tmp_path, monkeypatch):
+    """If the stamped archive copy is written but the inbox copy will not
+    delete, the message must not end up in both places -- read in the
+    archive and still pending in the inbox is the one state the caller
+    cannot reason about. Better to undo the write and offer it again."""
+    msg = _msg(tmp_path, text="stuck")
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    real_unlink = Path.unlink
+
+    def refuse_inbox_unlink(self, *args, **kwargs):
+        if self.parent == inbox:
+            raise PermissionError("file is locked")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_inbox_unlink)
+    assert operator_mail.archive(tmp_path, "beta", [msg["id"]]) == 0
+    monkeypatch.undo()
+
+    assert [m["id"] for m in operator_mail.pending(tmp_path, "beta")] == [msg["id"]]
+    assert operator_mail.history(tmp_path, "beta") == []
 
 
 def test_archive_does_not_let_a_filename_stand_in_for_an_id(tmp_path):
