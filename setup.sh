@@ -51,6 +51,12 @@ find_python() {
 # Setup installs what is missing rather than handing the user a homework
 # list, so a machine without a usable Python gets one here.
 install_python() {
+    # `sudo_cmd` is empty whenever setup runs as root, which is the ordinary
+    # case in a container image — and expanding an empty array as
+    # `"${a[@]}"` under the `set -u` above is an unbound-variable abort on
+    # every bash before 4.4, macOS's 3.2 included. Guarded uniformly rather
+    # than case by case: which arrays are reachable while empty is a fact
+    # about today's callers, not a property of the array.
     local sudo_cmd=()
     if [[ "$(id -u)" -ne 0 ]] && command -v sudo &>/dev/null; then
         sudo_cmd=(sudo)
@@ -58,16 +64,16 @@ install_python() {
     if command -v brew &>/dev/null; then
         brew install python@3.12 || brew install python3 || return 1
     elif command -v apt-get &>/dev/null; then
-        "${sudo_cmd[@]}" apt-get update || true
-        DEBIAN_FRONTEND=noninteractive "${sudo_cmd[@]}" apt-get install -y python3 python3-pip python3-venv || return 1
+        ${sudo_cmd[@]+"${sudo_cmd[@]}"} apt-get update || true
+        DEBIAN_FRONTEND=noninteractive ${sudo_cmd[@]+"${sudo_cmd[@]}"} apt-get install -y python3 python3-pip python3-venv || return 1
     elif command -v dnf &>/dev/null; then
-        "${sudo_cmd[@]}" dnf install -y python3 python3-pip || return 1
+        ${sudo_cmd[@]+"${sudo_cmd[@]}"} dnf install -y python3 python3-pip || return 1
     elif command -v pacman &>/dev/null; then
-        "${sudo_cmd[@]}" pacman -S --noconfirm python python-pip || return 1
+        ${sudo_cmd[@]+"${sudo_cmd[@]}"} pacman -S --noconfirm python python-pip || return 1
     elif command -v zypper &>/dev/null; then
-        "${sudo_cmd[@]}" zypper install -y python3 python3-pip || return 1
+        ${sudo_cmd[@]+"${sudo_cmd[@]}"} zypper install -y python3 python3-pip || return 1
     elif command -v apk &>/dev/null; then
-        "${sudo_cmd[@]}" apk add python3 py3-pip || return 1
+        ${sudo_cmd[@]+"${sudo_cmd[@]}"} apk add python3 py3-pip || return 1
     else
         return 1
     fi

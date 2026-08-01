@@ -972,7 +972,7 @@ start_copilot_in_tmux() {
                 [[ -n "$_s" ]] && _live_sessions+=("$_s")
             done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
             local _name
-            for _name in "${PRE_LAUNCH_MARKERS[@]}"; do
+            for _name in ${PRE_LAUNCH_MARKERS[@]+"${PRE_LAUNCH_MARKERS[@]}"}; do
                 if in_list "$_name" ${_live_sessions[@]+"${_live_sessions[@]}"}; then
                     touch "${RESTART_DIR}/${_name}.managed"
                     log "  Restored marker for live instance: $_name"
