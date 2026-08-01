@@ -20,7 +20,6 @@ never under ``~/.copilot``, which the Copilot CLI wholesale-deletes on startup.
 from __future__ import annotations
 
 import atexit
-import csv
 import json
 import os
 import platform
@@ -59,6 +58,7 @@ from operator_mux import (                                    # noqa: E402
     Mux, MuxError, MuxNotFoundError, safe_instance_id,
 )
 from project_paths import (                                   # noqa: E402
+    catalog_rows,
     guid_is_usable,
     primary_repo_root,
     project_dir,
@@ -1341,7 +1341,13 @@ def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
         target = target.lower()
     try:
         with open(catalog, "r", encoding="utf-8", errors="replace", newline="") as fh:
-            for row in csv.reader(fh):
+            for row in catalog_rows(fh):
+                if row is None:
+                    # The line would not parse at all. Same reasoning as an
+                    # unresolvable row below: it is a row not compared, not a
+                    # row that failed to match.
+                    undecided = True
+                    continue
                 if len(row) < 2:
                     continue
                 path, guid = row[0].strip().strip('"'), row[1].strip().strip('"')
