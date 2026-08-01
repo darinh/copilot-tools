@@ -1,5 +1,39 @@
 # Repository Agent Instructions
 
+## Shell scripts must run on bash 3.2
+
+`/bin/bash` on macOS is 3.2 — Apple froze it at the last GPLv2 release and is
+never going to move it — so on macOS it is the default interpreter,
+permanently, not a legacy configuration a user could upgrade out of. Every
+`*.sh` file in this repo runs under `set -u`, so two bash 4 features are
+runtime aborts there rather than warnings:
+
+- **Associative arrays.** `local -A x` is `declare: -A: invalid option`, and
+  under `set -e` that ends the run. Use an indexed array with the `in_list`
+  helper (`operator.sh`, `handoff.sh`) instead.
+- **Expanding an empty array.** `"${a[@]}"` under `set -u` is an
+  unbound-variable abort on every bash before 4.4. Write
+  `${a[@]+"${a[@]}"}` instead — **uniformly**, including where the array
+  looks provably non-empty. Which arrays can be reached while empty is a fact
+  about today's callers, and callers change. `${#a[@]}` is safe.
+
+`tests/test_shell_bash32_conformance.py` enforces this over every first-party
+shell script, along with the other bash 4 constructs that would break there
+(namerefs, `mapfile`, `coproc`, `;;&`, `[ -v x ]`, `exec {fd}<`, `${v@Q}`,
+`$'\uXXXX'` and more). Every detector has a positive control asserting it
+fires and a negative control asserting the portable spelling still passes — a
+detector that matches nothing reports the whole tree clean, which reads
+exactly like success. Add both when you add a detector.
+
+It is deliberately a static scan: these are the exact tokens bash 3.2 rejects,
+and CI executes these scripts under a 3.2 interpreter on one leg only, so an
+execution test cannot object on the other seven.
+
+Do not narrow that scan to a single file. It replaced a tripwire that read
+only `operator.sh`, which is how `handoff.sh` kept an associative array
+through the change that removed operator.sh's — a rule enforced against one
+file is not a rule, it is that file's history.
+
 ## Spec-kit workflow
 
 - Read `.specify/memory/constitution.md` and the active feature under `specs/`
