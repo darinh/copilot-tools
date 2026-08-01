@@ -102,7 +102,8 @@ case-insensitively; on Linux and macOS compare case-sensitively.
 4. **If not found**: Ask the user:
    - "This project isn't in the catalog yet. Would you like to set it up?"
    - Choices: "Enable all features" / "Select features" / "Skip for now"
-   - If enabling: generate a GUID, create the directory, write `copilot-instructions.md` with selected features, add entry to `catalog.csv`.
+   - If enabling: generate a GUID, create the directory, write `copilot-instructions.md` (see
+     **What to write in a per-project file** below), add entry to `catalog.csv`.
    - **If spec-driven is selected and `.specify/` is missing**, initialize spec-kit using the script
      variant matching your platform — `ps` on Windows, `sh` on Linux/macOS/WSL:
 
@@ -128,7 +129,34 @@ When setting up a new project, the user selects which conventions to enable:
 | **Parallel Agents** | SQL-coordinated parallel task execution via `todo_claims`. | ON |
 | **Branching Strategy** | Feature branches in worktrees, merged to `main`, conventional commits | ON |
 
-The generated `copilot-instructions.md` includes only the enabled sections.
+### What to write in a per-project file
+
+The per-project `copilot-instructions.md` records what is **true of this project only**. It does
+not restate the protocols in this file — an agent reads both, and a second copy of the handoff
+or branching rules only creates something to drift. Name the enabled features and stop.
+
+```markdown
+# {project} — project conventions
+
+Enabled features: session-handoff, session-history, spec-driven, parallel-agents,
+branching-strategy.        <!-- list only the ones actually enabled -->
+
+## What this repo is
+One paragraph. What it does, and what makes changes here risky.
+
+## Validation
+The exact commands that prove a change works, with expected results
+(e.g. `python -m pytest -q` — expect 518 passing). What CI runs.
+
+## Gotchas
+Things learned the hard way that a fresh agent would otherwise rediscover.
+
+## Standing questions
+Open decisions the user wants re-raised each session, if any.
+```
+
+Everything in it should be something you verified, not something you assumed. An empty section is
+better than an invented one — fill it in as the project teaches you.
 
 ---
 

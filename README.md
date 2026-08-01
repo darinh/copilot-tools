@@ -244,8 +244,7 @@ copilot-tools/
 │       └── SKILL.md          # Parallel operator agents and mail
 ├── templates/
 │   ├── copilot-instructions.md    # Workflow conventions
-│   ├── mcp-config.json            # MCP server config
-│   └── project-instructions.md    # Per-project template
+│   └── mcp-config.json            # MCP server config
 ├── tests/                      # pytest suite + bash coordination tests
 └── docs/
     ├── operator.md           # Operator documentation

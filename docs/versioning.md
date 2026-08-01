@@ -16,7 +16,7 @@ without reading, which is how customisations get destroyed.
 One number, in `copilot_tools_version.py`:
 
 ```python
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 ```
 
 `pyproject.toml` reads it with `dynamic = ["version"]`, so the packaging
