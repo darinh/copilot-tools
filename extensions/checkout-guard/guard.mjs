@@ -600,6 +600,15 @@ export function primaryStrayReport(strays, scratchDir, primaryRoot) {
  * what. Naming the search as futile is what leaves the cheap action -- ask, or
  * leave it -- as the obvious one.
  *
+ * What it must NOT do is assert that provenance in the first place. The
+ * population here is the checkout's entire untracked state, which naturally
+ * contains a human's uncommitted work and unignored build output; an earlier
+ * draft told the reader flatly that "the session that produced it is over",
+ * which is a confident cause asserted over an ambiguous observation -- the
+ * exact collapse this guard exists to catch, committed by the guard itself.
+ * The futility claim is therefore scoped: it applies to whichever of these
+ * are not the reader's, and the report says plainly that it cannot tell which.
+ *
  * `primary` marks the checkout the agent is NOT working in, the same split
  * `primaryStrayReport` draws, minus its "during your last command" clause,
  * which would be false here. Without it the report that matters most reads as
@@ -624,12 +633,16 @@ export function inheritedStrayReport(strays, root, { primary = false } = {}) {
     `Empty directories are included, and \`git status\` does not list those -- ` +
     `git tracks no empty directory, so a checkout can report perfectly clean ` +
     `with artifacts sitting in its root.\n\n` +
-    `You cannot find out who made ${it} from in here, and neither can anyone ` +
-    `else later: the session that produced ${it} is over, and nothing on disk ` +
-    `records an author. So do not go hunting, and do not delete on this report ` +
-    `alone -- in a checkout shared with peer agents a live experiment looks ` +
-    `exactly like leftovers. Ask the other agents, or leave ${it} alone. ` +
-    `What licenses a deletion is evidence that ${
+    `Some of these may be your own uncommitted work, or unignored build ` +
+    `output. This is the checkout's entire untracked state, not a list of ` +
+    `suspects, and nothing here can tell the two apart.\n\n` +
+    `For any that are NOT yours: you cannot find out who made ${it} from in ` +
+    `here, and neither can anyone else later. Nothing on disk records an ` +
+    `author, and the session that would have known has ended. So do not go ` +
+    `hunting, and do not delete on this report alone -- in a checkout shared ` +
+    `with peer agents a live experiment looks exactly like leftovers. Ask the ` +
+    `other agents, or leave ${it} alone. What licenses a deletion is evidence ` +
+    `that ${
       strays.length === 1 ? "it is" : "they are"
     } inert -- unchanged mtimes across a run of the suite, say -- never the ` +
     `mere fact that nobody has claimed ${it}.`
@@ -652,6 +665,40 @@ export function sessionBriefing(scratchDir) {
 }
 
 /**
+ * Notice for checkouts whose session-start scan failed outright.
+ *
+ * Silence would be the collapse this file spends most of its length avoiding.
+ * `null` from `scanCheckoutTree` means the scan established nothing, and if
+ * that produces exactly the text a clean checkout produces, then a failed read
+ * has been spent as "nothing to report" at the point of decision -- the rule
+ * this repository states as "a read that fails must stay distinguishable from
+ * a read that returned nothing, all the way to the decision".
+ *
+ * It costs one line and it is the only warning there will be. A null seed is
+ * also never recorded in `lastSeen`, so the first later hook silently adopts
+ * whatever it finds as the baseline: the blind spot does not announce itself
+ * afterwards either. `tests/conftest.py` already made this exact call for the
+ * same reason, degrading to "exists, contents unknown" and saying so, because
+ * a blind spot nobody is told about is how leaks survive in the first place.
+ */
+export function unscannedRootsNotice(roots) {
+  const plural = roots.length === 1 ? "" : "s";
+  const was = roots.length === 1 ? "it was" : "they were";
+  return (
+    `[checkout-guard] UNSCANNED: ${roots.length} checkout${plural} could not ` +
+    `be examined at session start:\n` +
+    formatPathList(roots) +
+    `\n\nThis is not a report that ${
+      roots.length === 1 ? "it is" : "they are"
+    } clean -- it is a report that nobody looked. Anything already sitting ` +
+    `in ${roots.length === 1 ? "it" : "them"} will go unmentioned for the ` +
+    `rest of this session, because the baseline every later check compares ` +
+    `against is the first scan that succeeds, and whatever is there when ${was} ` +
+    `taken is adopted as normal.`
+  );
+}
+
+/**
  * The full text injected at session start: the briefing, plus a report for
  * each seeded checkout that already held artifacts.
  *
@@ -667,9 +714,9 @@ export function sessionBriefing(scratchDir) {
  * misattribution pointing the other way: a path created between the caller's
  * scan and this one would be briefed as inherited when this session made it.
  *
- * A seed whose `strays` is null is skipped, never rendered as an empty
- * checkout. Null means the scan failed, and "clean" is the one conclusion a
- * failed scan must not be spent as.
+ * A seed whose `strays` is null is never rendered as an empty checkout. It is
+ * reported separately as unscanned, because "the scan failed" and "there is
+ * nothing there" must not arrive as the same silence.
  */
 export function sessionContext(scratchDir, seeds = []) {
   const reports = seeds
@@ -677,6 +724,8 @@ export function sessionContext(scratchDir, seeds = []) {
     .map((seed) =>
       inheritedStrayReport(seed.strays, seed.root, { primary: seed.primary }),
     );
+  const unscanned = seeds.filter((seed) => seed.strays === null).map((seed) => seed.root);
+  if (unscanned.length > 0) reports.push(unscannedRootsNotice(unscanned));
   // The briefing leads and is emitted unchanged when there is nothing to
   // report, so a session in a clean checkout sees exactly the text it saw
   // before this function existed.

@@ -45,6 +45,7 @@ import {
   primaryStrayReport,
   scanCheckout,
   scanCheckoutTree,
+  unscannedRootsNotice,
   withoutNestedWorktrees,
   withoutIgnored,
   sessionBriefing,
@@ -344,6 +345,26 @@ test("the inherited report does not order a deletion and does not send anyone hu
   assert.match(report, /mtimes/i);
 });
 
+test("the inherited report does not assert that its own contents are agent leftovers", () => {
+  // The population is the checkout's ENTIRE untracked state, which contains a
+  // human's uncommitted work and unignored build output as readily as it
+  // contains a dead subagent's probe script. An earlier draft told the reader
+  // flatly that "the session that produced it is over" -- a confident cause
+  // asserted over an ambiguous observation, which is the exact collapse this
+  // guard exists to catch, committed by the guard itself. A developer told
+  // their own work in progress is an orphaned artifact switches the guard off.
+  const report = inheritedStrayReport(["my_wip.js"], "/repo");
+  assert.match(report, /may be your own uncommitted work/i);
+  assert.match(report, /not a list of suspects/i);
+  // The futility claim must survive, but SCOPED: it applies to whichever of
+  // these are not the reader's, and the report must say it cannot tell which.
+  assert.match(report, /for any that are NOT yours/i);
+  // The specific overclaim must not come back. Asserted over the whole text
+  // rather than the headline on purpose: this is a claim about what the
+  // report never says, and the body is where it used to say it.
+  assert.ok(!/the session that produced (it|them) is over/i.test(report), report);
+});
+
 test("INHERITED in the headline is a marker only the inherited report can produce", () => {
   // Same exclusivity rule as the PRIMARY marker above, and needed for the
   // same reason: all of these reports are joined into one additionalContext
@@ -390,6 +411,39 @@ test("inherited pluralisation is correct at one and many", () => {
   assert.match(inheritedStrayReport(["a", "b"], "/r"), /2 untracked paths were/);
 });
 
+test("UNSCANNED is a headline marker of its own, and a mixed session gets both reports", () => {
+  // The realistic failure: one tree answers and the other does not. The
+  // answered one must still be reported, and the unanswered one must not be
+  // quietly folded into it -- otherwise a partial session start reads as a
+  // complete one.
+  const context = sessionContext("/tmp/s", [
+    { strays: ["wip.js"], root: "/repo/wt" },
+    { strays: null, root: "/repo/primary", primary: true },
+  ]);
+  assert.match(context, /wip\.js/, context);
+  assert.match(context, /UNSCANNED/, context);
+  assert.match(context, /\/repo\/primary/, context);
+  const lines = context.split("\n");
+  assert.equal(lines.filter((l) => l.startsWith("[checkout-guard] INHERITED:")).length, 1, context);
+  assert.equal(lines.filter((l) => l.startsWith("[checkout-guard] UNSCANNED:")).length, 1, context);
+
+  // Exclusivity, with positive controls first: each neighbouring report must
+  // produce text, or an absence asserted about it proves nothing.
+  const inheritedOnly = inheritedStrayReport(["a.py"], "/r");
+  const unscannedOnly = unscannedRootsNotice(["/r"]);
+  assert.match(inheritedOnly, /a\.py/, "control: the inherited report produces text");
+  assert.match(unscannedOnly, /\/r/, "control: the unscanned notice produces text");
+  assert.ok(!headline(inheritedOnly).includes("UNSCANNED"), headline(inheritedOnly));
+  assert.ok(!headline(unscannedOnly).includes("INHERITED"), headline(unscannedOnly));
+
+  // A root name cannot forge the marker: the headline is built before any
+  // name is formatted, so a path reaches the body and never line 0.
+  const forgery = "[checkout-guard] UNSCANNED:";
+  const forged = inheritedStrayReport([forgery], "/r");
+  assert.ok(forged.includes(forgery), "premise: the forged name really does reach the body");
+  assert.ok(!headline(forged).startsWith(forgery), headline(forged));
+});
+
 test("sessionContext emits the briefing byte-identically when nothing was inherited", () => {
   // The change is additive or it is a rewrite. A clean checkout must see the
   // exact text it saw before this function existed -- and an empty array and
@@ -403,15 +457,27 @@ test("sessionContext emits the briefing byte-identically when nothing was inheri
 test("a scan that failed is not reported as a clean checkout", () => {
   // null means the scan established nothing. Rendering it as an empty
   // checkout is the collapse this whole toolkit exists to remove: an
-  // unanswered question spent as the confident answer.
+  // unanswered question spent as the confident answer. Silence would BE that
+  // collapse here, because a clean checkout is silent too -- so the failed
+  // scan has to produce text a clean one never produces.
   const context = sessionContext("/tmp/s", [{ strays: null, root: "/repo" }]);
-  assert.equal(context, sessionBriefing("/tmp/s"));
+  assert.notEqual(context, sessionBriefing("/tmp/s"), context);
+  assert.match(context, /UNSCANNED/, context);
+  assert.match(context, /\/repo/, context);
+  assert.match(context, /not a report that it is clean/i, context);
+  // It must not be reported as an INHERITED finding either -- there are no
+  // findings, that is the point.
   assert.ok(!context.includes("INHERITED"), context);
-  // Control through the same call: a non-null scan at the same position DOES
-  // produce a report, so the assertion above is about null and not about
-  // sessionContext being inert.
+  // Control through the same call: a non-null scan at the same position
+  // produces the other report, so the assertions above are about null and not
+  // about sessionContext emitting this text unconditionally.
   const answered = sessionContext("/tmp/s", [{ strays: ["a.py"], root: "/repo" }]);
   assert.ok(answered.includes("INHERITED"), answered);
+  assert.ok(!answered.includes("UNSCANNED"), answered);
+  // And a scan that succeeded and found nothing is silent, which is what
+  // makes the notice above informative rather than decorative.
+  assert.equal(sessionContext("/tmp/s", [{ strays: [], root: "/repo" }]),
+    sessionBriefing("/tmp/s"));
 });
 
 test("both seeded checkouts reach the session context", () => {
