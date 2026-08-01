@@ -60,6 +60,16 @@ writing down beside the check rather than discovering them in a red build:
 * Merging through the GitHub web UI authors the merge commit with the
   *clicking user's* primary GitHub address, which is not necessarily the one
   configured on any machine. Merge locally, or keep that address allowed.
+* Co-authors are read with git's own trailer parser, which means the final
+  paragraph only, and no indented lines. An address written into
+  commit-message *prose* is therefore not reported. That boundary is not a
+  convenience: it is the same one GitHub uses to decide whether a commit has
+  a co-author, so it separates "an address that is an identity on this
+  commit" from "an address that is text in it". This module found the
+  distinction by reporting a violation against its own commit, whose message
+  quoted four example trailers. The address in prose is still published; if
+  that ever needs catching it needs its own check under its own name, not a
+  quietly widened definition of "co-author".
 * The scan is unconditional over all of history, so a single bad commit
   reddens every subsequent build until the history is rewritten. That is
   deliberate and it is the same bill the incident already presented: there is
@@ -105,46 +115,46 @@ UNDETERMINED = 2
 _FIELD = "\x1f"
 _RECORD = "\x1e"
 
-# Co-author trailers are read in two stages, and the reason is a bypass that
-# two independent reviewers found in the one-stage version. A single regex
-# ending `<([^>]*)>\s*$` captures only the LAST address on the line, so
+# Co-author trailers are read with git's own trailer parser rather than by
+# searching the message, and that choice was forced by this module reporting a
+# violation against its own commit. A commit message that *discusses* trailers
+# -- as every commit on this branch does -- contains lines that are
+# indistinguishable from trailers to a regex, and the scan flagged four of
+# them. A check that fires on its own documentation is the kind of noise that
+# gets a check deleted, which is a worse outcome than the false positive.
 #
-#     Co-authored-by: Evil <corp@example.com> and Good <darinh@gmail.com>
+# `%(trailers:key=...)` is also the more correct question. Git defines a
+# trailer as living in the message's final paragraph, and that same definition
+# is what decides whether GitHub attributes co-authorship -- so it is exactly
+# the line between "an address that is an identity on this commit" and "an
+# address that appears in prose". Author and committer are unaffected.
 #
-# reported only the allowed address and the commit passed as clean; and a line
-# with any trailing text after the bracket failed to match at all. Both are
-# false negatives, which is the direction that publishes. So: find the trailer
-# lines, then take *every* address on each one.
-#
-# The first fix for that was itself the same bug one layer down. It took the
-# bracketed addresses when there were any and the bare remainder only when
-# there were none, so `Co-authored-by: Evil bad@corp and Good <ok@allowed>`
-# reported nothing -- the bracketed branch won and the bare address was never
-# looked at. Worse, the bare branch kept the *whole line* as one address, so a
-# line ending in an allowed suffix was allowed wholesale. Both are false
-# negatives, and both came from branching on the spelling instead of just
-# collecting the addresses. There is no bracketed-vs-bare distinction here now:
-# an address is a token with an `@` in it, and every one of them counts.
-_TRAILER_LINE = re.compile(r"^[ \t]*Co-authored-by:(.*)$",
-                           re.IGNORECASE | re.MULTILINE)
+# The deliberate non-goal: an address written into commit-message prose is not
+# an identity and is not reported here. It is still published, and if that
+# ever needs catching it needs its own check with its own name, not a widened
+# definition of "co-author".
+_TRAILER_KEY = "Co-authored-by"
+_TRAILERS_FMT = f"%(trailers:key={_TRAILER_KEY},valueonly,unfold)"
+
+# Addresses are tokens containing an `@`, wherever they sit in the trailer's
+# value. The value may hold several, and this deliberately does not branch on
+# whether they are wrapped in angle brackets: a previous version took the
+# bracketed ones when there were any and the bare remainder otherwise, so
+# `Evil bad@corp and Good <ok@allowed>` reported only the allowed address.
+# That is the same "stop at the first thing you can approve of" bug the
+# bracket handling was written to fix, rotated one axis. Brackets are
+# punctuation; an address is an address.
 _ADDRESS = re.compile(r"[^\s<>(),;:\"']+@[^\s<>(),;:\"']+")
 
 
-def _trailer_addresses(body: str) -> list[str]:
-    """Every address on every ``Co-authored-by:`` line of a commit message.
-
-    Angle brackets are not required. Git's own tooling writes them, but a
-    hand-typed ``Co-authored-by: Someone corp@example.com`` names exactly the
-    same person and publishes exactly as widely, so the brackets are treated
-    as punctuation rather than as the thing that makes an address an address.
-    """
+def _trailer_addresses(value: str) -> list[str]:
+    """Every address in the ``Co-authored-by`` values git reported."""
     found: list[str] = []
-    for line in _TRAILER_LINE.findall(body):
-        for address in _ADDRESS.findall(line):
-            # A trailing period is sentence punctuation, never part of an
-            # address; leaving it on would turn an allowed address into an
-            # unrecognised one and report a violation that is not there.
-            found.append(address.rstrip(".").strip())
+    for address in _ADDRESS.findall(value):
+        # A trailing period is sentence punctuation, never part of an
+        # address; leaving it on would turn an allowed address into an
+        # unrecognised one and report a violation that is not there.
+        found.append(address.rstrip(".").strip())
     return found
 
 
@@ -249,10 +259,19 @@ def _parse_log(raw: str) -> list[Identity]:
             # change from quietly becoming a clean bill of health.
             raise _GitUnavailable(
                 f"unparseable git log record ({len(parts)} fields, expected 4)")
-        commit, author, committer, body = parts
+        commit, author, committer, trailers = parts
+        if "%(trailers" in trailers:
+            # git echoed the placeholder instead of expanding it, which is what
+            # a version that does not support `%(trailers:key=...)` does --
+            # silently, with exit status 0. Believing it would mean reporting
+            # "no co-authors" for every commit in the repository, which is a
+            # clean bill of health issued by a scan that never ran.
+            raise _GitUnavailable(
+                "this git does not support `%(trailers:key=...)`; co-author "
+                "trailers could not be read")
         found.append(Identity(commit, "author", author))
         found.append(Identity(commit, "committer", committer))
-        for address in _trailer_addresses(body):
+        for address in _trailer_addresses(trailers):
             found.append(Identity(commit, "co-author", address))
     return found
 
@@ -280,7 +299,7 @@ def scan(repo: str = ".", revs: tuple[str, ...] = ("--all",)) -> Result:
             f"git could not say whether the clone is shallow (answered "
             f"{shallow!r}), and an unanswered question is not a 'no'.")
 
-    fmt = f"--format=%H{_FIELD}%ae{_FIELD}%ce{_FIELD}%B{_RECORD}"
+    fmt = f"--format=%H{_FIELD}%ae{_FIELD}%ce{_FIELD}{_TRAILERS_FMT}{_RECORD}"
     try:
         raw = _git(["log", fmt, *revs], repo)
         identities = _parse_log(raw)

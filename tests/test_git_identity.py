@@ -212,7 +212,7 @@ def test_a_corporate_co_author_trailer_is_found(tmp_path):
     # hand does not, and the address is published either way.
     f"Co-authored-by: {CORPORATE}",
     # Indented, and in a different case than the canonical spelling.
-    f"    co-authored-BY: Evil <{CORPORATE}>",
+    f"co-authored-BY: Evil <{CORPORATE}>",
     # Comma-separated, which is how a multi-author trailer is often written.
     f"Co-authored-by: <{ALLOWED}>, Evil <{CORPORATE}>",
     # Two separate trailer lines: the allowed one first, so an implementation
@@ -253,6 +253,87 @@ def test_an_allowed_trailer_is_not_reported_however_it_is_spelled(tmp_path, trai
     assert result.state == CLEAN, (
         f"clean trailer {trailer!r} was reported as "
         f"{[o.email for o in result.offenders]}")
+
+
+# ---------------------------------------------------------------------------
+# Where a co-author stops being a co-author. This boundary is git's, not this
+# module's, and it is load-bearing in both directions -- so both directions
+# are asserted against the SAME address, which is the only way to show the
+# rule is about position rather than about the address.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("prose", [
+    # Indented. Measured: git does not treat an indented line as a trailer,
+    # with spaces or with a tab, so GitHub does not attribute co-authorship
+    # for it either.
+    f"    Co-authored-by: Evil <{CORPORATE}>",
+    f"\tCo-authored-by: Evil <{CORPORATE}>",
+    # In an earlier paragraph. Git reads trailers from the final paragraph
+    # only, so a message that *discusses* a trailer does not acquire one.
+    f"Co-authored-by: Evil <{CORPORATE}>\n\nthe real body ends here",
+])
+def test_a_co_author_line_in_prose_is_not_an_identity(tmp_path, prose):
+    """The deliberate non-goal, pinned so it stays deliberate.
+
+    This module found it by reporting a violation against its own commit: the
+    commit message explaining the trailer bug quoted four example trailers,
+    and a regex over the message body could not tell them from real ones.
+
+    The resolution was to ask git's parser instead, which draws the line at
+    the final paragraph -- the same line that decides whether GitHub
+    attributes co-authorship. So this is not a hole in the check; it is the
+    difference between an address that is an identity on the commit and an
+    address that is text in it. The address is still published, and if that
+    ever needs catching it needs its own check with its own name, rather than
+    a quietly widened definition of "co-author".
+    """
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "init", body=prose)
+    assert scan(str(repo)).state == CLEAN
+
+
+def test_the_same_address_in_a_real_trailer_is_still_caught(tmp_path):
+    """Negative control for the boundary above, and the reason it is safe.
+
+    Without this, every test in the block above is satisfied by a module that
+    stopped reading trailers altogether. Same address, same repository shape,
+    only the position differs -- so what is asserted is the position rule and
+    not the absence of a check.
+    """
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "init", body=f"Co-authored-by: Evil <{CORPORATE}>")
+    result = scan(str(repo))
+    assert result.state == VIOLATIONS
+    assert CORPORATE in {o.email for o in result.offenders}
+
+
+def test_a_git_too_old_for_trailer_parsing_is_undetermined_not_clean(clean_repo, monkeypatch):
+    """The silent half of asking git to do the parsing.
+
+    Measured: given a `%(trailers:...)` option it does not understand, git
+    prints the placeholder back verbatim and exits 0. Nothing is logged and
+    nothing fails. Believing that answer means reporting "no co-authors" for
+    every commit in the repository -- a clean bill of health from a scan that
+    never ran, which is the exact failure this module's third state exists to
+    prevent.
+    """
+    real_run = git_identity.subprocess.run
+    good = _git("log", "--format=%H", cwd=clean_repo).strip()
+
+    def unsupported(cmd, **kwargs):
+        proc = real_run(cmd, **kwargs)
+        if "log" in cmd:
+            proc.stdout = (f"{good}\x1f{ALLOWED}\x1f{ALLOWED}\x1f"
+                           "%(trailers:key=Co-authored-by,valueonly,unfold)\x1e")
+            proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(git_identity.subprocess, "run", unsupported)
+    result = scan(str(clean_repo))
+    assert result.state == UNDETERMINED, (
+        "git echoed the trailer placeholder instead of expanding it and the "
+        "scan reported the history as clean")
+    assert "trailers" in result.reason
 
 
 def test_an_allowed_address_beside_a_corporate_one_is_not_a_pass(tmp_path):
@@ -556,7 +637,14 @@ def test_a_commit_git_cannot_decode_is_clean_not_a_violation(tmp_path):
     (repo / "f.txt").write_text("x\n", encoding="utf-8")
     _git("add", "-A", cwd=repo)
     message = tmp_path / "msg.bin"
-    message.write_bytes(b"subject \x81 \xc3\xa9\n")
+    # The undecodable byte goes in a TRAILER VALUE, not the subject. When this
+    # module read `%B` the subject was enough; asking git for `%(trailers:...)`
+    # means the subject never reaches the decoder, and the mutation harness
+    # caught that this test had stopped exercising the encoding at all -- it
+    # passed with and without the fix. The byte has to land in a field the
+    # format actually emits or the test is measuring nothing.
+    message.write_bytes(
+        b"subject \x81 \xc3\xa9\n\nCo-authored-by: N\x81me <darinh@gmail.com>\n")
     # Not via `_git`: that helper decodes with the locale too, so it would
     # raise here and the test would fail before reaching the thing it tests.
     subprocess.run(
