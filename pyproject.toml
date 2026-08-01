@@ -21,7 +21,11 @@ operator-ingest = "operator_ingest:main"
 operator-runner = "operator_runner:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "PyYAML>=6.0"]
+# setuptools is a genuine test dependency, not a stray build artefact:
+# tests/test_worktree_install_guard.py compares our build backend's hooks
+# against setuptools.build_meta's, and Python 3.12 stopped shipping
+# setuptools in a fresh environment, so it has to be asked for by name.
+dev = ["pytest>=7.0", "PyYAML>=6.0", "setuptools>=64"]
 
 [build-system]
 requires = ["setuptools>=64"]
