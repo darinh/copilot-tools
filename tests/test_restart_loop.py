@@ -103,6 +103,11 @@ def test_loop_args_reject_non_string_args():
     inst.loop_args_file.write_text(
         json.dumps({"user_args": ["--agent", 7], "cwd": "/tmp"}), encoding="utf-8")
     assert op._load_loop_args(inst) == ([], None)
+    # ([], None) is what this loader returns for every payload it refuses and
+    # for the file being absent, so the same call over the same path has to be
+    # shown accepting a good payload.
+    op._save_loop_args(inst, ["--agent", "anvil:anvil"])
+    assert op._load_loop_args(inst)[0] == ["--agent", "anvil:anvil"]
 
 
 def test_loop_args_are_recorded_by_loop_mode(monkeypatch):
@@ -423,10 +428,11 @@ def test_restart_loop_requires_a_name():
 
 # ── handoff hazards found in adversarial review ─────────────────
 
-def test_concurrent_restarts_do_not_spawn_two_supervisors(monkeypatch):
+def test_concurrent_restarts_do_not_spawn_two_supervisors(monkeypatch, capsys):
     """Two supervisors watching one session relaunch over each other's work
     forever. Only one handoff may be in flight at a time."""
     spawned = {"n": 0}
+    refusal: dict = {}
     monkeypatch.setattr(op.MUX, "has_session", lambda session: True)
     monkeypatch.setattr(op, "_running_loop_pid", lambda instance: None)
 
@@ -438,7 +444,8 @@ def test_concurrent_restarts_do_not_spawn_two_supervisors(monkeypatch):
         spawned["n"] += 1
         if spawned["n"] == 1:
             # A second restart arriving mid-handoff must be turned away.
-            assert op.restart_loop("concurrent") == 1
+            refusal["rc"] = op.restart_loop("concurrent")
+            refusal["err"] = capsys.readouterr().err
         return 1
 
     monkeypatch.setattr(op, "_spawn_background_loop", reentrant_spawn)
@@ -446,6 +453,13 @@ def test_concurrent_restarts_do_not_spawn_two_supervisors(monkeypatch):
                         lambda instance: 55 if spawned["n"] else None)
 
     assert op.restart_loop("concurrent") == 0
+    assert refusal["rc"] == 1
+    # 1 is every refusal this function has, and the inner call is standing in
+    # front of several. Delete the handoff lock and it walks past this one
+    # into the handoff itself, waits out its budget on a supervisor that never
+    # dies, and returns the same 1 from a timeout -- which is what the suite
+    # used to accept. So the reason has to be read, not just the code.
+    assert "already in progress" in refusal["err"]
     assert spawned["n"] == 1, "the second restart must not have spawned anything"
 
 
@@ -456,10 +470,20 @@ def test_restart_lock_is_released_so_a_later_restart_works(monkeypatch):
     _claim(inst)
     op._save_loop_args(inst, [])
     state = _fake_supervisor(monkeypatch, inst, pid=55)
-    monkeypatch.setattr(op, "_spawn_background_loop",
-                        lambda *a, **k: state.__setitem__("pid", 56) or 56)
+    held: list[bool] = []
+
+    def spawn(*a, **k):
+        held.append(inst.restart_lock_file.exists())
+        state["pid"] = 56
+        return 56
+
+    monkeypatch.setattr(op, "_spawn_background_loop", spawn)
 
     assert op.restart_loop("lockrelease") == 0
+    # A lock that was never taken also "does not exist" afterwards, and that
+    # is this assertion's own failure mode inverted. The spawn happens inside
+    # the handoff lock, so the same restart has to be caught holding it.
+    assert held == [True], "the handoff never held the lock it claims to release"
     assert not inst.restart_lock_file.exists(), "lock must not outlive the handoff"
     assert op.restart_loop("lockrelease") == 0
 
@@ -494,9 +518,20 @@ def test_restart_loop_does_not_resurrect_a_session_that_stop_killed(monkeypatch)
 
     # Supervisor dies, but the detach marker is left behind untouched.
     pids = iter([4242, None, None, None])
-    monkeypatch.setattr(op, "_running_loop_pid", lambda instance: next(pids, None))
+    marker_seen: list[bool] = []
+
+    def running(instance):
+        marker_seen.append(instance.detach_marker.exists())
+        return next(pids, None)
+
+    monkeypatch.setattr(op, "_running_loop_pid", running)
 
     assert op.restart_loop("stoprace") == 1
+    # A marker that was never created is also one that does not exist at the
+    # end, and a restart that never asked for a detach would satisfy the line
+    # below while doing nothing at all. The polls run between the request and
+    # its cleanup, so only they can show the marker was really there.
+    assert True in marker_seen, "the detach request was never made"
     assert not inst.detach_marker.exists(), "the unconsumed marker must be cleaned up"
 
 
@@ -576,16 +611,21 @@ def test_restart_loop_survives_a_failed_spawn(monkeypatch):
     monkeypatch.setattr(op.MUX, "has_session", lambda session: True)
     monkeypatch.setattr(op, "_running_loop_pid", lambda instance: None)
 
+    inst = op.Instance("spawnfail")
+    _claim(inst)
+    op._save_loop_args(inst, [])
+    held: list[bool] = []
+
     def boom(*a, **k):
+        held.append(inst.restart_lock_file.exists())
         raise OSError("no more processes")
 
     monkeypatch.setattr(op, "_spawn_background_loop", boom)
 
-    inst = op.Instance("spawnfail")
-    _claim(inst)
-    op._save_loop_args(inst, [])
-
     assert op.restart_loop("spawnfail") == 1
+    # Same reason as the release test: the failing spawn is the only moment
+    # that can prove a lock existed to be released on the way out.
+    assert held == [True], "the failed handoff never held the lock"
     assert not inst.restart_lock_file.exists()
 
 
@@ -629,6 +669,10 @@ def test_spawn_passes_adopt_flag_to_the_supervisor(monkeypatch):
 
     op._spawn_background_loop(inst, ["--agent", "test:agent"], is_fresh=False)
     assert "--adopt" not in captured["cmd"], "adoption must be opt-in"
+    # "not in" is satisfied by any command line at all, including an empty
+    # one. The same capture has to show a real spawn behind it, so the user
+    # args are checked on the call that drops the flag.
+    assert "test:agent" in captured["cmd"]
 
 
 def test_adopt_flag_is_parsed_and_threaded_through(monkeypatch):
