@@ -52,6 +52,12 @@ def test_file_digest_matches_known_sha256(tmp_path):
 
 def test_file_digest_of_missing_file_is_none(tmp_path):
     assert im.file_digest(tmp_path / "nope") is None
+    # Sole author: an unreadable file and a missing one share this return
+    # value, so the same call has to be shown answering for a file that is
+    # there, or "is None" is satisfied by a function that only ever fails.
+    present = tmp_path / "yes"
+    present.write_bytes(b"abc")
+    assert im.file_digest(present) is not None
 
 
 def test_tree_digest_is_stable_across_identical_trees(tmp_path):
@@ -96,6 +102,11 @@ def test_tree_digest_of_a_non_directory_is_none(tmp_path):
     path = tmp_path / "f.txt"
     path.write_text("x", encoding="utf-8")
     assert im.tree_digest(path) is None
+    # None is also what this function returns for every failure it has, so on
+    # its own the line above passes for a tree_digest that never works. The
+    # same call over the directory holding that file answers, which makes the
+    # None a verdict on the argument.
+    assert im.tree_digest(tmp_path) is not None
 
 
 def test_digest_for_dispatches_on_type(tmp_path):
@@ -154,6 +165,13 @@ def test_save_stamps_updated_at(tmp_path):
 def test_missing_manifest_loads_as_empty(tmp_path):
     assert im.load(tmp_path)["artifacts"] == {}
     assert im.load(tmp_path)["package_version"] is None
+    # An empty manifest is what load returns for every failure it survives, so
+    # the same call over the same home has to be shown returning content once
+    # there is content to return.
+    manifest = im.empty_manifest()
+    manifest["package_version"] = "1.2.3"
+    im.save(tmp_path, manifest)
+    assert im.load(tmp_path)["package_version"] == "1.2.3"
 
 
 def test_corrupt_manifest_loads_as_empty(tmp_path):
@@ -289,6 +307,13 @@ def test_path_present_says_unknown_when_it_cannot_look(tmp_path, monkeypatch):
     path.write_text("the user's work", encoding="utf-8")
     deny_lstat(monkeypatch, path)
     assert im.path_present(path) is None
+    # None on its own is also what a probe that lost the ability to answer
+    # returns for everything. The denial is scoped to one path, so the same
+    # call must still produce both other verdicts while it is installed --
+    # evidence only this call can author, since a probe that could not see
+    # the denial could not see these two either.
+    assert im.path_present(tmp_path) is True
+    assert im.path_present(tmp_path / "never-existed.md") is False
 
 
 def test_path_present_treats_every_io_failure_as_unknown(tmp_path, monkeypatch):
@@ -298,6 +323,12 @@ def test_path_present_treats_every_io_failure_as_unknown(tmp_path, monkeypatch):
     for number in (errno.EIO, errno.ESTALE, errno.EACCES, errno.ENETDOWN):
         deny_lstat(monkeypatch, path, OSError(number, os.strerror(number)))
         assert im.path_present(path) is None, f"errno {number} read as an answer"
+        # Sole author, per errno: each patch is scoped to one path, so the
+        # same call has to keep answering for its neighbours or the None
+        # above is the probe failing rather than the errno being honoured.
+        assert im.path_present(tmp_path) is True, f"errno {number} leaked"
+        assert im.path_present(tmp_path / "gone.md") is False, (
+            f"errno {number} leaked")
 
 
 def test_path_present_sees_a_link_whose_target_is_gone(tmp_path):
@@ -326,6 +357,11 @@ def test_unreadable_destination_is_not_classified_absent(pair, monkeypatch):
     deny_lstat(monkeypatch, dest)
     assert im.classify(im.empty_manifest(), "k", dest,
                        im.file_digest(source)) == im.UNREADABLE
+    # The denial is scoped to one path, so the same call must still reach its
+    # other verdicts -- including ABSENT, the state this test exists to keep
+    # an unexaminable destination out of.
+    assert im.classify(im.empty_manifest(), "k", dest.parent / "gone.md",
+                       im.file_digest(source)) == im.ABSENT
 
 
 def test_needs_update_is_true_when_a_destination_is_unreadable(tmp_path,
@@ -386,6 +422,11 @@ def test_discovery_reads_the_transition_from_the_name():
 def test_functions_not_named_for_a_transition_are_ignored():
     names = [f.__name__ for _a, _b, f in im.discover_migrations(_namespace([]))]
     assert "not_an_upgrade" not in names
+    # "not in" is also true of the empty list, which is what a discovery that
+    # matched nothing at all would return. The same call has to be shown
+    # keeping the three well-named neighbours it was handed alongside it.
+    assert names == ["upgrade_v1_0_0_to_v1_1_0", "upgrade_v1_1_0_to_v1_2_0",
+                     "upgrade_v1_2_0_to_v2_0_0"]
 
 
 def test_only_migrations_above_the_installed_version_are_pending():
@@ -413,7 +454,12 @@ def test_an_unknown_installed_version_runs_everything():
 
 
 def test_nothing_is_pending_when_already_current():
-    assert im.pending_migrations("2.0.0", "2.0.0", _namespace([])) == []
+    namespace = _namespace([])
+    assert im.pending_migrations("2.0.0", "2.0.0", namespace) == []
+    # Same call, same namespace, one argument moved: without this the empty
+    # list above is equally consistent with a selection that never selects.
+    assert [b for _a, b, _f in im.pending_migrations("1.2.0", "2.0.0", namespace)] \
+        == ["2.0.0"]
 
 
 def _ctx_kwargs(**overrides):
@@ -457,11 +503,48 @@ def test_a_migration_receives_the_paths_it_needs(tmp_path):
     assert seen == {"copilot": tmp_path, "from": "1.0.0"}
 
 
-def test_shipped_migrations_are_all_well_named():
+def test_shipped_migrations_are_all_well_named(monkeypatch):
     """Guards the naming convention: a typo'd upgrade function would silently
-    never run."""
-    for source, target, func in im.discover_migrations():
-        assert im.parse_version(source) < im.parse_version(target), func.__name__
+    never run.
+
+    Nothing ships a migration yet, so the ordering loop below runs zero times
+    and the assertion inside it has never once executed -- and the hazard the
+    name promises is precisely a function the regex does not match, which by
+    construction can never enter that loop. The guard is the set comparison:
+    everything in the module named like an upgrade must also be discovered.
+    That comparison is empty-equals-empty today, so the two ``monkeypatch``
+    steps are what make it evidence -- they show the same no-argument call
+    reading module globals, agreeing with the scan for a well-named function
+    and disagreeing for one whose name is missing a ``v``.
+    """
+    def discovered_and_named():
+        found = im.discover_migrations()
+        for source, target, func in found:
+            assert im.parse_version(source) < im.parse_version(target), func.__name__
+        named = {name for name, value in vars(im).items()
+                 if name.startswith("upgrade_") and callable(value)}
+        return {f.__name__ for _s, _t, f in found}, named
+
+    discovered, named_like_an_upgrade = discovered_and_named()
+    assert discovered == named_like_an_upgrade
+
+    def upgrade_v9_0_0_to_v9_1_0(ctx):
+        pass
+
+    monkeypatch.setattr(im, upgrade_v9_0_0_to_v9_1_0.__name__,
+                        upgrade_v9_0_0_to_v9_1_0, raising=False)
+    discovered, named_like_an_upgrade = discovered_and_named()
+    assert "upgrade_v9_0_0_to_v9_1_0" in discovered
+    assert discovered == named_like_an_upgrade
+
+    def upgrade_v9_1_0_to_9_2_0(ctx):
+        pass
+
+    monkeypatch.setattr(im, upgrade_v9_1_0_to_9_2_0.__name__,
+                        upgrade_v9_1_0_to_9_2_0, raising=False)
+    discovered, named_like_an_upgrade = discovered_and_named()
+    assert "upgrade_v9_1_0_to_9_2_0" in named_like_an_upgrade
+    assert discovered != named_like_an_upgrade
 
 
 # ── reporting ────────────────────────────────────────────────────
@@ -483,9 +566,15 @@ def test_needs_update_is_false_when_everything_is_current(tmp_path):
     source.write_text("v1", encoding="utf-8")
     dest = tmp_path / "dest.md"
     dest.write_text("v1", encoding="utf-8")
-    report = im.status(im.empty_manifest(),
-                       [("k", "template", source, dest)])
+    artifacts = [("k", "template", source, dest)]
+    report = im.status(im.empty_manifest(), artifacts)
+    # False is what any() says about an empty report too, so the artifact has
+    # to be shown reaching the report before its absence of findings counts.
+    assert [item.state for item in report] == [im.CURRENT]
     assert im.needs_update(report) is False
+    # Same call over the same artifact list, only the deployed bytes moved.
+    dest.write_text("the user's edits", encoding="utf-8")
+    assert im.needs_update(im.status(im.empty_manifest(), artifacts)) is True
 
 
 def test_needs_update_is_true_when_something_is_missing(tmp_path):
