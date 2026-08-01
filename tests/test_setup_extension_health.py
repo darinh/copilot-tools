@@ -96,7 +96,6 @@ def test_experimental_false_is_reported_as_nothing_loading(tmp_path):
 
 
 @pytest.mark.parametrize("body, why", [
-    ("{}", "an absent key is not a recorded false"),
     (json.dumps({"experimental": "true"}), "a string is not a boolean"),
     (json.dumps({"experimental": None}), "null is not a boolean"),
     (json.dumps(["experimental"]), "a list is not a settings object"),
@@ -106,25 +105,71 @@ def test_experimental_false_is_reported_as_nothing_loading(tmp_path):
 def test_anything_but_a_recorded_boolean_is_undetermined(tmp_path, body, why):
     """Never a verdict from a failed read.
 
-    ``copilot --help`` documents ``--experimental`` and ``--no-experimental``
-    and no default, so an absent key genuinely cannot be resolved from here.
-    Guessing it would produce exactly the false all-clear this module exists to
-    prevent.
+    Note what is *not* in this list any more: an absent key. That case moved
+    to DISABLED once it was measured, and the distinction the list now draws
+    is the one that survives: a file that cannot be read leaves the setting
+    unknown, while a file that reads cleanly and records nothing leaves it
+    unset -- and unset was measured to load nothing. Not knowing what the file
+    says is a different thing from knowing it says nothing.
+
+    Guessing at the first of those would produce exactly the false all-clear
+    this module exists to prevent.
     """
     mode = setup_tools.extension_mode(_settings(tmp_path, body))
     assert mode.state == setup_tools.UNDETERMINED, why
     assert mode.detail, "an undetermined answer must say what stopped it"
 
 
-def test_a_missing_settings_file_is_undetermined_not_disabled(tmp_path):
+@pytest.mark.parametrize("body, why", [
+    ("{}", "a settings file that records nothing leaves the setting unset"),
+    (json.dumps({"model": "gpt-5", "showReasoning": True}),
+     "other keys present and this one absent is the common real case"),
+])
+def test_an_absent_key_is_off_because_that_was_measured(tmp_path, body, why):
+    """The steady state of a fresh machine, and the reason this changed.
+
+    Measured on CLI 1.0.77: with no ``experimental`` key recorded, a probe
+    extension's module body never evaluated, while the same seeded settings
+    plus ``--experimental`` loaded it. The negative has a matched positive
+    differing only in the flag, which is what rules out "the harness broke the
+    loader" as an equally good explanation.
+
+    The finding that forced the code change was not the yes/no but that the
+    CLI **writes nothing** when given no flag. An unset key is therefore not a
+    startup transient that resolves on first run -- it persists until someone
+    passes a spelling explicitly. Reporting the most common inert
+    configuration as "could not tell" meant this report was at its most
+    equivocal exactly where it was most needed.
+    """
+    mode = setup_tools.extension_mode(_settings(tmp_path, body))
+    assert mode.state == setup_tools.DISABLED, why
+    # The remedy has to be in the detail: a verdict of OFF with no way out is
+    # a complaint, not a report.
+    assert "--experimental" in mode.detail
+    # Provenance, asserted rather than trusted to survive editing. The claim
+    # is measured, not documented, and a future reader re-measuring after a
+    # CLI update needs to know which version it was measured against.
+    assert "measured" in mode.detail
+
+
+def test_a_missing_settings_file_is_off_not_undetermined(tmp_path):
+    """No file at all is the same unset setting as a file with no key.
+
+    This was UNDETERMINED until the absent case was measured, on the reasoning
+    that a fresh machine should not be failed for a file the CLI has not
+    written yet. The measurement inverted it: a fresh machine genuinely loads
+    no extensions, so "could not tell" was not caution, it was the true answer
+    withheld.
+    """
     mode = setup_tools.extension_mode(tmp_path / "nothing-here.json")
-    assert mode.state == setup_tools.UNDETERMINED
-    assert mode.state != setup_tools.DISABLED
+    assert mode.state == setup_tools.DISABLED
     # The reason is asserted, not just the state. Deleting the absence branch
     # entirely leaves `read_text` raising FileNotFoundError into the same
-    # `except OSError` and returning UNDETERMINED too — so a test that checked
-    # only the state would pass with the branch it is named for removed.
+    # `except OSError` and returning UNDETERMINED -- so this assertion is what
+    # distinguishes "reported absent" from "fell through to the read failure",
+    # which are different states with the same name for the same file.
     assert "does not exist" in mode.detail
+    assert "--experimental" in mode.detail
 
 
 def test_an_unreadable_settings_file_is_undetermined(tmp_path, monkeypatch):
@@ -459,19 +504,65 @@ def test_status_refuses_to_call_an_inert_machine_healthy(deployed, capsys):
 
 
 @node
-def test_status_does_not_call_an_undetermined_machine_broken(deployed, capsys):
-    """No settings file at all: say so, but do not report a defect found."""
+def test_status_calls_a_machine_with_no_settings_file_inert(deployed, capsys):
+    """No settings file at all: the fresh-machine case, and it is a finding.
+
+    This test used to assert the opposite -- "could not tell", exit 0 -- on the
+    reasoning that a machine where the CLI had never run should not be failed
+    for a file the CLI had not written yet. That was the wrong shape of
+    caution. An unset setting was measured to load nothing, and the CLI never
+    writes the key on its own, so a fresh machine is not *pending* an answer,
+    it is inert and staying that way. Exit 0 there meant the report was
+    quietest about the single most common broken configuration.
+
+    Kept as a distinct test from the ``experimental: false`` case above
+    because they reach DISABLED down different branches, and a report that
+    handles one is not thereby shown to handle the other.
+    """
     _repo, home, _operator = deployed
     (home / "settings.json").unlink()
 
     code = setup_tools.report_status()
     out = capsys.readouterr().out
 
+    assert "experimental mode is OFF" in out
+    assert "inert" in out
+    assert code == 1
+    # The remedy and the provenance both have to survive into the output the
+    # user actually sees, not just into the ExtensionMode object. Asserting
+    # the state alone leaves the wording free to drift away from it.
+    assert "--experimental" in out
+    assert "measured" in out
+    # And it must not still be hedging: the old wording claimed the answer was
+    # unavailable, which is now false and would be the more expensive kind of
+    # wrong, because it reads as care.
+    assert "could not be determined" not in out
+
+
+@node
+def test_status_does_not_call_an_undetermined_machine_broken(deployed, capsys):
+    """A failed read still must not be reported as a defect found.
+
+    The absent-key and absent-file cases moved to DISABLED, and they used to
+    be what covered this branch. They are gone from it now, so the branch
+    needs a cause that is genuinely unknown rather than merely unset: a
+    recorded value that is not a boolean says the file was read fine and still
+    settles nothing.
+
+    Without this replacement, retiring those two cases would have silently
+    dropped the only coverage of the report's most important restraint --
+    which is the same shape of loss as the bug the restraint exists to
+    prevent.
+    """
+    _repo, home, _operator = deployed
+    (home / "settings.json").write_text(json.dumps({"experimental": "true"}),
+                                        encoding="utf-8")
+
+    code = setup_tools.report_status()
+    out = capsys.readouterr().out
+
     assert "could not tell" in out
     assert code == 0
-    # A failed read must not be reported as a finding. Asserting only the
-    # state above leaves the wording free to say the opposite of it, which is
-    # exactly what it used to do.
     assert "inert and silent" not in out, \
         "a failed read was reported as a verdict about the extensions"
     assert "could not be determined" in out

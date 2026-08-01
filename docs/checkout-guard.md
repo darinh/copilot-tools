@@ -59,9 +59,15 @@ and reported a successful migration. See scenarios 8–12 in
 
 Three states, kept apart on purpose. `experimental mode is on` and
 `experimental mode is OFF` are measurements; `could not tell whether extensions
-load` means the settings file was absent, unreadable, or held no `experimental`
-key. The CLI documents no default for the key, so an absent one is not read as
-either answer.
+load` means the settings file could not be read, or held an `experimental`
+value that is not a boolean. An **unset** setting — no settings file, or a
+settings file with no `experimental` key — is reported as `OFF`, because that
+was measured on CLI 1.0.77: a probe extension whose module body writes a marker
+at evaluation time never ran with the key absent, and ran with the same seeded
+settings plus `--experimental`. The negative is only worth anything because of
+that matched positive: identical settings, identical probe, only the flag
+differing, and the flag deciding. Without it, "the extension did not load" is
+explained just as well by the harness having broken the loader.
 
 Two limits on that answer, both deliberate:
 
@@ -87,13 +93,35 @@ silence-with-two-causes, spread across time instead of across processes. If you
 need to know what actually happened in a session that has already started, use
 the logs below rather than `--status`.
 
-**`could not tell` exits 0.** Only a measured `OFF`, or an extension that
-cannot parse, exits non-zero. An absent settings file is the normal state of a
-machine where the CLI has not run yet, and failing there would make the check
-cry wolf on every fresh install. The cost is real and worth naming: if the
-CLI's own default turns out to be experimental-off, a machine with no
-`experimental` key is inert and this command will not say so. It says `could
-not tell` instead, which is the true statement available.
+**`could not tell` exits 0; unset does not.** Only a failed read — an
+unreadable settings file, or a non-boolean value — exits 0 while declining to
+answer. An unset setting exits non-zero along with a measured `false`, because
+those two are the same state: extensions do not load, and nothing will change
+that on its own.
+
+That is a reversal, and the reasoning it replaced is worth keeping because it
+was wrong in an instructive way. This document used to argue that an absent
+settings file is the normal state of a machine where the CLI has not run yet,
+so failing there would cry wolf on every fresh install — and it named the cost
+honestly, as a conditional: *if the CLI's own default turns out to be
+experimental-off, a machine with no `experimental` key is inert and this
+command will not say so.*
+
+The measurement turned that `if` into an `is`. A fresh machine is not waiting
+for an answer, it is inert; and because the CLI writes nothing unless given a
+spelling explicitly, it stays inert indefinitely. So the old behaviour was not
+caution — it was the true answer withheld, and withheld precisely in the
+configuration that is both the most common and the most broken. The hedge was
+doing the same job as the silence this whole document is about: it was the
+component whose purpose is distinguishing "fine" from "not checked", returning
+the second when it could have returned the first.
+
+The scope of the claim is narrow and stated in the code that relies on it
+(`_UNSET_IS_OFF` in `setup_tools.py`): measured on CLI 1.0.77, one platform,
+and `copilot --help` still documents no default. It is measured behaviour, not
+a contract, and a `copilot update` can move it — which is why the reason string
+says `measured` and names the version instead of asserting what the CLI
+promises.
 
 ### Other ways to tell, from outside a session
 
