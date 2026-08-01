@@ -1645,18 +1645,8 @@ def has_agent_flag(args: list[str]) -> bool:
     return any(a == "--agent" or a.startswith("--agent=") for a in args)
 
 
-def has_experimental_flag(args: list[str]) -> bool:
-    """True when the caller already decided about experimental features.
-
-    `--no-experimental` counts. It is a deliberate opt-out, and the default
-    added below must not quietly overturn it.
-    """
-    return any(a in ("--experimental", "--no-experimental")
-               or a.startswith("--experimental=") for a in args)
-
-
-def with_experimental(defaults: list[str], user_args: list[str]) -> list[str]:
-    """Add `--experimental` to `defaults` unless the user ruled on it.
+def with_experimental(defaults: list[str]) -> list[str]:
+    """Append `--experimental` to the operator's injected defaults.
 
     Runtime extensions -- `checkout-guard` among them -- load ONLY when the
     CLI is in experimental mode, and the CLI persists the last spelling it was
@@ -1670,9 +1660,23 @@ def with_experimental(defaults: list[str], user_args: list[str]) -> list[str]:
 
     Passing it explicitly on every launch is what makes the guard's silence
     mean "scanned and found nothing" rather than "was never there".
+
+    It is added UNCONDITIONALLY, and callers must place the result BEFORE the
+    user's own arguments. A user who really wants `--no-experimental` still
+    gets it, because the CLI resolves conflicting spellings last-wins -- both
+    orders were measured against CLI 1.0.77:
+
+        copilot --experimental --no-experimental ...  -> experimental: false
+        copilot --no-experimental --experimental ...  -> experimental: true
+
+    Deciding by *inspecting* the user's arguments instead is what the earlier
+    version of this function did, and it was wrong: it could not tell a flag
+    from a value, so `-p --no-experimental` -- a prompt that merely looks like
+    a ruling -- suppressed the injected flag and put the session straight back
+    into the silent, guardless state this exists to prevent. Any such check
+    needs a list of which options take values, and that list goes stale every
+    time the CLI grows one. Ordering needs no list.
     """
-    if has_experimental_flag(user_args) or has_experimental_flag(defaults):
-        return defaults
     return [*defaults, "--experimental"]
 
 
@@ -2611,8 +2615,8 @@ def show_inbox(args: list[str]) -> int:
 
 def run_single_session(instance: Instance, copilot_args: list[str],
                        headless: bool = False) -> int:
-    args = [*with_experimental(["--yolo", "--autopilot", "--effort", "high"],
-                               copilot_args), *copilot_args]
+    args = [*with_experimental(["--yolo", "--autopilot", "--effort", "high"]),
+            *copilot_args]
     handle_existing_session(instance)
     operator_ingest.init_db(METRICS_DB)
     run_started = utcnow()
@@ -2653,7 +2657,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     watching. Everything after the initial launch is identical either way.
     """
     copilot_args = with_experimental(
-        ["--yolo", "--autopilot", "--no-ask-user", "--effort", "high"], user_args)
+        ["--yolo", "--autopilot", "--no-ask-user", "--effort", "high"])
     agent = extract_agent_from_args(user_args)
     if not has_agent_flag(user_args):
         copilot_args += ["--agent", agent]
