@@ -30,6 +30,9 @@ State written to the instance state directory:
 ``{id}.pid``      Copilot's real process id, removed on exit
 ``{id}.session``  Copilot CLI session UUID, once discovered
 ``{id}.exit``     Exit code, written after metrics capture completes
+
+A malformed launch spec exits ``EXIT_BAD_SPEC`` and is still reported through
+those files: see :func:`_load_spec`.
 """
 from __future__ import annotations
 
@@ -39,7 +42,7 @@ import os
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 
 # `operator_ingest` is imported lazily below. When this module runs as the
 # installed `operator-runner` console script rather than by path, an editable
@@ -52,6 +55,22 @@ if _HERE not in sys.path:
 SESSION_ID_TIMEOUT = 20
 LOG_PIN_TIMEOUT = 30
 TREE_SETTLE_SECONDS = 1.5
+
+# Distinct from any code Copilot itself can return, so the parent can tell
+# "I was launched wrong" from "the session failed". 78 is sysexits' EX_CONFIG.
+EXIT_BAD_SPEC = 78
+
+# Keys the operator always writes into the spec, and the type each must have.
+# `argv` is checked against `list` rather than "is iterable" deliberately: a
+# spec holding a bare string would otherwise pass through `list()` and be
+# spawned one character per argument.
+_REQUIRED_SPEC_KEYS = ("instance", "argv", "cwd",
+                       "state_dir", "copilot_log_dir", "metrics_db")
+
+# The spec the operator writes lives at ``{state_dir}/{instance}.launch.json``
+# (see ``Instance.spec_file``), so its own path names both values we need to
+# report a failure -- even when nothing inside the file can be read.
+_SPEC_SUFFIX = ".launch.json"
 
 
 def _log(state_dir: Path, instance: str, msg: str) -> None:
@@ -220,8 +239,153 @@ def _extract_session_id(path: Path) -> str | None:
     return None
 
 
+class SpecError(Exception):
+    """The launch spec cannot be used. Carries a human-readable diagnostic.
+
+    ``spec`` holds whatever was successfully parsed before the failure, so the
+    caller can still recover the instance name from a spec that is merely
+    incomplete rather than unreadable.
+    """
+
+    def __init__(self, message: str, spec: object = None) -> None:
+        super().__init__(message)
+        self.spec = spec
+
+
+def _is_safe_component(name: object) -> bool:
+    """True when ``name`` can only ever name a file *inside* a directory.
+
+    The instance name is interpolated straight into `{instance}.exit`,
+    `{instance}.pid` and `{instance}.runner.log`, so a corrupt or hand-edited
+    spec carrying `..\\escaped` would otherwise write outside the state
+    directory the parent is watching. Legitimate ids are already single path
+    components -- the operator writes the spec itself as `{id}.launch.json` --
+    so requiring that here rejects nothing real. `safe_instance_id` is not
+    usable for this: it *rewrites* a name and appends a digest, which would
+    silently address different files than the operator does.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return False
+    if "\x00" in name or name in (".", ".."):
+        return False
+    return PurePath(name).name == name and PurePosixPath(name).name == name
+
+
+def _fallback_identity(spec_path: Path, spec: object) -> tuple[Path, str]:
+    """Best guess at ``(state_dir, instance)`` when the spec is unusable.
+
+    Derived from the spec's own path, never from the spec's contents. The
+    operator writes the spec to ``{state_dir}/{instance}.launch.json`` and
+    polls ``{state_dir}/{instance}.exit``, so the path it handed us is by
+    construction the one directory it is known to be watching. A spec that
+    already failed validation has no authority to redirect the report
+    somewhere the parent will never look -- which would hide the failure just
+    as effectively as the traceback this function exists to replace.
+    """
+    instance = spec_path.name
+    if instance.endswith(_SPEC_SUFFIX):
+        instance = instance[: -len(_SPEC_SUFFIX)]
+    else:
+        instance = spec_path.stem
+    if not _is_safe_component(instance):
+        instance = "unknown"
+    return spec_path.parent, instance
+
+
+def _report_bad_spec(spec_path: Path, spec: object, message: str) -> int:
+    """Make an unusable spec observable instead of a bare traceback.
+
+    The supervisor dying silently is the worst case for the parent: the loop
+    polls for ``{id}.exit`` and would otherwise have no record of why the pane
+    went away. So write the marker and the runner log on the way out, and only
+    then fail.
+
+    Nothing in here may raise. It is the last-resort reporter, and a crash
+    here restores exactly the failure it was written to prevent -- so the
+    filesystem calls catch ``ValueError`` as well as ``OSError``: a path
+    carrying an embedded NUL raises the former, not the latter.
+    """
+    state_dir, instance = _fallback_identity(spec_path, spec)
+    detail = f"invalid launch spec {spec_path}: {message}"
+    print(f"operator-runner: {detail}", file=sys.stderr)
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        _log(state_dir, instance, detail)
+        (state_dir / f"{instance}.exit").write_text(str(EXIT_BAD_SPEC),
+                                                    encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        print(f"operator-runner: cannot write exit marker under {state_dir}: {exc}",
+              file=sys.stderr)
+    return EXIT_BAD_SPEC
+
+
+def _load_spec(spec_path: Path) -> dict:
+    """Read and validate the launch spec, or raise :class:`SpecError`.
+
+    Every failure names the offending file and the offending key, because the
+    reader of this diagnostic is looking at a pane that closed.
+    """
+    try:
+        text = spec_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SpecError(f"cannot read spec: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        # Not an OSError. Reading binary garbage must fail like every other
+        # malformed spec, not as a bare traceback.
+        raise SpecError(f"not valid UTF-8: {exc}") from exc
+    try:
+        spec = json.loads(text)
+    except ValueError as exc:
+        raise SpecError(f"not valid JSON: {exc}") from exc
+    if not isinstance(spec, dict):
+        raise SpecError(f"expected a JSON object, got {type(spec).__name__}")
+
+    missing = [key for key in _REQUIRED_SPEC_KEYS if key not in spec]
+    if missing:
+        raise SpecError(f"missing required key(s): {', '.join(missing)}", spec)
+
+    for key in ("instance", "cwd", "state_dir", "copilot_log_dir", "metrics_db"):
+        value = spec[key]
+        if not isinstance(value, str) or not value.strip():
+            raise SpecError(f"key {key!r} must be a non-empty string, "
+                            f"got {value!r}", spec)
+        # An embedded NUL survives JSON but makes every filesystem call and
+        # `Popen` raise ValueError -- which is not an OSError, so it would
+        # escape the guards around the spawn and crash after validation
+        # "passed", with no marker written.
+        if "\x00" in value:
+            raise SpecError(f"key {key!r} contains an embedded NUL", spec)
+
+    if not _is_safe_component(spec["instance"]):
+        raise SpecError(f"key 'instance' must be a single path component, "
+                        f"got {spec['instance']!r}", spec)
+
+    argv = spec["argv"]
+    if not isinstance(argv, list):
+        raise SpecError(f"key 'argv' must be a list, got {type(argv).__name__}",
+                        spec)
+    if not argv:
+        raise SpecError("key 'argv' is empty; nothing to launch", spec)
+    bad = [item for item in argv if not isinstance(item, str)]
+    if bad:
+        raise SpecError(f"key 'argv' must contain only strings; offending "
+                        f"entries: {bad!r}", spec)
+    if any("\x00" in item for item in argv):
+        raise SpecError("key 'argv' contains an embedded NUL", spec)
+
+    session_num = spec.get("session_num", 0)
+    if isinstance(session_num, bool) or not isinstance(session_num, int):
+        raise SpecError(f"key 'session_num' must be an integer, "
+                        f"got {session_num!r}", spec)
+    return spec
+
+
 def run(spec_path: Path) -> int:
-    spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    spec_path = Path(spec_path)
+    try:
+        spec = _load_spec(spec_path)
+    except SpecError as exc:
+        return _report_bad_spec(spec_path, exc.spec, str(exc))
 
     instance: str = spec["instance"]
     argv: list[str] = list(spec["argv"])
@@ -256,6 +420,15 @@ def run(spec_path: Path) -> int:
         _log(state_dir, instance, f"spawn failed: {exc}")
         exit_file.write_text("126", encoding="utf-8")
         return 126
+    except ValueError as exc:
+        # Belt and braces: validation rejects the argument shapes known to
+        # reach this (an embedded NUL), but ValueError is not an OSError, so
+        # anything missed here would escape both handlers above and kill the
+        # supervisor without a marker.
+        _log(state_dir, instance, f"invalid launch arguments: {exc}")
+        exit_file.write_text(str(EXIT_BAD_SPEC), encoding="utf-8")
+        print(f"operator-runner: invalid launch arguments: {exc}", file=sys.stderr)
+        return EXIT_BAD_SPEC
 
     pid_file.write_text(str(proc.pid), encoding="utf-8")
     _log(state_dir, instance, f"launcher pid={proc.pid}")
