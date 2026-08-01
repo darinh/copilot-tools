@@ -567,6 +567,7 @@ class _FloorFinder(ast.NodeVisitor):
         self.module_alias: dict[str, str] = {}
         self.symbol_alias: dict[str, str] = {}
         self.typing_names: set[str] = {"typing"}
+        self.augmented = 0
 
     def scan(self, tree: ast.AST) -> None:
         """Collect aliases across the whole module, then walk it.
@@ -698,20 +699,44 @@ class _FloorFinder(ast.NodeVisitor):
                     self._record(node, gated[name])
         self.generic_visit(node)
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        """``Path.walk += 1`` reads the attribute before it writes it.
+
+        Its target carries ``ctx=Store`` like an ordinary assignment, so the
+        context alone gets this one wrong — measured on 3.10.20, ``T.walk +=
+        1`` raises ``AttributeError`` while ``T.walk = 1``, ``with cm as
+        T.walk``, ``for T.walk in []`` and ``a, T.walk = 1, 2`` all run. It
+        is the only Store that is a use, and an ``AugAssign`` target is a
+        single node rather than a tuple, so the flag can only reach the
+        target itself.
+
+        The value is visited outside the flag: it is an ordinary expression
+        and its own contexts mean what they say.
+        """
+        self.augmented += 1
+        self.visit(node.target)
+        self.augmented -= 1
+        self.visit(node.value)
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        # A Store is not a use. Measured on 3.10.20: `x = Path.walk` and
-        # `del Path.walk` both raise AttributeError, while `Path.walk = fake`
-        # succeeds — so the context decides, not the spelling, and the line
-        # falls between Store and everything else rather than at "is Load".
+        # A Store is not a use, with one exception. Measured on 3.10.20:
+        # `x = Path.walk` and `del Path.walk` raise AttributeError, while
+        # `Path.walk = fake`, `with cm as Path.walk`, `for Path.walk in []`
+        # and `a, Path.walk = 1, 2` all run. So the context decides, not the
+        # spelling, and the line falls between Store and everything else
+        # rather than at "is Load" — `del` needs the attribute to exist
+        # exactly as reading it does. The exception is augmented assignment,
+        # which reads before it writes while still carrying `ctx=Store`; see
+        # :meth:`visit_AugAssign`.
         #
-        # Flagging the Store flagged the *polyfill*. Rebinding a post-floor
-        # method onto the class is the ordinary way to make code run on the
-        # floor, and a scan that reports the fix for the very thing it checks
-        # is a scan that gets switched off rather than fixed. `visit_Name`
-        # draws this same line and its comment records the same bug from the
-        # other side: without it, `fd = None` read as a use of the gated
-        # symbol it happened to be named after.
-        is_use = not isinstance(node.ctx, ast.Store)
+        # Flagging the plain Store flagged the *polyfill*. Rebinding a
+        # post-floor method onto the class is the ordinary way to make code
+        # run on the floor, and a scan that reports the fix for the very
+        # thing it checks is a scan that gets switched off rather than fixed.
+        # `visit_Name` draws this same line and its comment records the same
+        # bug from the other side: without it, `fd = None` read as a use of
+        # the gated symbol it happened to be named after.
+        is_use = self.augmented or not isinstance(node.ctx, ast.Store)
         parent = node.value
         name = None
         if isinstance(parent, ast.Name):
@@ -1314,13 +1339,27 @@ FIRES = {
         "    pass\n"
     ),
     "a post-floor method deleted from the class, which needs it to exist": (
-        # `del` is a use and a Store is not, which is why the context check
-        # below tests for Store rather than for Load. Measured on 3.10.20:
-        # `del Path.walk` raises AttributeError exactly as reading it does,
-        # while `Path.walk = fake` succeeds. Written unguarded so only that
-        # distinction can decide it.
+        # `del` is a use and a plain Store is not, which is why the context
+        # check below tests for Store rather than for Load. Measured on
+        # 3.10.20: `del Path.walk` raises AttributeError exactly as reading
+        # it does, while `Path.walk = fake` succeeds. Written unguarded so
+        # only that distinction can decide it.
         "from pathlib import Path\n"
         "del Path.walk\n"
+    ),
+    "a post-floor attribute augmented, which reads before it writes": (
+        # The one Store that is a use. `hashlib.file_digest += 1` is not
+        # something anyone would write - it is here because the *rule* has
+        # to be right, and a context check that stopped at "Store is never a
+        # use" would be wrong in a way nothing else in this file would
+        # notice. Measured on 3.10.20: `T.walk += 1` raises AttributeError,
+        # `T.walk = 1` does not.
+        "import hashlib\n"
+        "hashlib.file_digest += 1\n"
+    ),
+    "a post-floor method augmented on the class": (
+        "from pathlib import Path\n"
+        "Path.walk += 1\n"
     ),
 }
 
@@ -1382,6 +1421,9 @@ EXERCISES = {
         "pathlib.Path.walk",
     "a post-floor method deleted from the class, which needs it to exist":
         "pathlib.Path.walk",
+    "a post-floor attribute augmented, which reads before it writes":
+        "hashlib.file_digest",
+    "a post-floor method augmented on the class": "pathlib.Path.walk",
 }
 
 #: Source that must NOT trip it. Each is a spelling this repo can actually run.
@@ -1569,6 +1611,18 @@ PASSES = {
         "def _file_digest(fh, name):\n"
         "    ...\n"
         "hashlib.file_digest = _file_digest\n"
+    ),
+    "the other Store shapes, none of which need the attribute to exist": (
+        # The negative half of the augmented-assignment rule. All three run
+        # on 3.10.20 with the attribute absent, so treating every Store
+        # target as a use - the obvious over-correction once `+=` is known to
+        # be a use - would flag them.
+        "from pathlib import Path\n"
+        "with cm as Path.walk:\n"
+        "    pass\n"
+        "for Path.walk in []:\n"
+        "    pass\n"
+        "first, Path.walk = 1, 2\n"
     ),
     "an annotated use with a real reason": (
         "import hashlib\n"
