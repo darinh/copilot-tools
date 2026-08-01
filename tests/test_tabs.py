@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -304,6 +308,193 @@ def test_build_wt_command_chains_multiple_tabs_with_semicolon(monkeypatch):
     cmd = op._build_wt_command(entries)
     assert cmd.count("new-tab") == 2
     assert ";" in cmd
+
+
+def test_build_wt_command_preserves_argument_boundaries_native(monkeypatch):
+    """A tracked argument containing spaces must survive the round trip."""
+    monkeypatch.setattr(op.shutil, "which", lambda name: "wt.exe" if "wt" in name else None)
+    entries = [("local:a", {
+        "display_name": "my project",
+        "cwd": "C:\\Users\\me\\my proj",
+        "argv": ["--loop", "--name", "my project", "--allow-tool", "shell(git status)"],
+        "wsl_distro": "",
+    })]
+    inner = op._build_wt_command(entries)[-1]
+    assert inner == ("operator --loop --name 'my project' "
+                     "--allow-tool 'shell(git status)'")
+
+
+def test_build_wt_command_preserves_argument_boundaries_wsl(monkeypatch):
+    monkeypatch.setattr(op.shutil, "which", lambda name: "wt.exe" if "wt" in name else None)
+    entries = [("Ubuntu:a", {
+        "display_name": "my project",
+        "cwd": "/home/me/my proj",
+        "argv": ["--name", "my project", "--banner", "it's here"],
+        "wsl_distro": "Ubuntu",
+    })]
+    inner = op._build_wt_command(entries)[-1]
+    assert shlex.split(inner) == ["operator", "--name", "my project",
+                                  "--banner", "it's here"]
+
+
+@pytest.mark.parametrize("argv", [
+    [],
+    ["--loop", "--name", "proj"],
+    ["--name", "my project", "--banner", "it's here", "--path", "C:\\tmp\\a b"],
+    ["--empty", "", "--quote", 'say "hi"', "--dollar", "$HOME", "--back", "a`b"],
+])
+def test_relaunch_command_round_trips_through_a_posix_parser(argv):
+    """shlex is the reference POSIX parser `bash -lic` will use."""
+    assert shlex.split(op._relaunch_command(argv, shlex.quote)) == ["operator", *argv]
+
+
+def test_ps_quote_leaves_ordinary_arguments_bare():
+    for arg in ["--loop", "proj", "anvil:anvil", "C:\\Users\\me\\proj", "a.b-c_d"]:
+        assert op._ps_quote(arg) == arg
+
+
+@pytest.mark.parametrize("arg,expected", [
+    ("my project", "'my project'"),
+    ("it's here", "'it''s here'"),
+    ("", "''"),
+    ("shell(git status)", "'shell(git status)'"),
+    ('say "hi"', "'say \"hi\"'"),
+    ("$HOME", "'$HOME'"),
+    ("#comment", "'#comment'"),
+    ("@args", "'@args'"),
+    ("a,b", "'a,b'"),
+])
+def test_ps_quote_wraps_arguments_powershell_would_reparse(arg, expected):
+    assert op._ps_quote(arg) == expected
+
+
+def test_build_wt_command_survives_a_non_list_argv(monkeypatch):
+    """A hand-edited registry must not relaunch one character per argument."""
+    monkeypatch.setattr(op.shutil, "which", lambda name: "wt.exe" if "wt" in name else None)
+    entries = [("local:a", {"display_name": "a", "cwd": "C:\\a",
+                            "argv": "--loop --name a", "wsl_distro": ""})]
+    assert op._build_wt_command(entries)[-1] == "operator"
+
+
+_PS = shutil.which("powershell") or shutil.which("pwsh")
+
+_PS_PARSE = """
+$ast = [System.Management.Automation.Language.Parser]::ParseInput(
+    $env:OPERATOR_PS_INPUT, [ref]$null, [ref]$null)
+$cmds = @($ast.FindAll({
+    param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+if ($cmds.Count -ne 1) { exit 2 }
+ConvertTo-Json -Compress -InputObject @(
+    $cmds[0].CommandElements | ForEach-Object { $_.Value })
+"""
+
+
+@pytest.mark.skipif(_PS is None, reason="no PowerShell available")
+def test_ps_quote_round_trips_through_the_real_powershell_parser(monkeypatch):
+    """The only authority on PowerShell quoting is PowerShell's own parser."""
+    argv = ["--loop", "--name", "my project", "--allow-tool", "shell(git status)",
+            "--banner", "it's here", "--path", "C:\\tmp\\a b", "--dollar", "$HOME",
+            "--empty", "", "--quote", 'say "hi"', "--back", "a`b",
+            "--hash", "#comment", "--splat", "@args", "--comma", "a,b",
+            "--pct", "%", "--tilde", "~", "--bang", "!", "--caret", "^",
+            "--star", "*", "--question", "?", "--brace", "{x}",
+            "--amp", "&", "--pipe", "|", "--lt", "<", "--gt", ">"]
+    env = {**os.environ,
+           "OPERATOR_PS_INPUT": op._relaunch_command(argv, op._ps_quote)}
+    proc = subprocess.run([_PS, "-NoProfile", "-NonInteractive", "-Command", _PS_PARSE],
+                          capture_output=True, text=True, timeout=120, env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == ["operator", *argv]
+
+
+_ARGDUMP = "import json, sys; print(json.dumps(sys.argv[1:]))"
+
+
+@pytest.mark.skipif(_PS is None, reason="no PowerShell available")
+def test_relaunch_command_delivers_arguments_to_a_native_process(tmp_path):
+    """End to end: what PowerShell actually hands the `operator` executable.
+
+    Arguments that are empty or contain a literal double quote are excluded on
+    purpose -- Windows PowerShell drops or mangles those on the way into any
+    native process, which `_ps_quote` cannot repair (see its docstring).
+    """
+    dump = tmp_path / "argdump.py"
+    dump.write_text(_ARGDUMP, encoding="utf-8")
+    argv = ["--loop", "--name", "my project", "--allow-tool", "shell(git status)",
+            "--banner", "it's here", "--path", "C:\\tmp\\a b", "--dollar", "$HOME",
+            "--back", "a`b", "--hash", "#comment",
+            "--splat", "@args", "--comma", "a,b", "--brace", "{x}",
+            "--amp", "&", "--pipe", "|", "--gt", ">", "--pct", "%"]
+    inner = op._relaunch_command(argv, op._ps_quote)
+    script = (f"& {op._ps_quote(sys.executable)} {op._ps_quote(str(dump))} "
+              + inner[len("operator "):])
+    proc = subprocess.run([_PS, "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == argv
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("$HOME", "\\$HOME"),
+    ("`echo x`", "\\`echo x\\`"),
+    ("$(echo x)", "\\$(echo x)"),
+    ("a\\b", "a\\\\b"),
+    ("plain", "plain"),
+    ("\\$HOME", "\\\\\\$HOME"),
+])
+def test_wsl_escape_neutralises_the_expansion_pass(raw, expected):
+    assert op._wsl_escape(raw) == expected
+
+
+def test_build_wt_command_escapes_expansion_on_the_wsl_path(monkeypatch):
+    """A tracked `$(...)` argument must not run during restore."""
+    monkeypatch.setattr(op.shutil, "which", lambda name: "wt.exe" if "wt" in name else None)
+    entries = [("Ubuntu:a", {
+        "display_name": "a", "cwd": "/home/me", "wsl_distro": "Ubuntu",
+        "argv": ["--name", "$(rm -rf ~)"],
+    })]
+    inner = op._build_wt_command(entries)[-1]
+    assert "\\$(rm -rf ~)" in inner
+    assert "$(rm" not in inner.replace("\\$(rm", "")
+
+
+def test_build_wt_command_coerces_non_string_metadata(monkeypatch):
+    """Hand-edited JSON must not reach subprocess as a dict."""
+    monkeypatch.setattr(op.shutil, "which", lambda name: "wt.exe" if "wt" in name else None)
+    entries = [("local:a", {"display_name": {"a": 1}, "cwd": ["x"],
+                            "wsl_distro": 7, "argv": ["--loop"]})]
+    cmd = op._build_wt_command(entries)
+    assert all(isinstance(part, str) for part in cmd)
+    assert "operator --loop" in cmd
+
+
+def _wsl_works() -> bool:
+    exe = shutil.which("wsl.exe")
+    if not exe:
+        return False
+    try:
+        proc = subprocess.run([exe, "--", "bash", "-lic", "echo ok"],
+                              capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and "ok" in proc.stdout
+
+
+_WSL_OK = _wsl_works()
+
+
+@pytest.mark.skipif(not _WSL_OK, reason="no working WSL distro")
+def test_wsl_transport_delivers_arguments_without_expanding_them():
+    """End to end: a hostile tracked argument reaches the process unexecuted."""
+    argv = ["--sub", "$(echo PWNED)", "--tick", "`echo PWNED`", "--home", "$HOME",
+            "--name", "my project", "--quote", "it's here", "--star", "*",
+            "--semi", "a;b", "--back", "a\\b", "--tail"]
+    inner = op._wsl_escape(op._relaunch_command(argv, shlex.quote))
+    dump = inner.replace("operator", "printf '%s\\n'", 1)
+    proc = subprocess.run([shutil.which("wsl.exe"), "--", "bash", "-lic", dump],
+                          capture_output=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    assert proc.stdout.decode("utf-8", "replace").splitlines() == argv
 
 
 def test_build_wt_command_dies_without_wt(monkeypatch):
