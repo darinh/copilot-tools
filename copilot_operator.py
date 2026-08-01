@@ -2352,20 +2352,45 @@ def _inbox_usage(stream=None) -> None:
           "other\n  instance is live here; pass your own name.", file=stream)
 
 
-def _dir_matches(child: str | None, parent: Path) -> bool:
-    """True when ``child`` is ``parent`` or lives beneath it.
+def _dir_matches(child: str | None, parent: Path) -> bool | None:
+    """True when ``child`` is ``parent`` or lives beneath it, None when the
+    two could not be compared at all.
 
     Path comparison follows the convention used elsewhere in this file:
     resolve first, then lowercase on Windows, where ``C:\\Repo`` and
     ``c:\\repo`` are the same directory.
+
+    Three answers rather than two, for the reason
+    :func:`install_manifest.path_present` gives about the presence probes:
+    ``False`` here does not mean "could not tell", it means *somewhere else*,
+    and that is a placement this comparison is in no position to make. The
+    only caller is the census behind a destructive mail read, where an
+    instance reported elsewhere is an instance that does not stop the read.
+
+    ``Path.resolve`` declines to answer in three different ways, and the
+    handler this replaced caught one of them:
+
+    * a **symlink loop** raises ``RuntimeError`` on the interpreters this
+      project supports and ``OSError(ELOOP)`` on newer ones -- so both are
+      caught, and which one arrives is a version detail, not a behaviour;
+    * an **embedded NUL** raises ``ValueError``. The recorded directory comes
+      out of a hand-editable launch-spec JSON, and JSON carries ``\\u0000``
+      happily;
+    * everything else -- a denial, a disconnected network home, WINERROR 21 --
+      raises ``OSError``, which *was* caught and answered ``False``.
+
+    The first two were not caught at all, so ``operator inbox`` ended in a
+    traceback rather than a decision. ``parent`` is resolved here too, so a
+    parent that will not resolve made *every* comparison answer "elsewhere"
+    and the census came back confidently empty.
     """
     if not child:
         return False
     try:
         cp = str(Path(child).resolve())
         pp = str(parent.resolve())
-    except OSError:
-        return False
+    except (OSError, ValueError, RuntimeError):
+        return None
     if IS_WINDOWS:
         cp, pp = cp.lower(), pp.lower()
     if cp == pp:
@@ -2398,7 +2423,10 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
     backend there are no sessions to miss, so that answers the empty list.
     The same rule applies one record down: an unreadable launch spec, tab
     registry or state directory refuses the census rather than quietly
-    dropping the instance it could not place.
+    dropping the instance it could not place. So does a directory that will
+    not compare — a path the backend reported happily and :func:`_dir_matches`
+    cannot resolve places an instance nowhere, which is not the same as
+    placing it elsewhere.
     """
     try:
         if not MUX.available():
@@ -2429,7 +2457,8 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
         else:
             pane_failed = False
         recorded = _tracked_cwd_for_id(ident)
-        if _dir_matches(pane, cwd):
+        pane_here = _dir_matches(pane, cwd)
+        if pane_here:
             found.append(ident)
             continue
         if recorded is UNPLACEABLE:
@@ -2439,8 +2468,17 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
             # directory — the same refusal as a failed pane lookup, one
             # record further down.
             return None
-        if _dir_matches(recorded, cwd):
+        recorded_here = _dir_matches(recorded, cwd)
+        if recorded_here:
             found.append(ident)
+        elif (pane_here is None or recorded_here is None) and ident in known:
+            # The backend answered, and the answer was a path that cannot be
+            # compared to this directory — a symlink loop, an embedded NUL, a
+            # denial part-way down. `pane_failed` is False, so without this
+            # the instance would fall past every branch below and simply not
+            # be in the list: the same hole in the census as a failed pane
+            # lookup, arriving one step later.
+            return None
         elif pane_failed and ident in known:
             # The backend refused to say where this instance is and the
             # recorded directory does not place it here either. That is not
