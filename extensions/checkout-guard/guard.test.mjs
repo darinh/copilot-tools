@@ -1730,7 +1730,7 @@ test("the outstanding set stays bounded however long an agent ignores it", async
 test("noteAuthored folds a deliberate write into the baseline and clears the block", async () => {
   const state = createGuardState();
   const root = join(tmpdir(), "cg-authored-root");
-  const scan = scanner(["a"], ["a", "written.py"]);
+  const scan = scanner(["a"], ["a", "written.py", "unrelated.py"]);
   await observe(state, root, { scan });
   setFor(state.outstanding, root).add("written.py");
 
@@ -1740,8 +1740,13 @@ test("noteAuthored folds a deliberate write into the baseline and clears the blo
   assert.ok(state.lastSeen.get(root).includes("written.py"),
     "folded into the baseline rather than rescanned: a five-file edit would "
     + "otherwise fire five concurrent whole-tree traversals");
-  assert.deepEqual(await observe(state, root, { scan }), [],
-    "so the next observation does not hand the agent back its own writing");
+  // The suppression and a positive control THROUGH THE SAME CALL. Both paths
+  // are new by the same measurement; asserting only that the authored one is
+  // absent would pass just as happily against an `observe` that had stopped
+  // reporting anything at all.
+  assert.deepEqual(await observe(state, root, { scan }), ["unrelated.py"],
+    "the next observation does not hand the agent back its own writing, and is "
+    + "not simply blind: a real stray in the same call is still reported");
 });
 
 test("noteAuthored ignores a write outside the checkout", () => {
