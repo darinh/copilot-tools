@@ -61,6 +61,19 @@ one spelling is that spelling's history:
 lstat-based. They are the fix, not the defect, and are deliberately not
 flagged.
 
+**But ``follow_symlinks=`` is not available on this project's floor.**
+``pyproject.toml`` declares 3.10 and CI runs 3.10; ``Path.exists`` grew the
+keyword in 3.12 and ``is_dir``/``is_file`` in 3.13, so writing it here is a
+``TypeError``, not a fix. That is a separate rule with a separate scan —
+``tests/test_python_floor_conformance.py`` — and the two compose: this file
+says the call is not two-valued, that one says you cannot write it yet.
+Reach for ``install_manifest.path_present()`` or ``os.stat(p,
+follow_symlinks=False)``, which has been lstat-based since 3.3. The
+keyword spelling is kept below in ``PASSES_ABOVE_FLOOR`` rather than
+``PASSES``, because it sat in the negative control certifying correctness
+for a whole release cycle while raising on every interpreter this project
+supports.
+
 The annotation is deliberately cheap to write and impossible to write
 silently: it appears in the diff, it carries a reason, and this file's
 ``test_every_annotation_carries_a_reason`` refuses an empty one. The point is
@@ -240,6 +253,14 @@ def _probe_name(func: ast.expr, call: ast.Call) -> str | None:
     ``follow_symlinks=False`` is deliberately *not* a probe. It makes the
     call ``lstat``-based, which is the fix rather than the defect, so
     flagging it would demand a guard against a failure mode it does not have.
+
+    That is a claim about *semantics*, and it stays true. It is not a claim
+    about *availability*: the keyword arrived in 3.12 for ``exists`` and 3.13
+    for ``is_dir``/``is_file``, above this project's 3.10 floor, so a call
+    written this way raises ``TypeError`` before its symlink behaviour ever
+    matters. ``tests/test_python_floor_conformance.py`` is what says so —
+    keeping the two questions in two scans is why this one does not have to
+    know what interpreter you are on.
     """
     if _lstat_based(call):
         return None
@@ -589,11 +610,18 @@ FIRES = {
     ),
 }
 
-#: Source that must NOT trip it. Each is a spelling the repo actually uses.
+#: Source that must NOT trip it. Each is a spelling the repo actually uses,
+#: **and can actually run on the floor** — see ``PASSES_ABOVE_FLOOR`` below
+#: for the spellings that are correct but not yet available.
 PASSES = {
-    "lstat-based by keyword": (
-        "from pathlib import Path\n"
-        "if Path('x').is_dir(follow_symlinks=False):\n"
+    "os.stat with follow_symlinks=False, lstat-based since 3.3": (
+        "import os\n"
+        "import stat\n"
+        "try:\n"
+        "    mode = os.stat('x', follow_symlinks=False).st_mode\n"
+        "except OSError:\n"
+        "    mode = None\n"
+        "if mode is not None and stat.S_ISDIR(mode):\n"
         "    pass\n"
     ),
     "os.path.islink is lstat-based and is the fix, not the defect": (
@@ -669,6 +697,42 @@ PASSES = {
     ),
 }
 
+#: Correct spellings that this project **cannot use yet**.
+#:
+#: ``follow_symlinks=False`` genuinely makes a probe ``lstat``-based, so
+#: :func:`_lstat_based` is right to stop calling it a two-valued probe — that
+#: is a statement about semantics, and it is true on any interpreter that has
+#: the keyword. What is *not* true is that it is available: ``Path.exists``
+#: grew it in 3.12 and ``is_dir``/``is_file`` in 3.13, while
+#: ``pyproject.toml`` declares 3.10 and CI runs 3.10 on three operating
+#: systems. Measured on both CI interpreters, ``is_dir(follow_symlinks=False)``
+#: raises ``TypeError`` on each.
+#:
+#: It sat in ``PASSES`` for a whole release cycle — this file's negative
+#: control, the register that certifies the *fix*, endorsing a call that
+#: crashes everywhere the project runs. That is the second wrong entry this
+#: register has held (``os.path.exists`` was the first), and both survived for
+#: the same reason: a negative control is the one place a mistake does not
+#: look like one. It does not fail, it does not warn, and it reads as a
+#: decision somebody made.
+#:
+#: So the two claims are separated. These entries still assert that the probe
+#: detector stays quiet, because that part was always true. What they no
+#: longer do is claim you may write this.
+#: ``tests/test_python_floor_conformance.py`` pins the split from outside,
+#: in both directions: every ``PASSES`` entry must be floor-clean, and every
+#: entry here must be floor-*dirty*. Parking a crash in the safe register
+#: fails there, and so does leaving a spelling here after the floor rises
+#: past it — which is what finally gets these entries promoted rather than
+#: forgotten.
+PASSES_ABOVE_FLOOR = {
+    "lstat-based by keyword (Path.exists 3.12+, is_dir/is_file 3.13+)": (
+        "from pathlib import Path\n"
+        "if Path('x').is_dir(follow_symlinks=False):\n"
+        "    pass\n"
+    ),
+}
+
 
 @pytest.mark.parametrize("name", sorted(FIRES))
 def test_every_detector_fires_on_source_that_has_the_defect(name: str) -> None:
@@ -679,9 +743,11 @@ def test_every_detector_fires_on_source_that_has_the_defect(name: str) -> None:
     )
 
 
-@pytest.mark.parametrize("name", sorted(PASSES))
+@pytest.mark.parametrize(
+    "name", [*sorted(PASSES), *sorted(PASSES_ABOVE_FLOOR)])
 def test_the_correct_spellings_still_pass(name: str) -> None:
-    assert not unguarded_probes(PASSES[name]), (
+    source = PASSES.get(name) or PASSES_ABOVE_FLOOR[name]
+    assert not unguarded_probes(source), (
         f"the detector fired on {name!r}, which is the shape this repo asks "
         f"for. A scan that rejects the fix teaches people to disable it."
     )
