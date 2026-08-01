@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,22 +19,36 @@ if str(ROOT) not in sys.path:
 
 # Directories a test must never write into. The repo root and skills/ are
 # tracked, so an artifact dropped there gets swept up by `git add -A`.
-# Each entry is (directory, recursive). The repo root is scanned top-level
-# only -- recursing it would walk .git, docs/ and sibling worktrees on every
-# test -- while skills/ is small, tracked, and has actually been polluted, so
-# it is walked in full.
-_GUARDED_DIRS: tuple[tuple[Path, bool], ...] = (
-    (ROOT, False),
-    (ROOT / "skills", True),
+# Each entry is (directory, recursive, fatal). The repo root is scanned
+# top-level only -- recursing it would walk .git, docs/ and sibling worktrees
+# on every test -- while skills/ is small, tracked, and has actually been
+# polluted, so it is walked in full.
+#
+# ``fatal`` says what a hit DOES, which is a separate question from what the
+# guard can SEE. The repo root is shared: peer agents, reviewer subagents and
+# anything not run in a worktree write into it while a suite is running, so a
+# stray there is not evidence that the running test produced it. Failing on it
+# accuses the innocent, and it does so intermittently, which reads as a flaky
+# integration test rather than a guard problem -- so the guard gets switched
+# off, and a disabled detector and a blind one produce the same silence except
+# that the disabled one took a real finding with it. The root is therefore
+# reported and not failed. It is still reported, because a stray there gets
+# swept into somebody else's `git add -A` no matter who made it.
+#
+# skills/ is not shared in that way, so a hit there is still an error.
+_GUARDED_DIRS: tuple[tuple[Path, bool, bool], ...] = (
+    (ROOT, False, False),
+    (ROOT / "skills", True, True),
 )
 
 # The user's real projects directory is deliberately NOT guarded by default.
 # Peer agents and the operator itself legitimately write handoff files there
 # (see handoff_tool.write_handoff), so a concurrent write would blame whichever
 # test happened to be running -- manufacturing exactly the misattribution this
-# guard exists to prevent. Opt in only for a run with no other live agents.
+# guard exists to prevent. Opt in only for a run with no other live agents,
+# which is also why opting in makes it fatal.
 if os.environ.get("COPILOT_TOOLS_GUARD_HOME") == "1":
-    _GUARDED_DIRS += ((Path.home() / ".copilot" / "projects", True),)
+    _GUARDED_DIRS += ((Path.home() / ".copilot" / "projects", True, True),)
 
 # Churn that is not a test artifact: tooling caches and developer worktrees.
 _GUARD_IGNORED = frozenset({".git", ".pytest_cache", "__pycache__", ".worktrees"})
@@ -81,6 +96,24 @@ def _catalog_state():
         return _UNREADABLE
 
 
+def _guarded_dirs() -> tuple[tuple[Path, bool, bool], ...]:
+    """``_GUARDED_DIRS`` with duplicate directories merged.
+
+    The snapshot is keyed by directory, so a repeated entry would otherwise be
+    last-wins: listing a path twice, once recursive and once not, would leave
+    the shallower scan in place and hide everything nested under it, reporting
+    nothing at all. ``recursive`` and ``fatal`` are therefore OR-ed. A
+    duplicate must never be able to reduce what the guard sees or how loudly
+    it objects -- the only safe direction for a misconfiguration to fail is
+    toward more visibility.
+    """
+    merged: dict[Path, tuple[bool, bool]] = {}
+    for directory, recursive, fatal in _GUARDED_DIRS:
+        was_recursive, was_fatal = merged.get(directory, (False, False))
+        merged[directory] = (was_recursive or recursive, was_fatal or fatal)
+    return tuple((d, recursive, fatal) for d, (recursive, fatal) in merged.items())
+
+
 def _snapshot_guarded() -> dict[Path, tuple[bool, frozenset[str]]]:
     """Record whether each guarded directory exists and what it contains.
 
@@ -89,7 +122,7 @@ def _snapshot_guarded() -> dict[Path, tuple[bool, frozenset[str]]]:
     directory and a missing one are not the same thing.
     """
     snapshot: dict[Path, tuple[bool, frozenset[str]]] = {}
-    for directory, recursive in _GUARDED_DIRS:
+    for directory, recursive, _fatal in _guarded_dirs():
         if not directory.is_dir():
             snapshot[directory] = (False, frozenset())
             continue
@@ -127,18 +160,82 @@ def _entries(directory: Path, recursive: bool) -> set[str]:
     return found
 
 
+def _find_strays_by_dir(
+    before: dict[Path, tuple[bool, frozenset[str]]],
+    after: dict[Path, tuple[bool, frozenset[str]]],
+) -> dict[Path, list[str]]:
+    """Strays keyed by the guarded directory they were found under.
+
+    Keying by the guarded root rather than by path prefix keeps the severity
+    lookup exact: skills/ lives inside the repo root, so a prefix match would
+    have to guess which of two guarded directories a hit belongs to.
+    """
+    found: dict[Path, list[str]] = {}
+    for directory, (exists, names) in after.items():
+        existed, seen = before.get(directory, (False, frozenset()))
+        strays: set[str] = set()
+        if exists and not existed:
+            strays.add(str(directory))
+        strays.update(str(directory / name) for name in names - seen)
+        if strays:
+            found[directory] = sorted(strays)
+    return found
+
+
 def _find_strays(
     before: dict[Path, tuple[bool, frozenset[str]]],
     after: dict[Path, tuple[bool, frozenset[str]]],
 ) -> list[str]:
     """Return paths present in ``after`` that were absent from ``before``."""
-    strays: set[str] = set()
-    for directory, (exists, names) in after.items():
-        existed, seen = before.get(directory, (False, frozenset()))
-        if exists and not existed:
-            strays.add(str(directory))
-        strays.update(str(directory / name) for name in names - seen)
-    return sorted(strays)
+    flat: set[str] = set()
+    for strays in _find_strays_by_dir(before, after).values():
+        flat.update(strays)
+    return sorted(flat)
+
+
+# Filesystem timestamps are recorded but never used to suppress a report.
+# The before/after name diff already establishes that a path appeared during
+# this test; mtime cannot strengthen that and can only subtract from it, since
+# st_mtime is not a creation time -- shutil.copy2, os.utime, archive
+# extraction, some git flows and NTFS timestamp tunnelling all produce a file
+# that is genuinely new to the directory and carries an old mtime. Filtering on
+# it would drop those silently, which is the one failure a detector may not
+# have. So it is annotation: it tells the reader whether the artifact looks
+# fresh, and decides nothing.
+_MTIME_SLACK_SECONDS = 2.0
+
+
+def _appeared_since(path: str, since: float) -> bool | None:
+    """Whether ``path`` was last written after ``since``. None means unknown.
+
+    ``lstat``, not ``stat``: a dangling symlink dropped into a guarded
+    directory is exactly the kind of artifact worth naming, and ``stat`` would
+    raise on it and report the mtime as unreadable.
+
+    Three-valued because an mtime that cannot be read is not an old mtime.
+    The slack absorbs coarse filesystem timestamps (FAT rounds to two
+    seconds) so that a fresh file is not described as old.
+
+    ``ValueError`` is caught alongside ``OSError`` because ``os.lstat``
+    raises it for an embedded NUL (measured, not assumed -- a long path and a
+    surrogate both give OSError, only NUL gives ValueError). No name from
+    ``os.scandir`` can contain one, so this is unreachable from a real
+    filesystem walk and reachable only from a malformed guarded-directory
+    setting. It is caught anyway on cost: an exception escaping teardown
+    fails an unrelated test, which is precisely the misattribution this
+    module was changed to stop doing.
+    """
+    try:
+        return os.lstat(path).st_mtime >= since - _MTIME_SLACK_SECONDS
+    except (OSError, ValueError):
+        return None
+
+
+def _describe(path: str, recent: bool | None) -> str:
+    """One reported line: the path, and what its mtime says about the window."""
+    if recent is None:
+        return f"{path} (mtime unreadable)"
+    return f"{path} (mtime {'within' if recent else 'before'} this test)"
 
 
 def _stray_report(nodeid: str, strays: list[str]) -> str:
@@ -152,19 +249,59 @@ def _stray_report(nodeid: str, strays: list[str]) -> str:
     )
 
 
+def _stray_notice(nodeid: str, described: list[str]) -> str:
+    """The advisory wording for a shared directory.
+
+    It states what was observed and not what it concludes. "A file appeared
+    while this test was running" is true whoever wrote it; "this test left a
+    file" is a guess that is wrong every time a peer agent is working in the
+    same checkout, and a report that overstates its own evidence is one the
+    reader learns to skip.
+    """
+    listed = "\n  ".join(described)
+    return (
+        f"a file appeared in a guarded shared directory while {nodeid} was "
+        f"running:\n  {listed}\n"
+        "This does not establish that the test wrote it -- the repo root is "
+        "shared with peer agents and subagents. It is reported because a "
+        "stray there is swept into the next `git add -A` regardless of who "
+        "made it. If it was the test, point the code under test at tmp_path."
+    )
+
+
 @pytest.fixture(autouse=True)
 def _no_stray_artifacts(request: pytest.FixtureRequest):
-    """Fail the test that leaves files behind, naming it and the artifact.
+    """Report artifacts appearing in guarded directories, naming the test.
 
     Attribution is the whole point: an artifact discovered later cannot be
     traced back to a producer, which is how stray files survive cleanup and
-    reappear. Failing here pins the leak to a nodeid at the moment it happens.
+    reappear. Recording it here pins it to a nodeid at the moment it happens.
+
+    Whether that is a failure or a warning depends on whether the directory
+    has other writers -- see ``_GUARDED_DIRS``. Nothing is filtered out: the
+    before/after name diff is what establishes that a path appeared during
+    this test, and mtime only annotates how fresh it looks. It is never a
+    reason to stay quiet, because it does not answer the question the diff
+    already answered.
     """
+    started = time.time()
     before = _snapshot_guarded()
     yield
-    strays = _find_strays(before, _snapshot_guarded())
-    if strays:
-        raise AssertionError(_stray_report(request.node.nodeid, strays))
+    by_dir = _find_strays_by_dir(before, _snapshot_guarded())
+    fatal: list[str] = []
+    advisory: list[str] = []
+    for directory, _recursive, is_fatal in _guarded_dirs():
+        found = by_dir.get(directory)
+        if not found:
+            continue
+        if is_fatal:
+            fatal.extend(found)
+            continue
+        advisory.extend(_describe(path, _appeared_since(path, started)) for path in found)
+    if advisory:
+        warnings.warn(_stray_notice(request.node.nodeid, advisory), stacklevel=2)
+    if fatal:
+        raise AssertionError(_stray_report(request.node.nodeid, sorted(fatal)))
 
 
 def _bank(before: bytes) -> Path | None:
