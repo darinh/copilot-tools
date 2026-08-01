@@ -185,12 +185,19 @@ _EXTENSIONS_ROW = re.compile(
 
 
 def _listed_extensions(text: str) -> set[str]:
-    row = _EXTENSIONS_ROW.search(text)
-    assert row, "README.md's map table has no row for `extensions/`"
-    _, sep, names = row.group("cell").partition(":")
+    rows = _EXTENSIONS_ROW.findall(text)
+    # Exactly one, for the same reason ``_tree_block`` insists on one tree: the
+    # first match wins otherwise, so a row added above this one -- in an
+    # example, a second table, a fenced block -- would be parsed instead, and
+    # the gate would report on a row nobody maintains.
+    assert len(rows) == 1, (
+        f"expected exactly one `extensions/` row in README.md, found "
+        f"{len(rows)}"
+    )
+    _, sep, names = rows[0].partition(":")
     assert sep, (
         "the `extensions/` row no longer lists the extensions by name, so "
-        "there is nothing to check it against: " + row.group("cell").strip()
+        "there is nothing to check it against: " + rows[0].strip()
     )
     return {name.strip() for name in names.split(",") if name.strip()}
 
@@ -237,3 +244,17 @@ def test_the_extension_row_parser_reads_the_names_and_not_the_prose():
     row = ("| [`extensions/`](extensions/README.md) | Copilot CLI runtime "
            "extensions: alpha, beta-two, gamma |\n")
     assert _listed_extensions(row) == {"alpha", "beta-two", "gamma"}
+
+
+def test_a_second_extensions_row_is_refused_rather_than_silently_preferred():
+    """The first match must not win.
+
+    A reviewer put a decoy row above the real one and the parser read the
+    decoy, which would have graded the repository against a line nobody
+    maintains -- green while the row a reader actually sees was wrong.
+    """
+    decoy = ("| [`extensions/`](elsewhere) | runtime extensions: decoy-one |\n"
+             "| [`extensions/`](extensions/README.md) | Copilot CLI runtime "
+             "extensions: alpha, beta |\n")
+    with pytest.raises(AssertionError, match="exactly one"):
+        _listed_extensions(decoy)
