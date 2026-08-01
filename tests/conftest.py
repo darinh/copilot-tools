@@ -17,6 +17,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Imported after ROOT joins sys.path -- these live at the repo root.
+import copilot_operator  # noqa: E402
+import operator_mux  # noqa: E402
+
 # Directories a test must never write into. The repo root and skills/ are
 # tracked, so an artifact dropped there gets swept up by `git add -A`.
 # Each entry is (directory, recursive, fatal). The repo root is scanned
@@ -382,6 +386,137 @@ def _real_catalog_is_never_rewritten(request: pytest.FixtureRequest):
     complaint = _catalog_complaint(before, request.node.nodeid)
     if complaint:
         raise AssertionError(complaint)
+
+
+# ── the multiplexer boundary ────────────────────────────────────
+#
+# `copilot_operator.MUX` is a module-level `Mux()` built at import time, so any
+# test that calls into copilot_operator without replacing it drives the
+# DEVELOPER'S OWN tmux/psmux server. Measured on 2026-08-01: 30 unit tests did
+# exactly that, 134 real `tmux has-session` invocations per suite run, against
+# whatever the machine happened to be running at the time.
+#
+# Two things follow, and the second is the expensive one:
+#
+#   * The tests are nondeterministic. Their answers depend on a live server, on
+#     process-spawn latency and on what sessions exist right now. That is what
+#     made test_unexpected_exit_without_marker_is_relaunched fail in a full run
+#     and pass 3/3 alone -- five real subprocess spawns per run, none of them
+#     visible in the test.
+#   * They are also destructive in principle. The loop's stop path calls
+#     `MUX.kill_session(instance.session)`, and its session names come from the
+#     instance name in the test -- so a developer with a real session named
+#     `relaunch-me` or `detach-me` loses it to a unit test.
+#
+# The double fakes the SUBPROCESS BOUNDARY ONLY: `_run` answers the tmux verbs
+# from an in-memory session table and everything above it is the real `Mux`
+# code. So new_session still verifies the session exists afterwards,
+# kill_session still raises when one survives, and send_keys still splits
+# literal text from Enter -- a test double built by reimplementing that surface
+# would agree with whatever the implementation assumed rather than with what it
+# does. An unrecognised verb raises rather than returning a plausible rc: a
+# double that answers a question it does not understand is the failure this
+# whole file keeps re-learning.
+#
+# Tests that want different behaviour still override `op.MUX` themselves; this
+# runs first, so their own monkeypatch wins. Real-multiplexer coverage lives in
+# test_integration.py, which builds its own `Mux()` and is untouched by this.
+class FakeMux(operator_mux.Mux):
+    """A `Mux` whose backend is a dict instead of a terminal multiplexer."""
+
+    def __init__(self, sessions: tuple[str, ...] = ()):
+        super().__init__(binary="fakemux")
+        self.sessions: dict[str, dict] = {
+            name: {"cwd": "", "argv": [], "remain_on_exit": False, "dead": False}
+            for name in sessions
+        }
+        self.keys: list[tuple[str, str]] = []
+
+    @property
+    def binary(self) -> str:
+        return "fakemux"
+
+    def _run(self, *args: str, capture: bool = True) -> tuple[str, str, int]:
+        verb = args[0] if args else ""
+        if verb == "-V":
+            return "fakemux 0.0", "", 0
+        if verb == "has-session":
+            return "", "", 0 if args[2] in self.sessions else 1
+        if verb == "list-sessions":
+            return "\n".join(self.sessions), "", 0
+        if verb == "new-session":
+            name = args[3]
+            self.sessions[name] = {
+                "cwd": args[5], "argv": list(args[7:]),
+                "remain_on_exit": False, "dead": False,
+            }
+            return "", "", 0
+        if verb == "kill-session":
+            name = args[2]
+            if name not in self.sessions:
+                return "", f"can't find session: {name}", 1
+            del self.sessions[name]
+            return "", "", 0
+        if verb == "set-option":
+            name = args[2]
+            if name not in self.sessions:
+                return "", f"can't find session: {name}", 1
+            self.sessions[name]["remain_on_exit"] = args[4] == "on"
+            return "", "", 0
+        if verb == "send-keys":
+            name = args[2]
+            if name not in self.sessions:
+                return "", f"can't find session: {name}", 1
+            self.keys.append((name, args[-1]))
+            return "", "", 0
+        if verb == "display-message":
+            name = args[2]
+            session = self.sessions.get(name)
+            if session is None:
+                return "", f"can't find session: {name}", 1
+            fmt = args[4]
+            if fmt == "#{pane_dead}":
+                return "1" if session["dead"] else "0", "", 0
+            if fmt == "#{pane_pid}":
+                return "0", "", 0
+            if fmt == "#{pane_current_path}":
+                return session["cwd"], "", 0
+            raise AssertionError(f"FakeMux does not model display format {fmt!r}")
+        if verb == "attach":
+            return "", "", 0 if args[2] in self.sessions else 1
+        raise AssertionError(
+            f"FakeMux does not model the {verb!r} verb (args: {args!r}). "
+            "Teach it the verb rather than letting a test reach the real "
+            "multiplexer -- see the comment above FakeMux."
+        )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_multiplexer():
+    """Point `copilot_operator.MUX` at an empty in-memory multiplexer.
+
+    An empty one, because that is what the leaking tests were already getting
+    by accident: no session of theirs exists on the real server, so every
+    `has_session` came back False. The behaviour they assert is unchanged; only
+    its dependence on the machine goes away.
+
+    It saves and restores by hand rather than taking `monkeypatch`, and that is
+    not a style choice. An autouse fixture that REQUESTS `monkeypatch` pulls
+    monkeypatch's lifetime up to its own, so monkeypatch is finalised earlier
+    than it used to be -- and `_no_stray_artifacts` above then runs its
+    end-of-test scan with the test's patches STILL APPLIED. Doing that here
+    turned all 26 tests in test_artifact_guard.py into teardown errors, because
+    they patch `_GUARDED_DIRS` to their own tmp_path and the guard duly found
+    their fixtures there. Depending on no fixture keeps this one first to set
+    up and last to tear down, which is also the only order in which a test's
+    own `monkeypatch.setattr(op, "MUX", ...)` is undone before this restores.
+    """
+    real = copilot_operator.MUX
+    copilot_operator.MUX = FakeMux()
+    try:
+        yield
+    finally:
+        copilot_operator.MUX = real
 
 
 @pytest.fixture
