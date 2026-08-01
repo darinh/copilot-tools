@@ -67,9 +67,43 @@ def test_primary_root_outside_a_repository_is_unchanged(tmp_path):
     assert primary_repo_root(plain) == plain
 
 
-def test_primary_root_of_a_missing_path_is_unchanged(tmp_path):
+def test_primary_root_of_a_missing_path_is_unchanged(tmp_path, monkeypatch):
+    """A path that is absent is answered without consulting git.
+
+    The return value alone cannot show this. ``gone`` comes back from the
+    ``is_dir()`` early return, but it is also what the two failure handlers
+    below return, so deleting the early return entirely leaves this test
+    green: git would then run with a non-existent ``cwd``, raise ``OSError``,
+    and hand back the very same ``base``. The observable has to be the call
+    that was *not* made.
+
+    That makes this the other half of the polarity pinned by the EACCES test
+    below, and the pair is the whole argument of the module: a stat that
+    answers *no* is trusted and git is skipped; a stat that *raises* has not
+    answered, so git is still asked. One spy records both directions, and the
+    real directory in the same test is what proves the spy was capable of
+    recording a call at all -- without it, an empty list is equally good
+    evidence that the spy was never installed.
+    """
     gone = tmp_path / "nope"
+    here = tmp_path / "here"
+    here.mkdir()
+    calls: list[str | None] = []
+    real_run = subprocess.run
+
+    def spy(cmd, **kwargs):
+        calls.append(kwargs.get("cwd"))
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(project_paths.subprocess, "run", spy)
     assert primary_repo_root(gone) == gone
+    assert calls == [], f"an absent path was taken to git: {calls!r}"
+
+    # Same call, same spy: a directory that does exist is asked about, so the
+    # empty list above is a decision and not a dead instrument.
+    primary_repo_root(here)
+    assert calls == [str(here)], \
+        f"the spy never recorded anything; the assertion above is vacuous: {calls!r}"
 
 
 def test_primary_root_of_a_worktree_it_cannot_examine_is_still_the_root(
@@ -147,12 +181,56 @@ def test_operator_finds_the_handoff_file_from_a_worktree(
 def test_an_uncatalogued_project_is_still_reported_as_such(
         repo_with_worktree, tmp_path, monkeypatch):
     """Resolving the primary root must not invent a match for a project that
-    genuinely has no catalog entry."""
-    _root, wt = repo_with_worktree
-    catalog = _catalog(tmp_path, monkeypatch, tmp_path / "elsewhere", "other")
+    genuinely has no catalog entry.
+
+    The row deliberately names the *worktree*, not somewhere unrelated. With
+    an unrelated path in it this assertion was vacuous: a resolver that handed
+    back ``wt`` unchanged -- the duplicate-identity failure this whole module
+    exists to prevent -- misses a row for ``elsewhere`` exactly as cleanly as
+    a working one does, so ``None`` was consistent with the bug and with the
+    fix alike. Keyed on the worktree instead, the broken resolver *matches*
+    and returns a path, so ``None`` is now evidence only correct root
+    resolution can produce.
+
+    The rewrite afterwards is the second half: without it, a ``None`` caused
+    by a catalog that was never opened at all -- a wrong ``project_catalog_path``
+    patch, a probe that denied the read -- would look identical.
+    """
+    root, wt = repo_with_worktree
+    catalog = _catalog(tmp_path, monkeypatch, wt, "guid-trap")
     monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
 
     assert op.project_handoff_file(wt) is None
+
+    catalog.write_text(f'"{root.resolve()}",guid-root\n', encoding="utf-8")
+    found = op.project_handoff_file(wt)
+    assert found is not None and found.parent.name == "guid-root", \
+        f"the same call could not produce a hit at all: {found!r}"
+
+
+def test_a_catalogued_worktree_does_not_shadow_its_own_project(
+        repo_with_worktree, tmp_path, monkeypatch):
+    """Both paths in the catalog, and the project's row is the one that wins.
+
+    This is the collision the layout makes easy to create: a worktree
+    catalogued in its own right sits under the project that already has an
+    entry, and the two rows name different GUIDs. Nothing else in this file
+    covers it, because every other case has at most one matching row -- and a
+    resolver that stopped at the worktree would be caught there only by
+    returning ``None``, never by returning the *wrong* project's state
+    directory, which is the outcome that actually loses a handoff.
+    """
+    root, wt = repo_with_worktree
+    catalog = _catalog(tmp_path, monkeypatch, wt, "guid-worktree")
+    with catalog.open("a", encoding="utf-8") as fh:
+        fh.write(f'"{root.resolve()}",guid-project\n')
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+
+    found = op.project_handoff_file(wt)
+
+    assert found is not None, "neither row matched; the lookup found nothing"
+    assert found.parent.name == "guid-project", \
+        f"the worktree's own row shadowed the project's: {found.parent.name}"
 
 
 # -- one definition of a valid project id ------------------------
