@@ -8,7 +8,7 @@
 
 import { execFile } from "node:child_process";
 import { readdirSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
 
 // The only directories excluded on this extension's own authority. Everything
 // else that should be ignored is decided by asking git (`check-ignore`), so
@@ -112,22 +112,98 @@ export function emptyDirCandidates(dirNames, known) {
 }
 
 /**
+ * Split a command string into segments of tokens, honouring quotes.
+ *
+ * Quote awareness is not a nicety here, it is the difference between a guard
+ * and the appearance of one. Whitespace splitting alone leaves the quotes
+ * attached to the token, so `git add "-A"` arrives as `'"-A"'`, matches no
+ * flag pattern, and sails through -- the guard reports allowed and the sweep
+ * happens. The same hole hides `"C:\Program Files\Git\cmd\git.exe" add -A`,
+ * whose binary token ends in a quote and so fails the `git` test entirely.
+ *
+ * It cuts the other way too. Splitting a quoted `-m` message on whitespace
+ * turns `git stash push -m "wip fix -u handling"` into a bare `-u` token and
+ * blocks a stash that sweeps nothing. Both directions are wrong answers
+ * delivered confidently, which is the one outcome this guard may not produce.
+ *
+ * Backslash is deliberately NOT an escape character. This runs on Windows,
+ * where `\` is the path separator: treating it as an escape would reduce
+ * `C:\cmd\git.exe` to `C:cmdgit.exe` and `.\` to `.`, breaking exactly the
+ * detections the quoting fix is here to add. The cost is that POSIX `\*`
+ * survives as a literal token, which the blanket-form check handles by name.
+ *
+ * An unterminated quote closes at end of input, so a truncated command still
+ * yields its tokens rather than vanishing.
+ */
+export function tokenizeCommand(command) {
+  const source = String(command ?? "");
+  const segments = [];
+  let tokens = [];
+  let current = "";
+  let started = false;
+  let quote = null;
+
+  const endToken = () => {
+    if (started) tokens.push(current);
+    current = "";
+    started = false;
+  };
+  const endSegment = () => {
+    endToken();
+    if (tokens.length) segments.push(tokens);
+    tokens = [];
+  };
+
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (quote) {
+      // A quoted empty string is still a token, hence `started` rather than a
+      // length test: `git commit -m ""` must not drop the message argument.
+      if (ch === quote) quote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (ch === "&" || ch === "|") {
+      // `&&` and `||` are two characters; a single `&` or `|` separates just
+      // as surely, so either way the segment ends here.
+      if (source[i + 1] === ch) i++;
+      endSegment();
+      continue;
+    }
+    if (ch === ";" || ch === "\n" || ch === "\r") {
+      endSegment();
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      endToken();
+      continue;
+    }
+    current += ch;
+    started = true;
+  }
+  endSegment();
+  return segments;
+}
+
+/**
  * Split a shell command into the argument runs of its `git` invocations.
  *
  * A single tool call routinely chains commands (`git add -A && git commit`),
  * so matching the string as a whole would attribute one subcommand's flags to
  * another. Splitting on the shell operators that separate commands keeps each
- * invocation's arguments to itself. This is deliberately not a shell parser:
- * an operator inside a quoted string splits a segment a real shell would not.
- * That direction is safe -- it can only shorten an argument run, never merge
- * two commands into one.
+ * invocation's arguments to itself.
  */
 export function gitInvocations(command) {
   const found = [];
-  for (const segment of String(command ?? "").split(/(?:&&|\|\||[;&|\n])/)) {
-    const tokens = segment.trim().split(/\s+/).filter(Boolean);
+  for (const tokens of tokenizeCommand(command)) {
     for (let i = 0; i < tokens.length; i++) {
-      // `git`, `/usr/bin/git`, `git.exe` -- but not `github` or `mygit`.
+      // `git`, `/usr/bin/git`, `C:\Program Files\Git\cmd\git.exe` -- but not
+      // `github` or `mygit`. Quotes are already gone by this point.
       if (!/(?:^|[\\/])git(?:\.exe)?$/i.test(tokens[i])) continue;
       found.push(tokens.slice(i + 1));
       break;
@@ -170,6 +246,50 @@ export function gitSubcommand(args) {
   return null;
 }
 
+// Pathspecs that mean "the entire checkout" regardless of where git is run.
+// `.\` is here because this runs on Windows, where it is what `.` looks like
+// once a shell has completed a directory name. `\*` is the POSIX escaped glob,
+// which survives tokenisation intact because backslash is not an escape here.
+const ROOT_WIDE_PATHSPECS = new Set([
+  ".", "./", ".\\", ":/", ":/.", "*", "\\*", "./*", ".\\*", ":/*", ":(top)",
+]);
+
+// Options whose value is a separate following token. The value must never be
+// classified as a flag: `git stash push -m "-u"` carries no `-u` option at
+// all, and `--chmod +x` is not a pathspec.
+const ADD_OPTIONS_WITH_VALUE = new Set(["--chmod", "--pathspec-from-file"]);
+const STASH_OPTIONS_WITH_VALUE = new Set(["-m", "--message", "-S", "--gpg-sign"]);
+
+/**
+ * Partition an argument list into flags and pathspecs.
+ *
+ * Everything after `--` is a pathspec by definition, even if it starts with a
+ * dash, and a value-taking option swallows the token after it.
+ */
+function partitionArgs(args, optionsWithValue) {
+  const flags = [];
+  const pathspecs = [];
+  let literal = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (literal) {
+      pathspecs.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      literal = true;
+      continue;
+    }
+    if (optionsWithValue.has(arg)) {
+      i++;
+      continue;
+    }
+    if (arg.startsWith("-") && arg !== "-") flags.push(arg);
+    else pathspecs.push(arg);
+  }
+  return { flags, pathspecs };
+}
+
 /**
  * True when this `git add` argument list stages everything, strays included.
  *
@@ -179,6 +299,13 @@ export function gitSubcommand(args) {
  * blocked. What is being prevented is not committing an artifact, it is
  * committing one *without noticing*.
  *
+ * `-A` alongside a pathspec is therefore not blanket, and that is git's own
+ * behaviour rather than a concession: `git add -A keep.txt` stages `keep.txt`
+ * and leaves an untracked stray exactly where it was. Blocking it would have
+ * punished the most careful form of the command available -- naming the file
+ * *and* asking for its deletions -- while the guard's own escape hatch told
+ * the agent to name the file.
+ *
  * `-u`/`--update` is intentionally absent: it restages already-tracked files
  * and cannot pick up an untracked artifact. A dry run is likewise never
  * blanket -- it changes nothing, and it is the obvious way for an agent to
@@ -186,32 +313,30 @@ export function gitSubcommand(args) {
  * caution this guard is asking for.
  */
 export function addIsBlanket(args) {
-  let afterPathspecSeparator = false;
-  for (const arg of args) {
-    if (arg === "--") break;
-    if (arg === "--dry-run" || (/^-[A-Za-z]+$/.test(arg) && arg.includes("n"))) return false;
+  const { flags, pathspecs } = partitionArgs(args, ADD_OPTIONS_WITH_VALUE);
+  for (const flag of flags) {
+    if (flag === "--dry-run") return false;
+    if (/^-[A-Za-z]+$/.test(flag) && flag.includes("n")) return false;
   }
-  for (const arg of args) {
-    if (arg === "--") {
-      afterPathspecSeparator = true;
-      continue;
-    }
-    if (!afterPathspecSeparator) {
-      if (arg === "-A" || arg === "--all" || arg === "--no-ignore-removal") return true;
-      // Combined short flags (`-Av`, `-fA`). A `-u` in the same cluster does
-      // not cancel `-A`; git takes the broader of the two.
-      if (/^-[A-Za-z]+$/.test(arg) && arg.includes("A")) return true;
-      if (arg.startsWith("-")) continue;
-    }
-    if (arg === "." || arg === "./" || arg === ":/" || arg === "*") return true;
+  // A root-wide pathspec sweeps whatever it is combined with.
+  if (pathspecs.some((p) => ROOT_WIDE_PATHSPECS.has(p))) return true;
+  // Any other named pathspec scopes the command, `-A` included.
+  if (pathspecs.length > 0) return false;
+  for (const flag of flags) {
+    if (flag === "-A" || flag === "--all" || flag === "--no-ignore-removal") return true;
+    // Combined short flags (`-Av`, `-fA`). A `-u` in the same cluster does
+    // not cancel `-A`; git takes the broader of the two.
+    if (/^-[A-Za-z]+$/.test(flag) && flag.includes("A")) return true;
   }
   return false;
 }
 
 // `git stash` subcommands that do not create a stash entry, so no `-u`/`-a`
 // they carry can sweep anything. `push`/`save` are the creating forms.
+// `create` builds a stash commit object and prints its hash without touching
+// the working tree at all, and `store` only records one that already exists.
 const STASH_NON_CREATING = new Set([
-  "apply", "pop", "list", "show", "drop", "branch", "clear", "store",
+  "apply", "pop", "list", "show", "drop", "branch", "clear", "store", "create",
 ]);
 
 /**
@@ -223,16 +348,18 @@ const STASH_NON_CREATING = new Set([
  * A peer agent lost 454 lines of staged work to a subagent's `git stash` this
  * same evening, recoverable only from dangling objects, so this is an observed
  * failure rather than a hypothetical one.
+ *
+ * The message argument is skipped rather than scanned, because `git stash push
+ * -m "wip fix -u handling"` sweeps nothing and blocking it would be a false
+ * positive with no escape hatch: unlike `add`, there is no way to name your
+ * way out of a stash.
  */
 export function stashTakesUntracked(args) {
-  for (const arg of args) {
-    if (arg === "--") break;
-    if (!arg.startsWith("-")) {
-      if (STASH_NON_CREATING.has(arg)) return false;
-      continue;
-    }
-    if (arg === "--include-untracked" || arg === "--all") return true;
-    if (/^-[A-Za-z]+$/.test(arg) && (arg.includes("u") || arg.includes("a"))) return true;
+  const { flags, pathspecs } = partitionArgs(args, STASH_OPTIONS_WITH_VALUE);
+  if (pathspecs.some((p) => STASH_NON_CREATING.has(p))) return false;
+  for (const flag of flags) {
+    if (flag === "--include-untracked" || flag === "--all") return true;
+    if (/^-[A-Za-z]+$/.test(flag) && (flag.includes("u") || flag.includes("a"))) return true;
   }
   return false;
 }
@@ -253,15 +380,40 @@ export function sweepDecision(command, strays) {
   return null;
 }
 
+/**
+ * Format a path list for injection into the agent's context, bounded.
+ *
+ * An unpacked archive or an `npm install` that escapes its ignore rules can
+ * produce thousands of paths, and this text goes straight into the model's
+ * context. Emitting all of them would wedge the session the guard is meant to
+ * be protecting -- a warning that costs more than the thing it warns about.
+ * The count is always exact even when the list is truncated, because the
+ * number is what tells the agent something went badly wrong.
+ */
+export const MAX_LISTED = 10;
+
+export function formatPathList(paths, limit = MAX_LISTED) {
+  const shown = paths.slice(0, limit).map((s) => `  - ${s}`);
+  const hidden = paths.length - limit;
+  if (hidden > 0) shown.push(`  ... and ${hidden} more`);
+  return shown.join("\n");
+}
+
 /** Message shown to the agent when a sweep is blocked. */
-export function blockReason({ verb, strays }) {
+export function blockReason({ verb, strays, unannounced = [] }) {
   const plural = strays.length === 1 ? "" : "s";
+  const surprise = unannounced.length
+    ? `\n\n${unannounced.length} of these are being named for the first time ` +
+      `now -- they appeared without a tool call of yours in between, so a peer ` +
+      `agent sharing this checkout or a background process is the likelier ` +
+      `author:\n${formatPathList(unannounced)}`
+    : "";
   return (
     `[checkout-guard] BLOCKED: \`${verb}\` would sweep ${strays.length} stray ` +
-    `artifact${plural} into git. These appeared in the checkout as a side ` +
-    `effect of a shell command in this session and were never authored with ` +
-    `the create/edit tools:\n` +
-    strays.map((s) => `  - ${s}`).join("\n") +
+    `artifact${plural} into git. These are untracked paths that were never ` +
+    `authored with the create/edit tools:\n` +
+    formatPathList(strays) +
+    surprise +
     `\n\nAd-hoc probe scripts must write to a temp directory, not the shared ` +
     `checkout. Delete these, or -- if one is real work you meant to keep -- ` +
     `stage it by name (\`git add <path>\`), which this guard deliberately ` +
@@ -277,7 +429,7 @@ export function strayReport(strays, scratchDir) {
     `[checkout-guard] ${strays.length} new untracked path${plural} appeared in ` +
     `the checkout during your last command (a checkout can be shared with peer ` +
     `agents, so one of these may not be yours):\n` +
-    strays.map((s) => `  - ${s}`).join("\n") +
+    formatPathList(strays) +
     `\n\nIf they are probe or scratch artifacts, delete them now and rerun the ` +
     `work under ${scratchDir}. Do it while you still know what produced them: ` +
     `an artifact found later has no provenance, which is how it survives ` +
@@ -395,6 +547,45 @@ export async function trackedTopLevel(root) {
 }
 
 /**
+ * True when a directory contains no files at any depth.
+ *
+ * This is the precise question the empty-directory scan exists to ask, and it
+ * matters that it is asked separately from the ignore check. `git status` is
+ * silent about a directory for two very different reasons: because git cannot
+ * represent it (it holds no files, so there is nothing to track), or because
+ * everything inside it is ignored and git is deliberately declining to
+ * mention it. Only the first is a stray. Reading silence as the first case
+ * unconditionally reported any directory holding nothing but ignored output --
+ * a build cache the project had explicitly told git to forget -- as a
+ * mysterious artifact, which is the guard crying wolf about the project's own
+ * configuration.
+ *
+ * The walk is bounded because it runs on paths chosen by nobody in particular;
+ * exceeding the budget returns false, which reports nothing. Failing towards
+ * silence is right for a guard whose false positives cost an agent a detour.
+ */
+export function holdsNoFiles(dir, budget = 512) {
+  const stack = [dir];
+  let visited = 0;
+  while (stack.length) {
+    if (++visited > budget) return false;
+    let entries;
+    try {
+      entries = readdirSync(stack.pop(), { withFileTypes: true });
+    } catch {
+      // Unreadable is not empty, and guessing either way would be a claim the
+      // filesystem declined to support.
+      return false;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) return false;
+      stack.push(join(entry.parentPath ?? entry.path ?? dir, entry.name));
+    }
+  }
+  return true;
+}
+
+/**
  * Every untracked path in the checkout, including the empty directories git
  * refuses to report. Returns null when git could not answer, which callers
  * must treat as "no information" rather than "clean".
@@ -405,5 +596,8 @@ export async function scanCheckout(root) {
   const untracked = parseUntracked(stdout);
   const known = [...parseStatusPaths(stdout), ...(await trackedTopLevel(root))];
   const dirs = await withoutIgnored(root, topLevelDirs(root));
-  return [...untracked, ...emptyDirCandidates(dirs, known)];
+  const invisible = emptyDirCandidates(dirs, known).filter((rel) =>
+    holdsNoFiles(join(root, rel.replace(/\/$/, ""))),
+  );
+  return [...untracked, ...invisible];
 }

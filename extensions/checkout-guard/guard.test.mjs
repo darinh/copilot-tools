@@ -10,17 +10,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   addIsBlanket,
   blockReason,
   checkoutRoot,
   emptyDirCandidates,
+  formatPathList,
   git,
   gitInvocations,
   gitSubcommand,
+  holdsNoFiles,
   newEntries,
   parseStatusPaths,
   parseUntracked,
@@ -29,6 +32,7 @@ import {
   stashTakesUntracked,
   strayReport,
   sweepDecision,
+  tokenizeCommand,
 } from "./guard.mjs";
 
 const NUL = "\0";
@@ -352,16 +356,65 @@ test("checkoutRoot resolves a real repository and returns null outside one", asy
   await withRepo(async (root) => {
     assert.equal(await checkoutRoot(root), root);
   });
-  // Paired negative: a directory that is not a repository. Skipped when the
-  // temp directory itself happens to sit inside one, which would make the
-  // assertion meaningless rather than merely false.
+  // Paired negative: a directory that is not a repository. The skip condition
+  // is decided BEFORE the call and by different means -- walking the ancestor
+  // chain for a .git -- so it can never be satisfied by the same bug it is
+  // guarding. Folding the skip into the assertion (`if (r === null) assert...`)
+  // is the vacuous shape this file's header forbids: a broken checkoutRoot
+  // returning cwd would take the false branch and the test would pass having
+  // asserted nothing. Three independent reviewers caught it here.
   const outside = await realpath(await mkdtemp(join(tmpdir(), "checkout-guard-bare-")));
   try {
+    let insideARepo = false;
+    for (let dir = outside; ; ) {
+      if (existsSync(join(dir, ".git"))) { insideARepo = true; break; }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
     const result = await checkoutRoot(outside);
-    if (result === null) assert.equal(result, null);
+    if (insideARepo) {
+      assert.ok(result !== null, "the temp dir is inside a repo, so a root is the right answer");
+    } else {
+      assert.strictEqual(result, null, "no repository above the temp dir, so there is no root");
+    }
   } finally {
     await rm(outside, { recursive: true, force: true, maxRetries: 3 });
   }
+});
+
+test("scanCheckout ignores a directory holding only ignored files", async () => {
+  await withRepo(async (root) => {
+    await writeFile(join(root, ".gitignore"), "*.tmp\n");
+    await mkdir(join(root, "cache"));
+    await mkdir(join(root, "probe"));
+    await writeFile(join(root, "probe", "keep.py"), "x = 1\n");
+    // Control first: with a real file in it, `cache/` is reported.
+    await writeFile(join(root, "cache", "real.txt"), "content\n");
+    const before = await scanCheckout(root);
+    assert.ok(before.includes("cache/real.txt"), "control: a real file inside cache/ is seen");
+
+    await rm(join(root, "cache", "real.txt"));
+    await writeFile(join(root, "cache", "a.tmp"), "scratch\n");
+    const after = await scanCheckout(root);
+    assert.ok(!after.includes("cache/"),
+      "git is silent about cache/ because its contents are ignored, not because it is empty");
+    assert.ok(!after.some((p) => p.startsWith("cache/")), "and nothing inside it either");
+    assert.ok(after.includes("probe/keep.py"),
+      "control: an unignored file elsewhere is still reported, so the scan ran");
+  });
+});
+
+test("scanCheckout still reports a directory git cannot represent at all", async () => {
+  await withRepo(async (root) => {
+    await mkdir(join(root, "t_src"));
+    await mkdir(join(root, "nested", "deeper"), { recursive: true });
+    const found = await scanCheckout(root);
+    // These are the two real artifacts from the primary checkout: empty, so
+    // `git status --porcelain` returns absolutely nothing for them.
+    assert.ok(found.includes("t_src/"), "an empty directory is invisible to git and must be reported");
+    assert.ok(found.includes("nested/"), "a directory holding only empty directories holds no files");
+  });
 });
 
 test("end to end: a real stray blocks a real blanket add, and cleanup unblocks it", async () => {
@@ -388,4 +441,174 @@ test("end to end: a real stray blocks a real blanket add, and cleanup unblocks i
       "an agent that cleans up must not stay blocked");
   });
 });
+
+// --- regressions found by adversarial review ----------------------------
+//
+// Every test below corresponds to a bypass or false positive that three
+// reviewer models found in code that already had 29 passing tests. The theme
+// is uniform: the tokenizer was whitespace-only, so a quote turned a detected
+// command into an undetected one, and a message argument turned an innocent
+// command into a blocked one. Both directions are confident wrong answers.
+
+test("tokenizeCommand strips quotes and keeps quoted whitespace together", () => {
+  assert.deepEqual(tokenizeCommand('git add "-A"'), [["git", "add", "-A"]]);
+  assert.deepEqual(tokenizeCommand("git add '*'"), [["git", "add", "*"]]);
+  assert.deepEqual(
+    tokenizeCommand('git stash push -m "wip fix -u handling"'),
+    [["git", "stash", "push", "-m", "wip fix -u handling"]],
+    "a quoted message is one token, so its contents are never read as flags",
+  );
+  assert.deepEqual(
+    tokenizeCommand('git commit -m ""'),
+    [["git", "commit", "-m", ""]],
+    "a quoted empty string is still an argument and must not be dropped",
+  );
+  assert.deepEqual(
+    tokenizeCommand('git add "-A'),
+    [["git", "add", "-A"]],
+    "an unterminated quote closes at end of input rather than losing the token",
+  );
+});
+
+test("tokenizeCommand splits on operators but not on operators inside quotes", () => {
+  assert.deepEqual(tokenizeCommand("git add -A && git commit"), [
+    ["git", "add", "-A"],
+    ["git", "commit"],
+  ]);
+  assert.deepEqual(tokenizeCommand("a | b ; c & d"), [["a"], ["b"], ["c"], ["d"]]);
+  assert.deepEqual(
+    tokenizeCommand('git commit -m "fix a && b"'),
+    [["git", "commit", "-m", "fix a && b"]],
+    "an operator inside a message must not split the command",
+  );
+});
+
+test("tokenizeCommand leaves backslashes alone because Windows paths need them", () => {
+  // Treating backslash as a POSIX escape would turn the git binary's own path
+  // into `C:ProgramFilesGitcmdgit.exe` and defeat the detection entirely.
+  assert.deepEqual(
+    tokenizeCommand('"C:\\Program Files\\Git\\cmd\\git.exe" add -A'),
+    [["C:\\Program Files\\Git\\cmd\\git.exe", "add", "-A"]],
+  );
+  assert.deepEqual(tokenizeCommand("git add .\\"), [["git", "add", ".\\"]]);
+});
+
+test("gitInvocations finds a quoted absolute Windows path to git.exe", () => {
+  assert.deepEqual(
+    gitInvocations('"C:\\Program Files\\Git\\cmd\\git.exe" add -A'),
+    [["add", "-A"]],
+  );
+  assert.deepEqual(gitInvocations("'/usr/bin/git' add -A"), [["add", "-A"]]);
+  assert.deepEqual(gitInvocations('"github-cli" pr list'), [],
+    "control: a quoted binary that is not git is still not git");
+});
+
+test("a quoted flag or pathspec cannot smuggle a blanket add past the guard", () => {
+  const strays = ["probe.py"];
+  for (const command of [
+    'git add "-A"',
+    "git add '-A'",
+    'git add "*"',
+    "git add '.'",
+    'git add ".\\"',
+    '"C:\\Program Files\\Git\\cmd\\git.exe" add -A',
+  ]) {
+    assert.ok(sweepDecision(command, strays), `${command} must still be blocked`);
+  }
+  assert.equal(sweepDecision('git add "probe.py"', strays), null,
+    "control: a quoted explicit pathspec is still the escape hatch and stays allowed");
+});
+
+test("git add -A with an explicit pathspec is scoped, so it is not blanket", () => {
+  // Verified against real git: `git add -A keep.txt` stages keep.txt and
+  // leaves an untracked stray exactly where it was. Blocking it punished the
+  // most careful available form of the command.
+  assert.equal(addIsBlanket(["-A", "keep.txt"]), false);
+  assert.equal(addIsBlanket(["--all", "src/"]), false);
+  assert.equal(addIsBlanket(["-A"]), true, "control: with no pathspec it really is blanket");
+  assert.equal(addIsBlanket(["-A", "."]), true,
+    "a root-wide pathspec sweeps whatever it is combined with");
+  assert.equal(addIsBlanket(["-A", ".\\"]), true, "including the Windows spelling of it");
+  assert.equal(addIsBlanket(["--", "-weird-name.txt"]), false,
+    "after -- a dashed token is a filename, not a flag");
+});
+
+test("git add -A with a pathspec really does leave the stray untracked", async () => {
+  await withRepo(async (root) => {
+    await writeFile(join(root, "keep.txt"), "wanted\n");
+    await writeFile(join(root, "probe.py"), "stray\n");
+    await git(["add", "-A", "keep.txt"], root);
+    const { stdout } = await git(["status", "--porcelain", "-uall", "-z"], root);
+    assert.ok(parseUntracked(stdout).includes("probe.py"),
+      "git itself scopes -A to the pathspec, which is why the guard must too");
+    assert.ok(parseStatusPaths(stdout).includes("keep.txt"), "control: keep.txt was staged");
+  });
+});
+
+test("a stash message mentioning -u does not block a stash that sweeps nothing", () => {
+  const strays = ["probe.py"];
+  assert.equal(sweepDecision('git stash push -m "wip fix -u handling in cli"', strays), null);
+  assert.equal(sweepDecision('git stash push -m "note about -a flag"', strays), null);
+  assert.equal(sweepDecision("git stash push -m tidy -u", strays) !== null, true,
+    "control: a real -u outside the message still blocks");
+});
+
+test("git stash create and store do not sweep the working tree", () => {
+  assert.equal(stashTakesUntracked(["create", "-u"]), false);
+  assert.equal(stashTakesUntracked(["store", "-u", "deadbeef"]), false);
+  assert.equal(stashTakesUntracked(["push", "-u"]), true, "control: push -u does sweep");
+});
+
+test("git stash create leaves untracked files in place", async () => {
+  await withRepo(async (root) => {
+    await writeFile(join(root, "tracked.txt"), "one\n");
+    await git(["add", "tracked.txt"], root);
+    await git(["commit", "-m", "base"], root);
+    await writeFile(join(root, "tracked.txt"), "two\n");
+    await writeFile(join(root, "probe.py"), "stray\n");
+    await git(["stash", "create", "-u"], root);
+    assert.ok(existsSync(join(root, "probe.py")),
+      "create builds an object and prints its hash; the working tree is untouched");
+  });
+});
+
+test("formatPathList bounds what is injected into the agent's context", () => {
+  const many = Array.from({ length: 10_000 }, (_, i) => `artifact-${i}.tmp`);
+  const text = formatPathList(many);
+  assert.ok(text.length < 500, "10k paths must not become 10k lines of context");
+  assert.ok(text.includes("... and 9990 more"));
+  assert.equal(formatPathList(["a.py", "b.py"]).includes("more"), false,
+    "control: a short list is shown in full with no truncation notice");
+  // The count in the headline stays exact even when the list is cut, because
+  // the number is the part that tells the agent something went badly wrong.
+  assert.ok(blockReason({ verb: "git add", strays: many }).includes("10000 stray"));
+  assert.ok(strayReport(many, "/tmp/scratch").includes("10000 new untracked"));
+});
+
+test("blockReason names artifacts the agent was never told about", () => {
+  const text = blockReason({
+    verb: "git add",
+    strays: ["mine.py", "peers.py"],
+    unannounced: ["peers.py"],
+  });
+  assert.ok(text.includes("first time"), "an unannounced stray must be flagged as such");
+  assert.ok(text.includes("peer agent"), "and attributed honestly rather than blamed on the agent");
+  const plain = blockReason({ verb: "git add", strays: ["mine.py"] });
+  assert.equal(plain.includes("first time"), false,
+    "control: when everything was already reported, no surprise notice appears");
+});
+
+test("holdsNoFiles distinguishes an empty tree from one with content", async () => {
+  await withRepo(async (root) => {
+    await mkdir(join(root, "hollow", "deeper"), { recursive: true });
+    assert.equal(holdsNoFiles(join(root, "hollow")), true,
+      "directories all the way down is what git cannot represent");
+    await writeFile(join(root, "hollow", "deeper", "x.txt"), "content\n");
+    assert.equal(holdsNoFiles(join(root, "hollow")), false,
+      "control: one file at any depth makes it visible to git");
+    assert.equal(holdsNoFiles(join(root, "does-not-exist")), false,
+      "unreadable is not empty; the guard reports nothing rather than guessing");
+  });
+});
+
 

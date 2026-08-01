@@ -148,15 +148,21 @@ const session = await joinSession({
       if (!/\bgit\b/i.test(command)) return;
       const root = await checkoutRoot(process.cwd());
       if (!root) return;
-      // Re-observe rather than trusting the last scan. The artifact may have
-      // been produced by the immediately preceding command, and the sweep is
-      // the last moment at which it can still be caught.
-      await observe(root);
+      // Re-observe rather than trusting the last scan. Anything this turns up
+      // arrived without a tool call of this agent's in between -- a peer agent
+      // in the same checkout, or a background process -- so it has never been
+      // reported, and the block message says so rather than implying the agent
+      // made it. Silently folding it into the outstanding set would produce a
+      // block citing artifacts the agent had never been shown.
+      const unannounced = await observe(root);
       const decision = sweepDecision(command, [...setFor(outstanding, root)]);
-      if (!decision) return;
+      if (!decision) {
+        if (unannounced.length === 0) return;
+        return { additionalContext: strayReport(unannounced, scratchDir) };
+      }
       return {
         permissionDecision: "deny",
-        permissionDecisionReason: blockReason(decision),
+        permissionDecisionReason: blockReason({ ...decision, unannounced }),
       };
     },
 
@@ -169,16 +175,20 @@ const session = await joinSession({
         const filePath = String(input.toolArgs?.path || "");
         if (!filePath) return;
         const rel = relativeToCheckout(root, filePath);
-        if (rel) {
-          const deliberate = setFor(authored, root);
-          deliberate.add(rel);
-          bound(deliberate);
-          setFor(outstanding, root).delete(rel);
-        }
-        // Keep the baseline current, so a file the agent deliberately authored
-        // is not reported as a stray by the next shell command.
-        const current = await scanCheckout(root);
-        if (current !== null) lastSeen.set(root, current);
+        if (!rel) return;
+        const deliberate = setFor(authored, root);
+        deliberate.add(rel);
+        bound(deliberate);
+        setFor(outstanding, root).delete(rel);
+        // Fold the authored path straight into the baseline instead of
+        // rescanning. A full `git status -uall` walks the entire working tree,
+        // and the CLI issues parallel edit calls in a single response, so a
+        // five-file edit would have fired five concurrent whole-tree
+        // traversals -- the guard becoming the most expensive thing in the
+        // session. The answer a rescan would give for this path is already
+        // known: the agent just wrote it.
+        const seen = lastSeen.get(root);
+        if (seen && !seen.includes(rel)) lastSeen.set(root, [...seen, rel]);
         return;
       }
 
