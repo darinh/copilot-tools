@@ -114,24 +114,36 @@ PYPROJECT = REPO / "pyproject.toml"
 NOT_SOURCE = (".git", ".worktrees", "node_modules", "__pycache__",
               ".specify", "build", "dist", ".eggs", "site-packages")
 
-#: Directory *prefixes* that name a virtual environment. Matching by exact
-#: name misses ``.venv-3.10``, ``venv-linux`` and ``.tox``, and a scan that
-#: walks into ``site-packages`` reports thousands of findings against code
-#: the contributor did not write -- which reads as "your change broke
-#: dependency conformance" and is the fastest way to get a scan switched off.
-NOT_SOURCE_PREFIXES = (".venv", "venv", ".tox", ".nox", ".env", "env",
-                       "virtualenv")
+#: Directory names that mean "virtual environment", matched exactly or with a
+#: version suffix. A *prefix* match on the bare word is too greedy: ``env``
+#: as a prefix swallows ``environment/`` and ``envoy/``, and a source
+#: directory skipped by the walk is never scanned at all -- a silent false
+#: negative, which is the one direction this file exists to prevent. So the
+#: match requires the name to be the word itself, or the word followed by a
+#: separator or a digit (``venv-3.10``, ``.venv3``). ``env_scripts`` is
+#: deliberately *not* an environment: an underscore reads as a compound word
+#: far more often than as a version, and anything genuinely a virtualenv is
+#: caught by ``pyvenv.cfg`` regardless of what it is called.
+NOT_SOURCE_ENVIRONMENTS = ("env", "venv", ".env", ".venv", ".tox", ".nox",
+                           "virtualenv")
+
+#: What may follow the word and still mean the same thing.
+_VERSION_SUFFIX = "-.0123456789"
 
 
 def _is_environment(directory):
     """True if ``directory`` looks like, or declares itself, a virtualenv.
 
     ``pyvenv.cfg`` is the definitive marker and costs one ``exists`` per
-    directory; the name prefixes catch the rest. Both are needed: a venv can
-    be called anything, and a partially-built one may have no marker yet.
+    directory; the names catch the rest. Both are needed: a venv can be
+    called anything, and a partially-built one may have no marker yet.
     """
-    if directory.name.startswith(NOT_SOURCE_PREFIXES):
-        return True
+    name = directory.name.lower()
+    for word in NOT_SOURCE_ENVIRONMENTS:
+        if name == word:
+            return True
+        if name.startswith(word) and name[len(word)] in _VERSION_SUFFIX:
+            return True
     try:
         return (directory / "pyvenv.cfg").exists()
     except OSError:
@@ -333,6 +345,38 @@ def _split_table_and_key(table, key):
     return (f"{table}.{head}" if table else head), last
 
 
+def _is_pure_string_array(region):
+    """True if ``region`` is ``[ "a", "b" ]`` and nothing else.
+
+    The values are recovered from the string spans that fall inside the
+    array, which means a *non*-string element is simply not seen -- and an
+    inline table like ``["real", {note = "ghost"}]`` then contributes
+    ``ghost`` as though it were a requirement. That is the silent direction:
+    it widens the allow-list and the scan goes on passing. So an array is
+    read only when everything in it, once strings and comments are masked
+    out, is punctuation.
+    """
+    depth = 0
+    started = False
+    for index, char in enumerate(region):
+        if char == "[":
+            depth += 1
+            started = True
+            if depth > 1:            # a nested array is not a string array
+                return False
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return all(c in _BLANK + " \t\r\n"
+                           for c in region[index + 1:])
+        elif started:
+            if char not in _BLANK + " \t\r\n,":
+                return False
+        elif char not in " \t\r\n":
+            return False
+    return False
+
+
 def parse_string_arrays(text):
     """``{(table, key): [strings]}`` for every array-of-strings assignment."""
     masked, spans = scan(text)
@@ -367,9 +411,10 @@ def parse_string_arrays(text):
             depth += _depth(line)
         if depth <= 0:
             values_to = line_start + len(line)
-            arrays[_split_table_and_key(table, key)] = [
-                value for start, _, value in spans
-                if values_from <= start < values_to]
+            if _is_pure_string_array(masked[values_from:values_to]):
+                arrays[_split_table_and_key(table, key)] = [
+                    value for start, _, value in spans
+                    if values_from <= start < values_to]
             key = None
             depth = 0
     return arrays
@@ -532,13 +577,21 @@ def module_names(paths, roots):
     control still passes because the controls score against a fixed set.
 
     Deeper files are still *scanned*. They just do not get a vote on what
-    counts as ours.
+    counts as ours -- with one exception, because it is not an exception at
+    all: ``pkg/__init__.py`` makes ``pkg`` importable, so the *directory*
+    contributes the name. This repository is flat modules today, and a scan
+    that reported ``import pkg`` as undeclared the day somebody added a
+    package would be a loud false positive on a change that did nothing
+    wrong.
     """
     resolved = [Path(root).resolve() for root in roots]
     names = set()
     for path in paths:
-        if Path(path).resolve().parent in resolved:
+        parent = Path(path).resolve().parent
+        if parent in resolved:
             names.add(Path(path).stem)
+        elif Path(path).name == "__init__.py" and parent.parent in resolved:
+            names.add(parent.name)
     return names
 
 
@@ -552,24 +605,44 @@ def first_party_modules():
     return module_names(_python_sources(), import_roots())
 
 
-def _literal_import_arguments(node):
+def _import_module_aliases(tree):
+    """Names bound to ``importlib.import_module`` in this module.
+
+    A bare ``import_module("requests")`` only means an import if something
+    actually imported ``import_module``. Accepting it unconditionally reports
+    ``def run(import_module): return import_module("requests")`` as a
+    dependency on requests -- a finding about a parameter, which no
+    declaration can silence and no reader can act on.
+    """
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module":
+                    aliases.add(alias.asname or alias.name)
+    return aliases
+
+
+def _literal_import_arguments(node, aliases=()):
     """The module name a dynamic-import call names, if it names one literally.
 
     ``importlib.import_module("requests")`` and ``__import__("requests")``
     need the distribution just as much as the statement form does, and the
     statement form is the only one the AST's import nodes describe.
 
-    Two restraints, both deliberate. The receiver of an attribute call must
+    Three restraints, all deliberate. The receiver of an attribute call must
     be spelled ``importlib``, so that somebody else's ``loader.import_module``
-    is not reported as a dependency it has nothing to do with. And a
-    non-literal argument is skipped rather than guessed at: ``__import__(name)``
-    proves nothing, and a finding no reader can act on and no declaration can
-    silence is worse than no finding. ``importlib`` aliased to another name
-    is missed for the same reason -- this scan reports what it can prove.
+    is not reported as a dependency it has nothing to do with. A bare call
+    counts only against a name this module actually bound from ``importlib``.
+    And a non-literal argument is skipped rather than guessed at:
+    ``__import__(name)`` proves nothing, and a finding no reader can act on
+    and no declaration can silence is worse than no finding. ``importlib``
+    aliased to another name is missed for the same reason -- this scan
+    reports what it can prove.
     """
     function = node.func
     if isinstance(function, ast.Name):
-        if function.id not in ("__import__", "import_module"):
+        if function.id != "__import__" and function.id not in aliases:
             return None
     elif isinstance(function, ast.Attribute):
         if function.attr != "import_module":
@@ -593,8 +666,10 @@ def top_level_imports(source):
     Relative imports are skipped: ``from . import x`` names nothing the
     environment has to supply.
     """
+    tree = ast.parse(source)
+    aliases = _import_module_aliases(tree)
     found = []
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 found.append((node.lineno, alias.name.split(".")[0]))
@@ -602,7 +677,7 @@ def top_level_imports(source):
             if node.level == 0 and node.module:
                 found.append((node.lineno, node.module.split(".")[0]))
         elif isinstance(node, ast.Call):
-            module = _literal_import_arguments(node)
+            module = _literal_import_arguments(node, aliases)
             if module:
                 found.append((node.lineno, module))
     return sorted(set(found))
@@ -706,7 +781,62 @@ def test_only_files_on_the_import_path_name_a_first_party_module(tmp_path):
     )
 
 
+def test_a_directory_that_merely_starts_with_env_is_still_our_source(tmp_path):
+    """``env`` as a *prefix* swallows ``envoy/`` and ``environment/``.
+
+    A source directory pruned from the walk is never scanned, so an
+    undeclared import inside it is never reported -- silent, and the exact
+    failure this file exists to prevent, reintroduced by the filter meant to
+    keep the scan fast. Directories that really are environments are still
+    caught by ``pyvenv.cfg`` whatever they are called, so the name match can
+    afford to be strict.
+    """
+    ours = ("environment", "envoy", "env_scripts", "venvironment",
+            "envelope", "tests", "extensions")
+    theirs = ("env", "venv", ".venv", ".env", ".tox", ".nox", "virtualenv",
+              "venv-3.10", ".venv3", "venv.old")
+    for name in ours + theirs:
+        (tmp_path / name).mkdir()
+    for name in ours:
+        assert not _is_environment(tmp_path / name), (
+            f"{name!r} is a plausible source directory and was pruned"
+        )
+    for name in theirs:
+        assert _is_environment(tmp_path / name), f"{name!r} was not pruned"
+
+    unmarked = tmp_path / "totally_normal_name"
+    unmarked.mkdir()
+    (unmarked / "pyvenv.cfg").write_text("home = /usr\n", encoding="utf-8")
+    assert _is_environment(unmarked), "the pyvenv.cfg marker was ignored"
+
+
+def test_a_package_directory_names_a_first_party_module(tmp_path):
+    """``pkg/__init__.py`` makes ``pkg`` importable, so ``import pkg`` is ours.
+
+    Loud rather than silent -- but loud on a change that did nothing wrong,
+    which is how a scan gets an exemption list bolted onto it.
+    """
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "inner.py").write_text("", encoding="utf-8")
+    (tmp_path / "deep" / "nested").mkdir(parents=True)
+    (tmp_path / "deep" / "nested" / "__init__.py").write_text(
+        "", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text("import pkg\n", encoding="utf-8")
+
+    names = module_names(_walk(tmp_path), [tmp_path])
+    assert names == {"consumer", "pkg"}, sorted(names)
+    assert not undeclared_imports("import pkg\n", names)
+    assert "nested" not in names, (
+        "a package below an import root is not importable by its own name"
+    )
+    assert "inner" not in names, (
+        "pkg.inner is not importable as `inner`"
+    )
+
+
 def test_no_first_party_module_shadows_an_installed_distribution():
+
     """The other half of the same problem, and the half a path check misses.
 
     A ``requests.py`` in the repository *root* is on the path, so it really
@@ -878,6 +1008,18 @@ PASSES = {
         "    return loader.import_module('requests')\n"
     ),
     "a call with no arguments at all": "__import__()\n",
+    # A bare `import_module` that nothing imported from importlib is a local
+    # name, not an import. Reporting it produces a finding about a function
+    # parameter that no declaration can silence.
+    "a parameter that happens to be called import_module": (
+        "def run(import_module):\n"
+        "    return import_module('requests')\n"
+    ),
+    "a local function called import_module": (
+        "def import_module(name):\n"
+        "    return name\n"
+        "import_module('requests')\n"
+    ),
 }
 
 
@@ -1127,6 +1269,26 @@ TOML_CASES = {
         "[project]\ndependencies = ['a\\nb']\n",
         {("project", "dependencies"): ["a\\nb"]},
     ),
+    # An array holding anything that is not a string is not a dependency
+    # list. The strings inside an inline table would otherwise be collected
+    # as though they were requirements -- silent, and in the widening
+    # direction.
+    "an inline table in the array is not a requirement": (
+        '[project]\ndependencies = ["real", {note = "ghost"}]\n',
+        {},
+    ),
+    "a nested array is not a string array": (
+        '[project]\ndependencies = [["a"], ["b"]]\n',
+        {},
+    ),
+    "a number in the array is not a requirement": (
+        '[project]\nversions = ["a", 2]\n',
+        {},
+    ),
+    "a boolean in the array is not a requirement": (
+        '[project]\nflags = ["a", true]\n',
+        {},
+    ),
     "empty array": (
         '[project]\ndependencies = []\n',
         {("project", "dependencies"): []},
@@ -1191,6 +1353,18 @@ def test_the_narrow_parser_agrees_with_tomllib_on_our_own_pyproject():
         _requirements_from_tomllib(text))
 
 
+#: Corpus documents that are *expected* to declare no string array, because
+#: what they contain is not one. Naming them makes the vacuity control below
+#: exact: a document that quietly stops declaring anything is a corpus entry
+#: that has stopped proving anything, and it would otherwise be invisible.
+TOML_DECLARE_NOTHING = frozenset({
+    "an inline table in the array is not a requirement",
+    "a nested array is not a string array",
+    "a number in the array is not a requirement",
+    "a boolean in the array is not a requirement",
+})
+
+
 def test_the_corpus_the_reference_checks_is_not_trivially_satisfiable():
     """Every corpus document must really be TOML, or the comparison is empty.
 
@@ -1199,10 +1373,13 @@ def test_the_corpus_the_reference_checks_is_not_trivially_satisfiable():
     """
     if tomllib is None:
         pytest.skip("tomllib is 3.11+")
-    empty = [name for name in TOML_CASES
+    empty = {name for name in TOML_CASES
              if not _string_arrays_from_tomllib(tomllib.loads(
-                 TOML_CASES[name][0]))]
-    assert not empty, f"these corpus documents declare no arrays: {empty}"
+                 TOML_CASES[name][0]))}
+    assert empty == TOML_DECLARE_NOTHING, (
+        f"corpus documents that declare no array: {sorted(empty)}; "
+        f"expected exactly {sorted(TOML_DECLARE_NOTHING)}"
+    )
 
 
 def test_an_array_of_tables_header_is_read_as_its_table_path():
@@ -1241,6 +1418,21 @@ def test_a_multi_line_string_cannot_inject_a_dependency():
 def test_a_quoted_table_header_still_declares_its_extras():
     assert declared_requirements(
         '[project."optional-dependencies"]\ndev = ["a"]\n') == ["a"]
+
+
+def test_an_inline_table_cannot_inject_a_dependency():
+    """The other silent widening vector, and the one masking does not close.
+
+    The values are recovered from string spans inside the array, so a
+    non-string element is not seen at all -- and the strings *inside* it are
+    collected as though they were requirements. ``ghost`` is not a
+    dependency of anything here.
+    """
+    injected = '[project]\ndependencies = ["real", {note = "ghost"}]\n'
+    assert declared_requirements(injected) == []
+    assert undeclared_imports("import ghost\n",
+                              allowed_import_names(
+                                  declared_requirements(injected)))
 
 
 def test_a_dotted_key_still_declares_its_extras():
