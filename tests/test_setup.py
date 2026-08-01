@@ -759,16 +759,66 @@ def test_failed_skill_copy_leaves_the_installed_skill_intact(skill_repo, monkeyp
 
 
 def test_failed_skill_copy_leaves_no_staging_directory_behind(skill_repo, monkeypatch):
+    """The staging tree must be cleaned up after it has actually been created.
+    A copy that dies before writing anything proves nothing about cleanup, and
+    the scratch name holds a SKILL.md, so litter is a skill the CLI may load."""
     repo, home = skill_repo
 
-    def explode(*_a, **_k):
+    def half_written(_source, target, *_a, **_k):
+        Path(target).mkdir(parents=True, exist_ok=True)
+        (Path(target) / "SKILL.md").write_text("half written", encoding="utf-8")
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(setup_tools.shutil, "copytree", explode)
+    monkeypatch.setattr(setup_tools.shutil, "copytree", half_written)
     setup_tools.install_skills(assume_yes=True)
 
     assert list((home / "skills").iterdir()) == [], \
         "staging scratch was left in the skills directory"
+
+
+def test_a_double_rename_failure_still_puts_the_skill_back(skill_repo, monkeypatch):
+    """Both the swap and its rollback can fail, which leaves the only copy
+    under the aside name. The run must still end with the skill where it
+    belongs rather than with a warning and an empty destination."""
+    repo, home = skill_repo
+    setup_tools.install_skills(assume_yes=True)
+    (repo / "skills" / "demo" / "SKILL.md").write_text("v2", encoding="utf-8")
+
+    real_replace = setup_tools.os.replace
+    calls = {"n": 0}
+
+    def fail_the_swap_and_its_rollback(source, target, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] in (2, 3):
+            raise OSError("the swap and the rollback both failed")
+        return real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(setup_tools.os, "replace", fail_the_swap_and_its_rollback)
+    setup_tools.install_skills(assume_yes=True)
+
+    assert calls["n"] >= 3, "the double failure was never reached"
+    assert (home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8") == "v1"
+    assert [p.name for p in (home / "skills").iterdir()] == ["demo"]
+
+
+def test_a_swap_interrupted_by_a_killed_process_is_repaired_next_run(skill_repo, monkeypatch):
+    """No exception handler runs when the process is killed outright, so the
+    repair has to happen on the way in, not on the way out."""
+    repo, home = skill_repo
+    setup_tools.install_skills(assume_yes=True)
+    dest = home / "skills" / "demo"
+    os.replace(dest, dest.with_name(".demo.previous"))
+    assert not dest.exists()
+
+    def explode(*_a, **_k):
+        raise OSError("and the next run cannot copy either")
+
+    monkeypatch.setattr(setup_tools.shutil, "copytree", explode)
+    setup_tools.install_skills(assume_yes=True)
+
+    assert (dest / "SKILL.md").read_text(encoding="utf-8") == "v1", \
+        "the copy left under the aside name was not restored"
+    assert [p.name for p in (home / "skills").iterdir()] == ["demo"]
 
 
 def test_undeletable_destination_does_not_abort_the_whole_install(skill_repo, monkeypatch):

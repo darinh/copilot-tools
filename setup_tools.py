@@ -1026,6 +1026,11 @@ def _replace_tree(staged: Path, dest: Path) -> None:
     replaced. A rename either happens or does not, and on Windows it is also
     the operation that fails when something inside is still open, which is
     precisely when stopping is the right answer.
+
+    If the swap fails the old copy is renamed back. If *that* fails too, or if
+    the process dies between the two renames, the only copy is left under the
+    aside name — which :func:`_reconcile_scratch` restores before anything else
+    looks at the destination.
     """
     previous = dest.with_name(f".{dest.name}.previous")
     _discard(previous)
@@ -1040,6 +1045,30 @@ def _replace_tree(staged: Path, dest: Path) -> None:
             os.replace(previous, dest)
         raise
     _discard(previous)
+
+
+def _reconcile_scratch(dest: Path) -> None:
+    """Clear anything a half-finished install left beside ``dest``.
+
+    Two reasons this is not merely tidiness. A swap that failed between its
+    renames — or a process killed outright, which no ``except`` clause can
+    cover — leaves the user's only copy under the aside name, and putting it
+    back is the difference between a skill that reappears and one that is gone
+    until somebody notices. And the scratch names are directories holding a
+    ``SKILL.md``, so leaving them in the skills directory invites the CLI to
+    load a half-written copy as a skill in its own right.
+    """
+    _discard(dest.with_name(f".{dest.name}.installing"))
+    previous = dest.with_name(f".{dest.name}.previous")
+    if not (previous.exists() or _is_link(previous)):
+        return
+    if dest.exists() or _is_link(dest):
+        _discard(previous)
+        return
+    try:
+        os.replace(previous, dest)
+    except OSError:
+        pass
 
 
 #: Files copied from ``templates/`` into ``~/.copilot``.
@@ -1210,6 +1239,7 @@ def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> No
     dest_root.mkdir(parents=True, exist_ok=True)
     for src in skills:
         dest = dest_root / src.name
+        _reconcile_scratch(dest)
         key = f"skills/{src.name}"
         label = f"skill '{src.name}'"
         source_digest = install_manifest.tree_digest(src)
@@ -1235,7 +1265,7 @@ def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> No
             _replace_tree(staged, dest)
         except OSError as exc:
             warn(f"{label}: not installed ({exc})")
-            _discard(staged)
+            _reconcile_scratch(dest)
             continue
         install_manifest.record(manifest, key, dest, kind="skill",
                                 digest=install_manifest.tree_digest(dest))
