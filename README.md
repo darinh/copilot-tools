@@ -50,7 +50,8 @@ script syntax" job parses every `*.sh` with `bash -n` on every pull request
 and every push to `main`, and the
 suite exercises `operator.sh` and `handoff.sh` directly —
 `tests/test_operator_sh_bash32.py`, `tests/test_handoff_sh.py`,
-`tests/test_operator_sh_help.py` and `tests/test_shell_bash32_conformance.py`
+`tests/test_operator_sh_entrypoint.py`, `tests/test_operator_sh_help.py` and
+`tests/test_shell_bash32_conformance.py`
 all read or run them, the last of those because macOS `/bin/bash` is
 permanently 3.2 and macOS is exactly where someone is most likely to need the
 fallback. They still get bug fixes; they get no new features, and a divergence

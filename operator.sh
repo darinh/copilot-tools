@@ -28,55 +28,45 @@
 # ═══════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# Resolve the directory where this script lives (follows symlinks).
+# Resolve the directory where this script lives, following symlinks.
 #
-# NOT `readlink -f`. That is GNU-only, and macOS ships BSD readlink, which
-# rejects `-f` -- and it does not fail loudly there. The failing readlink sits
-# in a *nested* command substitution feeding `dirname`, so the assignment's
-# exit status is that of `cd ... && pwd`, which succeeds: `set -euo pipefail`
-# never fires. readlink writes to stderr and nothing to stdout, `dirname ""`
-# is `.`, and SCRIPT_DIR silently becomes THE CALLER'S working directory.
-# Measured with a stub readlink that refuses `-f` exactly as BSD's does:
-# exit 0, no abort, SCRIPT_DIR=/ when invoked from /.
+# `readlink -f` is GNU-only. macOS ships BSD readlink, which has no `-f` at
+# all -- setup.sh has said so in a comment since it was written, and this was
+# the last script in the repo still relying on it.
 #
-# That is why this matters here specifically: the documented rollback is a
-# symlink in ~/.local/bin invoked from wherever the user happens to be, so
-# SCRIPT_DIR was wrong precisely in the situation the script exists to serve,
-# and its real uses are all `${SCRIPT_DIR}/operator-ingest.py`. Nothing
-# warning-shaped ever appeared: capture_and_store_metrics runs in a subshell
-# opened with `set +e` whose last statement is a successful `log`, so the
-# subshell exits 0 and the "(non-fatal)" arm never fires, while python's
-# "can't open file" is captured by 2>&1 and printed as an ordinary
-# `Metrics: ...` line. A macOS loop looked healthy and stored no metrics.
-# `setup.sh` already avoids this call for this reason.
+# The failure it produced was not the abort you would hope for. The failing
+# `readlink` sits inside `$(dirname "$(...)")`, so `set -e` never sees it: the
+# assignment takes the status of the OUTER `$(cd ... && pwd)`, which succeeds.
+# `dirname ""` is ".", so `cd .` works, and SCRIPT_DIR silently became the
+# CALLER'S working directory. The two `operator-ingest.py` invocations below
+# then looked for it wherever the user happened to be standing, and the only
+# other symptom was one line of readlink usage text on stderr.
+#
+# The loop below is the portable equivalent: plain `readlink` with no `-f`
+# exists on BSD and GNU alike, and resolving one link at a time arrives at the
+# same place. CDPATH is emptied because a user's CDPATH can make `cd` print a
+# directory and jump somewhere else entirely. The hop limit stands in for the
+# ELOOP that `readlink -f` would have raised on a circular link; failing loudly
+# there is the opposite of the bug being fixed, and deliberately so.
 resolve_script_dir() {
     local src="$1" dir hops=0
-    # `readlink` with no flags is POSIX and resolves one hop, which is all BSD
-    # offers; the loop is what `-f` was doing. Bounded, because a symlink
-    # cycle here would hang the launcher rather than fail it.
-    #
-    # Exceeding the bound *fails* rather than breaking out and resolving
-    # whatever `src` happens to hold. Breaking would hand back a real,
-    # plausible-looking directory that is not this script's, which is the
-    # precise failure this whole function exists to delete -- and it would do
-    # it silently. Adversarial review argued the branch is unreachable, since
-    # a cyclic `BASH_SOURCE[0]` makes the kernel ELOOP at `exec` before bash
-    # ever loads the script; that is very likely right, and is exactly why
-    # this must not be the one place that answers a question it cannot answer.
     while [ -L "$src" ]; do
+        # An assignment, not `(( hops++ ))` -- an arithmetic command whose
+        # result is 0 returns status 1, which under `set -e` would end the
+        # script on the first hop.
         hops=$((hops + 1))
         if [ "$hops" -gt 40 ]; then
-            printf '%s: symlink loop while resolving %s\n' "${0##*/}" "$1" >&2
+            echo "operator.sh: too many symbolic links resolving $1" >&2
             return 1
         fi
-        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        dir="$(CDPATH="" cd "$(dirname "$src")" && pwd)"
         src="$(readlink "$src")"
         case "$src" in
             /*) ;;
-            *) src="${dir}/${src}" ;;
+            *) src="$dir/$src" ;;
         esac
     done
-    ( cd -P "$(dirname "$src")" && pwd )
+    CDPATH="" cd "$(dirname "$src")" && pwd
 }
 SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"
 
