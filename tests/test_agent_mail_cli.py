@@ -330,6 +330,77 @@ def test_inbox_is_empty_not_an_error_for_a_quiet_instance(idle_recipient, capsys
     assert "No messages." in capsys.readouterr().out
 
 
+def test_inbox_that_cannot_be_read_does_not_report_no_messages(idle_recipient,
+                                                                capsys,
+                                                                monkeypatch):
+    """The whole failure, at the seam where a human or an agent reads it.
+
+    The test directly above is the control and the two must not agree: a quiet
+    mailbox prints "No messages." and exits 0, and until this was fixed a
+    mailbox that could not be opened printed the same words and the same code
+    while holding mail. `Path.glob` swallows `PermissionError` and stops
+    yielding, so every layer above it saw an ordinary empty sequence.
+
+    That is the one lie this command cannot tell. An agent reads its inbox
+    once at the start of a session and believes the answer -- so a peer that
+    is blocked on a reply stays blocked, and nothing anywhere reports a fault.
+    """
+    op.send_message(["--from", "alpha", "--to", "beta", "please reply"])
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+    inbox = operator_mail.inbox_dir(op.OPERATOR_HOME, "beta")
+    real_scandir = os.scandir
+    denying = {"on": True}
+
+    def denied_scandir(path=".", *args, **kwargs):
+        if denying["on"] and Path(path) == inbox:
+            raise PermissionError(13, "Permission denied")
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(operator_mail.os, "scandir", denied_scandir)
+    capsys.readouterr()
+
+    assert op.show_inbox(["beta"]) == 1
+    captured = capsys.readouterr()
+    assert "No messages." not in captured.out + captured.err
+    assert "could not read mail" in captured.err
+
+    # Nothing was consumed on the way past, so the message is still there.
+    # The denial is lifted with a flag rather than `monkeypatch.undo()`, which
+    # would also revert the autouse fixture's OPERATOR_HOME and quietly assert
+    # against the real mailbox instead of this test's.
+    denying["on"] = False
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+    assert [m["text"] for m in operator_mail.pending(op.OPERATOR_HOME, "beta")] \
+        == ["please reply"]
+
+
+def test_send_still_reports_success_when_the_pending_count_cannot_be_read(
+        idle_recipient, capsys, monkeypatch):
+    """The message is already queued by then; the count is a courtesy.
+
+    Letting the refusal escape would turn a delivered message into a reported
+    failure, and the caller's repair for that is to send it again.
+    """
+    inbox = operator_mail.inbox_dir(op.OPERATOR_HOME, "beta")
+    real_scandir = os.scandir
+    denying = {"on": True}
+
+    def denied_scandir(path=".", *args, **kwargs):
+        if denying["on"] and Path(path) == inbox:
+            raise PermissionError(13, "Permission denied")
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(operator_mail.os, "scandir", denied_scandir)
+    assert op.send_message(["--from", "alpha", "--to", "beta", "queued anyway"]) == 0
+    out = capsys.readouterr().out
+    assert "Pending: unknown" in out
+    assert "Pending: 0" not in out
+
+    denying["on"] = False
+    assert [m["text"] for m in operator_mail.pending(op.OPERATOR_HOME, "beta")] \
+        == ["queued anyway"]
+
+
 @pytest.mark.parametrize("bad", ["--peak", "--unraed", "--help-me", "-x"])
 def test_inbox_refuses_an_unknown_option_and_keeps_the_mail(bad, idle_recipient,
                                                             capsys):

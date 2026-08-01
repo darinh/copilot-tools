@@ -226,11 +226,58 @@ def _read_message(path: Path) -> dict | None | _Unreadable:
     return data if isinstance(data, dict) else None
 
 
-def _load_dir(directory: Path) -> list[tuple[Path, dict]]:
-    if not directory.is_dir():
+def _message_files(directory: Path) -> list[Path]:
+    """Message files in ``directory``, oldest name first.
+
+    An absent mailbox is genuinely empty and returns ``[]``: nobody has ever
+    written to it, which is a complete answer. A mailbox that *exists* but
+    cannot be listed is not an answer at all, and raises :class:`MailError`.
+
+    That distinction is the whole point of this function, and it cannot be
+    made with the ``is_dir()``-then-``glob()`` pair it replaces, because both
+    halves of that pair lose it in opposite directions. ``Path.glob`` catches
+    ``PermissionError`` internally and yields nothing, so an unreadable inbox
+    holding real mail produced exactly the observation an empty one produces
+    -- measured, not deduced: ``pending``, ``pending_count`` and ``consume``
+    all returned 0 for an inbox holding a message. And ``Path.is_dir`` fails
+    the other way, re-raising EACCES rather than swallowing it (it only
+    ignores ENOENT, ENOTDIR, EBADF, ELOOP and three WinErrors), so the guard
+    meant to make the listing safe was itself the thing that could escape
+    through ``pending()`` on every poll of the supervisor loop.
+
+    This is the module's own established reading one level up: ``_read_message``
+    already refuses to let a file it could not open pass as a file that said
+    nothing. The same care was missing for the directory holding them, where
+    the cost is higher -- a message that cannot be seen is a peer waiting on a
+    reply that will never come, and silence is what a healthy empty mailbox
+    looks like too.
+
+    ``scandir`` establishes only that the directory can be read; the selection
+    itself stays with ``glob`` so the matching rules -- including the
+    platform's case sensitivity -- are exactly what they have always been.
+    Nothing here is a new answer to "which files are messages"; the only new
+    outcome is the refusal.
+    """
+    try:
+        with os.scandir(directory) as entries:
+            for _ in entries:
+                pass
+    except FileNotFoundError:
+        # Never written to. An empty answer is the true one.
         return []
+    except NotADirectoryError:
+        # A plain file where the mailbox should be. It holds no messages and
+        # never will, and unlike a permission fault this will not clear on a
+        # retry, so reporting it as empty keeps callers moving.
+        return []
+    except OSError as exc:
+        raise MailError(f"could not read mailbox {directory}: {exc}") from exc
+    return sorted(directory.glob("*.json"))
+
+
+def _load_dir(directory: Path) -> list[tuple[Path, dict]]:
     found: list[tuple[Path, dict]] = []
-    for path in sorted(directory.glob("*.json")):
+    for path in _message_files(directory):
         data = _read_message(path)
         # Neither a corrupt file nor an unreadable one can be listed, but
         # nothing is destroyed here, so skipping is safe for both: a message
@@ -241,15 +288,17 @@ def _load_dir(directory: Path) -> list[tuple[Path, dict]]:
 
 
 def pending(root: Path, instance_id: str) -> list[dict]:
-    """Unread messages, oldest first."""
+    """Unread messages, oldest first.
+
+    Raises :class:`MailError` if the inbox exists but cannot be read, rather
+    than reporting the empty list that would mean "nothing is waiting".
+    """
     return [msg for _, msg in _load_dir(inbox_dir(root, instance_id))]
 
 
 def pending_count(root: Path, instance_id: str) -> int:
-    directory = inbox_dir(root, instance_id)
-    if not directory.is_dir():
-        return 0
-    return sum(1 for _ in directory.glob("*.json"))
+    """How many messages are waiting. Raises :class:`MailError` if unknown."""
+    return len(_message_files(inbox_dir(root, instance_id)))
 
 
 def consume(root: Path, instance_id: str) -> list[dict]:
@@ -260,12 +309,13 @@ def consume(root: Path, instance_id: str) -> list[dict]:
     """
     inbox = inbox_dir(root, instance_id)
     archive = archive_dir(root, instance_id)
-    if not inbox.is_dir():
+    messages = _message_files(inbox)
+    if not messages:
         return []
     read_at = _utcnow()
     taken: list[dict] = []
     archive.mkdir(parents=True, exist_ok=True)
-    for path in sorted(inbox.glob("*.json")):
+    for path in messages:
         data = _read_message(path)
         if data is UNREADABLE:
             # The read failed, so this message has not been seen by anybody.
@@ -333,12 +383,12 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
     """
     inbox = inbox_dir(root, instance_id)
     destination = archive_dir(root, instance_id)
-    if not inbox.is_dir() or not ids:
+    if not ids:
         return 0
     wanted = {i for i in ids if isinstance(i, str)}
     if not wanted:
         return 0
-    files = sorted(inbox.glob("*.json"))
+    files = _message_files(inbox)
     chosen: set[Path] = set()
     found: set[str] = set()
     for path in files:

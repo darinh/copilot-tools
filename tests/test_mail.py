@@ -338,6 +338,140 @@ def test_an_unsearchable_inbox_does_not_crash_the_poll_loop(tmp_path):
         os.chmod(inbox, 0o700)
 
 
+@pytest.mark.skipif(not _POSIX_PERMS,
+                    reason="needs POSIX permissions enforced against a non-root user")
+def test_an_unlistable_inbox_is_not_reported_as_empty(tmp_path):
+    """An inbox that cannot be listed must not read as an inbox with no mail.
+
+    The sibling test above is the *readable but unsearchable* shape (0o400),
+    where the names still list. This is one notch worse and it used to be
+    silent: 0o100 grants traversal without read, so `opendir` itself fails and
+    `Path.glob` -- which catches `PermissionError` internally and simply stops
+    yielding -- produced the empty sequence. Every caller then reported the
+    same thing an empty mailbox reports.
+
+    That was measured before the fix, not deduced: `pending`, `pending_count`
+    and `consume` all returned 0 for an inbox holding one real message. The
+    consequence is the one failure this module cannot afford, because the
+    whole point of a mailbox is that somebody is waiting for an answer: a peer
+    blocked on a reply, and a recipient told in the ordinary words that nobody
+    wrote to it.
+
+    So the empty inbox is asserted alongside the blocked one here. "Raises"
+    is only meaningful against a case that does not, and the two differ by
+    nothing but the permission bits.
+    """
+    _msg(tmp_path, text="important")
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    operator_mail.inbox_dir(tmp_path, "gamma").mkdir(parents=True)
+    os.chmod(inbox, 0o100)
+    try:
+        # Prove the premise. Without this the test passes on any inbox.
+        with pytest.raises(OSError):
+            os.listdir(inbox)
+        assert sorted(inbox.glob("*.json")) == [], \
+            "premise: glob is silent about the denial, which is the bug"
+
+        for call in (lambda: operator_mail.pending(tmp_path, "beta"),
+                     lambda: operator_mail.pending_count(tmp_path, "beta"),
+                     lambda: operator_mail.consume(tmp_path, "beta")):
+            with pytest.raises(operator_mail.MailError):
+                call()
+
+        # The matched control: a real, readable, empty inbox answers 0 -- so
+        # the refusal above is about the denial and not about emptiness.
+        assert operator_mail.pending(tmp_path, "gamma") == []
+        assert operator_mail.pending_count(tmp_path, "gamma") == 0
+        assert operator_mail.consume(tmp_path, "gamma") == []
+    finally:
+        os.chmod(inbox, 0o700)
+
+    # Nothing was destroyed while the mailbox was unreadable.
+    assert operator_mail.pending_count(tmp_path, "beta") == 1
+    assert [m["text"] for m in operator_mail.pending(tmp_path, "beta")] == \
+        ["important"]
+
+
+def test_an_unlistable_inbox_is_not_reported_as_empty_on_any_platform(
+        tmp_path, monkeypatch):
+    """The same claim where the POSIX permission test cannot run.
+
+    Windows is the platform this toolkit is developed on and the one whose CI
+    job would otherwise only ever skip the case above, so the denial is
+    injected at the one call that reports it. Scoped to the one directory:
+    `operator_mail.os` is the shared `os` module, and a blanket failure would
+    take pytest's own machinery with it.
+    """
+    _msg(tmp_path, text="important")
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    real_scandir = os.scandir
+    denying = {"on": True}
+
+    def denied_scandir(path=".", *args, **kwargs):
+        if denying["on"] and Path(path) == inbox:
+            raise PermissionError(13, "Permission denied")
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(operator_mail.os, "scandir", denied_scandir)
+
+    for call in (lambda: operator_mail.pending(tmp_path, "beta"),
+                 lambda: operator_mail.pending_count(tmp_path, "beta"),
+                 lambda: operator_mail.consume(tmp_path, "beta"),
+                 lambda: operator_mail.archive(tmp_path, "beta", ["anything"])):
+        with pytest.raises(operator_mail.MailError):
+            call()
+
+    # An inbox nobody has ever written to is a complete answer, not a denial;
+    # if this raised too, the test above would pass for the wrong reason.
+    assert operator_mail.pending(tmp_path, "never-existed") == []
+    assert operator_mail.pending_count(tmp_path, "never-existed") == 0
+
+    denying["on"] = False
+    assert operator_mail.pending_count(tmp_path, "beta") == 1
+
+
+def test_an_unreadable_archive_does_not_pass_as_no_history(tmp_path,
+                                                           monkeypatch):
+    """`history` reads a directory too, and reports the same way.
+
+    Cheaper to get wrong and easy to miss, because history is only ever read
+    by a human: an archive that cannot be opened would otherwise render as the
+    conversation never having happened.
+    """
+    msg = _msg(tmp_path, text="said once")
+    operator_mail.archive(tmp_path, "beta", [msg["id"]])
+    assert [m["text"] for m in operator_mail.history(tmp_path, "beta")] == \
+        ["said once"], "premise: the history is there to be lost"
+
+    archive = operator_mail.archive_dir(tmp_path, "beta")
+    real_scandir = os.scandir
+
+    def denied_scandir(path=".", *args, **kwargs):
+        if Path(path) == archive:
+            raise PermissionError(13, "Permission denied")
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(operator_mail.os, "scandir", denied_scandir)
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.history(tmp_path, "beta")
+
+
+def test_a_plain_file_where_the_inbox_should_be_is_empty_not_a_denial(tmp_path):
+    """ENOTDIR is knowledge about the mailbox, and it will not clear.
+
+    Distinct from a permission fault on purpose: retrying cannot help, so
+    raising here would jam every poll of the supervisor loop for ever over a
+    mailbox that holds no messages and never will.
+    """
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox.write_text("not a directory", encoding="utf-8")
+
+    assert operator_mail.pending(tmp_path, "beta") == []
+    assert operator_mail.pending_count(tmp_path, "beta") == 0
+    assert operator_mail.consume(tmp_path, "beta") == []
+
+
 def test_a_file_that_can_neither_be_read_nor_moved_is_left_alone(tmp_path,
                                                                  monkeypatch):
     """The Windows sharing-violation shape, where both operations fail.
