@@ -736,3 +736,157 @@ def test_missing_database_reports_and_fails(tmp_path, logs, capsys):
 
     assert rc == 1
     assert "No metrics database" in capsys.readouterr().out
+
+
+# --- Two generations of log_file key ---------------------------------------
+#
+# ``sessions.log_file`` held ``Path.name`` until the log-identity fix and now
+# holds the full case-folded path (:func:`operator_ingest.log_key`). A real
+# database carries both at once: legacy rows are re-keyed only when their log
+# is ingested again *and* its ``started_at`` still matches, so a row whose log
+# was deleted, or whose stored start time came from the wall clock, keeps its
+# basename forever. This script joins whatever it finds onto ``--logs``, which
+# is correct for both only because an absolute right-hand side replaces the
+# join root rather than extending it. Nothing pinned that, and the direction
+# it fails in is the one this whole script exists to avoid: judge a row
+# against the wrong file and it erases measurements a shutdown event took.
+
+NO_EVENT = "no shutdown here"
+HAS_EVENT = '{"kind": "session_shutdown"}'
+
+
+def test_both_key_generations_are_repaired_in_one_pass(db_path, logs, capsys):
+    """The mixed database is the normal case, not an edge case."""
+    legacy = logs / "process-legacy.log"
+    modern = logs / "process-modern.log"
+    legacy.write_text(NO_EVENT, encoding="utf-8")
+    modern.write_text(NO_EVENT, encoding="utf-8")
+    modern_key = operator_ingest.log_key(modern)
+    assert modern_key != modern.name, (
+        "test precondition: log_key must not be a basename")
+    add_session(db_path, legacy.name)
+    add_session(db_path, modern_key)
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert rc == 0
+    assert read_row(db_path, legacy.name)["lines_added"] is None, (
+        "a pre-fix basename row was left unrepaired")
+    assert read_row(db_path, modern_key)["lines_added"] is None, (
+        "a full-path row was left unrepaired")
+    assert "Cleared 2 row(s)" in capsys.readouterr().out
+
+
+def test_a_full_path_row_is_read_from_its_own_directory(db_path, logs,
+                                                        tmp_path):
+    """A full-path row need not name a log under ``--logs`` at all.
+
+    That is the whole point of the key: a second log directory, a restored
+    backup or another machine's logs copied in for comparison produce logs
+    whose basenames repeat. Here the row's own log lacks the event while a
+    same-named file under ``--logs`` has one, so a repair that reduced the key
+    to its basename would read the decoy and spare a fabricated row.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    own = elsewhere / "process-7.log"
+    own.write_text(NO_EVENT, encoding="utf-8")
+    (logs / "process-7.log").write_text(HAS_EVENT, encoding="utf-8")
+    key = operator_ingest.log_key(own)
+    add_session(db_path, key)
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert rc == 0
+    assert read_row(db_path, key)["lines_added"] is None, (
+        "the row was judged against a same-named log it does not own")
+
+
+def test_a_measured_full_path_row_is_not_erased_by_a_same_named_log(
+        db_path, logs, tmp_path, capsys):
+    """The same swap the other way round, which is the destructive direction.
+
+    The row's own log carries the shutdown event, so its zeros are measured
+    fact; the decoy under ``--logs`` does not. Reading the decoy would clear
+    four columns a session actually recorded and rewrite its summary to say
+    "unknown" -- data loss the first test cannot detect, because a test that
+    only ever asserts rows *are* cleared passes on a script that clears
+    everything.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    own = elsewhere / "process-8.log"
+    own.write_text(HAS_EVENT, encoding="utf-8")
+    (logs / "process-8.log").write_text(NO_EVENT, encoding="utf-8")
+    key = operator_ingest.log_key(own)
+    add_session(db_path, key)
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert rc == 0
+    row = read_row(db_path, key)
+    assert row["api_time_seconds"] == 0, (
+        "erased a measured row by reading a same-named log in --logs")
+    assert row["raw_metrics"] == ZEROED_RAW
+    assert "No fabricated zeros found" in capsys.readouterr().out
+
+
+def test_two_rows_sharing_a_basename_get_their_own_verdicts(db_path, logs,
+                                                            tmp_path,
+                                                            capsys):
+    """The collision the full-path key exists to allow, now in one database.
+
+    Before the key change these two sessions could not coexist -- ``log_file``
+    is ``UNIQUE``, so the second silently overwrote the first. They coexist
+    now, and the repair has to reach a separate verdict for each: one log has
+    the event and one does not, and both answers are wrong if the basename is
+    what gets looked up.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    unmeasured = logs / "process-9.log"
+    measured = elsewhere / "process-9.log"
+    unmeasured.write_text(NO_EVENT, encoding="utf-8")
+    measured.write_text(HAS_EVENT, encoding="utf-8")
+    unmeasured_key = operator_ingest.log_key(unmeasured)
+    measured_key = operator_ingest.log_key(measured)
+    assert unmeasured_key != measured_key, (
+        "test precondition: the two keys must differ")
+    add_session(db_path, unmeasured_key)
+    add_session(db_path, measured_key)
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert rc == 0
+    assert read_row(db_path, unmeasured_key)["lines_added"] is None, (
+        "the unmeasured row was spared by its namesake's shutdown event")
+    assert read_row(db_path, measured_key)["lines_added"] == 0, (
+        "the measured row was erased by its namesake's missing event")
+    assert "Cleared 1 row(s)" in capsys.readouterr().out
+
+
+def test_missing_logs_flag_asks_after_the_rows_own_path(db_path, logs,
+                                                        tmp_path):
+    """``--missing-logs`` clears on "the log is gone", and gone is per path.
+
+    A surviving log that merely shares the basename is a different file. If
+    the fingerprint were taken from ``--logs`` the row would look present and
+    stay fabricated forever, which is the failure this flag exists to end.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    key = operator_ingest.log_key(elsewhere / "process-10.log")
+    (logs / "process-10.log").write_text(HAS_EVENT, encoding="utf-8")
+    add_session(db_path, key)
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply",
+         "--missing-logs"])
+
+    assert rc == 0
+    assert read_row(db_path, key)["lines_added"] is None, (
+        "a row whose own log is gone was held present by a namesake")
