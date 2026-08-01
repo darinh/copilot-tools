@@ -356,12 +356,27 @@ def test_a_lock_that_cannot_be_read_is_treated_as_held(tmp_path, monkeypatch):
     assert lock.exists()
 
 
-def test_migration_survives_an_unreadable_legacy_directory(tmp_path, monkeypatch):
+def test_migration_survives_an_unreadable_legacy_directory(
+        tmp_path, monkeypatch, capsys):
+    """Not raising is necessary and not sufficient.
+
+    ``~/.copilot`` is deleted by the CLI, so legacy state that was not moved
+    because it could not be examined is state that is about to be destroyed.
+    A silent skip is indistinguishable from "there was nothing to move" -- in
+    the log and in the outcome both -- and saying so is the only warning
+    anyone gets before it is gone.
+    """
     _point_at_legacy(monkeypatch, tmp_path)
     op.LEGACY_RESTART_DIR.mkdir()
     with denied(monkeypatch, op.LEGACY_RESTART_DIR, op.LEGACY_BACKUPS_DIR,
-                op.LEGACY_LOG_FILE, op.LEGACY_METRICS_DB):
+                op.LEGACY_LOG_FILE, op.LEGACY_METRICS_DB) as seen:
         op.migrate_legacy_state()  # must not raise
+
+    assert seen["n"], "the denial never fired; the test proves nothing"
+    err = capsys.readouterr().err
+    assert str(op.LEGACY_RESTART_DIR) in err, (
+        f"legacy state was left behind, and about to be deleted, without "
+        f"saying so: {err!r}")
 
 
 # ── destructive gate: the tab registry ──────────────────────────
@@ -643,6 +658,33 @@ def test_the_loop_does_not_call_an_unreadable_catalog_unregistered(
         f"strength of a catalog it could not read: {err!r}")
     assert "crash" not in seen_preambles[0].lower(), \
         "an unreadable catalog was reported to the agent as crash recovery"
+
+
+def test_an_unexaminable_log_directory_is_not_an_empty_one(
+        tmp_path, monkeypatch, capsys):
+    """"No Copilot logs found" is a census, and a denied stat is not one.
+
+    Logs are the only record of usage, and the report is what tells the user
+    whether any exist. Rendering a directory that could not be read as one
+    that holds nothing is the failed-read-becomes-empty-population bug
+    wearing a friendly message -- the same shape as ``managed_ids``, which
+    refuses outright rather than returning an empty set.
+    """
+    logs = tmp_path / "copilot-logs"
+    logs.mkdir()
+    (logs / "process-1-1.log").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(op, "COPILOT_LOG_DIR", logs)
+
+    with denied(monkeypatch, logs) as seen:
+        code = op.manage_logs([])
+
+    assert seen["n"], "the denial never fired; the test proves nothing"
+    out = capsys.readouterr().out
+    assert "No Copilot logs found" not in out, (
+        f"a log directory that could not be examined was reported as holding "
+        f"nothing: {out!r}")
+    assert code != 0, \
+        "an unexaminable log directory was reported as a successful census"
 
 
 def test_reload_refuses_to_rewrite_a_spec_it_could_not_read(tmp_path, monkeypatch):

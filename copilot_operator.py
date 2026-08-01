@@ -411,7 +411,15 @@ def migrate_legacy_state() -> None:
         if not acquired:
             return
         moved = 0
-        if dir_present(LEGACY_RESTART_DIR) and LEGACY_RESTART_DIR != RESTART_DIR:
+        # Each probe is spent on three states, not two. ~/.copilot is deleted
+        # by the CLI, so anything left behind here is lost for good -- and a
+        # skip caused by an unexaminable source is indistinguishable, in the
+        # log and in the outcome, from there having been nothing to move.
+        legacy_restart = dir_present(LEGACY_RESTART_DIR)
+        if legacy_restart is None:
+            log(f"  Could not examine {LEGACY_RESTART_DIR} — any legacy state "
+                f"there has been left in place, not migrated")
+        elif legacy_restart and LEGACY_RESTART_DIR != RESTART_DIR:
             try:
                 legacy_items = list(LEGACY_RESTART_DIR.iterdir())
             except OSError as exc:
@@ -421,9 +429,16 @@ def migrate_legacy_state() -> None:
                 moved += _move_legacy(src, RESTART_DIR / src.name)
         for src, dest in ((LEGACY_LOG_FILE, LOG_FILE),
                           (LEGACY_METRICS_DB, METRICS_DB)):
-            if file_present(src):
+            state = file_present(src)
+            if state is None:
+                log(f"  Could not examine {src} — left in place, not migrated")
+            elif state:
                 moved += _move_legacy(src, dest)
-        if dir_present(LEGACY_BACKUPS_DIR):
+        backups = dir_present(LEGACY_BACKUPS_DIR)
+        if backups is None:
+            log(f"  Could not examine {LEGACY_BACKUPS_DIR} — left in place, "
+                f"not migrated")
+        elif backups:
             moved += _move_legacy(LEGACY_BACKUPS_DIR, BACKUPS_DIR)
         if moved:
             log(f"Migrated {moved} legacy state item(s) into {OPERATOR_HOME}")
@@ -2040,13 +2055,24 @@ def ingest_all_logs(force: bool = False) -> int:
     return 0
 
 
-def _log_files() -> list[Path]:
-    if not dir_present(COPILOT_LOG_DIR):
+def _log_files() -> "list[Path] | None":
+    """The process logs, or None when the directory could not be examined.
+
+    An empty list is a census: it says the directory was read and found to
+    hold nothing. A denied stat or a failed glob establishes no such thing,
+    and the caller spends the empty list as "No Copilot logs found" -- a
+    failed read arriving as a confident statement about the filesystem, which
+    is the empty-population bug this module keeps having to unlearn.
+    """
+    present = dir_present(COPILOT_LOG_DIR)
+    if present is None:
+        return None
+    if present is False:
         return []
     try:
         return sorted(COPILOT_LOG_DIR.glob("process-*.log"))
     except OSError:
-        return []
+        return None
 
 
 def manage_logs(args: list[str]) -> int:
@@ -2074,6 +2100,10 @@ def manage_logs(args: list[str]) -> int:
                 die("--days requires a whole number")
 
     files = _log_files()
+    if files is None:
+        print(f"Could not examine {COPILOT_LOG_DIR} — not reporting whether "
+              f"logs are present there.")
+        return 1
     if not files:
         print(f"No Copilot logs found in {COPILOT_LOG_DIR}")
         return 0
