@@ -315,6 +315,17 @@ ATTRIBUTE_GATED = {
 #: construction (``Path('x').walk()``). A local variable holding a ``Path``
 #: is not, for the same reason the sibling probe scan does not resolve a
 #: local alias of ``Path``: a rule that has to follow names is a type checker.
+#:
+#: Matched on the *attribute access*, not on the call, because that is where
+#: the interpreter fails: ``Path.walk`` raises ``AttributeError`` on 3.10 the
+#: moment it is evaluated, whether or not a call follows. Keying it to a call
+#: made this the only detector here that could be stepped around by not
+#: calling — ``hashlib.file_digest`` is attribute-gated and was already caught
+#: bare, so ``fd = hashlib.file_digest`` fired while ``walk = Path.walk`` did
+#: not. The bare spelling is not hypothetical: saving a method off the class
+#: before monkeypatching it (``real_read_text = Path.read_text``) is the
+#: dominant idiom in this repo's own tests, and it is spelled out in full at
+#: the reference site, so seeing it needs no name resolution at all.
 METHOD_GATED = {"walk": "pathlib.Path.walk"}
 
 #: Spellings of the pathlib classes, shared with the probe scan's reasoning.
@@ -463,7 +474,19 @@ def _guard_names(construct: str) -> set[str]:
 
 
 def _is_pathlib_receiver(node: ast.expr) -> bool:
-    """True for ``Path`` and for a ``Path(...)`` construction."""
+    """True for ``Path`` and for a ``Path(...)`` construction.
+
+    An ``Attribute`` receiver is accepted on its trailing name alone, so
+    ``pathlib.Path.walk`` is recognised and so is a nested class of somebody
+    else's that happens to be called ``Path``. That is a known false
+    positive, raised independently by two reviewers, and it is left in
+    deliberately: narrowing it means resolving the receiver's own parent
+    against the module-alias register, which buys nothing against a spelling
+    nobody writes and costs a miss on every ``import pathlib as X`` form not
+    anticipated here. It predates the move of method detection onto the
+    attribute — ``Obj.Path.walk(p)`` was flagged by the call-keyed version
+    too — so this widened where it can be reached, not what it believes.
+    """
     if isinstance(node, ast.Name):
         return node.id in PATHLIB_CLASSES
     if isinstance(node, ast.Attribute):
@@ -544,6 +567,7 @@ class _FloorFinder(ast.NodeVisitor):
         self.module_alias: dict[str, str] = {}
         self.symbol_alias: dict[str, str] = {}
         self.typing_names: set[str] = {"typing"}
+        self.augmented = 0
 
     def scan(self, tree: ast.AST) -> None:
         """Collect aliases across the whole module, then walk it.
@@ -673,22 +697,78 @@ class _FloorFinder(ast.NodeVisitor):
             for name in self._keyword_names(node):
                 if name in gated:
                     self._record(node, gated[name])
-            construct = METHOD_GATED.get(func.attr)
-            if construct is not None and _is_pathlib_receiver(func.value):
-                self._record(node, construct)
         self.generic_visit(node)
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        """``Path.walk += 1`` reads the attribute before it writes it.
+
+        Its target carries ``ctx=Store`` like an ordinary assignment, so the
+        context alone gets this one wrong — measured on 3.10.20, ``T.walk +=
+        1`` raises ``AttributeError`` while ``T.walk = 1``, ``with cm as
+        T.walk``, ``for T.walk in []`` and ``a, T.walk = 1, 2`` all run. It
+        is the only Store that is a use, and an ``AugAssign`` target is a
+        single node rather than a tuple, so the flag can only reach the
+        target itself.
+
+        The value is visited outside the flag: it is an ordinary expression
+        and its own contexts mean what they say.
+
+        The span is set here for the same reason :meth:`generic_visit` sets
+        it for every other statement. Overriding the visitor took this
+        statement off that path, and at module level nothing showed: ``span``
+        is ``None`` there and :meth:`_record` falls back to the hit's own
+        line, which is the right answer by accident. Inside a function the
+        enclosing ``def`` has already set a span, so the annotation lookup
+        was handed the ``def`` line and a ``# floor-ok:`` on the augmented
+        assignment stopped working. Both ``+=`` controls were written at
+        module level, so none of them could see it — a reviewer did.
+        """
+        outer = self.span
+        self.span = _header_span(node)
+        self.augmented += 1
+        self.visit(node.target)
+        self.augmented -= 1
+        self.visit(node.value)
+        self.span = outer
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        # A Store is not a use, with one exception. Measured on 3.10.20:
+        # `x = Path.walk` and `del Path.walk` raise AttributeError, while
+        # `Path.walk = fake`, `with cm as Path.walk`, `for Path.walk in []`
+        # and `a, Path.walk = 1, 2` all run. So the context decides, not the
+        # spelling, and the line falls between Store and everything else
+        # rather than at "is Load" — `del` needs the attribute to exist
+        # exactly as reading it does. The exception is augmented assignment,
+        # which reads before it writes while still carrying `ctx=Store`; see
+        # :meth:`visit_AugAssign`.
+        #
+        # Flagging the plain Store flagged the *polyfill*. Rebinding a
+        # post-floor method onto the class is the ordinary way to make code
+        # run on the floor, and a scan that reports the fix for the very
+        # thing it checks is a scan that gets switched off rather than fixed.
+        # `visit_Name` draws this same line and its comment records the same
+        # bug from the other side: without it, `fd = None` read as a use of
+        # the gated symbol it happened to be named after.
+        is_use = self.augmented or not isinstance(node.ctx, ast.Store)
         parent = node.value
         name = None
         if isinstance(parent, ast.Name):
             name = self.module_alias.get(parent.id, parent.id).split(".")[-1]
         elif isinstance(parent, ast.Attribute):
             name = parent.attr
-        if name is not None:
+        if is_use and name is not None:
             construct = ATTRIBUTE_GATED.get((name, node.attr))
             if construct is not None:
                 self._record(node, construct)
+        # Method-gated names are matched here rather than at the call, so a
+        # reference that is never called is still a use. `Path.walk(p)` is a
+        # Call whose `func` is this very node, so the called form is covered
+        # by the same branch and reported once, not twice.
+        construct = METHOD_GATED.get(node.attr)
+        if is_use and construct is not None and _is_pathlib_receiver(parent):
+            self._record(node, construct)
+        # Descend regardless of context: the target of `obj[Path.walk].x = 1`
+        # is a Store whose subtree still contains a genuine use.
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -1248,6 +1328,52 @@ FIRES = {
         "from pathlib import Path\n"
         "Path('x').exists(**{**{'follow_symlinks': False}})\n"
     ),
+    # Round three, found by measuring which spellings this repo actually
+    # writes rather than by reading the visitor. `Path.walk` was the only
+    # construct here keyed to a *call*, so not calling it stepped around the
+    # detector — while `fd = hashlib.file_digest`, two lines away in the same
+    # scan, was caught bare.
+    "Path.walk saved off the class without being called": (
+        # `real_x = Path.method` is the monkeypatch idiom at 13 sites in
+        # tests/, so this is the shape a post-floor pathlib method would
+        # actually arrive in. `Path.walk` raises AttributeError on 3.10 at
+        # this line, before there is any call to flag.
+        "from pathlib import Path\n"
+        "real_walk = Path.walk\n"
+    ),
+    "Path.walk bound off a construction, then called through the binding": (
+        # The receiver is a construction rather than the class, and the call
+        # that would have been flagged is spelled `walker()` — a bare name,
+        # which nothing here resolves. Line 2 is the only chance the scan
+        # gets, and it is enough: the construct is spelled out in full there.
+        "from pathlib import Path\n"
+        "walker = Path('x').walk\n"
+        "for root, dirs, files in walker():\n"
+        "    pass\n"
+    ),
+    "a post-floor method deleted from the class, which needs it to exist": (
+        # `del` is a use and a plain Store is not, which is why the context
+        # check below tests for Store rather than for Load. Measured on
+        # 3.10.20: `del Path.walk` raises AttributeError exactly as reading
+        # it does, while `Path.walk = fake` succeeds. Written unguarded so
+        # only that distinction can decide it.
+        "from pathlib import Path\n"
+        "del Path.walk\n"
+    ),
+    "a post-floor attribute augmented, which reads before it writes": (
+        # The one Store that is a use. `hashlib.file_digest += 1` is not
+        # something anyone would write - it is here because the *rule* has
+        # to be right, and a context check that stopped at "Store is never a
+        # use" would be wrong in a way nothing else in this file would
+        # notice. Measured on 3.10.20: `T.walk += 1` raises AttributeError,
+        # `T.walk = 1` does not.
+        "import hashlib\n"
+        "hashlib.file_digest += 1\n"
+    ),
+    "a post-floor method augmented on the class": (
+        "from pathlib import Path\n"
+        "Path.walk += 1\n"
+    ),
 }
 
 #: Which construct each control in FIRES is a control *for*.
@@ -1303,6 +1429,14 @@ EXERCISES = {
         "hashlib.file_digest",
     "a gated keyword inside a nested literal ** unpack":
         "pathlib.Path.exists(follow_symlinks=)",
+    "Path.walk saved off the class without being called": "pathlib.Path.walk",
+    "Path.walk bound off a construction, then called through the binding":
+        "pathlib.Path.walk",
+    "a post-floor method deleted from the class, which needs it to exist":
+        "pathlib.Path.walk",
+    "a post-floor attribute augmented, which reads before it writes":
+        "hashlib.file_digest",
+    "a post-floor method augmented on the class": "pathlib.Path.walk",
 }
 
 #: Source that must NOT trip it. Each is a spelling this repo can actually run.
@@ -1446,6 +1580,91 @@ PASSES = {
         "for node in tree.walk():\n"
         "    pass\n"
     ),
+    "a pathlib method older than the floor, saved off the class": (
+        # The negative half of "Path.walk saved off the class". Matching the
+        # bare attribute rather than the call must not turn this repo's own
+        # monkeypatch idiom into a violation: `real_read_text =
+        # Path.read_text` appears at 13 sites in tests/ and `read_text` is as
+        # old as pathlib. Without this, widening the detector to references
+        # would have flagged a fifth of the test suite.
+        "from pathlib import Path\n"
+        "real_read_text = Path.read_text\n"
+        "real_iterdir = Path.iterdir\n"
+    ),
+    "a bare walk attribute on something that is not a pathlib object": (
+        # `tree.walk()` is already pinned above; this is the same receiver
+        # rule for the uncalled form, which is now a separate code path.
+        "handler = tree.walk\n"
+        "other = os.walk\n"
+    ),
+    "a post-floor pathlib method rebound onto the class, which is a polyfill": (
+        # Assigning to `Path.walk` does not require `Path.walk` to exist:
+        # measured on 3.10.20, the Store succeeds where a read raises. This
+        # is the shape of the fix, not of the defect — supplying the method
+        # the floor lacks — and the first version of the reference detector
+        # flagged it, which is a scan reporting the remedy for the thing it
+        # is checking for.
+        #
+        # Deliberately unguarded and unannotated. Under `if not hasattr(Path,
+        # 'walk')`, which is how a polyfill is really written, the whole
+        # branch is licensed by the feature test and this control would pass
+        # whether or not the context check existed at all.
+        "from pathlib import Path\n"
+        "def _walk(self):\n"
+        "    ...\n"
+        "Path.walk = _walk\n"
+    ),
+    "a post-floor module attribute rebound, which is the same polyfill": (
+        # The attribute-gated half of the rule above, and the reason the
+        # context check sits in front of both lookups rather than only the
+        # method one: `hashlib.file_digest = _backport` is a polyfill this
+        # repo could plausibly write, since install_manifest already feature-
+        # tests that exact name.
+        "import hashlib\n"
+        "def _file_digest(fh, name):\n"
+        "    ...\n"
+        "hashlib.file_digest = _file_digest\n"
+    ),
+    "the other Store shapes, none of which need the attribute to exist": (
+        # The negative half of the augmented-assignment rule. All three run
+        # on 3.10.20 with the attribute absent, so treating every Store
+        # target as a use - the obvious over-correction once `+=` is known to
+        # be a use - would flag them.
+        "from pathlib import Path\n"
+        "with cm as Path.walk:\n"
+        "    pass\n"
+        "for Path.walk in []:\n"
+        "    pass\n"
+        "first, Path.walk = 1, 2\n"
+    ),
+    "an augmented assignment annotated inside a function, above the line": (
+        # Both `+=` controls in FIRES sit at module level, where `self.span`
+        # is None and `_record` falls back to the hit's own line - so they
+        # pass whether or not `visit_AugAssign` maintains a span. Inside a
+        # function the enclosing `def` has already set one, and overriding
+        # the visitor took this statement off `generic_visit`'s span path,
+        # so the annotation lookup was handed the `def` line. The scope is
+        # the whole point of this control: at module level it proves nothing.
+        "import hashlib\n"
+        "def f():\n"
+        "    # floor-ok: only reached from the 3.11 fast path\n"
+        "    hashlib.file_digest += 1\n"
+    ),
+    "an augmented assignment annotated inside a function, on the line": (
+        # The inline half: `_annotation_in` looks in the statement's own
+        # header span as well as the block above it, and the header span is
+        # exactly what was wrong.
+        "from pathlib import Path\n"
+        "def f():\n"
+        "    Path.walk += 1  # floor-ok: 3.12-only fast path\n"
+    ),
+    "an augmented assignment guarded by a version test inside a function": (
+        "import sys\n"
+        "import hashlib\n"
+        "def f():\n"
+        "    if sys.version_info >= (3, 11):\n"
+        "        hashlib.file_digest += 1\n"
+    ),
     "an annotated use with a real reason": (
         "import hashlib\n"
         "# floor-ok: this branch is only reached from the 3.12-only fast path\n"
@@ -1470,6 +1689,27 @@ def test_the_detector_fires(label: str) -> None:
         f"  A control that only asserts *something* matched will keep passing "
         f"after the detector it is named for stops working, as long as any "
         f"other detector happens to cover the same source."
+    )
+
+
+def test_a_called_method_is_reported_once() -> None:
+    """``Path('x').walk()`` is one violation, not one per node that sees it.
+
+    The method detector moved from the call to the attribute the call hangs
+    off, and a call's ``func`` *is* that attribute — so a version keeping
+    both branches reports the same construct on the same line twice. Every
+    other assertion in this file asks only whether a hit exists, so a
+    duplicate is invisible to all of them and shows up only in the list a
+    developer is handed. "Fires" and "fires once" are different claims and
+    until now only the first was being made.
+    """
+    hits = floor_violations(
+        "from pathlib import Path\n"
+        "for root, dirs, files in Path('x').walk():\n"
+        "    pass\n"
+    )
+    assert hits == [(2, "pathlib.Path.walk")], (
+        f"expected exactly one hit for the called form, got {hits}"
     )
 
 
