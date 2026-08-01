@@ -417,6 +417,33 @@ def _run_loop(monkeypatch, args: list[str]) -> list[str]:
 
 
 @bash
+def test_both_operators_inject_identical_single_session_defaults(tmp_path,
+                                                                 monkeypatch):
+    """Not merely the same shape -- the same list, element for element.
+
+    The shape test below is deliberately loose because it also covers loop
+    mode, where the two legitimately differ (`operator.sh` resolves the agent
+    name itself). Single session has no such licence: every injected argument
+    is a decision about how the CLI behaves for the user, and there is no
+    reason any of them should depend on which platform they happen to be on.
+    `--yolo` is why this test exists -- the Python operator injected it here
+    and the shell operator did not, so the same command granted an agent
+    blanket approval on Windows and not on Linux, for two months, with nothing
+    in either program that would ever have said so.
+
+    Loose where the general case demands it, exact where exactness is
+    available.
+    """
+    shell_argv = _shell_launch_argv("run_single_session", [], tmp_path)
+    python_argv = _run_single(monkeypatch, [])
+
+    assert shell_argv == python_argv, (
+        "the two operators disagree about what a single session grants:\n"
+        f"  operator.sh:          {shell_argv}\n"
+        f"  copilot_operator.py:  {python_argv}")
+
+
+@bash
 @pytest.mark.parametrize("mode", ["single", "loop"])
 @pytest.mark.parametrize("user_argv", [
     ["--no-experimental"],
@@ -432,12 +459,12 @@ def test_both_operators_build_the_same_shaped_launch_argv(tmp_path, monkeypatch,
     """The shell and Python operators must agree about the launch argv.
 
     Asserted as a shared property rather than a fixed list, because the two
-    legitimately inject different defaults -- `operator.sh` does not pass
-    `--yolo` in single-session mode and `copilot_operator.py` does, a
-    divergence that predates this and is recorded in the CLI-surface contract.
-    What must never differ is where `--experimental` sits relative to the
-    user's own arguments, because that is what decides whether an opt-out is
-    expressible at all.
+    legitimately inject different defaults in loop mode -- `operator.sh`
+    resolves the agent name itself. (In single session there is no such
+    licence, and the argv is asserted identical above.) What must never differ
+    in either mode is where `--experimental` sits relative to the user's own
+    arguments, because that is what decides whether an opt-out is expressible
+    at all.
 
     Running the shell's own source is the point: a Linux or macOS regression
     here is otherwise invisible to a suite that only ever drives the Python
@@ -585,25 +612,36 @@ def test_project_handoff_file_still_accepts_a_real_guid(tmp_path, monkeypatch):
     assert found.parent.name == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 
 
-# ── --yolo everywhere ────────────────────────────────────────────
-def test_run_single_session_always_includes_yolo(monkeypatch, tmp_path):
-    seen_args = []
+# ── --yolo is loop-only ──────────────────────────────────────────
+def test_single_session_does_not_grant_yolo(monkeypatch):
+    """A single session attaches your terminal, so you are there to answer.
 
-    def fake_start_session(instance, args, session_num, remain_on_exit=False, preamble=""):
-        seen_args.append(args)
-        instance.exit_file.write_text("0", encoding="utf-8")
+    `--yolo` waives every approval prompt for the life of the session. In loop
+    mode that is the only workable setting -- nobody is watching, so a prompt
+    would hang until the session times out. A single session hands the
+    terminal straight back to the human who typed the command, so granting it
+    there buys nothing and spends the one control that mode still has.
+    """
+    assert "--yolo" not in _run_single(monkeypatch, [])
 
-    monkeypatch.setattr(op, "start_session", fake_start_session)
-    monkeypatch.setattr(op, "handle_existing_session", lambda instance: None)
-    monkeypatch.setattr(op.MUX, "attach", lambda session: None)
-    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
-    monkeypatch.setattr(op, "wait_for_exit", lambda instance, timeout=10: True)
-    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
 
-    inst = op.Instance("yolo-check")
-    op.run_single_session(inst, [])
+def test_a_single_session_still_honours_a_user_asking_for_yolo(monkeypatch):
+    """Not granting it by default is not the same as refusing it.
 
-    assert "--yolo" in seen_args[0]
+    It lands after the injected defaults, which is what makes it expressible
+    at all -- the same last-wins ordering `--experimental` relies on.
+    """
+    argv = _run_single(monkeypatch, ["--yolo"])
+    assert argv[-1] == "--yolo"
+
+
+def test_loop_mode_still_grants_yolo(monkeypatch):
+    """The asymmetry between the modes is the ruling, not an oversight.
+
+    Both operators inject it here. If this ever fails, an unattended loop is
+    one approval prompt away from stalling with nobody to notice.
+    """
+    assert "--yolo" in _run_loop(monkeypatch, [])
 
 
 # ── launch spec ─────────────────────────────────────────────────
