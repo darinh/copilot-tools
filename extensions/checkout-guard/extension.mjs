@@ -15,7 +15,15 @@
 //   2. After every command that can run arbitrary code -- including `task`,
 //      because a subagent's writes land in the parent's checkout -- the
 //      checkout is rescanned and newly appeared untracked paths are reported
-//      back immediately, while the producer is still known.
+//      back immediately, while the producer is still known. When the session
+//      is running inside a linked worktree the repository's primary checkout
+//      is rescanned as well: a subagent starts its own shell, so a relative
+//      path resolves against whatever directory it began in, and the primary
+//      is the tree every other agent resolves as the project. That case had
+//      nothing watching it, and it is the one that actually fired -- three
+//      artifacts appeared in a primary checkout while their author worked in a
+//      worktree, and the guard reported clean in the same words it uses when
+//      nothing happened.
 //   3. A blanket `git add -A`, or a `git stash` that takes untracked files, is
 //      DENIED while such artifacts are outstanding. Staging a path by name is
 //      always allowed: the aim is to stop artifacts being committed
@@ -40,7 +48,10 @@ import {
   blockReason,
   checkoutRoot,
   newEntries,
-  scanCheckout,
+  primaryCheckoutRoot,
+  primaryStrayReport,
+  rootToWatch,
+  scanCheckoutTree,
   sessionBriefing,
   strayReport,
   sweepDecision,
@@ -66,6 +77,38 @@ const lastSeen = new Map();
 const outstanding = new Map();
 /** Paths authored deliberately with create/edit, keyed by checkout root. */
 const authored = new Map();
+/**
+ * The primary checkout to also watch, keyed by the working checkout root.
+ *
+ * Cached because it costs a `git worktree list` and cannot change for a given
+ * root within a session. Negative results are cached too -- an agent working
+ * in the primary checkout would otherwise pay for the lookup on every command
+ * to be told the same "there is nothing else to watch" each time.
+ */
+const primaryRoots = new Map();
+
+/**
+ * The primary checkout, when it is a different tree from the one in use.
+ *
+ * Returns null when the agent is already working in the primary, so the two
+ * roots are never scanned as if they were separate places.
+ *
+ * A lookup that FAILED is not cached. `primaryCheckoutRoot` reports that case
+ * as `UNKNOWN_ROOT` rather than as null precisely so this can tell the two
+ * apart: caching an answer derived from one timed-out `git worktree list`
+ * would disable primary-root watching for the whole session, silently, and the
+ * session would look exactly like one that had nothing to watch.
+ */
+async function otherRootToWatch(root) {
+  if (primaryRoots.has(root)) return primaryRoots.get(root);
+  // Resolved from `root`, not from `process.cwd()`. They are normally the same
+  // repository -- `root` was derived from the cwd -- but asking about the root
+  // being watched is the question actually being answered, and it cannot drift
+  // into reporting on some unrelated repository the process happens to sit in.
+  const { watch, cache } = rootToWatch(root, await primaryCheckoutRoot(root));
+  if (cache) primaryRoots.set(root, watch);
+  return watch;
+}
 
 function setFor(map, root) {
   let value = map.get(root);
@@ -95,9 +138,15 @@ function relativeToCheckout(root, filePath) {
  * Artifacts that no longer exist are dropped from the outstanding set, so an
  * agent that cleans up is not then blocked by the memory of a file it has
  * already deleted.
+ *
+ * `blocking` is false for a checkout the agent is not working in. Such a path
+ * is worth telling them about, but it must not deny a `git add -A` here: the
+ * file may belong to a peer, and refusing this agent's commit over another
+ * agent's artifact is a refusal whose cost lands on the wrong asset -- and on
+ * work that has nothing to do with the thing being protected.
  */
-async function observe(root) {
-  const current = await scanCheckout(root);
+async function observe(root, { blocking = true, scan = scanCheckoutTree } = {}) {
+  const current = await scan(root);
   if (current === null) return [];
   const seen = lastSeen.get(root);
   lastSeen.set(root, current);
@@ -115,8 +164,10 @@ async function observe(root) {
 
   const deliberate = setFor(authored, root);
   const fresh = newEntries(seen, current).filter((p) => !deliberate.has(p));
-  for (const path of fresh) pending.add(path);
-  bound(pending);
+  if (blocking) {
+    for (const path of fresh) pending.add(path);
+    bound(pending);
+  }
   return fresh;
 }
 
@@ -133,8 +184,16 @@ const session = await joinSession({
       }
       const root = await checkoutRoot(process.cwd());
       if (root) {
-        const initial = await scanCheckout(root);
+        const initial = await scanCheckoutTree(root);
         if (initial !== null) lastSeen.set(root, initial);
+        // Seed the primary too, or its entire contents would read as new the
+        // first time a command is run and every existing file in it would be
+        // reported as this agent's doing.
+        const other = await otherRootToWatch(root);
+        if (other) {
+          const seedOther = await scanCheckoutTree(other);
+          if (seedOther !== null) lastSeen.set(other, seedOther);
+        }
       }
       return { additionalContext: sessionBriefing(scratchDir) };
     },
@@ -194,9 +253,30 @@ const session = await joinSession({
 
       if (!SHELL_TOOLS.has(input.toolName) && !SUBAGENT_TOOLS.has(input.toolName)) return;
       const fresh = await observe(root);
-      if (fresh.length === 0) return;
-      return { additionalContext: strayReport(fresh, scratchDir) };
+      // The primary is scanned as well as, never instead of, the working
+      // checkout -- but only after a SUBAGENT call, not after every command.
+      //
+      // Both real incidents came from subagents, and the restriction is what
+      // keeps this from being noise: the primary is shared, so scanning it
+      // after every shell command would report every peer agent's artifacts to
+      // every other agent, and a guard that cries wolf gets switched off. This
+      // agent's own shell commands cannot surprise it in another tree -- it
+      // would have had to name the path.
+      const other = SUBAGENT_TOOLS.has(input.toolName) ? await otherRootToWatch(root) : null;
+      const elsewhere = other
+        ? await observe(other, { blocking: false, scan: scanCheckoutTree })
+        : [];
+      if (fresh.length === 0 && elsewhere.length === 0) return;
+      const reports = [];
+      if (fresh.length > 0) reports.push(strayReport(fresh, scratchDir));
+      if (elsewhere.length > 0) {
+        reports.push(primaryStrayReport(elsewhere, scratchDir, other));
+      }
+      return { additionalContext: reports.join("\n\n") };
     },
   },
   tools: [],
 });
+
+
+
