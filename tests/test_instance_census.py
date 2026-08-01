@@ -295,3 +295,86 @@ def test_the_bare_inbox_refuses_rather_than_eating_the_peers_mail(
     # message.
     assert op.show_inbox(["proj"]) == 0
     assert "not yours to read" in capsys.readouterr().out
+
+
+# ── the same comparison, in the catalog ─────────────────────────
+# `project_handoff_file` resolves a path per catalog row and already has the
+# machinery for "this row could not be compared" -- it sets `undecided` and
+# returns CATALOG_UNREADABLE rather than "not registered". It caught only
+# OSError, so the other two ways `Path.resolve` declines went straight up and
+# out. These live beside the census tests because it is one defect, found by
+# one review, and splitting them would be how the next one gets fixed in a
+# single place again. `tests/test_presence_probes.py` covers the OSError row.
+def _catalog(tmp_path: Path, monkeypatch, text: str) -> Path:
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+    return catalog
+
+
+def test_a_catalog_row_with_a_nul_is_undecided_not_unregistered(tmp_path,
+                                                                monkeypatch):
+    """The catalog is a hand-edited CSV. A row it cannot compare must not be
+    read as a project that is not registered -- that verdict rests on rows
+    that were never examined, and it tells a restarting session it has no
+    handoff waiting."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    _catalog(tmp_path, monkeypatch, f'"{NUL_PATH}",guid-broken\n')
+
+    assert op.project_handoff_file(project) is op.CATALOG_UNREADABLE
+
+
+def test_a_catalog_row_that_is_a_symlink_loop_is_undecided(tmp_path,
+                                                           monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    loop = _symlink_loop(tmp_path)
+    _catalog(tmp_path, monkeypatch, f'"{loop}",guid-broken\n')
+
+    assert op.project_handoff_file(project) is op.CATALOG_UNREADABLE
+
+
+def test_an_uncomparable_target_is_undecided_rather_than_a_traceback(
+        tmp_path, monkeypatch):
+    """The target is resolved once, outside the row loop, and was unguarded.
+
+    Nothing can be compared against a target that will not resolve, so every
+    row is undecided -- the same argument as the parent in ``_dir_matches``.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    _catalog(tmp_path, monkeypatch, f'"{project}",guid-real\n')
+    assert isinstance(op.project_handoff_file(project), Path), (
+        "the control must match first, or the assertion below proves nothing")
+
+    real_resolve = Path.resolve
+    seen = {"n": 0}
+
+    def refusing(self, *a, **kw):
+        if str(self) == str(project):
+            seen["n"] += 1
+            raise ValueError("embedded null character in path")
+        return real_resolve(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "resolve", refusing)
+    found = op.project_handoff_file(project)
+    monkeypatch.setattr(Path, "resolve", real_resolve)
+
+    assert seen["n"], "the resolve never failed; the test proves nothing"
+    assert found is op.CATALOG_UNREADABLE
+
+
+def test_a_broken_row_does_not_shadow_a_registered_project(tmp_path,
+                                                           monkeypatch):
+    """The over-refusal control, again: caution must not buy safety by
+    disabling the lookup. A real row beside a NUL row still resolves."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    target = str(Path(project).resolve())
+    _catalog(tmp_path, monkeypatch,
+             f'"{NUL_PATH}",guid-broken\n"{target}",guid-real\n')
+
+    found = op.project_handoff_file(project)
+    assert isinstance(found, Path), found
+    assert "guid-real" in str(found), found

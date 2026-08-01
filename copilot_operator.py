@@ -1327,11 +1327,18 @@ def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
     catalog = project_catalog_path()
     if file_present(catalog) is False:
         return None
-    target = str(primary_repo_root(cwd).resolve())
-    if IS_WINDOWS:
-        target = target.lower()
     # "No row matched" is only an answer if every row was actually compared.
     undecided = False
+    try:
+        target = str(primary_repo_root(cwd).resolve())
+    except (OSError, ValueError, RuntimeError):
+        # Nothing can be compared against a target that will not resolve, so
+        # every row below is undecided rather than unmatched. Reporting "not
+        # registered" here would tell a restarting session its project has no
+        # handoff, which is the one thing this must never say on a guess.
+        return CATALOG_UNREADABLE
+    if IS_WINDOWS:
+        target = target.lower()
     try:
         with open(catalog, "r", encoding="utf-8", errors="replace", newline="") as fh:
             for row in csv.reader(fh):
@@ -1349,10 +1356,14 @@ def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
                     continue
                 try:
                     resolved = str(Path(path).resolve())
-                except OSError:
+                except (OSError, ValueError, RuntimeError):
                     # This row could not be compared. Skipping it is right, but
                     # it means the "not registered" verdict below is no longer
-                    # established for this catalog.
+                    # established for this catalog. All three arrive here: the
+                    # catalog is a hand-edited CSV, so a row can name a symlink
+                    # loop (RuntimeError, or OSError(ELOOP) on newer
+                    # interpreters) or carry an embedded NUL (ValueError) just
+                    # as easily as it can name a denied path (OSError).
                     undecided = True
                     continue
                 if IS_WINDOWS:
