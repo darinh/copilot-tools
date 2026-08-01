@@ -482,6 +482,9 @@ def ensure_copilot() -> bool:
         if ok and out.strip():
             root = Path(out.strip())
             bin_dir = root if IS_WINDOWS else root / "bin"
+            # probe-ok: a wrong False only skips a PATH entry, and the
+            # `which("copilot")` immediately below re-checks the outcome and
+            # prints manual instructions when it did not work.
             if bin_dir.is_dir():
                 persist_user_path(bin_dir)
     if which("copilot"):
@@ -644,6 +647,8 @@ def ensure_uv() -> str | None:
         # policy, and no network scripts piped into an interpreter.
         pip_install(["--upgrade", "uv"])
         scripts = _python_scripts_dir()
+        # probe-ok: a wrong False skips a PATH entry and nothing else; the
+        # `which("uv")` guarding the line below is what decides success.
         if scripts.is_dir():
             _prepend_process_path(scripts)
             if which("uv"):
@@ -653,6 +658,8 @@ def ensure_uv() -> str | None:
         _install_uv_from_astral_script()
 
     # uv installs itself into ~/.local/bin on every platform.
+    # probe-ok: a wrong False costs a PATH entry, and `which("uv")` two lines
+    # down reports the failure with the manual command to fix it.
     if LOCAL_BIN.is_dir():
         persist_user_path(LOCAL_BIN)
     refresh_path()
@@ -720,6 +727,8 @@ def ensure_specify() -> bool:
         return False
     ok = run([uv, "tool", "install", "--force", "specify-cli", "--from",
               f"git+https://github.com/github/spec-kit.git@{SPEC_KIT_VERSION}"])
+    # probe-ok: a wrong False costs a PATH entry; `which("specify")` below
+    # re-checks and falls through to the manual install instructions.
     if LOCAL_BIN.is_dir():
         persist_user_path(LOCAL_BIN)
     refresh_path()
@@ -861,6 +870,9 @@ def install_package(assume_yes: bool = False) -> bool:
 
     if not shutil.which("operator"):
         for candidate in (_python_scripts_dir(), _user_scripts_dir()):
+            # probe-ok: a wrong False just tries the next candidate, and the
+            # `shutil.which("operator")` below reports the failure with the
+            # directory to add by hand.
             if (candidate / ("operator.exe" if IS_WINDOWS else "operator")).exists():
                 _prepend_process_path(candidate)
                 persist_user_path(candidate)
@@ -912,6 +924,29 @@ def _present(path: Path) -> bool:
     return install_manifest.path_present(path) is not False
 
 
+def _dir_for_certain(path: Path) -> bool:
+    """True only when ``path`` is *provably* a directory.
+
+    The opposite polarity to :func:`_dir_or_unknown`, and deliberately so —
+    the two are named for their unknown case because that is the only thing
+    that distinguishes them. This one gates a shortcut ("already up to date")
+    that skips asking the user, so an unproven yes would let setup keep a
+    destination it never compared. An unproven *no* only costs the consent
+    prompt the code falls through to, which is the answer the user wanted to
+    be asked for anyway.
+
+    Without the guard this raised: ``Path.is_dir`` re-raises a permission
+    denial, and one unreadable destination aborted the entire setup run. The
+    single caller works around that by asking ``install_manifest.classify``
+    first and skipping ``UNREADABLE`` — a fix at the call site, which is a fix
+    that the next caller does not get.
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
                     may_replace: bool = False) -> str:
     """Link src -> dest, preferring a link and falling back to a copy.
@@ -938,7 +973,7 @@ def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
             return "skipped (kept existing)"
         _remove_dest(dest)
     elif _present(dest):
-        if dest.is_dir() and _dirs_match(src, dest):
+        if _dir_for_certain(dest) and _dirs_match(src, dest):
             return "already up to date"
         if not may_replace and not ask(
                 f"{dest} exists and differs from the repository copy. Replace it?",
@@ -1030,6 +1065,10 @@ def _remove_dest(path: Path) -> None:
             # Some link kinds are directories to the API that refuses unlink.
             os.rmdir(path)
         return
+    # probe-ok: every wrong answer here raises rather than removing the wrong
+    # thing — `unlink` on a real directory fails, `rmtree` on a link fails,
+    # and this function is documented to let its failures reach the caller
+    # while the original is still intact.
     if path.is_dir():
         shutil.rmtree(path)
         return
@@ -1209,19 +1248,103 @@ TEMPLATE_ARTIFACTS = (
 )
 
 
+def _dir_entries(root: Path, label: str) -> list[Path] | None:
+    """Everything directly inside ``root``, or None when it cannot be listed.
+
+    None and ``[]`` are different answers, and the difference is discharged by
+    a warning rather than by the return value — both callers below go on to
+    install nothing, because there is nothing else they *can* do. What must
+    not happen is doing that quietly. ``[]`` means the repository genuinely
+    ships none of this kind and deserves no comment; None means the question
+    went unanswered, and a run that installs nothing for that reason has to
+    say so or it reads as a success.
+
+    ``Path.is_dir`` cannot make that distinction. It answers False for a root
+    that is occupied but unexaminable -- a symlink whose target is gone, a
+    symlink loop, a disconnected network home (WINERROR 21) -- and it raises
+    on a permission denial, aborting the whole run over one directory. Both
+    were reachable here: ``if not root.is_dir(): return []`` turned an
+    unreadable ``skills/`` into a repository that ships no skills, and setup
+    then installed nothing and reported success.
+
+    The listing is materialised inside the guard on purpose. ``iterdir`` is a
+    generator, so a denial part-way through a directory surfaces at the
+    consumer rather than here, and the consumer would receive a *short* list
+    that is indistinguishable from a small one.
+    """
+    present = install_manifest.path_present(root)
+    if present is False:
+        return []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError as exc:
+        warn(f"{label}: {root} could not be listed ({exc}) — "
+             "installing none of them this run")
+        return None
+    return entries
+    present = install_manifest.path_present(root)
+    if present is False:
+        return []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError as exc:
+        warn(f"{label}: {root} could not be listed ({exc}) — "
+             "installing none of them this run")
+        return None
+    return entries
+
+
+def _dir_or_unknown(path: Path) -> bool:
+    """Whether ``path`` is a directory, resolving "cannot tell" to *yes*.
+
+    The opposite polarity to :func:`_dir_for_certain`, because the cost is
+    reversed. Both source scans below use this to decide what to hand the
+    installer, so a wrong False silently removes an artifact from everything
+    setup deploys *and* from what ``--status`` reports — the two agree, and
+    the absence is invisible from either. A wrong True costs an installer call
+    that fails loudly and changes nothing, because ``_link_directory`` and
+    ``install_skills`` already report an ``OSError`` per artifact.
+
+    Both halves of the defect are handled, and the second is the one that is
+    easy to miss. ``is_dir`` *raises* on a permission denial — that is the
+    ``except``. It also *returns False*, silently and confidently, for a link
+    whose target is gone or cannot be resolved, because it follows the link
+    and finds nothing. So a False is only believed for a path that is not a
+    link; for a link it means nothing was resolved, which is not the same as
+    "not a directory". A plain file still answers False and stays out.
+    """
+    try:
+        if path.is_dir():
+            return True
+    except OSError:
+        return True
+    return _is_link(path)
+
+
 def _skill_sources() -> list[Path]:
     root = REPO_ROOT / "skills"
-    if not root.is_dir():
+    entries = _dir_entries(root, "skills")
+    if not entries:
         return []
-    return sorted(p for p in root.iterdir()
-                  if p.is_dir() and (p / "SKILL.md").is_file())
+    # A skill is a directory holding a SKILL.md. `is_file` answers False for a
+    # SKILL.md it cannot examine *and* for one that is a link to a file that
+    # has gone, which would drop that one skill from every install while the
+    # other six succeeded. `path_present` is lstat-based and keeps "cannot
+    # tell" apart from "absent", so only a genuinely missing SKILL.md
+    # disqualifies a directory; a wrong include is visible and reversible,
+    # a wrong exclude is neither.
+    def _has_manifest(p: Path) -> bool:
+        return install_manifest.path_present(p / "SKILL.md") is not False
+
+    return sorted(p for p in entries if _dir_or_unknown(p) and _has_manifest(p))
 
 
 def _extension_sources() -> list[Path]:
     root = REPO_ROOT / "extensions"
-    if not root.is_dir():
+    entries = _dir_entries(root, "extensions")
+    if not entries:
         return []
-    return sorted(p for p in root.iterdir() if p.is_dir())
+    return sorted(p for p in entries if _dir_or_unknown(p))
 
 
 def deployed_artifacts() -> list[tuple[str, str, Path, Path]]:
@@ -1663,7 +1786,7 @@ def install_templates(assume_yes: bool = False, manifest: dict | None = None) ->
         src = REPO_ROOT / "templates" / src_name
         dest = COPILOT_DIR / dest_name
         key = f"templates/{src_name}"
-        if not src.is_file():
+        if install_manifest.path_present(src) is False:
             warn(f"{label}: source missing ({src})")
             continue
         source_digest = install_manifest.file_digest(src)

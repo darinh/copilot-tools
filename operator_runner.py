@@ -131,6 +131,8 @@ def _process_parents_windows() -> dict[int, int]:
 def _process_parents_posix() -> dict[int, int]:
     parents: dict[int, int] = {}
     proc_root = Path("/proc")
+    # probe-ok: a wrong False falls through to the `ps` fallback below, which
+    # answers the same question by another route.
     if proc_root.is_dir():
         for entry in proc_root.iterdir():
             if not entry.name.isdigit():

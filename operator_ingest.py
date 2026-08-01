@@ -28,6 +28,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+import install_manifest
+
 BUSY_TIMEOUT = 15.0
 
 # Billing constants.
@@ -414,6 +416,9 @@ def extract_premium_from_usage(text: str) -> tuple[dict, int]:
 
 
 def git_branch(work_dir: str) -> str:
+    # probe-ok: a wrong False returns "" and the row is recorded without a
+    # branch. The git call below would fail on the same directory anyway, and
+    # this reaches the same "" by the guarded route.
     if not work_dir or not Path(work_dir).is_dir():
         return ""
     try:
@@ -442,6 +447,9 @@ def ingest_file(
 ) -> str:
     """Parse one log file into the database. Returns a short status string."""
     logfile = Path(logfile).resolve()
+    # probe-ok: a wrong answer raises rather than skipping — the only caller
+    # is `ingest_all`, which turns the exception into an `ERROR <name>` line
+    # for that one log and goes on to the rest.
     if not logfile.is_file():
         raise FileNotFoundError(str(logfile))
 
@@ -670,12 +678,40 @@ def ingest_file(
     )
 
 
-def ingest_all(log_dir, db_path, force: bool = False) -> list[str]:
+def ingest_all(log_dir, db_path, force: bool = False) -> "list[str] | None":
+    """Ingest every process log in ``log_dir``; None when it cannot be read.
+
+    ``[]`` is a census -- the directory was read and found to hold no logs.
+    A directory that could not be examined establishes nothing of the kind,
+    and the caller spends an empty list as "No Copilot logs found" and exits
+    0, so a machine that has silently stopped recording metrics is
+    indistinguishable from one that has simply not run yet.
+
+    ``Path.is_dir`` cannot draw that line: it answers False for a dangling
+    symlink, a symlink loop and a disconnected network home, and raises on a
+    permission denial. :func:`copilot_operator._log_files` already reaches the
+    correct answer for the same directory a few lines from the caller of this
+    function; ``ingest_all`` kept the bare probe because the rule had only
+    ever been applied to the other module.
+
+    ``iterdir`` rather than ``glob``, and that is the whole mechanism.
+    ``glob`` swallows the error and yields nothing, so a directory link whose
+    target is gone comes back as a readable directory holding no logs --
+    which is the same wrong answer in a new place. ``iterdir`` raises, and
+    the raise is the only thing here that distinguishes "read it, found
+    nothing" from "never read it".
+    """
     log_dir = Path(log_dir)
-    results = []
-    if not log_dir.is_dir():
+    results: list[str] = []
+    if install_manifest.path_present(log_dir) is False:
         return results
-    for path in sorted(log_dir.glob("process-*.log")):
+    try:
+        entries = sorted(log_dir.iterdir())
+    except OSError:
+        return None
+    logs = [p for p in entries
+            if p.name.startswith("process-") and p.name.endswith(".log")]
+    for path in logs:
         try:
             results.append(ingest_file(path, db_path, force=force))
         except Exception as exc:  # pragma: no cover - defensive

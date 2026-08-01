@@ -114,6 +114,8 @@ def main() -> int:
         check("pane has a pid", old_pane_pid is not None, str(old_pane_pid))
 
         args_file = restart_dir / f"{NAME}.loopargs.json"
+        # probe-ok: both probes are the check itself — this harness reports to
+        # a human watching it, and a wrong False fails the check loudly.
         check("loop args recorded", args_file.exists(),
               args_file.read_text(encoding="utf-8") if args_file.exists() else "")
 
