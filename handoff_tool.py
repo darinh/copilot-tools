@@ -50,10 +50,12 @@ from operator_mux import Mux, MuxError, safe_instance_id      # noqa: E402
 from project_paths import (                                   # noqa: E402
     guid_is_usable,
     primary_repo_root,
+    project_dir,
+    projects_root,
 )
 
 IS_WINDOWS = platform.system() == "Windows"
-CATALOG = Path.home() / ".copilot" / "projects" / "catalog.csv"
+CATALOG = projects_root() / "catalog.csv"
 # Where a handoff that was never read goes instead of into the bit bucket.
 SUPERSEDED_DIRNAME = "superseded"
 # A handoff is a few kilobytes of prose. Anything past this is not one, and
@@ -677,18 +679,18 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
 
     guid = resolve_guid(primary_repo_root(project_root))
-    project_dir = Path.home() / ".copilot" / "projects" / guid
-    handoff_file = project_dir / "next-session.md"
+    proj_dir = project_dir(guid)
+    handoff_file = proj_dir / "next-session.md"
     marker = state_dir() / instance_id
 
     # Even a validated guid can fail here -- a read-only home, a full disk, a
     # revoked permission. Report it the way the rest of the tool reports
     # trouble rather than with a bare traceback.
     try:
-        project_dir.mkdir(parents=True, exist_ok=True)
+        proj_dir.mkdir(parents=True, exist_ok=True)
         state_dir().mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        die(f"Cannot create {project_dir} or {state_dir()}: {exc}")
+        die(f"Cannot create {proj_dir} or {state_dir()}: {exc}")
 
     # Rendered before the lock is taken: it cannot fail on the filesystem, and
     # holding a shared lock across work that does not need it is how a

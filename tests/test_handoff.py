@@ -1118,6 +1118,44 @@ def test_handoff_leaves_no_archive_when_nothing_was_waiting(env, monkeypatch):
     assert [p.name for p in project_dir.iterdir()] == ["next-session.md"]
 
 
+def test_no_handoff_is_lost_when_several_pile_up_unread(env, monkeypatch):
+    """Four handoffs, nobody reading, and all four are still there afterwards.
+
+    The guarantee is append-only, and one supersession cannot show that: a
+    preserve step that archived the predecessor and then cleared the archives
+    it found from *earlier* rounds would pass every single-round test here
+    while losing everything but the most recent pair. The claim documented in
+    ``docs/operator.md`` and in the deployed instructions -- that nothing ever
+    prunes this directory, so agents must not either -- is a promise about
+    repetition, so it is checked by repeating.
+
+    Named after the property rather than the mechanism, and it reads the whole
+    project directory rather than ``SUPERSEDED_DIRNAME``, so it stays honest if
+    the archive ever moves: the question is whether the context still exists,
+    not where it was filed.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-11\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-11"
+    project_dir.mkdir(parents=True)
+
+    contexts = [f"context of agent {n}" for n in range(4)]
+    for context in contexts:
+        assert ho.main([
+            "--instance", "proj",
+            "--status", context,
+            "--next", "n",
+            "--project-root", str(env["project"]),
+        ]) == 0
+
+    surviving = [p.read_text(encoding="utf-8", errors="replace")
+                 for p in project_dir.rglob("*") if p.is_file()]
+    for context in contexts:
+        assert any(context in text for text in surviving), \
+            f"{context!r} was pruned: the archive is not append-only"
+
+
 def test_handoff_refuses_rather_than_destroying_what_it_cannot_preserve(
         env, monkeypatch):
     """No archive, no overwrite. The predecessor survives a failed handoff.

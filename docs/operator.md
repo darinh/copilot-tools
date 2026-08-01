@@ -311,6 +311,62 @@ Intentional operator handoffs still start a fresh Copilot CLI session and rely o
 
 If a named loop resumes with a saved CLI session ID but finds **no handoff file** for the project (`~/.copilot/projects/{guid}/next-session.md`, resolved from `~/.copilot/projects/catalog.csv`), that almost always means the previous session ended without calling `handoff` — most likely a crash. The preamble gets an extra note in that case telling the agent this looks like crash recovery and, if it *did* mean to stop cleanly, to remember to write a handoff next time. Resuming after a clean `handoff`-triggered restart (or any run where the handoff file already exists) never adds this note.
 
+### Superseded handoffs
+
+`handoff` does not silently replace an unread handoff. `os.replace` is atomic —
+a reader never sees half a file — but it says nothing about a file nobody ever
+read, and it will overwrite one without a trace. The protocol says the reader
+deletes `next-session.md` once it has consumed it, so a handoff still sitting
+there when the next one is written *means* unread, and the losing side would be
+a session that has already ended and cannot be asked to repeat itself.
+
+So neither is discarded. The old file is copied (not moved — the original stays
+put until the copy has succeeded) into
+`~/.copilot/projects/{guid}/superseded/`, under a timestamped name created with
+`O_EXCL` so no archive can land on another one. Only then is the new handoff
+published. Both survive.
+
+#### What this does not cover
+
+Preserve-then-publish is serialised by a lock, so the guarantee holds between
+two handoffs that can both take it. When the lock cannot be taken at all, the
+tool writes anyway — refusing would discard the current session for certain, to
+protect one that might not exist — after *trying* to bank a copy of its own
+handoff into `superseded/`. Banking is best-effort: if that write also fails the
+tool says so on stderr and still publishes.
+
+So there are two residual windows, not one. When the spare was banked, the
+writer that *held* the lock can publish in between the other writer's preserve
+and its rename, and be overwritten by it; the overwritten writer never banked a
+spare, because from inside the lock there was nothing to defend against, so its
+handoff is the one that is gone. When the spare could *not* be banked, the
+unlocked writer has no copy either, and whichever of the two loses the race
+leaves nothing behind.
+
+The practical consequence is narrow but worth knowing: after a
+`Warning: another handoff is in progress for this project`, the file at
+`next-session.md` is not guaranteed to be the most recent handoff, and the
+other one may exist only in `superseded/`. Read both. Closing the windows
+properly means making the publish itself the exclusive operation rather than
+guarding it with a lock the tool is willing to proceed without.
+
+#### Never pruned
+
+**Nothing ever prunes `superseded/`.** That is a deliberate promise, not a
+missing feature. A reaper inside a fix for an unwanted delete is the same bug
+wearing the fix's clothes, and it would be reasoning about the age of files
+whose value it cannot judge. The directory only grows when a handoff went
+unread, which is already the anomaly — a full `superseded/` is a symptom worth
+reading, not a mess to clear.
+
+The prohibition is on the tool and on agents acting unasked; it is not a lock on
+the user's own disk. Clearing it is a decision for the person who owns the
+context, so if it has grown, read what is in there before deciding it is noise:
+
+```bash
+ls -la ~/.copilot/projects/*/superseded/
+```
+
 ### Multi-Instance
 
 Multiple operator instances can run concurrently. Each gets its own multiplexer
@@ -594,6 +650,9 @@ logs.
 | `~/.operator/messages/<id>/inbox/` | Undelivered messages for an instance |
 | `~/.operator/messages/<id>/archive/` | Messages already delivered, kept as an audit trail |
 | `~/.operator/backups/` | Historical backups of the operator script |
+| `~/.copilot/projects/catalog.csv` | Maps a project root to its `{guid}` |
+| `~/.copilot/projects/{guid}/next-session.md` | Session handoff, written by `handoff`, deleted by the session that reads it |
+| `~/.copilot/projects/{guid}/superseded/` | Handoffs that were replaced before anyone read them. Timestamped, append-only, [never pruned](#superseded-handoffs) |
 | `~/.copilot/logs/process-*.log` | Copilot process logs (override with `COPILOT_LOG_DIR`) |
 
 > **Note**: Operator state used to live under `~/.copilot/`, but the copilot CLI itself wholesale-deletes `~/.copilot/restart/` on every startup (confirmed via fatrace). State was moved to `~/.operator/` to eliminate the collision. On first run the operator automatically migrates any legacy state from `~/.copilot/` into `~/.operator/`.
