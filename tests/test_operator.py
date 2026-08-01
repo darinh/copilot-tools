@@ -298,65 +298,106 @@ def _shell_function(name: str) -> str:
 
 
 @pytest.mark.parametrize("function", ["run_single_session", "run_loop_mode"])
-def test_operator_sh_launches_copilot_in_experimental_mode(function):
-    """Both shell launch paths, not just one.
+def test_operator_sh_injects_experimental_ahead_of_the_user_args(function):
+    """Both shell launch paths put the flag in, and put it in *first*.
 
-    Parametrised because they are separate code paths that were changed
-    separately. Covering only the loop would leave a plain `operator` on macOS
-    starting sessions with no extensions at all.
+    Order is the whole mechanism now that injection is unconditional. The CLI
+    resolves conflicting spellings last-wins, so `--experimental` ahead of the
+    user's arguments is what leaves a real `--no-experimental` able to win. The
+    same line appended *after* them would silently make the opt-out
+    unexpressible through the operator -- and would still satisfy any test that
+    only asked whether the flag was present.
+
+    Parametrised over both functions because they are separate code paths that
+    have now been edited separately twice. Covering only the loop would leave a
+    plain `operator` on macOS starting sessions with no extensions at all.
     """
-    body = _shell_function(function)
-    appends = [line.strip() for line in body.splitlines()
-               if 'copilot_args+=("--experimental")' in line]
-    assert len(appends) == 1, (
-        f"{function}() should add --experimental exactly once, found {appends}")
-    # Guarded, never unconditional -- the shell counterpart of
-    # test_loop_mode_keeps_an_explicit_no_experimental. Without this line,
-    # hard-coding the flag would satisfy the assertion above while making
-    # --no-experimental impossible to express through the operator.
-    assert appends[0].startswith("has_experimental_flag "), (
-        f"{function}() adds --experimental unconditionally: {appends[0]}")
+    lines = _shell_function(function).splitlines()
+
+    injected = [i for i, line in enumerate(lines)
+                if "copilot_args=(" in line and '"--experimental"' in line]
+    assert len(injected) == 1, (
+        f"{function}() should build copilot_args with --experimental exactly "
+        f"once, found {[lines[i].strip() for i in injected]}")
+
+    forwarded = [i for i, line in enumerate(lines)
+                 if 'copilot_args+=("$@")' in line
+                 or 'copilot_args+=("${user_args[@]}")' in line]
+    assert len(forwarded) == 1, (
+        f"{function}() should append the user's arguments exactly once, "
+        f"found {[lines[i].strip() for i in forwarded]}")
+
+    assert injected[0] < forwarded[0], (
+        f"{function}() adds --experimental after the user's arguments, so an "
+        f"explicit --no-experimental could never win:\n"
+        f"  {lines[injected[0]].strip()}\n  {lines[forwarded[0]].strip()}")
+
+
+def _shell_launch_argv(function: str, user_argv: list[str], tmp_path: Path) -> list[str]:
+    """The argv `operator.sh` actually builds, by running its own source.
+
+    Only the lines that construct the array are kept, so this is the shell's
+    real ordering rather than a restatement of it, without dragging in tmux or
+    the filesystem. The `--agent` append is dropped: it depends on a lookup
+    that is orthogonal to this question and is covered elsewhere.
+    """
+    kept = [line for line in _shell_function(function).splitlines()
+            if re.match(r"\s*(local\s+)?(copilot_args|user_args)\+?=", line)
+            and "--agent" not in line]
+    assert any("--experimental" in line for line in kept), (
+        f"no copilot_args construction found in {function}() -- the extraction "
+        f"missed, so this would have tested nothing: {kept}")
+
+    script = tmp_path / "argv.sh"
+    script.write_text(
+        "set -euo pipefail\nbuild() {\n" + "\n".join(kept) + "\n"
+        'printf "%s\\n" "${copilot_args[@]}"\n}\nbuild "$@"\n',
+        encoding="utf-8", newline="\n")
+    proc = subprocess.run([_bash_executable(), "argv.sh", *user_argv], cwd=tmp_path,
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, (
+        f"the argv probe did not run (exit {proc.returncode}): {proc.stderr}")
+    return proc.stdout.splitlines()
 
 
 @bash
-@pytest.mark.parametrize("args", [
-    ["--experimental"], ["--no-experimental"], ["--experimental=true"],
-    ["--yolo"], [], ["--experimentalish"],
-    # Value positions. A blind token scan cannot tell an option from the value
-    # of one, so these are the cases where the two implementations are most
-    # likely to be fixed apart -- and the ones a bare-token table misses.
-    ["-i", "--no-experimental"], ["-p", "--no-experimental"],
+@pytest.mark.parametrize("user_argv", [
+    ["--no-experimental"],
+    # Values that merely look like a ruling. These are what broke the previous
+    # implementation, and they are the cases most likely to be fixed in one
+    # language and not the other.
+    ["-p", "--no-experimental"],
+    ["-i", "--no-experimental"],
     ["--", "--no-experimental"],
 ])
-def test_operator_sh_has_experimental_flag_agrees_with_python(tmp_path, args):
-    """Run the real shell function and require the same answer as Python's.
+def test_both_operators_build_the_same_shaped_launch_argv(tmp_path, monkeypatch,
+                                                          user_argv):
+    """The shell and Python operators must agree about the launch argv.
 
-    This asserts AGREEMENT, deliberately, not correctness: the expected value
-    is `op.has_experimental_flag` itself rather than a hand-written table, so
-    the two implementations cannot drift apart without this failing. Whether a
-    given answer is the *right* one is the job of the tests that name the
-    behaviour; the job of this one is that Linux and macOS never quietly get a
-    different launch decision from Windows.
+    Asserted as a shared property rather than a fixed list, because the two
+    legitimately inject different defaults -- `operator.sh` does not pass
+    `--yolo` in single-session mode and `copilot_operator.py` does, a
+    divergence that predates this and is recorded in the CLI-surface contract.
+    What must never differ is where `--experimental` sits relative to the
+    user's own arguments, because that is what decides whether an opt-out is
+    expressible at all.
 
-    That is why the value-position cases belong here even while both sides
-    still answer them the same way. The moment one implementation learns to
-    skip option values and the other does not, this goes red -- which is the
-    realistic failure, since the shell half is the half that gets forgotten.
-
-    A harness that fails to run the script at all exits with some other code
-    and fails loudly, rather than passing vacuously.
+    Running the shell's own source is the point: a Linux or macOS regression
+    here is otherwise invisible to a suite that only ever drives the Python
+    operator, and CI checks `operator.sh` with `bash -n`, which proves it
+    parses and nothing whatever about what it passes.
     """
-    script = tmp_path / "probe.sh"
-    script.write_text(
-        "set -euo pipefail\n"
-        f"has_experimental_flag() {{\n{_shell_function('has_experimental_flag')}}}\n"
-        'has_experimental_flag "$@"\n',
-        encoding="utf-8", newline="\n")
-    proc = subprocess.run([_bash_executable(), "probe.sh", *args], cwd=tmp_path,
-                          capture_output=True, text=True, timeout=60)
-    assert proc.returncode in (0, 1), (
-        f"the probe did not run (exit {proc.returncode}): {proc.stderr}")
-    assert (proc.returncode == 0) is op.has_experimental_flag(args)
+    shell_argv = _shell_launch_argv("run_single_session", user_argv, tmp_path)
+    python_argv = _run_single(monkeypatch, list(user_argv))
+
+    for label, argv in (("operator.sh", shell_argv),
+                        ("copilot_operator.py", python_argv)):
+        assert argv.count("--experimental") == 1, f"{label}: {argv}"
+        # The user's arguments survive intact, at the tail, in order.
+        assert argv[-len(user_argv):] == user_argv, f"{label}: {argv}"
+        # ...and the injected flag is in the head, so anything the user passed
+        # is seen by the CLI later and therefore wins.
+        assert "--experimental" in argv[:-len(user_argv)], f"{label}: {argv}"
 
 
 # ── preamble ────────────────────────────────────────────────────
