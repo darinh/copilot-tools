@@ -198,8 +198,18 @@ def _read_message(path: Path) -> dict | None | _Unreadable:
         try:
             regular = path.is_file()
         except OSError:
-            # The probe failed too, so nothing has been established. Keep the
-            # reading that cannot lose a message.
+            # Not belt-and-braces: `is_file()` is not total. It swallows
+            # OSError only for `_IGNORED_ERRNOS` -- ENOENT, ENOTDIR, EBADF,
+            # ELOOP, plus three WinErrors -- and re-raises everything else,
+            # EACCES included, which is documented nowhere in its signature.
+            # An inbox that is readable but not searchable reaches here, and
+            # without this the exception escapes through `pending()` on every
+            # poll of the supervisor loop.
+            #
+            # It is also this function's own subject one level down: False is
+            # a claim about the object, raising is a claim about the attempt,
+            # and pathlib merges them. Nothing has been established, so keep
+            # the reading that cannot lose a message.
             return UNREADABLE
         return UNREADABLE if regular else None
     except ValueError:
