@@ -17,9 +17,11 @@ psmux implements tmux's command surface and installs a `tmux` alias, so the same
 code path serves every platform. Override the choice with
 `COPILOT_OPERATOR_MUX` if you need a specific binary.
 
-> The original bash `operator.sh` is retained unchanged for existing Linux and
-> WSL users. The Python implementation described here is the supported entry
-> point on all platforms.
+> The original bash `operator.sh` is retained as a rollback path for existing
+> Linux and WSL users, and is still actively maintained — see
+> [Platform Support](../README.md#platform-support) for what that does and
+> does not cover. The Python implementation described here is the supported
+> entry point on all platforms.
 
 ## Prerequisites
 
@@ -45,15 +47,21 @@ extensions, and installs configuration templates. It is safe to rerun and will
 not overwrite edited configuration without asking.
 
 <details>
-<summary>Legacy bash install (Linux/WSL only)</summary>
+<summary>Rolling back to the bash entry point (Linux/WSL only)</summary>
+
+`./setup.sh` does **not** install the bash entry point any more — it migrates
+*away* from it, moving a `~/.local/bin/operator` symlink that resolves to this
+checkout's `operator.sh` aside and deleting it once the Python console scripts
+are confirmed working. So the symlink below is a rollback, not an install:
 
 ```bash
-# From the copilot-tools repo
-./setup.sh
-
-# Or manually
 ln -sf /path/to/copilot-tools/operator.sh ~/.local/bin/operator
+ln -sf /path/to/copilot-tools/handoff.sh ~/.local/bin/handoff
 ```
+
+The next `./setup.sh` run will migrate it away again, by design. Both scripts
+are still maintained and still exercised by the test suite, so a rollback lands
+on working code rather than on whatever they looked like at the migration.
 </details>
 
 ## Architecture
