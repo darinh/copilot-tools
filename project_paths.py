@@ -14,7 +14,7 @@ import platform
 import subprocess
 from pathlib import Path
 
-__all__ = ["primary_repo_root", "guid_is_usable"]
+__all__ = ["primary_repo_root", "guid_is_usable", "projects_root", "project_dir"]
 
 # A background supervisor with no console of its own would otherwise flash a
 # real console window for each of these calls on Windows.
@@ -68,6 +68,30 @@ _WINDOWS_RESERVED = {
 # `mkdir` -- and an embedded NUL raises ValueError, which is not an OSError and
 # so slips straight through the usual guards.
 _UNSAFE_GUID_CHARS = frozenset('<>:"|?*') | frozenset(chr(c) for c in range(32))
+
+
+def projects_root() -> Path:
+    """The directory holding one subdirectory per catalogued project.
+
+    Resolved on each call rather than captured at import: the tests, and anyone
+    who relocates a home directory, patch ``Path.home`` and expect the writer
+    and the reader to follow it to the same place.
+    """
+    return Path.home() / ".copilot" / "projects"
+
+
+def project_dir(guid: str) -> Path:
+    """Where one project's handoff, its ``superseded/`` archive and its
+    instructions live.
+
+    Here for the same reason :func:`guid_is_usable` is: ``handoff_tool`` writes
+    this path and ``copilot_operator`` reads it, and a path spelled out
+    separately in the writer and the reader is a path that can drift. The
+    deployed instructions quote it too, which makes a third copy -- pinned by
+    ``tests/test_instructions_template.py`` against this function rather than
+    against a retyped literal.
+    """
+    return projects_root() / guid
 
 
 def guid_is_usable(guid: str) -> bool:

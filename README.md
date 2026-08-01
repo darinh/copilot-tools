@@ -193,7 +193,9 @@ See [Skills Reference](docs/skills.md) for details and setup.
 
 The `templates/copilot-instructions.md` file establishes conventions for:
 - **Project Configuration System** — per-project settings stored in `~/.copilot/projects/`
-- **Session Handoff** — cross-session continuity via `next-session.md` files
+- **Session Handoff** — cross-session continuity via `next-session.md` files; an
+  unread handoff is archived to `superseded/` rather than overwritten, and that
+  archive is [never pruned](docs/operator.md#superseded-handoffs)
 - **Session History** — SQL-based audit trail of work across sessions
 - **Spec-Driven Development** — specs as the single source of truth (enabled by default)
 - **Parallel Agents** — SQL-coordinated parallel task execution via `todo_claims`
