@@ -4,6 +4,28 @@ Copilot CLI runtime extensions that hook into the agent's tool-use lifecycle.
 Installed globally to `~/.copilot/extensions/` by `setup.sh` (symlinked, so
 edits here take effect on the next session).
 
+## They only load in experimental mode
+
+Extensions are an experimental CLI feature. A session that is not in
+experimental mode loads **none** of them, and says nothing about it — an
+extension that never loaded cannot report its own absence, so the session
+looks exactly like one where every guard scanned and found nothing.
+
+The CLI persists the last spelling it was given (`--experimental` /
+`--no-experimental`) into `~/.copilot/settings.json`, which makes it sticky
+global state that any session, on any project, can flip. This is not
+hypothetical: agent sessions on this machine ran for over an hour with no
+`checkout-guard` at all, in the shared primary checkout it exists to protect,
+and nothing inside them could have told.
+
+`operator` therefore passes `--experimental` on every launch unless the caller
+ruled on it (see `with_experimental` in `copilot_operator.py`). If you start
+`copilot` by hand and want the extensions, pass it yourself:
+
+```bash
+copilot --experimental
+```
+
 | Extension | Hook | What it does |
 |-----------|------|--------------|
 | `open-in-vs-code`      | `onPostToolUse` | Opens each edited/created file in VS Code (deduped, filtered, no shell injection). |

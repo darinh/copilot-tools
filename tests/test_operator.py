@@ -141,6 +141,95 @@ def test_has_agent_flag(args, expected):
     assert op.has_agent_flag(args) is expected
 
 
+# ── extensions load only in experimental mode ───────────────────
+@pytest.mark.parametrize("args,expected", [
+    (["--experimental"], True),
+    (["--no-experimental"], True),
+    (["--experimental=true"], True),
+    (["--yolo"], False),
+    ([], False),
+    (["--experimentalish"], False),
+])
+def test_has_experimental_flag(args, expected):
+    assert op.has_experimental_flag(args) is expected
+
+
+def test_with_experimental_adds_the_flag_when_the_user_said_nothing():
+    assert op.with_experimental(["--yolo"], []) == ["--yolo", "--experimental"]
+
+
+@pytest.mark.parametrize("opt_out", [["--no-experimental"], ["--experimental"]])
+def test_with_experimental_leaves_an_explicit_choice_alone(opt_out):
+    """A caller who ruled on it owns the decision, either way.
+
+    `--no-experimental` is the one that matters: overriding it would make the
+    flag impossible to turn off through the operator. `--experimental` is here
+    so the flag is never passed twice.
+    """
+    defaults = ["--yolo"]
+    assert op.with_experimental(defaults, opt_out) == defaults
+
+
+def _capture_launch_args(monkeypatch):
+    """Record the argv the operator would hand to copilot."""
+    seen = []
+
+    def fake_start_session(instance, args, session_num, remain_on_exit=False, preamble=""):
+        seen.append(args)
+        instance.exit_file.write_text("0", encoding="utf-8")
+        instance.stop_marker.touch()
+
+    monkeypatch.setattr(op, "start_session", fake_start_session)
+    monkeypatch.setattr(op, "handle_existing_session", lambda instance: None)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+    return seen
+
+
+def test_single_session_launches_copilot_in_experimental_mode(monkeypatch):
+    """Runtime extensions load only in experimental mode.
+
+    Without the flag the CLI loads no extensions AND reports nothing about it,
+    so `checkout-guard` is absent in exactly the shape of a guard that ran and
+    found the checkout clean. Measured, not assumed: sessions on this machine
+    ran over an hour with no guard in the shared primary checkout.
+    """
+    seen = _capture_launch_args(monkeypatch)
+    monkeypatch.setattr(op.MUX, "attach", lambda session: None)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
+    monkeypatch.setattr(op, "wait_for_exit", lambda instance, timeout=10: True)
+
+    op.run_single_session(op.Instance("exp-single"), [])
+
+    assert seen, "the session never launched, so nothing about its args was tested"
+    assert seen[0].count("--experimental") == 1
+
+
+def test_loop_mode_launches_copilot_in_experimental_mode(monkeypatch):
+    seen = _capture_launch_args(monkeypatch)
+
+    op.run_loop_mode(op.Instance("exp-loop"), ["--agent", "test:agent"], is_fresh=True)
+
+    assert seen, "the loop never launched, so nothing about its args was tested"
+    assert seen[0].count("--experimental") == 1
+
+
+def test_loop_mode_keeps_an_explicit_no_experimental(monkeypatch):
+    """Control: the flag is a default, not something the operator forces.
+
+    Paired with the test above through the same call, so a change that simply
+    hard-coded `--experimental` unconditionally would pass that one and fail
+    this one.
+    """
+    seen = _capture_launch_args(monkeypatch)
+
+    op.run_loop_mode(op.Instance("exp-loop-off"),
+                     ["--agent", "test:agent", "--no-experimental"], is_fresh=True)
+
+    assert seen, "the loop never launched, so nothing about its args was tested"
+    assert "--experimental" not in seen[0]
+    assert "--no-experimental" in seen[0]
+
+
 # ── preamble ────────────────────────────────────────────────────
 def test_preamble_is_platform_neutral():
     """The preamble is read by an agent that may be on Windows, so it must not

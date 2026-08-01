@@ -42,8 +42,8 @@ and non-ASCII characters (FR-007).
 
 | Mode | Injected |
 |---|---|
-| Single session | `--autopilot --effort high` |
-| Loop mode | `--yolo --autopilot --no-ask-user --effort high`, plus `--agent <name>` when absent, plus the autonomous preamble via `-i` |
+| Single session | `--autopilot --effort high`, plus `--experimental` when the user gave neither `--experimental` nor `--no-experimental` |
+| Loop mode | `--yolo --autopilot --no-ask-user --effort high`, plus `--experimental` when the user gave neither `--experimental` nor `--no-experimental`, plus `--agent <name>` when absent, plus the autonomous preamble via `-i` |
 | Both | `--log-level debug`, unless the user set `--log-level` or `COPILOT_OPERATOR_NO_DEBUG_LOG=1`. Required because Copilot only writes usage data at debug level. |
 
 In loop mode with saved state, `--resume=<session-id>` is appended **exactly once**, and is suppressed

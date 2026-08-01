@@ -1645,6 +1645,37 @@ def has_agent_flag(args: list[str]) -> bool:
     return any(a == "--agent" or a.startswith("--agent=") for a in args)
 
 
+def has_experimental_flag(args: list[str]) -> bool:
+    """True when the caller already decided about experimental features.
+
+    `--no-experimental` counts. It is a deliberate opt-out, and the default
+    added below must not quietly overturn it.
+    """
+    return any(a in ("--experimental", "--no-experimental")
+               or a.startswith("--experimental=") for a in args)
+
+
+def with_experimental(defaults: list[str], user_args: list[str]) -> list[str]:
+    """Add `--experimental` to `defaults` unless the user ruled on it.
+
+    Runtime extensions -- `checkout-guard` among them -- load ONLY when the
+    CLI is in experimental mode, and the CLI persists the last spelling it was
+    given into `~/.copilot/settings.json`. So the flag is sticky global state
+    that any other session, on any project, can flip; and when it is off,
+    every extension silently does not load. There is no error and no missing
+    output, because an extension that never loaded cannot report its own
+    absence. That was measured on this machine: agent sessions ran for over an
+    hour with no checkout-guard at all, in the shared primary checkout it
+    exists to protect, and nothing inside those sessions could have told.
+
+    Passing it explicitly on every launch is what makes the guard's silence
+    mean "scanned and found nothing" rather than "was never there".
+    """
+    if has_experimental_flag(user_args) or has_experimental_flag(defaults):
+        return defaults
+    return [*defaults, "--experimental"]
+
+
 def handle_existing_session(instance: Instance) -> None:
     if not MUX.has_session(instance.session):
         return
@@ -2580,7 +2611,8 @@ def show_inbox(args: list[str]) -> int:
 
 def run_single_session(instance: Instance, copilot_args: list[str],
                        headless: bool = False) -> int:
-    args = ["--yolo", "--autopilot", "--effort", "high", *copilot_args]
+    args = [*with_experimental(["--yolo", "--autopilot", "--effort", "high"],
+                               copilot_args), *copilot_args]
     handle_existing_session(instance)
     operator_ingest.init_db(METRICS_DB)
     run_started = utcnow()
@@ -2620,7 +2652,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     operator code, say — without disturbing the Copilot session it was
     watching. Everything after the initial launch is identical either way.
     """
-    copilot_args = ["--yolo", "--autopilot", "--no-ask-user", "--effort", "high"]
+    copilot_args = with_experimental(
+        ["--yolo", "--autopilot", "--no-ask-user", "--effort", "high"], user_args)
     agent = extract_agent_from_args(user_args)
     if not has_agent_flag(user_args):
         copilot_args += ["--agent", agent]
