@@ -20,8 +20,9 @@
 #
 # Single-session mode launches copilot in tmux and auto-attaches.
 # When copilot exits, metrics are captured and a brief summary shown.
+# It adds --autopilot --effort high --experimental.
 #
-# Loop mode (--loop) adds --yolo --autopilot --no-ask-user, sends a
+# Loop mode (--loop) adds --yolo --autopilot --no-ask-user --effort high --experimental, sends a
 # preamble for autonomous operation, and restarts copilot when the
 # agent signals via a restart marker file. Ctrl+C shows aggregate stats.
 # ═══════════════════════════════════════════════════════════════════
@@ -735,11 +736,12 @@ OPTIONS
 MODES
     Single session (default)
         Launches copilot in tmux with your args, auto-attaches.
+        Adds --autopilot --effort high --experimental automatically.
         When copilot exits, usage metrics are parsed from its process
         log and stored in the metrics database.
 
     Loop mode (--loop)
-        Adds --yolo --autopilot --no-ask-user automatically.
+        Adds --yolo --autopilot --no-ask-user --effort high --experimental automatically.
         Sends a preamble for autonomous operation. Restarts copilot
         when the agent touches the instance-specific restart marker.
         Ctrl+C captures metrics and shows an aggregate run summary.
