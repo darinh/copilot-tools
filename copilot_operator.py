@@ -1899,7 +1899,7 @@ def send_message(args: list[str]) -> int:
         if arg == "--":
             body.extend(args[i + 1:])
             break
-        if arg.startswith("--") and not (
+        if arg.startswith("-") and not (
                 arg in SEND_FLAGS or arg.startswith(("--from=", "--to="))):
             print(f"operator send: unknown option '{arg}'", file=sys.stderr)
             print("  If it belongs to the message, put it after --:",
@@ -1972,6 +1972,8 @@ def _inbox_usage(stream=None) -> None:
           file=stream)
     print("  --history  show mail that was already read", file=stream)
     print("  --json     machine-readable output", file=stream)
+    print("  --         the next argument is a mailbox name, dash or not",
+          file=stream)
     print("  With no NAME, reads the mailbox for this directory's instance.",
           file=stream)
 
@@ -1984,28 +1986,51 @@ def show_inbox(args: list[str]) -> int:
     ignored — a typo'd ``--peek`` that fell through to the default would
     consume the mailbox it was asked to leave alone, and the next reader
     could not tell that from an empty inbox.
+
+    Nothing stops an instance being named ``-beta``, so ``--`` ends the
+    options and makes what follows a name.
     """
-    if any(a in HELP_FLAGS for a in args):
+    flags: list[str] = []
+    names: list[str] = []
+    end_of_options = False
+    for arg in args:
+        if end_of_options:
+            names.append(arg)
+        elif arg == "--":
+            end_of_options = True
+        elif arg.startswith("-"):
+            flags.append(arg)
+        else:
+            names.append(arg)
+
+    if any(f in HELP_FLAGS for f in flags):
         _inbox_usage(sys.stdout)
         return 0
 
-    unknown = [a for a in args
-               if a.startswith("-") and a not in INBOX_FLAGS]
+    unknown = [f for f in flags if f not in INBOX_FLAGS]
     if unknown:
         print(f"operator inbox: unknown option '{unknown[0]}'",
               file=sys.stderr)
+        if unknown[0].startswith("-") and not unknown[0].startswith("--"):
+            print("  If it is a mailbox name, put it after --:",
+                  file=sys.stderr)
+            print(f"    operator inbox -- {unknown[0]}", file=sys.stderr)
         print("  No mail was read.", file=sys.stderr)
         _inbox_usage()
         return 2
 
-    peek = "--peek" in args
-    as_json = "--json" in args
-    want_history = "--history" in args
-    names = [a for a in args if not a.startswith("-")]
+    peek = "--peek" in flags
+    as_json = "--json" in flags
+    want_history = "--history" in flags
 
     if len(names) > 1:
         print("operator inbox reads one mailbox at a time, got: "
-              f"{', '.join(names)}", file=sys.stderr)
+              f"{', '.join(repr(n) for n in names)}", file=sys.stderr)
+        print("  No mail was read.", file=sys.stderr)
+        _inbox_usage()
+        return 2
+    if names and not names[0].strip():
+        print("operator inbox: the mailbox name is empty.", file=sys.stderr)
         print("  No mail was read.", file=sys.stderr)
         _inbox_usage()
         return 2

@@ -490,6 +490,20 @@ message carries a ready-made reply command. A `--to` naming no known instance
 is refused and the known names are listed, because a typo would otherwise queue
 a message into a mailbox nobody ever reads.
 
+**An option either command does not recognize is refused, never ignored.**
+Reading an inbox archives what it shows, so a typo'd `--peek` that fell through
+to the default would eat the mail it was asked to leave alone — and the next
+reader could not tell that from an empty inbox. On `send` the same silence ran
+the other way: an unrecognized flag became message text, so `--dry-run`
+delivered a message to a sender who believed nothing had been sent. Both now
+exit 2, print usage, and change nothing. `--` ends the options when the text or
+the name really does start with a dash:
+
+```bash
+operator send --from alpha --to beta -- "--force is the flag you want"
+operator inbox -- -beta           # a mailbox named -beta
+```
+
 **Delivery.** If the recipient's Copilot process is running, the message is
 typed into its session and lands immediately. If it is between sessions (or the
 pane is dead), the message is queued and handed over in the next session's

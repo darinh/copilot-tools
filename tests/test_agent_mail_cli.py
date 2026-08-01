@@ -132,12 +132,31 @@ def test_send_takes_flag_shaped_text_after_a_double_dash(idle_recipient):
     assert msg["text"] == "--force is the flag"
 
 
-def test_send_does_not_mistake_message_text_for_a_help_request(idle_recipient):
-    """`-h` in the body must be delivered, not swallowed by the help path."""
+def test_send_does_not_mistake_message_text_for_a_help_request(idle_recipient,
+                                                               capsys):
+    """`-h` is only help in first position; anywhere else it is refused.
+
+    Swallowing it as a help request would be the same silent non-send this
+    change exists to stop, so the dash-leading word is refused and `--`
+    delivers it.
+    """
     assert op.send_message(["--from", "alpha", "--to", "beta", "-h", "means",
-                            "help"]) == 0
+                            "help"]) == 2
+    assert "unknown option '-h'" in capsys.readouterr().err
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 0
+
+    assert op.send_message(["--from", "alpha", "--to", "beta", "--", "-h",
+                            "means", "help"]) == 0
     (msg,) = operator_mail.pending(op.OPERATOR_HOME, "beta")
     assert msg["text"] == "-h means help"
+
+
+def test_send_refuses_an_unknown_short_option_too(idle_recipient, capsys):
+    """A short-flag typo is exactly as silent as a long one."""
+    assert op.send_message(["--from", "alpha", "--to", "beta", "-q",
+                            "hello"]) == 2
+    assert "unknown option '-q'" in capsys.readouterr().err
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 0
 
 
 def test_send_help_prints_usage_on_stdout_and_sends_nothing(idle_recipient,
@@ -338,6 +357,36 @@ def test_inbox_help_from_main_does_not_touch_this_directorys_mailbox(
     assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
     capsys.readouterr()
     assert op.main(["inbox", "--help"]) == 0
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+
+
+def test_inbox_reads_a_mailbox_whose_name_starts_with_a_dash(monkeypatch,
+                                                             capsys):
+    """Nothing stops an instance being named `-beta`, so `--` must reach it.
+
+    Refusing every dash-leading token is what keeps a typo from eating mail,
+    but it would otherwise make such a mailbox unreadable by name.
+    """
+    monkeypatch.setattr(op, "MUX", RecordingMux())
+    monkeypatch.setattr(op, "is_copilot_running", lambda _i: False)
+    op.send_message(["--from", "alpha", "--to", "-beta", "--force",
+                     "dash named"])
+    assert operator_mail.pending_count(op.OPERATOR_HOME, op.Instance("-beta").id) == 1
+    capsys.readouterr()
+
+    assert op.show_inbox(["-beta"]) == 2
+    assert "operator inbox -- -beta" in capsys.readouterr().err
+
+    assert op.show_inbox(["--", "-beta"]) == 0
+    assert "dash named" in capsys.readouterr().out
+
+
+def test_inbox_refuses_an_empty_mailbox_name(idle_recipient, capsys):
+    """An empty name would resolve to some other instance's mailbox."""
+    op.send_message(["--from", "alpha", "--to", "beta", "not yours"])
+    capsys.readouterr()
+    assert op.show_inbox(["--", ""]) == 2
+    assert "name is empty" in capsys.readouterr().err
     assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
 
 
