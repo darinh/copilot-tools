@@ -112,6 +112,109 @@ _ADDED_COLUMNS = {
 }
 
 
+def log_key(path) -> str:
+    """The identity of a log file in the ``sessions`` table: its full path.
+
+    ``sessions.log_file`` used to hold ``Path.name``, and a basename is half of
+    a file's identity. Copilot names a process log after a timestamp and a pid,
+    both of which repeat across directories -- a second log directory, a
+    restored backup, a second machine's logs copied in for comparison -- and
+    the column is ``UNIQUE``, so the two collapsed onto one row. Neither
+    failure said anything: with equal mtimes the second log returned
+    ``SKIP ... (already processed)`` and was never recorded at all, and with
+    differing mtimes the ``ON CONFLICT`` upsert overwrote the first session's
+    row and deleted its ``model_usage`` rows. Both spend one session's credits
+    against another session's name.
+
+    Writer and reader both call this rather than each spelling the path out,
+    for the reason :func:`project_paths.resolved_str` exists at all: the two
+    sides of a comparison have to be normalised by the same code or they
+    normalise differently. :func:`copilot_operator.manage_logs` decides from
+    this key whether a log has been ingested and may be deleted, so a
+    disagreement here deletes an unrecorded log.
+
+    ``normcase`` on top of ``resolved_str``, because that helper is not total
+    and its fallback normalises less than its main path. ``Path.resolve``
+    returns Windows' canonical capitalisation; the ``os.path.abspath``
+    fallback preserves whatever the caller typed. A log ingested once while
+    its path would not resolve and again once it would therefore yielded two
+    keys differing only in case -- two rows for one file, and its credits
+    counted twice. ``normcase`` lower-cases on Windows, where paths are
+    case-insensitive, and is the identity on POSIX, where they are not; it is
+    already how :func:`ingest_all` matches log names for the same reason.
+
+    ``normcase`` closes the case difference and nothing else, and the gap is
+    worth stating plainly rather than leaving for the next reader to discover.
+    ``resolve`` expands symlinks, directory junctions and 8.3 short names;
+    ``abspath`` is lexical and expands none of them. A path containing one of
+    those *and* ingested across a resolve failure still yields two keys, and
+    so a duplicate row. That is accepted rather than fixed, because the
+    alternative -- keying on ``abspath`` alone, which is perfectly stable --
+    gives up the expansion in every run, not just the failing one: a log dir
+    reached through a junction (how a relocated user profile is normally
+    reached on Windows) or under an 8.3 ``TEMP`` would key differently from
+    the same directory named the long way, permanently. The chosen failure
+    needs a resolve failure *and* an aliased component, and it over-counts;
+    the alternative needs only an aliased component. Neither destroys a row,
+    which is what the ordering of these trade-offs is protecting.
+    """
+    return os.path.normcase(resolved_str(path))
+
+
+def _adopt_legacy_row(conn, basename: str, row_key: str,
+                      started_at: str) -> None:
+    """Re-key a row written before ``log_file`` held a full path.
+
+    Left alone, such a row would never match again, so the first ingest after
+    the change would insert a second row for the same log and every historical
+    session would be counted twice in every report -- a silent doubling of the
+    user's recorded spend.
+
+    Adoption is evidence-driven, and the evidence is the point. A legacy row
+    names a basename and nothing else, so "there is a row with this name" is
+    exactly the ambiguity this change exists to remove; re-keying on the name
+    alone would let a log inherit the identity of a *different* session that
+    happened to share it -- and the upsert that follows would then overwrite
+    that session's row and delete its ``model_usage`` breakdown. That is the
+    original defect wearing the fix's clothes, and it destroys history rather
+    than merely mixing it.
+
+    The evidence is ``started_at`` and only ``started_at``. It is parsed from
+    the log's own first line, so it identifies the *session*: it survives the
+    log being appended to since it was last ingested, and two genuinely
+    different logs disagree on it. ``log_file_mtime`` was the obvious second
+    witness and is deliberately not consulted, because it identifies only
+    *when a file stopped changing*, to the second -- and two different
+    same-basename logs sharing an mtime is not a hypothetical, it is the exact
+    equal-mtime collision this whole change exists to stop merging silently.
+    Accepting it as corroboration (``started_at = ? OR log_file_mtime = ?``)
+    re-admitted the destructive case through the gate built to close it. The
+    column is ``NOT NULL``, so there is no row for the weaker witness to speak
+    for.
+
+    The cost of that strictness is a row whose recorded ``started_at`` is not
+    the log's own -- the previous ingest fell back to the wall clock because
+    the first line carried no timestamp. Such a row is not adopted and this
+    log gets a row of its own. That is the direction to fail in: a duplicate
+    count is a wrong number, but re-keying the wrong row hands this log the
+    older session's identity, and the upsert that follows overwrites it and
+    deletes its ``model_usage`` breakdown -- a wrong number *and* the loss of
+    the only record that could correct it.
+
+    The rename is also skipped when the full path is already present, because
+    that row is the current one; renaming onto it would fail the ``UNIQUE``
+    constraint and abort the whole ingest.
+    """
+    if row_key == basename:
+        return
+    conn.execute(
+        "UPDATE sessions SET log_file = ? "
+        "WHERE log_file = ? AND started_at = ? "
+        "AND NOT EXISTS (SELECT 1 FROM sessions WHERE log_file = ?)",
+        (row_key, basename, started_at, row_key),
+    )
+
+
 def credits_from_nano(nano_aiu) -> float:
     return (nano_aiu or 0) / NANO_AIU_PER_CREDIT
 
@@ -476,12 +579,15 @@ def ingest_file(
 
     init_db(db_path)
     basename = logfile.name
+    # The row key is the full path; `basename` survives only for the status
+    # lines, which a human reads next to a directory they already know.
+    row_key = log_key(logfile)
     mtime = _iso(logfile.stat().st_mtime)
 
     with connect(db_path) as conn:
         if not force:
             row = conn.execute(
-                "SELECT log_file_mtime FROM sessions WHERE log_file = ?", (basename,)
+                "SELECT log_file_mtime FROM sessions WHERE log_file = ?", (row_key,)
             ).fetchone()
             if row and row["log_file_mtime"] == mtime:
                 return f"SKIP {basename} (already processed)"
@@ -499,6 +605,7 @@ def ingest_file(
         # every modern session.
         if not event and credit_usage["calls"] == 0:
             ts = _extract_ts(first_line) or _now()
+            _adopt_legacy_row(conn, basename, row_key, ts)
             conn.execute(
                 """
                 INSERT INTO sessions (session_num, log_file, log_file_mtime, no_op,
@@ -510,7 +617,7 @@ def ingest_file(
                     started_at = excluded.started_at,
                     ended_at = excluded.ended_at
                 """,
-                (basename, mtime, ts, ts),
+                (row_key, mtime, ts, ts),
             )
             conn.commit()
             return f"SKIP {basename} (no usage data)"
@@ -620,6 +727,7 @@ def ingest_file(
                     f"({cost})"
                 )
 
+        _adopt_legacy_row(conn, basename, row_key, started_at)
         conn.execute(
             """
             INSERT INTO sessions (session_num, log_file, log_file_mtime, no_op,
@@ -651,7 +759,7 @@ def ingest_file(
                 raw_metrics = excluded.raw_metrics
             """,
             (
-                session_num, basename, mtime, started_at, ended_at, work_dir, branch,
+                session_num, row_key, mtime, started_at, ended_at, work_dir, branch,
                 total_premium, nano_aiu, tokens["input"], tokens["cache_read"],
                 tokens["cache_write"], tokens["output"],
                 api_time_s, session_time_s, lines_added, lines_removed,
@@ -659,7 +767,7 @@ def ingest_file(
             ),
         )
         row = conn.execute(
-            "SELECT id FROM sessions WHERE log_file = ?", (basename,)
+            "SELECT id FROM sessions WHERE log_file = ?", (row_key,)
         ).fetchone()
         session_id = row["id"]
 
