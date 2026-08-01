@@ -101,6 +101,7 @@ operator                             # interactive menu (no args)
 operator list                        # show running instances
 operator stop project-a              # stop one instance (loop + session)
 operator stop-loop project-a         # stop only the background supervisor
+operator restart-loop project-a      # replace the supervisor, keep the session
 operator stop-session project-a      # stop only the Copilot session
 operator stop                        # stop all instances
 
@@ -174,6 +175,8 @@ control them independently:
 ```bash
 operator stop-loop NAME     # stop only the supervisor; session keeps running
                              # re-attach any time with `operator join NAME`
+operator restart-loop NAME  # replace the supervisor with a fresh one, leaving
+                             # the session running
 operator stop-session NAME  # stop only the session; if the supervisor is
                              # still running it relaunches a fresh one shortly
 operator stop NAME          # stop both, cleanly, with no relaunch
@@ -183,6 +186,38 @@ This is useful when you want to keep working in a session by hand for a bit
 without the supervisor auto-restarting it out from under you (`stop-loop`),
 or you want to force a clean restart of just the Copilot process while
 leaving the crash-recovery supervisor in place (`stop-session`).
+
+### Picking up a new operator version
+
+The supervisor is a long-lived Python process that imported the operator's
+code when it started. Updating the operator therefore does **not** affect
+supervisors that are already running — they keep executing the code they
+started with, and only newly started ones pick up the change.
+
+`operator restart-loop NAME` is how a running instance adopts a new version
+without losing its work:
+
+```bash
+git pull                     # or however the operator gets updated
+operator restart-loop alpha  # alpha's supervisor is replaced; its session
+                             # keeps running, uninterrupted
+```
+
+The old supervisor is asked to detach (the same mechanism as `stop-loop`, so
+the session is never touched), and the replacement *adopts* the running
+session rather than launching a new one — the Copilot process keeps its pid,
+its scrollback and its context. Since the adopted session is the one already
+running, it keeps its session number too.
+
+`restart-loop` refuses rather than guess when it cannot do this safely:
+
+| Situation | Behaviour |
+|---|---|
+| No session running | Refuses — there is nothing to keep alive |
+| Session not owned by this operator | Refuses — it belongs to someone else |
+| No recorded loop arguments | Refuses — the replacement would differ from the original; it tells you the manual commands instead |
+| Supervisor does not stop in time | Aborts without spawning, leaving the session and its old supervisor alone |
+| No supervisor running (e.g. after `stop-loop`) | Starts one that adopts the session |
 
 ### Interactive menu
 
