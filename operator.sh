@@ -859,7 +859,15 @@ generate_run_script() {
             printf 'PREAMBLE=%q\n' "$SCRIPT_PREAMBLE"
         fi
         printf 'exec copilot'
-        for arg in "${copilot_args[@]}"; do
+        # Guarded like the loop path above, though every caller today builds
+        # this array from a non-empty defaults list. That non-emptiness is a
+        # fact about those lists, not an invariant of this function -- and the
+        # single-session list was shortened from six elements to four in
+        # cb10f72, by the same hand that had just verified these expansions as
+        # safe, without the coupling being visible from either end. This is the
+        # innermost consumer, so it inherits emptiness from every caller,
+        # including ones not written yet.
+        for arg in ${copilot_args[@]+"${copilot_args[@]}"}; do
             printf ' %q' "$arg"
         done
         if [[ -n "$SCRIPT_PREAMBLE" ]]; then
@@ -1027,7 +1035,7 @@ run_single_session() {
     log "Starting single session: $INSTANCE_NAME"
 
     SCRIPT_PREAMBLE=""
-    generate_run_script "${copilot_args[@]}"
+    generate_run_script ${copilot_args[@]+"${copilot_args[@]}"}
     start_copilot_in_tmux 1 off
 
     set_tab_title "operator - $INSTANCE_NAME"
@@ -1116,9 +1124,9 @@ run_loop_mode() {
         CURRENT_SESSION_NUM=$session_num
         save_instance_state
 
-        local launch_args=("${copilot_args[@]}")
+        local launch_args=(${copilot_args[@]+"${copilot_args[@]}"})
         if [[ -n "$resume_session_id" ]]; then
-            if args_have_explicit_session "${launch_args[@]}"; then
+            if args_have_explicit_session ${launch_args[@]+"${launch_args[@]}"}; then
                 log "  Skipping automatic --resume; user args already choose a session"
             else
                 launch_args+=("--resume=$resume_session_id")
@@ -1126,7 +1134,7 @@ run_loop_mode() {
             resume_session_id=""
         fi
 
-        generate_run_script "${launch_args[@]}"
+        generate_run_script ${launch_args[@]+"${launch_args[@]}"}
         start_copilot_in_tmux "$session_num" on
 
         local restart_requested=false

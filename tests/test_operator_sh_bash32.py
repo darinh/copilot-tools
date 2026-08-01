@@ -178,6 +178,46 @@ def test_stop_operator_kills_only_the_sessions_it_manages(tmp_path):
         f"and leave the unmarked one alone.\n{proc.stdout}")
 
 
+@bash
+def test_generate_run_script_survives_and_quotes_an_empty_argument_list(tmp_path):
+    """The innermost consumer of the argv array, run with nothing in it.
+
+    `generate_run_script` does `local copilot_args=("$@")`, so it is empty
+    exactly when its caller passed nothing -- and on bash 3.2 an empty array
+    expanded as `"${a[@]}"` under `set -u` is an unbound-variable abort, not
+    zero words. Every caller today builds the array from a non-empty defaults
+    list, which is a fact about those lists and not a property of this
+    function: cb10f72 shortened one of them from six elements to four.
+
+    The non-empty case is asserted in the same test, because a
+    `generate_run_script` that had been broken into writing nothing at all
+    would satisfy the empty case perfectly.
+    """
+    def run(*argv: str) -> str:
+        out = tmp_path / "run.sh"
+        script = (
+            "set -euo pipefail\n"
+            f'RUN_SCRIPT="{out.as_posix()}"\n'
+            'SCRIPT_PREAMBLE=""\n'
+            f"generate_run_script() {{\n{_shell_function('generate_run_script')}}}\n"
+            'generate_run_script "$@"\n'
+        )
+        proc = _run(script, tmp_path, *argv)
+        assert proc.returncode == 0, (
+            f"generate_run_script({list(argv)}) did not survive this bash:\n"
+            f"{proc.stderr}")
+        return out.read_text(encoding="utf-8")
+
+    assert run().splitlines()[-1] == "exec copilot"
+
+    # The positive control, and the reason the guard has to preserve quoting
+    # rather than merely avoid the abort: an unquoted expansion would word-split
+    # this argument into two and launch with a prompt the user did not write.
+    launched = run("--yolo", "-p", "two words").splitlines()[-1]
+    assert launched.startswith("exec copilot --yolo -p ")
+    assert launched.endswith("two\\ words") or launched.endswith("'two words'"), launched
+
+
 def test_operator_sh_uses_no_bash_4_only_declarations():
     """A tripwire, and deliberately a textual one.
 
