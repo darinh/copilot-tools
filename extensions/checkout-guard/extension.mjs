@@ -50,8 +50,8 @@ import {
   newEntries,
   primaryCheckoutRoot,
   primaryStrayReport,
-  scanCheckout,
-  scanPrimaryCheckout,
+  rootToWatch,
+  scanCheckoutTree,
   sessionBriefing,
   strayReport,
   sweepDecision,
@@ -92,13 +92,22 @@ const primaryRoots = new Map();
  *
  * Returns null when the agent is already working in the primary, so the two
  * roots are never scanned as if they were separate places.
+ *
+ * A lookup that FAILED is not cached. `primaryCheckoutRoot` reports that case
+ * as `UNKNOWN_ROOT` rather than as null precisely so this can tell the two
+ * apart: caching an answer derived from one timed-out `git worktree list`
+ * would disable primary-root watching for the whole session, silently, and the
+ * session would look exactly like one that had nothing to watch.
  */
 async function otherRootToWatch(root) {
   if (primaryRoots.has(root)) return primaryRoots.get(root);
-  const primary = await primaryCheckoutRoot(process.cwd());
-  const other = primary && primary !== root ? primary : null;
-  primaryRoots.set(root, other);
-  return other;
+  // Resolved from `root`, not from `process.cwd()`. They are normally the same
+  // repository -- `root` was derived from the cwd -- but asking about the root
+  // being watched is the question actually being answered, and it cannot drift
+  // into reporting on some unrelated repository the process happens to sit in.
+  const { watch, cache } = rootToWatch(root, await primaryCheckoutRoot(root));
+  if (cache) primaryRoots.set(root, watch);
+  return watch;
 }
 
 function setFor(map, root) {
@@ -136,7 +145,7 @@ function relativeToCheckout(root, filePath) {
  * agent's artifact is a refusal whose cost lands on the wrong asset -- and on
  * work that has nothing to do with the thing being protected.
  */
-async function observe(root, { blocking = true, scan = scanCheckout } = {}) {
+async function observe(root, { blocking = true, scan = scanCheckoutTree } = {}) {
   const current = await scan(root);
   if (current === null) return [];
   const seen = lastSeen.get(root);
@@ -175,14 +184,14 @@ const session = await joinSession({
       }
       const root = await checkoutRoot(process.cwd());
       if (root) {
-        const initial = await scanCheckout(root);
+        const initial = await scanCheckoutTree(root);
         if (initial !== null) lastSeen.set(root, initial);
         // Seed the primary too, or its entire contents would read as new the
         // first time a command is run and every existing file in it would be
         // reported as this agent's doing.
         const other = await otherRootToWatch(root);
         if (other) {
-          const seedOther = await scanPrimaryCheckout(other);
+          const seedOther = await scanCheckoutTree(other);
           if (seedOther !== null) lastSeen.set(other, seedOther);
         }
       }
@@ -245,13 +254,17 @@ const session = await joinSession({
       if (!SHELL_TOOLS.has(input.toolName) && !SUBAGENT_TOOLS.has(input.toolName)) return;
       const fresh = await observe(root);
       // The primary is scanned as well as, never instead of, the working
-      // checkout. A subagent writing into the cwd is the commoner case and the
-      // one the working-checkout scan already catches; a subagent writing into
-      // the primary while its parent sits in a worktree is the case that had
-      // nothing watching it at all.
-      const other = await otherRootToWatch(root);
+      // checkout -- but only after a SUBAGENT call, not after every command.
+      //
+      // Both real incidents came from subagents, and the restriction is what
+      // keeps this from being noise: the primary is shared, so scanning it
+      // after every shell command would report every peer agent's artifacts to
+      // every other agent, and a guard that cries wolf gets switched off. This
+      // agent's own shell commands cannot surprise it in another tree -- it
+      // would have had to name the path.
+      const other = SUBAGENT_TOOLS.has(input.toolName) ? await otherRootToWatch(root) : null;
       const elsewhere = other
-        ? await observe(other, { blocking: false, scan: scanPrimaryCheckout })
+        ? await observe(other, { blocking: false, scan: scanCheckoutTree })
         : [];
       if (fresh.length === 0 && elsewhere.length === 0) return;
       const reports = [];
@@ -264,3 +277,6 @@ const session = await joinSession({
   },
   tools: [],
 });
+
+
+

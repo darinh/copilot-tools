@@ -11,7 +11,7 @@ edits here take effect on the next session).
 | `lint-on-edit`         | `onPostToolUse` | Runs ESLint or `ruff` on the changed file when the project supports it. |
 | `security-shield`      | `onPreToolUse`  | Blocks destructive shell commands (`rm -rf /`, force-push to `main`, fork bombs, etc.) and obvious secret commits. |
 | `test-enforcer`        | `onPreToolUse`  | Blocks `git commit` if source files were modified without tests in the same session. |
-| `checkout-guard`       | session start + `onPreToolUse` + `onPostToolUse` | Names a scratch directory, reports untracked artifacts the moment they appear in the checkout, and blocks a blanket `git add -A` / `git stash -u` while they are outstanding. |
+| `checkout-guard`       | session start + `onPreToolUse` + `onPostToolUse` | Names a scratch directory, reports untracked artifacts the moment they appear in the checkout — and in the repository's primary checkout when the session is in a linked worktree — and blocks a blanket `git add -A` / `git stash -u` while they are outstanding. |
 | `architecture-enforcer` | `onPostToolUse` | Surfaces import-boundary violations defined in a per-project `.copilot-architecture.json`. |
 
 ## Knobs
@@ -37,12 +37,26 @@ Writing it down did not work, so this extension enforces it:
 - **Session start** creates `<tmp>/copilot-scratch/session-<pid>` and tells the
   agent the path, so the correct place to write is discoverable rather than
   merely mandated. The briefing says to pass the same path to subagents,
-  because their shell commands land in the parent's checkout.
+  because a subagent starts its own shell in a directory the parent did not
+  choose, and a relative path resolves against that.
 - **After every command that can run code** — including `task`, since a
   subagent's writes are invisible to the parent otherwise — the checkout is
   rescanned and anything new is reported immediately, while the producer is
   still known. Attribution is the point: an artifact found later fits every
   explanation equally well.
+- **When the session is inside a linked worktree, the repository's primary
+  checkout is watched as well.** `git rev-parse --show-toplevel` answers the
+  worktree, so a session in `.worktrees/<branch>` used to be watching only that
+  tree — while its subagents, starting in a directory nobody chose, wrote into
+  the primary. That is not hypothetical: three artifacts appeared in this
+  repository's primary checkout while their author worked in a worktree, and
+  the guard reported clean in the same words it uses when nothing happened. It
+  is a union and not a replacement; watching only the primary would go blind to
+  the commoner case. The second tree is scanned **only after a subagent call**,
+  not after every shell command: both real incidents came from subagents, and
+  the primary is shared, so scanning it after every command would report every
+  peer agent's artifacts to every other agent. This agent's own shell commands
+  cannot surprise it in a tree it would have had to name the path of.
 - **A blanket `git add -A`, or a `git stash` taking untracked files, is denied**
   while artifacts are outstanding. Staging a path by name is always allowed —
   including `git add -A keep.txt`, because git itself scopes `-A` to the
@@ -50,8 +64,27 @@ Writing it down did not work, so this extension enforces it:
   being committed, it is to stop one being committed *unnoticed* — so the
   escape hatch is to name the file, which is what turns it into a decision.
 
-Two things it does deliberately:
+Four things it does deliberately:
 
+- **A stray in the primary checkout is reported but never blocks.** It cannot
+  deny a `git add -A` in the worktree, and the report does not tell anyone to
+  delete anything. The primary is shared with peer agents, so from here a
+  subagent's leftovers and a peer's live experiment are indistinguishable —
+  and refusing this agent's commit over another agent's file is a refusal whose
+  cost lands on a different asset than the one being protected.
+- **Linked worktrees are excluded from every scan**, using the paths git
+  reports rather than the `.worktrees/` name, so a worktree placed elsewhere is
+  still recognised. `INTRINSIC_EXCLUSIONS` looks like it covers this and does
+  not — it is consulted for empty-directory candidates and ignore lookups, not
+  for git's own untracked records. In *this* repository that is invisible,
+  because `.gitignore` lists `/.worktrees/` and those paths never reach the
+  scan; there the exclusion is defence in depth rather than the thing standing
+  between you and a false report. It bites where a worktree lands somewhere the
+  ignore rules do not cover — `git worktree add <anywhere>` makes that a
+  one-liner — and this extension ships to projects with no such convention at
+  all. The exclusion applies to the working checkout as well as the primary:
+  an agent in the primary would otherwise have its own `git add -A` *denied*
+  because a peer created a worktree beside it.
 - **It asks git what is ignored** (`check-ignore`) instead of carrying its own
   list of build-output directory names. A first draft hardcoded `target/` as
   conventional build output; `target/` was one of the two real artifacts in

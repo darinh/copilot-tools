@@ -29,9 +29,12 @@ import {
   parseUntracked,
   nestedWorktreePrefixes,
   primaryCheckoutRoot,
+  rootToWatch,
+  UNKNOWN_ROOT,
   primaryStrayReport,
   scanCheckout,
-  scanPrimaryCheckout,
+  scanCheckoutTree,
+  withoutNestedWorktrees,
   sessionBriefing,
   stashTakesUntracked,
   strayReport,
@@ -757,16 +760,20 @@ test("a stray in the primary is invisible to a worktree scan and visible to the 
     // at. Without this, the `false` below is satisfied by a scan that is
     // simply broken.
     await writeFile(join(worktree, "in_worktree.py"), "scratch\n");
-    const wtScan = await scanCheckout(await checkoutRoot(worktree));
+    const wtScan = await scanCheckoutTree(await checkoutRoot(worktree));
     assert.ok(wtScan.includes("in_worktree.py"),
       `control: the worktree scan finds its own stray: ${JSON.stringify(wtScan)}`);
 
     // The incident: a subagent writes into the primary while the agent is here.
     await writeFile(join(primary, "test_order.py"), "scratch\n");
-    const blind = await scanCheckout(await checkoutRoot(worktree));
+    const blind = await scanCheckoutTree(await checkoutRoot(worktree));
     assert.ok(!blind.includes("test_order.py"),
       "the old single-root scan cannot see the primary -- this is the defect");
-    const watched = await scanCheckout(await primaryCheckoutRoot(worktree));
+    // Deliberately the shipped call: root resolution AND the scan that the
+    // extension actually invokes. Reaching for `scanCheckout` here would leave
+    // this test green with the new scan function deleted, testing git's
+    // behaviour rather than any code in this change.
+    const watched = await scanCheckoutTree(await primaryCheckoutRoot(worktree));
     assert.ok(watched.includes("test_order.py"),
       `the primary scan sees it: ${JSON.stringify(watched)}`);
   });
@@ -790,13 +797,13 @@ test("watching the primary does not report the worktrees directory itself", asyn
     assert.ok(raw.some((p) => p.startsWith(".worktrees")),
       `premise: git reports a nested worktree as untracked: ${JSON.stringify(raw)}`);
 
-    const found = await scanPrimaryCheckout(primary);
+    const found = await scanCheckoutTree(primary);
     assert.ok(!found.some((p) => p.startsWith(".worktrees")),
       `.worktrees is a checkout, not repository content: ${JSON.stringify(found)}`);
     // Control: this scan does find real strays in the same tree, so the clean
     // result above is an exclusion working rather than a scan seeing nothing.
     await writeFile(join(primary, "probe.py"), "scratch\n");
-    assert.ok((await scanPrimaryCheckout(primary)).includes("probe.py"),
+    assert.ok((await scanCheckoutTree(primary)).includes("probe.py"),
       "control: the primary scan is not simply blind");
   });
 });
@@ -816,7 +823,7 @@ test("the worktree exclusion is derived from git, not from the .worktrees name",
     assert.ok(prefixes.includes(".worktrees/feat/"), JSON.stringify(prefixes));
     assert.ok(!prefixes.some((p) => p === "/" || p === ""), "the primary is not its own nested worktree");
 
-    const found = await scanPrimaryCheckout(primary);
+    const found = await scanCheckoutTree(primary);
     assert.ok(!found.some((p) => p.startsWith("scratch-checkout")),
       `a worktree is a checkout wherever it lives: ${JSON.stringify(found)}`);
   });
@@ -860,11 +867,86 @@ test("primaryCheckoutRoot returns null for a bare main worktree", async () => {
   }
 });
 
-test("primaryCheckoutRoot returns null outside a repository", async () => {
+test("an unanswered worktree list is not an answer of 'no worktrees'", () => {
+  // The propagation, which the two halves being individually correct does not
+  // establish: a null from either question has to arrive at the caller as
+  // null. `found` returned here would name the agent's own worktree as a stray
+  // in the primary, on every command after one transient git failure.
+  assert.equal(withoutNestedWorktrees(["a.py", ".worktrees/x/"], null), null,
+    "no list of worktrees: the honest result is 'I do not know'");
+  assert.equal(withoutNestedWorktrees(null, [".worktrees/x/"]), null,
+    "no scan: nothing to filter and nothing to claim");
+  // Controls, so the assertions above are about null and not about the filter
+  // being broken in general.
+  assert.deepEqual(withoutNestedWorktrees(["a.py", ".worktrees/x/"], [".worktrees/x/"]),
+    ["a.py"], "a real list really does filter");
+  assert.deepEqual(withoutNestedWorktrees(["a.py"], []), ["a.py"],
+    "a real answer of 'no nested worktrees' passes everything through");
+});
+
+test("primaryCheckoutRoot reports a failed lookup as UNKNOWN_ROOT, not as null", async () => {
   const base = await mkdtemp(join(tmpdir(), "checkout-guard-norepo-"));
   try {
-    assert.equal(await primaryCheckoutRoot(await realpath(base)), null);
+    const root = await realpath(base);
+    // Premise: git must actually FAIL here, or this is testing the parser
+    // rather than the failure path it claims to cover.
+    const probe = await git(["worktree", "list", "--porcelain"], root);
+    assert.equal(probe.ok, false, "premise: git refuses outside a repository");
+    assert.equal(await primaryCheckoutRoot(root), UNKNOWN_ROOT);
   } finally {
     await rm(base, { recursive: true, force: true, maxRetries: 3 });
   }
 });
+
+test("a failed lookup is never cached, a real answer always is", () => {
+  // The distinction this encodes: `null` is a claim about the repository and
+  // UNKNOWN_ROOT is a claim about the attempt. The session caches this once,
+  // so remembering an answer derived from one timed-out `git worktree list`
+  // would disable primary-root watching for the rest of the session -- and the
+  // result would be indistinguishable from a session with nothing to watch.
+  assert.deepEqual(rootToWatch("/repo/.worktrees/x", UNKNOWN_ROOT),
+    { watch: null, cache: false }, "a failure must be retried, not remembered");
+  // Controls: every answer that is a real answer IS remembered, so the
+  // assertion above is about failure and not about caching being broken.
+  assert.deepEqual(rootToWatch("/repo/.worktrees/x", "/repo"),
+    { watch: "/repo", cache: true });
+  assert.deepEqual(rootToWatch("/repo", "/repo"),
+    { watch: null, cache: true }, "already in the primary: nothing else to watch");
+  assert.deepEqual(rootToWatch("/repo", null),
+    { watch: null, cache: true }, "bare: a real answer that there is no working tree");
+});
+
+test("a failed worktree lookup does not become an empty list of worktrees", async () => {
+  // The census bug: `[]` from a failed lookup reads as "there are no nested
+  // worktrees", and every worktree in the tree is then reported as a stray.
+  const base = await mkdtemp(join(tmpdir(), "checkout-guard-norepo2-"));
+  try {
+    const root = await realpath(base);
+    const probe = await git(["worktree", "list", "--porcelain"], root);
+    assert.equal(probe.ok, false, "premise: the lookup really does fail here");
+    assert.equal(await nestedWorktreePrefixes(root), null,
+      "null means 'could not find out', which is not the same as 'none'");
+  } finally {
+    await rm(base, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test("the worktree exclusion applies to the tree the agent is working in too", async () => {
+  // Not just to the primary. An agent working in the primary would otherwise
+  // have its own `git add -A` denied because a peer created a worktree beside
+  // it -- the same false positive, with a blocking consequence instead of an
+  // advisory one.
+  await withWorktree(async ({ primary }) => {
+    const odd = join(primary, "peer-checkout");
+    const { ok } = await git(["worktree", "add", "-q", odd, "-b", "peer"], primary);
+    assert.ok(ok, "premise: the peer worktree was created");
+    const raw = await scanCheckout(primary);
+    assert.ok(raw.some((p) => p.startsWith("peer-checkout")),
+      `premise: the raw scan does report it: ${JSON.stringify(raw)}`);
+    const found = await scanCheckoutTree(primary);
+    assert.ok(!found.some((p) => p.startsWith("peer-checkout")),
+      `the scan the extension uses excludes it: ${JSON.stringify(found)}`);
+  });
+});
+
+
