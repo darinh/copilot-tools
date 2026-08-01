@@ -125,6 +125,12 @@ operator restore myproject           # reopen one tracked tab by name
 operator restore --all --dry-run     # preview without launching anything
 ```
 
+A `—` in a report means *not measured*, not zero. API time, session duration and
+line counts come only from a `session_shutdown` telemetry event that current
+Copilot CLI versions usually do not write, so those columns are left empty
+rather than filled with a zero that would read as a real measurement. Credit,
+token and cost figures come from a different source and are always present.
+
 ## Modes
 
 ### Single Session (default)

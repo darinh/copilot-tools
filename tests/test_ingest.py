@@ -7,6 +7,7 @@ import pytest
 
 import operator_ingest
 from conftest import make_log
+from test_billing import usage_response
 
 
 def test_init_db_creates_schema(db_path):
@@ -153,6 +154,36 @@ def test_ingest_records_metrics(tmp_path, db_path):
     assert row["session_time_seconds"] == 1800
     assert row["lines_added"] == 10
     assert row["lines_removed"] == 2
+
+
+def test_absent_shutdown_event_records_unknown_not_zero(tmp_path, db_path):
+    """Copilot CLI 1.0.77 stopped emitting session_shutdown in most logs (only
+    3 of 50 real logs had one), so these four fields have no source. Writing 0
+    would be a fabricated measurement: "this session changed no code" would be
+    indistinguishable from "nobody looked", and every average over the column
+    would be silently dragged toward zero by sessions that were never measured.
+    NULL keeps unknown and zero distinguishable."""
+    log = make_log(tmp_path / "process-1700000000000-4243.log",
+                   extra_text=usage_response())
+    text = log.read_text(encoding="utf-8")
+    # Keep the usage blocks (so the row is still ingested) but drop the
+    # shutdown event, reproducing what the real logs now look like.
+    start = text.index('2026-07-27T10:30:00.000Z [telemetry] {')
+    end = text.index('2026-07-27T10:30:05.000Z')
+    log.write_text(text[:start] + text[end:], encoding="utf-8")
+
+    result = operator_ingest.ingest_file(log, db_path, session_num=4)
+    assert result.startswith("OK"), result
+    with operator_ingest.connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM sessions").fetchone()
+
+    for column in ("api_time_seconds", "session_time_seconds",
+                   "lines_added", "lines_removed"):
+        assert row[column] is None, f"{column} must be NULL, not {row[column]!r}"
+    assert "unknown" in row["raw_metrics"]
+    # The cost/token path does not depend on the shutdown event, so it must
+    # still have produced real numbers rather than degrading along with it.
+    assert row["nano_aiu"] > 0
 
 
 def test_premium_requests_sum_usage_events(tmp_path, db_path):

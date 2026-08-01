@@ -489,10 +489,21 @@ def ingest_file(
         nano_aiu = credit_usage["nano_aiu"]
         tokens = credit_usage["tokens"]
 
-        api_time_s = int((metrics.get("total_api_duration_ms", 0) or 0) / 1000)
-        session_time_s = int((metrics.get("session_duration_ms", 0) or 0) / 1000)
-        lines_added = metrics.get("lines_added", 0) or 0
-        lines_removed = metrics.get("lines_removed", 0) or 0
+        # A shutdown event is the only source of these four. When the CLI does
+        # not emit one, recording 0 would be a lie that reads as a measurement:
+        # "this session changed no code" is indistinguishable from "nobody
+        # looked". NULL keeps unknown and zero distinguishable, so an average
+        # over these columns cannot be silently dragged down by absent data.
+        def _measured(key, scale=1):
+            if key not in metrics:
+                return None
+            value = metrics.get(key) or 0
+            return int(value / scale)
+
+        api_time_s = _measured("total_api_duration_ms", 1000)
+        session_time_s = _measured("session_duration_ms", 1000)
+        lines_added = _measured("lines_added")
+        lines_removed = _measured("lines_removed")
 
         started_at = _extract_ts(first_line) or _now()
         ended_at = _extract_ts(last_line) or _now()
@@ -539,15 +550,22 @@ def ingest_file(
             ]
         else:
             raw_lines = [f"Total usage est: {total_premium} Premium requests"]
-        raw_lines.append(f"API time spent: {api_time_s}s")
-        if session_time_s >= 3600:
+        raw_lines.append(
+            "API time spent: unknown" if api_time_s is None
+            else f"API time spent: {api_time_s}s")
+        if session_time_s is None:
+            raw_lines.append("Total session time: unknown")
+        elif session_time_s >= 3600:
             h, rem = divmod(session_time_s, 3600)
             mn, sec = divmod(rem, 60)
             raw_lines.append(f"Total session time: {h}h {mn}m {sec}s")
         else:
             mn, sec = divmod(session_time_s, 60)
             raw_lines.append(f"Total session time: {mn}m {sec}s")
-        raw_lines.append(f"Total code changes: +{lines_added} -{lines_removed}")
+        raw_lines.append(
+            "Total code changes: unknown"
+            if lines_added is None or lines_removed is None
+            else f"Total code changes: +{lines_added} -{lines_removed}")
         if models:
             raw_lines.append("Breakdown by AI model:")
             for name in sorted(
@@ -636,8 +654,10 @@ def ingest_file(
     else:
         summary = f"{total_premium} premium"
     return (
-        f"OK {basename}: {summary}, {api_time_s}s api, "
-        f"+{lines_added} -{lines_removed}"
+        f"OK {basename}: {summary}, "
+        f"{'?' if api_time_s is None else api_time_s}s api, "
+        + ("+? -?" if lines_added is None or lines_removed is None
+           else f"+{lines_added} -{lines_removed}")
     )
 
 

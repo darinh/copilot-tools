@@ -28,6 +28,30 @@ def sql_esc(s):
     return str(s).replace("'", "''")
 
 
+def measured(metrics, key, scale=1):
+    """The metric, or None when the shutdown event never reported it.
+
+    Defaulting to 0 would fabricate a measurement: "this session changed no
+    code" would be indistinguishable from "nobody looked", and every average
+    over the column would be dragged toward zero by sessions never observed.
+    Kept identical to operator_ingest.py so both ingesters agree.
+    """
+    if key not in metrics:
+        return None
+    return int((metrics.get(key) or 0) / scale)
+
+
+def sql_num(value):
+    """SQL literal for a number that may be unknown."""
+    return 'NULL' if value is None else str(int(value))
+
+
+def fmt_changes(added, removed):
+    if added is None or removed is None:
+        return "unknown"
+    return f"+{added} -{removed}"
+
+
 def fmt_tokens(n):
     n = int(n)
     if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
@@ -158,13 +182,10 @@ def main():
     usage_models, usage_premium = extract_premium_from_usage(logfile)
     total_premium = usage_premium if usage_premium > 0 else metrics.get('total_premium_requests', 0)
 
-    api_duration_ms = metrics.get('total_api_duration_ms', 0)
-    session_duration_ms = metrics.get('session_duration_ms', 0)
-    lines_added = metrics.get('lines_added', 0)
-    lines_removed = metrics.get('lines_removed', 0)
-
-    api_time_s = int(api_duration_ms / 1000)
-    session_time_s = int(session_duration_ms / 1000)
+    api_time_s = measured(metrics, 'total_api_duration_ms', 1000)
+    session_time_s = measured(metrics, 'session_duration_ms', 1000)
+    lines_added = measured(metrics, 'lines_added')
+    lines_removed = measured(metrics, 'lines_removed')
 
     # Timestamps from head/tail
     first_line, _ = run_cmd(['head', '-1', logfile])
@@ -221,15 +242,19 @@ def main():
 
     # Build raw summary
     raw_lines = [f"Total usage est: {total_premium} Premium requests",
-                 f"API time spent: {api_time_s}s"]
-    if session_time_s >= 3600:
+                 "API time spent: unknown" if api_time_s is None
+                 else f"API time spent: {api_time_s}s"]
+    if session_time_s is None:
+        raw_lines.append("Total session time: unknown")
+    elif session_time_s >= 3600:
         h, rem = divmod(session_time_s, 3600)
         mn, s = divmod(rem, 60)
         raw_lines.append(f"Total session time: {h}h {mn}m {s}s")
     else:
         mn, s = divmod(session_time_s, 60)
         raw_lines.append(f"Total session time: {mn}m {s}s")
-    raw_lines.append(f"Total code changes: +{lines_added} -{lines_removed}")
+    raw_lines.append(
+        f"Total code changes: {fmt_changes(lines_added, lines_removed)}")
     if models:
         raw_lines.append("Breakdown by AI model:")
         for name in sorted(models, key=lambda n: -int(models[n].get('request_cost', 0))):
@@ -248,8 +273,8 @@ def main():
         VALUES ({args.session_num}, '{sql_esc(log_basename)}', '{sql_esc(file_mtime)}',
                 '{sql_esc(start_time)}', '{sql_esc(end_time)}',
                 '{sql_esc(work_dir)}', '{sql_esc(git_branch)}',
-                {total_premium}, {api_time_s}, {session_time_s},
-                {lines_added}, {lines_removed}, '{sql_esc(chr(10).join(raw_lines))}')
+                {total_premium}, {sql_num(api_time_s)}, {sql_num(session_time_s)},
+                {sql_num(lines_added)}, {sql_num(lines_removed)}, '{sql_esc(chr(10).join(raw_lines))}')
         ON CONFLICT(log_file) DO UPDATE SET
             log_file_mtime = '{sql_esc(file_mtime)}',
             no_op = 0,
@@ -258,10 +283,10 @@ def main():
             work_dir = '{sql_esc(work_dir)}',
             git_branch = '{sql_esc(git_branch)}',
             premium_requests = {total_premium},
-            api_time_seconds = {api_time_s},
-            session_time_seconds = {session_time_s},
-            lines_added = {lines_added},
-            lines_removed = {lines_removed},
+            api_time_seconds = {sql_num(api_time_s)},
+            session_time_seconds = {sql_num(session_time_s)},
+            lines_added = {sql_num(lines_added)},
+            lines_removed = {sql_num(lines_removed)},
             raw_metrics = '{sql_esc(chr(10).join(raw_lines))}';
         SELECT id FROM sessions WHERE log_file = '{sql_esc(log_basename)}';
     """)
@@ -279,7 +304,9 @@ def main():
                     '{fmt_tokens(md.get("cache_read_tokens", 0))}', {mc});
         """)
 
-    print(f"OK {log_basename}: {total_premium} premium, {api_time_s}s api, +{lines_added} -{lines_removed}")
+    print(f"OK {log_basename}: {total_premium} premium, "
+          f"{'?' if api_time_s is None else api_time_s}s api, "
+          f"{fmt_changes(lines_added, lines_removed)}")
     for name in sorted(models, key=lambda n: -int(models[n].get('request_cost', 0))):
         md = models[name]
         mc = int(md.get('request_cost', 0))

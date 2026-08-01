@@ -524,7 +524,7 @@ report_metrics() {
                                    (session_time_seconds / 3600) || 'h ' || ((session_time_seconds % 3600) / 60) || 'm'
                                ELSE (session_time_seconds / 60) || 'm ' || (session_time_seconds % 60) || 's'
                            END, '—') AS sess_time,
-                       '+' || COALESCE(lines_added,0) || ' -' || COALESCE(lines_removed,0) AS changes,
+                       COALESCE('+' || lines_added || ' -' || lines_removed, '—') AS changes,
                        COALESCE(substr(git_branch,1,20),'—') AS branch,
                        COALESCE(replace(work_dir, '${home_esc}', '~'), '—') AS project
                 FROM sessions WHERE no_op = 0 ORDER BY id DESC LIMIT 20;
@@ -549,7 +549,7 @@ report_metrics() {
                 SELECT COALESCE(replace(work_dir, '${home_esc}', '~'), '—') AS project,
                        COALESCE(SUM(premium_requests), 0) AS total_premium,
                        COUNT(*) AS sessions,
-                       COALESCE(SUM(api_time_seconds), 0) || 's' AS total_api_time
+                       COALESCE(SUM(api_time_seconds) || 's', '—') AS total_api_time
                 FROM sessions WHERE no_op = 0
                 GROUP BY work_dir
                 ORDER BY total_premium DESC;
@@ -600,14 +600,14 @@ show_run_summary() {
         SELECT
             COUNT(*) AS sessions,
             COALESCE(SUM(premium_requests), 0) AS total_premium,
-            COALESCE(SUM(api_time_seconds), 0) || 's' AS total_api_time,
+            COALESCE(SUM(api_time_seconds) || 's', '—') AS total_api_time,
             COALESCE(
                 CASE
                     WHEN SUM(session_time_seconds) >= 3600 THEN
                         (SUM(session_time_seconds) / 3600) || 'h ' || ((SUM(session_time_seconds) % 3600) / 60) || 'm'
-                    ELSE COALESCE((SUM(session_time_seconds) / 60) || 'm ' || (SUM(session_time_seconds) % 60) || 's', '0s')
-                END, '0s') AS total_sess_time,
-            '+' || COALESCE(SUM(lines_added), 0) || ' -' || COALESCE(SUM(lines_removed), 0) AS total_changes,
+                    ELSE (SUM(session_time_seconds) / 60) || 'm ' || (SUM(session_time_seconds) % 60) || 's'
+                END, '—') AS total_sess_time,
+            COALESCE('+' || SUM(lines_added) || ' -' || SUM(lines_removed), '—') AS total_changes,
             printf('\$%.2f', COALESCE(SUM(premium_requests), 0) * 0.04) AS est_cost
         FROM sessions
         WHERE no_op = 0 AND ended_at >= '${OPERATOR_RUN_STARTED}';
