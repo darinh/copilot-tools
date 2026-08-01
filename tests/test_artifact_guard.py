@@ -7,6 +7,7 @@ It failed as an unenforceable convention; these tests keep it a check.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -386,3 +387,77 @@ def test_an_unreadable_catalog_at_teardown_yields_no_verdict(tmp_path: Path,
 
     assert conftest._catalog_complaint(before, "t") is None
     assert not list(tmp_path.glob("catalog.csv.pre-test-*"))
+
+
+def test_the_documented_bank_name_is_the_one_the_guard_writes(
+        tmp_path: Path, monkeypatch):
+    """The name in docs/operator.md is the name that actually appears on disk.
+
+    A reader who finds one of these beside their catalog has one way to learn
+    what it is: search for the name. That only works while the documented name
+    and the produced name are the same string, and nothing else checks it --
+    the guard is silent in every passing run, so a rename here would stay
+    invisible until the day it mattered, which is the day somebody has just
+    lost their registrations.
+
+    The prefix is read out of the documentation rather than written down a
+    second time here, so changing the suffix in ``_bank`` without touching the
+    docs fails this test rather than passing it.
+
+    Every occurrence is checked, not the first one. A search-and-check that
+    stops at the first hit passes while the Files table -- the place a reader
+    actually looks something up -- carries a stale name, because the prose two
+    paragraphs below still carries the right one. The population is all of
+    them; taking the first is the same narrowing that let the original loss
+    through.
+    """
+    docs = (Path(__file__).resolve().parent.parent
+            / "docs" / "operator.md").read_text(encoding="utf-8")
+    documented = re.findall(r"catalog\.csv\.pre-test-[^\s`|]*", docs)
+    assert documented, "docs/operator.md does not name the banked copy at all"
+
+    # Named in the Files table specifically, since that is the index rather
+    # than a mention in passing, and checked as a literal so that renaming the
+    # row cannot be absorbed by a correct mention elsewhere in the file.
+    rows = [line for line in docs.splitlines()
+            if line.startswith("| `~/.copilot/projects/catalog.csv.pre-test-")]
+    assert rows, "the banked copy is not listed in the Files table"
+    table_name = re.search(r"catalog\.csv\.pre-test-[^\s`|]*", rows[0]).group(0)
+    assert "<" in table_name, (
+        f"the Files table names no placeholder for the varying part: {rows[0]!r}")
+    # The one form of the name the docs are entitled to use without a
+    # placeholder, taken from the table rather than written down here so that
+    # it cannot drift from the row this test just validated.
+    stem = table_name.split("<")[0]
+
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_bytes(b"rows\n")
+    _aim_at(monkeypatch, catalog)
+
+    banked = conftest._bank(b"rows\n")
+
+    assert banked is not None
+    for occurrence in documented:
+        # A mention that ends a sentence picks up the full stop, which is
+        # prose and not part of the name. Ambiguous in principle; in practice
+        # this guard does not write a name ending in punctuation.
+        occurrence = occurrence.rstrip(".,;:)")
+        parts = [p for p in re.split(r"(<[^>]*>)", occurrence) if p]
+        if any(p.startswith("<") for p in parts):
+            # A template names the whole shape, so the whole shape is the
+            # claim. Checking only the stem would let a documented
+            # ``...<timestamp>.bak`` pass on the strength of its prefix while
+            # naming a file that never appears.
+            shape = "".join(".+" if p.startswith("<") else re.escape(p)
+                            for p in parts)
+            matches = re.fullmatch(shape, banked.name) is not None
+        else:
+            # A bare mention is allowed to be the stem and nothing else.
+            # Accepting any prefix would accept ``...pre-test-2``, which is a
+            # prefix of a real name only by the accident of what today's
+            # timestamp starts with, and is not a name anything ever writes.
+            matches = occurrence == stem
+        assert matches, (
+            f"the guard writes {banked.name!r} but docs/operator.md documents "
+            f"{occurrence!r}: a reader searching for the documented name finds "
+            "nothing")

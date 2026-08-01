@@ -651,11 +651,56 @@ logs.
 | `~/.operator/messages/<id>/archive/` | Messages already delivered, kept as an audit trail |
 | `~/.operator/backups/` | Historical backups of the operator script |
 | `~/.copilot/projects/catalog.csv` | Maps a project root to its `{guid}` |
+| `~/.copilot/projects/catalog.csv.pre-test-<timestamp>` | The catalog as it was before a test run overwrote it. Written by this repository's test suite, only when that happens, and [never removed automatically](#banked-catalog-copies) |
 | `~/.copilot/projects/{guid}/next-session.md` | Session handoff, written by `handoff`, deleted by the session that reads it |
 | `~/.copilot/projects/{guid}/superseded/` | Handoffs that were replaced before anyone read them. Timestamped, append-only, [never pruned](#superseded-handoffs) |
 | `~/.copilot/logs/process-*.log` | Copilot process logs (override with `COPILOT_LOG_DIR`) |
 
 > **Note**: Operator state used to live under `~/.copilot/`, but the copilot CLI itself wholesale-deletes `~/.copilot/restart/` on every startup (confirmed via fatrace). State was moved to `~/.operator/` to eliminate the collision. On first run the operator automatically migrates any legacy state from `~/.copilot/` into `~/.operator/`.
+
+### Banked catalog copies
+
+`catalog.csv.pre-test-<timestamp>` is not a routine artifact. One existing means
+something went wrong, and it is worth knowing what before you delete it.
+
+The catalog is registration data. No code in this repository writes it — both
+`handoff_tool` and `copilot_operator` only read it — so it changes when a human
+or an agent registers a project, and at no other time. It was nevertheless
+destroyed once, wholesale, by a test run that pointed at the real home instead
+of a temporary one and rewrote the file with a single fixture row. Eight project
+registrations went with it. Nothing failed at the time; it surfaced minutes later
+when `handoff` refused to start, by which point nothing connected the two events.
+
+So this repository's test suite now reads the catalog before every test and
+compares the bytes afterwards. If they differ, it copies the **old** bytes to
+`catalog.csv.pre-test-<timestamp>` beside the original and fails the test that
+did it, naming the test and printing the previous contents inline. The copy is
+created exclusively, so a bank never overwrites a bank.
+
+Two things it deliberately does not do.
+
+It does not compare names. The guard that watches for stray files elsewhere
+diffs the set of filenames before and after each test, which cannot see a file
+overwritten in place — the name is there both times, the difference is empty,
+and it reports clean in exactly the words it uses when nothing happened. That is
+how the loss went unnoticed. Content is the only population that contains the
+event.
+
+It does not put the file back. Restoring assumes the new contents are the test's
+doing, and the file has a second writer that arrives without announcement: an
+agent registering a project by hand, which happened *while this guard was being
+written*. Undoing a suspected clobber would destroy a real registration on a
+guess — a preserver that destroys, which is the failure the guard exists to
+catch. It preserves and reports; a human decides which of the two happened.
+
+Nothing removes the banked copies either, for the same reason the [superseded
+handoff archive](#superseded-handoffs) is never pruned — but the promise is a
+different shape here, and the difference matters. Superseded handoffs accumulate
+in normal use, so their growth is unbounded and expected. Banked catalogs should
+never appear at all. Each one is a marker that something wrote to your home
+during a test run, and deleting it before you have reconciled it against the
+live catalog throws away the only record of what was there first. Delete it once
+you have.
 
 ## Environment Variables
 
