@@ -104,7 +104,8 @@ def main():
     operator_ingest.ingest_file(log2, db, work_dir=nasty)
     with operator_ingest.connect(db) as conn:
         got = conn.execute(
-            "SELECT work_dir FROM sessions WHERE log_file = ?", (log2.name,)
+            "SELECT work_dir FROM sessions WHERE log_file = ?",
+            (operator_ingest.log_key(log2),)
         ).fetchone()["work_dir"]
         survived = conn.execute(
             "SELECT name FROM sqlite_master WHERE name='sessions'").fetchone()
