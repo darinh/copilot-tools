@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import time
 import warnings
 from pathlib import Path
@@ -325,22 +326,47 @@ def test_a_clean_test_neither_warns_nor_fails(tmp_path: Path, monkeypatch):
     assert [w for w in caught if "appeared in a guarded" in str(w.message)] == []
 
 
-def test_an_advisory_stray_older_than_the_test_window_is_not_reported(
+def test_an_advisory_stray_with_an_old_mtime_is_still_reported(
     tmp_path: Path, monkeypatch
 ):
-    """mtime is what keeps the advisory line worth reading rather than noise."""
+    """mtime annotates; it never suppresses.
+
+    The before/after name diff is what establishes that the path appeared
+    during this test. st_mtime is not a creation time, so filtering on it
+    could only ever subtract true positives -- shutil.copy2, os.utime, archive
+    extraction and NTFS timestamp tunnelling all produce a genuinely new
+    directory entry carrying an old timestamp.
+    """
     monkeypatch.setattr(conftest, "_GUARDED_DIRS", _advisory((tmp_path, False)))
     generator = _start_guard()
 
-    stale = tmp_path / "restored_from_an_old_commit.txt"
+    stale = tmp_path / "copied_with_copy2.txt"
     stale.write_text("x", encoding="utf-8")
     os.utime(stale, (0, 0))
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    with pytest.warns(UserWarning, match="copied_with_copy2.txt"):
         _finish_guard(generator)
 
-    assert [w for w in caught if "appeared in a guarded" in str(w.message)] == []
+
+def test_a_copy2_preserving_an_old_mtime_is_still_reported(
+    tmp_path: Path, monkeypatch
+):
+    """The reviewer's reproduction, kept as a test."""
+    source = tmp_path / "source"
+    source.mkdir()
+    original = source / "fixture.txt"
+    original.write_text("x", encoding="utf-8")
+    os.utime(original, (0, 0))
+
+    guarded = tmp_path / "guarded"
+    guarded.mkdir()
+    monkeypatch.setattr(conftest, "_GUARDED_DIRS", _advisory((guarded, False)))
+    generator = _start_guard()
+
+    shutil.copy2(original, guarded / "fixture.txt")
+
+    with pytest.warns(UserWarning, match="fixture.txt"):
+        _finish_guard(generator)
 
 
 def test_an_advisory_stray_with_an_unreadable_mtime_is_still_reported(
@@ -438,6 +464,53 @@ def test_the_advisory_notice_distinguishes_the_three_mtime_verdicts():
     assert conftest._describe("p", True).endswith("(mtime within this test)")
     assert conftest._describe("p", False).endswith("(mtime before this test)")
     assert conftest._describe("p", None).endswith("(mtime unreadable)")
+
+
+def test_a_duplicate_guarded_directory_cannot_narrow_the_scan(
+    tmp_path: Path, monkeypatch
+):
+    """Last-wins on a repeated path would hide everything nested under it.
+
+    The snapshot is keyed by directory, so listing one twice -- once recursive
+    and once not -- used to leave the shallower scan in place and report a
+    nested artifact as nothing at all. A misconfiguration may only ever fail
+    toward MORE visibility.
+    """
+    monkeypatch.setattr(
+        conftest,
+        "_GUARDED_DIRS",
+        ((tmp_path, True, True), (tmp_path, False, False)),
+    )
+    (tmp_path / "sub").mkdir()
+    before = conftest._snapshot_guarded()
+
+    (tmp_path / "sub" / "new.txt").write_text("x", encoding="utf-8")
+
+    assert conftest._find_strays(before, conftest._snapshot_guarded()) == [
+        str(tmp_path / "sub" / "new.txt")
+    ]
+
+
+def test_a_duplicate_guarded_directory_cannot_downgrade_severity(
+    tmp_path: Path, monkeypatch
+):
+    """The same rule for how loudly it objects, not just what it sees."""
+    monkeypatch.setattr(
+        conftest,
+        "_GUARDED_DIRS",
+        ((tmp_path, False, True), (tmp_path, False, False)),
+    )
+    generator = _start_guard()
+
+    (tmp_path / "leak.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="leak.txt"):
+        next(generator)
+
+
+def test_merging_duplicates_leaves_a_normal_configuration_alone():
+    """The control: the merge must not quietly rewrite the real settings."""
+    assert conftest._guarded_dirs() == tuple(conftest._GUARDED_DIRS)
 
 
 # ── the real project catalog ─────────────────────────────────────

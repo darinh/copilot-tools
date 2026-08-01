@@ -96,6 +96,24 @@ def _catalog_state():
         return _UNREADABLE
 
 
+def _guarded_dirs() -> tuple[tuple[Path, bool, bool], ...]:
+    """``_GUARDED_DIRS`` with duplicate directories merged.
+
+    The snapshot is keyed by directory, so a repeated entry would otherwise be
+    last-wins: listing a path twice, once recursive and once not, would leave
+    the shallower scan in place and hide everything nested under it, reporting
+    nothing at all. ``recursive`` and ``fatal`` are therefore OR-ed. A
+    duplicate must never be able to reduce what the guard sees or how loudly
+    it objects -- the only safe direction for a misconfiguration to fail is
+    toward more visibility.
+    """
+    merged: dict[Path, tuple[bool, bool]] = {}
+    for directory, recursive, fatal in _GUARDED_DIRS:
+        was_recursive, was_fatal = merged.get(directory, (False, False))
+        merged[directory] = (was_recursive or recursive, was_fatal or fatal)
+    return tuple((d, recursive, fatal) for d, (recursive, fatal) in merged.items())
+
+
 def _snapshot_guarded() -> dict[Path, tuple[bool, frozenset[str]]]:
     """Record whether each guarded directory exists and what it contains.
 
@@ -104,7 +122,7 @@ def _snapshot_guarded() -> dict[Path, tuple[bool, frozenset[str]]]:
     directory and a missing one are not the same thing.
     """
     snapshot: dict[Path, tuple[bool, frozenset[str]]] = {}
-    for directory, recursive, _fatal in _GUARDED_DIRS:
+    for directory, recursive, _fatal in _guarded_dirs():
         if not directory.is_dir():
             snapshot[directory] = (False, frozenset())
             continue
@@ -175,10 +193,15 @@ def _find_strays(
     return sorted(flat)
 
 
-# Filesystem timestamps are not always as fine-grained as time.time(): FAT
-# rounds to two seconds, and network filesystems round unpredictably. The slack
-# biases the comparison toward REPORTING, because a detector that errs toward
-# silence is the failure this whole module exists to prevent.
+# Filesystem timestamps are recorded but never used to suppress a report.
+# The before/after name diff already establishes that a path appeared during
+# this test; mtime cannot strengthen that and can only subtract from it, since
+# st_mtime is not a creation time -- shutil.copy2, os.utime, archive
+# extraction, some git flows and NTFS timestamp tunnelling all produce a file
+# that is genuinely new to the directory and carries an old mtime. Filtering on
+# it would drop those silently, which is the one failure a detector may not
+# have. So it is annotation: it tells the reader whether the artifact looks
+# fresh, and decides nothing.
 _MTIME_SLACK_SECONDS = 2.0
 
 
@@ -189,9 +212,9 @@ def _appeared_since(path: str, since: float) -> bool | None:
     directory is exactly the kind of artifact worth naming, and ``stat`` would
     raise on it and report the mtime as unreadable.
 
-    The three-way return is the point. An mtime that cannot be read is not an
-    old mtime, and collapsing the two would let an unreadable stray be filtered
-    out as stale -- silently, which is the one thing a guard must never do.
+    Three-valued because an mtime that cannot be read is not an old mtime.
+    The slack absorbs coarse filesystem timestamps (FAT rounds to two
+    seconds) so that a fresh file is not described as old.
     """
     try:
         return os.lstat(path).st_mtime >= since - _MTIME_SLACK_SECONDS
@@ -246,13 +269,11 @@ def _no_stray_artifacts(request: pytest.FixtureRequest):
     reappear. Recording it here pins it to a nodeid at the moment it happens.
 
     Whether that is a failure or a warning depends on whether the directory
-    has other writers -- see ``_GUARDED_DIRS``. mtime narrows the accusation
-    but never settles it: appearing inside the window is necessary for the
-    test to be the author and nowhere near sufficient, since a peer writing
-    during the same window looks identical. So mtime is used to keep the
-    advisory line informative, and never to suppress a fatal one -- a test
-    that unpacks a fixture with preserved timestamps would otherwise write
-    into skills/ and go unreported.
+    has other writers -- see ``_GUARDED_DIRS``. Nothing is filtered out: the
+    before/after name diff is what establishes that a path appeared during
+    this test, and mtime only annotates how fresh it looks. It is never a
+    reason to stay quiet, because it does not answer the question the diff
+    already answered.
     """
     started = time.time()
     before = _snapshot_guarded()
@@ -260,19 +281,14 @@ def _no_stray_artifacts(request: pytest.FixtureRequest):
     by_dir = _find_strays_by_dir(before, _snapshot_guarded())
     fatal: list[str] = []
     advisory: list[str] = []
-    for directory, _recursive, is_fatal in _GUARDED_DIRS:
+    for directory, _recursive, is_fatal in _guarded_dirs():
         found = by_dir.get(directory)
         if not found:
             continue
         if is_fatal:
             fatal.extend(found)
             continue
-        for path in found:
-            # Probed once and reused: probing again for the message would let
-            # the filter and the line it prints disagree about the same file.
-            recent = _appeared_since(path, started)
-            if recent is not False:
-                advisory.append(_describe(path, recent))
+        advisory.extend(_describe(path, _appeared_since(path, started)) for path in found)
     if advisory:
         warnings.warn(_stray_notice(request.node.nodeid, advisory), stacklevel=2)
     if fatal:
