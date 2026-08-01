@@ -312,7 +312,18 @@ def test_operator_sh_injects_experimental_ahead_of_the_user_args(function):
     have now been edited separately twice. Covering only the loop would leave a
     plain `operator` on macOS starting sessions with no extensions at all.
     """
-    lines = _shell_function(function).splitlines()
+    lines = [line for line in _shell_function(function).splitlines()
+             if not line.strip().startswith("#")]
+
+    # Every mention in live code, not just the ones that look like the
+    # defaults array. A later `copilot_args+=("--experimental")` does not
+    # contain `copilot_args=(`, so matching only the construction line would
+    # let the flag be re-added *after* the user's arguments -- the precise
+    # regression this test exists for -- while still reporting one injection.
+    mentions = [i for i, line in enumerate(lines) if '"--experimental"' in line]
+    assert len(mentions) == 1, (
+        f"{function}() should mention --experimental exactly once, found "
+        f"{[lines[i].strip() for i in mentions]}")
 
     injected = [i for i, line in enumerate(lines)
                 if "copilot_args=(" in line and '"--experimental"' in line]
@@ -333,34 +344,80 @@ def test_operator_sh_injects_experimental_ahead_of_the_user_args(function):
         f"  {lines[injected[0]].strip()}\n  {lines[forwarded[0]].strip()}")
 
 
-def _shell_launch_argv(function: str, user_argv: list[str], tmp_path: Path) -> list[str]:
-    """The argv `operator.sh` actually builds, by running its own source.
+def _shell_helper_names() -> list[str]:
+    """Every top-level function operator.sh defines.
 
-    Only the lines that construct the array are kept, so this is the shell's
-    real ordering rather than a restatement of it, without dragging in tmux or
-    the filesystem. The `--agent` append is dropped: it depends on a lookup
-    that is orthogonal to this question and is covered elsewhere.
+    Used to stub the whole helper surface generically, so the probe below
+    cannot go stale as the script grows: anything the code under test calls is
+    by definition defined here. Enumerating instead of hand-listing also keeps
+    it working on the bash 3.2 that ships with macOS, which has no
+    `command_not_found_handle` to lean on.
     """
-    kept = [line for line in _shell_function(function).splitlines()
-            if re.match(r"\s*(local\s+)?(copilot_args|user_args)\+?=", line)
-            and "--agent" not in line]
-    assert any("--experimental" in line for line in kept), (
-        f"no copilot_args construction found in {function}() -- the extraction "
-        f"missed, so this would have tested nothing: {kept}")
+    names = re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{",
+                       OPERATOR_SH.read_text(encoding="utf-8"), re.MULTILINE)
+    assert names, "no functions found in operator.sh -- the extraction missed"
+    return names
 
+
+# Distinct from any exit status the script itself produces, so "the probe
+# reached the launch" cannot be confused with "the probe fell over early".
+_LAUNCHED = 7
+
+
+def _shell_launch_argv(function: str, user_argv: list[str], tmp_path: Path) -> list[str]:
+    """The argv `operator.sh` really launches with, taken at the call site.
+
+    Runs the function's *entire* body against stubbed helpers, and captures
+    what arrives at `generate_run_script` -- the point where the arguments
+    stop being the operator's business and become the CLI's. An earlier
+    version of this reconstructed the array from just the assignment lines,
+    which was a restatement of the code rather than a run of it: any argv
+    assembled further down was invisible to it. `run_loop_mode` already does
+    exactly that, building `launch_args` from `copilot_args` inside the
+    session loop, so the reconstruction was checking something the script does
+    not launch with.
+
+    `set -euo pipefail` matches operator.sh's own line 28, so the probe is no
+    laxer than the script it is quoting.
+    """
+    stubs = "\n".join(f"{name}() {{ return 0; }}"
+                      for name in _shell_helper_names() if name != function)
     script = tmp_path / "argv.sh"
     script.write_text(
-        "set -euo pipefail\nbuild() {\n" + "\n".join(kept) + "\n"
-        'printf "%s\\n" "${copilot_args[@]}"\n}\nbuild "$@"\n',
+        "set -euo pipefail\n"
+        # Enough state for `set -u` to let the real body run.
+        'INSTANCE_NAME=probe\nTMUX_SESSION=probe\nRUN_SCRIPT=run\n'
+        'RESTART_DIR=.\nRESTART_MARKER=marker\nMAX_SESSIONS=1\n'
+        'POLL_INTERVAL=1\nIS_FRESH=true\nIS_LOOP_MODE=false\n'
+        'SCRIPT_PREAMBLE=""\nOPERATOR_RUN_STARTED=""\nCURRENT_SESSION_NUM=0\n'
+        'CURRENT_COPILOT_SESSION_ID=""\n'
+        f"{stubs}\n"
+        # `seq` is not guaranteed in a minimal msys; the loop must not iterate
+        # zero times and report a clean exit, which would test nothing.
+        'seq() { local i=$1; while [ "$i" -le "$2" ]; do echo "$i"; i=$((i+1)); done; }\n'
+        'extract_agent_from_args() { printf "%s\\n" "anvil:anvil"; }\n'
+        f'generate_run_script() {{ printf "%s\\n" "$@"; exit {_LAUNCHED}; }}\n'
+        f"{function}() {{\n{_shell_function(function)}}}\n"
+        f'{function} "$@"\n',
         encoding="utf-8", newline="\n")
     proc = subprocess.run([_bash_executable(), "argv.sh", *user_argv], cwd=tmp_path,
                           capture_output=True, text=True, timeout=60)
-    assert proc.returncode == 0, (
-        f"the argv probe did not run (exit {proc.returncode}): {proc.stderr}")
+    assert proc.returncode == _LAUNCHED, (
+        f"{function}() never reached generate_run_script (exit "
+        f"{proc.returncode}), so nothing about its launch args was tested:\n"
+        f"{proc.stderr}")
     return proc.stdout.splitlines()
 
 
+def _run_loop(monkeypatch, args: list[str]) -> list[str]:
+    seen = _capture_launch_args(monkeypatch)
+    op.run_loop_mode(op.Instance("exp-shape-loop"), list(args), is_fresh=True)
+    assert seen, "the loop never launched, so nothing about its args was tested"
+    return seen[0]
+
+
 @bash
+@pytest.mark.parametrize("mode", ["single", "loop"])
 @pytest.mark.parametrize("user_argv", [
     ["--no-experimental"],
     # Values that merely look like a ruling. These are what broke the previous
@@ -371,7 +428,7 @@ def _shell_launch_argv(function: str, user_argv: list[str], tmp_path: Path) -> l
     ["--", "--no-experimental"],
 ])
 def test_both_operators_build_the_same_shaped_launch_argv(tmp_path, monkeypatch,
-                                                          user_argv):
+                                                          mode, user_argv):
     """The shell and Python operators must agree about the launch argv.
 
     Asserted as a shared property rather than a fixed list, because the two
@@ -387,8 +444,12 @@ def test_both_operators_build_the_same_shaped_launch_argv(tmp_path, monkeypatch,
     operator, and CI checks `operator.sh` with `bash -n`, which proves it
     parses and nothing whatever about what it passes.
     """
-    shell_argv = _shell_launch_argv("run_single_session", user_argv, tmp_path)
-    python_argv = _run_single(monkeypatch, list(user_argv))
+    if mode == "single":
+        shell_argv = _shell_launch_argv("run_single_session", user_argv, tmp_path)
+        python_argv = _run_single(monkeypatch, list(user_argv))
+    else:
+        shell_argv = _shell_launch_argv("run_loop_mode", user_argv, tmp_path)
+        python_argv = _run_loop(monkeypatch, list(user_argv))
 
     for label, argv in (("operator.sh", shell_argv),
                         ("copilot_operator.py", python_argv)):
