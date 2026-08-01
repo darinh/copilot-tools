@@ -87,11 +87,21 @@ def _tracked_top_level() -> set[str]:
     # -z suppresses git's path quoting, so the bytes are the path verbatim.
     # Decoding them with the platform's preferred encoding, as text=True would,
     # mangles any non-ASCII name on a Windows runner.
-    return {
+    entries = {
         path.split("/", 1)[0]
         for path in proc.stdout.decode("utf-8", "surrogateescape").split("\0")
         if path
     }
+    # An empty inventory is not "the repository is empty", it is "the question
+    # was not answered". Left alone it would make the omission check below pass
+    # against nothing at all -- a green gate reporting on a repository it never
+    # managed to read.
+    assert entries, (
+        "git ls-files returned no tracked files in "
+        f"{REPO}. The comparison below would be vacuous, so this is a failure "
+        "of the check itself rather than a verdict on the README."
+    )
+    return entries
 
 
 @pytest.fixture(scope="module")
@@ -123,10 +133,13 @@ def test_the_parser_reads_only_the_top_level():
 
     If ``_TOP_LEVEL`` ever started matching indented lines, the tests above
     would demand that nested filenames appear at the root and the fix would be
-    to wreck the tree. If it stopped matching anything, they would both pass
-    vacuously against an empty set. The name with a space in it is here because
-    a "not whitespace" capture truncates it to ``a`` and reports the README as
-    missing an entry it plainly lists.
+    to wreck the tree. The name with a space in it is here because a "not
+    whitespace" capture truncates it to ``a`` and reports the README as missing
+    an entry it plainly lists.
+
+    A parser that matched nothing at all needs no test of its own: it makes
+    ``_tree_block`` find zero trees and take the whole module down in fixture
+    setup.
     """
     block = (
         "copilot-tools/\n"
@@ -161,8 +174,3 @@ def test_the_tree_is_identified_by_content_not_by_position():
         "```\n"
     )
     assert _listed_top_level(_tree_block(readme)) == {"LICENSE", "docs"}
-
-
-def test_the_tree_block_is_found_and_not_empty(listed):
-    """A parse that quietly returned nothing would make every check above pass."""
-    assert len(listed) > 20, f"parsed only {len(listed)} top-level entries"
