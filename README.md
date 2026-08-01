@@ -264,6 +264,7 @@ copilot-tools/
 ├── copilot_tools_version.py       # The single source of the version number
 ├── backfill_unknown_metrics.py    # One-off repair: fabricated zeros to NULL
 ├── verify_cross_platform.py       # Stdlib-only verification; runs without pytest
+├── git_identity.py                # Refuses to certify a history it could not read
 ├── e2e_restart_loop.py            # End-to-end restart-loop check, real processes
 ├── setup.sh                       # POSIX bootstrap; finds Python, runs setup_tools
 ├── setup.ps1                      # Windows bootstrap; same, winget if no Python
