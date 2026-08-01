@@ -55,7 +55,12 @@ from operator_console import enable_utf8_output               # noqa: E402
 from operator_mux import (                                    # noqa: E402
     Mux, MuxError, MuxNotFoundError, safe_instance_id,
 )
-from project_paths import guid_is_usable, primary_repo_root  # noqa: E402
+from project_paths import (                                   # noqa: E402
+    guid_is_usable,
+    primary_repo_root,
+    project_dir,
+    projects_root,
+)
 
 __version__ = "1.0.0"
 
@@ -1278,7 +1283,7 @@ def show_run_summary(run_started: str) -> None:
 
 # ── launching ───────────────────────────────────────────────────
 def project_catalog_path() -> Path:
-    return Path.home() / ".copilot" / "projects" / "catalog.csv"
+    return projects_root() / "catalog.csv"
 
 
 def project_handoff_file(cwd: Path) -> Path | None:
@@ -1320,7 +1325,7 @@ def project_handoff_file(cwd: Path) -> Path | None:
                 if IS_WINDOWS:
                     resolved = resolved.lower()
                 if resolved == target:
-                    return Path.home() / ".copilot" / "projects" / guid / "next-session.md"
+                    return project_dir(guid) / "next-session.md"
     except OSError:
         return None
     return None

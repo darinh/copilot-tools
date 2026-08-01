@@ -90,6 +90,15 @@ your checkout, and you never see the commands they issue — only the result. A
 reviewer prompt that says "do not write outside tmp" is worth the one line it
 costs.
 
+**The primary checkout is the strongest pull and the worst place to give in
+to it.** Filesystem probes especially — a dangling symlink, a read-only file, a
+junction — get run there because it is the tree that *is* the project, while a
+worktree feels like a copy of it. It is also the one tree every other agent
+resolves as the project, so whatever you leave becomes something they have to
+stop and reason about. Agents who had already read this section left artifacts
+there three times in a single evening. Knowing the rule is not what stops you;
+noticing that you are about to create a path relative to the wrong root is.
+
 ### Why this is a rule and not a preference
 
 Three agents once spent an evening diagnosing a working-directory bug in a test
@@ -307,9 +316,50 @@ touch ~/.operator/restart/{instance-name}
 [A ready-to-paste prompt the next agent can execute immediately]
 ```
 
+### Superseded handoffs
+
+`handoff` does not silently replace an unread handoff. If `next-session.md` is
+still sitting there when a new one is written — which, given the protocol says
+the reader deletes it, *means* nobody consumed it — the old file is copied to
+`~/.copilot/projects/{guid}/superseded/` first, and only then is the new one
+published. Both survive.
+
+One case is not covered, and it matters because the symptom is silent: when two
+handoffs race for the same project and the tool cannot take its lock, it
+publishes anyway rather than discard the live session, and one of the two can
+end up only in `superseded/`. Nothing about `next-session.md` shows this
+afterwards.
+
+That makes it a rule at both ends of a session:
+
+- **Starting**: if `~/.copilot/projects/{guid}/superseded/` is non-empty, read
+  what is in there alongside `next-session.md` before deciding what you are
+  picking up. The handoff file alone cannot tell you whether it is the newest
+  one.
+- **Ending**: if `handoff` printed a warning — that another handoff was in
+  progress, or that it could not bank a spare copy — say so in your final
+  message. That warning goes to stderr and dies with your session; you are the
+  only one who will ever see it.
+
+**Nothing ever prunes `superseded/`. That is a promise, not an oversight.** A
+reaper living inside a fix for an unwanted delete is the same bug wearing the
+fix's clothes, and it would be judging files by their age when age is not what
+makes them valuable. The directory only grows when a handoff went unread, which
+is already the anomaly — so a full `superseded/` is a symptom to read, not a
+mess to clear.
+
+- **Never delete from `superseded/` on your own initiative, and never add code
+  that prunes it.** Files in there are sessions whose context was dropped on the
+  floor. Read them before deciding they are noise.
+- If the *user* asks you to clear it, do it — it is their disk and their
+  context. Tell them what is in there first so the choice is informed. The rule
+  above is about you acting unasked, not about overriding them.
+
 ### Rules
 - The file is ephemeral — read once, then delete. Not documentation.
 - Write it proactively. The user should never have to ask for it.
+- Never hand-roll the preserve-then-publish dance. Use the `handoff` command;
+  writing `next-session.md` yourself is what destroys an unread one.
 
 ---
 

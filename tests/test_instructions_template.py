@@ -250,6 +250,82 @@ def test_documented_handoff_layout_matches_what_the_tool_writes(template):
     )
 
 
+def _bullets(section: str) -> list[str]:
+    """Each list item with its wrapped continuation lines folded back into one.
+
+    Checks that reason about a single instruction have to see the instruction
+    whole. These items are hard-wrapped, so a line-based search splits one
+    sentence into two halves that each look harmless, and a rule about what an
+    item says decays into a rule about where it happened to wrap.
+
+    Fence-aware and ordered-list-aware, and neither is hypothetical here: this
+    section holds ``powershell``, ``bash`` and ``markdown`` blocks, and a
+    numbered list. Without the fence check a code block following an item
+    without a blank line folds into it; without the ``\\d+.`` alternative a
+    numbered step is swallowed by whatever bullet preceded it. Both failures
+    are silent -- they widen an item's text, which makes a search over it
+    *more* likely to match, so the check goes green for the wrong reason.
+    """
+    items: list[str] = []
+    open_item = fenced = False
+    for line in section.splitlines():
+        if _FENCE_LINE.match(line):
+            fenced = not fenced
+            open_item = False
+        elif fenced:
+            continue
+        elif re.match(r"^\s*(?:[-*]|\d+\.) \S", line):
+            items.append(line.strip())
+            open_item = True
+        elif open_item and line.strip() and not _HEADING.match(line):
+            items[-1] += " " + line.strip()
+        else:
+            open_item = False
+    return items
+
+
+def test_the_documented_archive_directory_is_the_one_the_tool_writes(template):
+    """The directory agents are told not to delete must be the real one.
+
+    This document's instruction about the handoff archive is a *prohibition*,
+    and a prohibition naming the wrong path is worse than none: it reads as
+    coverage, it leaves the real directory unguarded, and the agent that later
+    finds an undocumented pile of files deletes them with a clear conscience.
+
+    Two things are checked because they rot separately. Where the archive lives
+    is not the same claim as what it is called -- an agent sent to
+    ``~/.operator/superseded/`` finds nothing and concludes nothing was kept --
+    and the prohibition can keep an old name while the informational path above
+    it is updated, which leaves a green test guarding a directory that no
+    longer exists.
+    """
+    section = _section(template, "Session Handoff Protocol")
+    archive = handoff_tool.SUPERSEDED_DIRNAME
+    tokens = _INLINE_CODE.findall(section)
+
+    # Built from the function the tool writes through, not from a retyped
+    # literal: a check against a hand-copied path is a check that the document
+    # agrees with the test author, which is the agreement least likely to be
+    # the one that breaks.
+    written = handoff_tool.project_dir("{guid}") / archive
+    documented = "~/" + written.relative_to(Path.home()).as_posix() + "/"
+    assert documented in tokens, (
+        f"the handoff section never says where {archive!r} lives; expected the "
+        f"inline path {documented!r}, found: {sorted(set(tokens))}"
+    )
+
+    forbidding = [b for b in _bullets(section)
+                  if re.search(r"\bdelete|\bprun", b, re.IGNORECASE)]
+    assert forbidding, (
+        "no bullet in the handoff section tells agents not to delete the "
+        "handoff archive any more"
+    )
+    assert any(archive in b for b in forbidding), (
+        f"the bullets forbidding deletion never name {archive!r}, which is the "
+        "directory handoff_tool actually writes:\n  " + "\n  ".join(forbidding)
+    )
+
+
 # --------------------------------------------------------------------------
 # The operator command lines
 # --------------------------------------------------------------------------
