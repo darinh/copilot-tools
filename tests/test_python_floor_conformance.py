@@ -522,9 +522,16 @@ def _has_lazy_annotations(tree: ast.AST) -> bool:
     ``as`` is not required to be absent: measured on 3.10.20, ``from
     __future__ import annotations as _a`` still enables the feature, because
     the compiler matches the imported *name* and ignores the binding.
+
+    Only ``body[0]`` may be a docstring. A *second* bare string is an
+    ordinary expression statement, and a future import after it is the same
+    SyntaxError as one in a dead branch — so skipping every leading string
+    would reopen the bypass this function exists to close, with two tokens
+    instead of one.
     """
-    for node in getattr(tree, "body", []):
-        if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+    for index, node in enumerate(getattr(tree, "body", [])):
+        if (index == 0 and isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Constant)
                 and isinstance(node.value.value, str)):
             continue  # the module docstring may precede a future statement
         if isinstance(node, ast.ImportFrom) and node.module == "__future__":
@@ -532,6 +539,37 @@ def _has_lazy_annotations(tree: ast.AST) -> bool:
                 return True
             continue  # another future feature; a further one may follow
         return False
+    return False
+
+
+#: Names that turn a deferred annotation back into an evaluated one.
+#:
+#: PEP 563 stores annotations as strings; these read them back and evaluate
+#: them, and on the floor that raises exactly as the eager spelling would.
+#: Matched on the trailing name alone, so ``typing.get_type_hints``,
+#: ``get_type_hints`` imported bare, and ``inspect.get_annotations`` all
+#: count. A bare-name match will also catch an unrelated method that happens
+#: to share the name, and that is the safe direction: the module simply keeps
+#: the behaviour it had before this rule existed.
+#:
+#: The limit this leaves is a library that resolves annotations on your
+#: behalf — pydantic does, ``dataclasses`` does not. Chasing those would mean
+#: knowing what every decorator does with ``__annotations__``, which is the
+#: type checker this file keeps declining to write. Neither name, nor
+#: pydantic, appears in any first-party file today; that was measured.
+ANNOTATION_RESOLVERS = frozenset({"get_type_hints", "get_annotations"})
+
+
+def _resolves_annotations(tree: ast.AST) -> bool:
+    """Whether the module reads its own annotations back and evaluates them."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in ANNOTATION_RESOLVERS:
+            return True
+        if isinstance(node, ast.Name) and node.id in ANNOTATION_RESOLVERS:
+            return True
+        if isinstance(node, ast.ImportFrom):
+            if any(a.name in ANNOTATION_RESOLVERS for a in node.names):
+                return True
     return False
 
 
@@ -633,7 +671,8 @@ class _FloorFinder(ast.NodeVisitor):
         to appear later in the source, which is a property of layout rather
         than of the program.
         """
-        self.lazy_annotations = _has_lazy_annotations(tree)
+        self.lazy_annotations = (_has_lazy_annotations(tree)
+                                 and not _resolves_annotations(tree))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -680,7 +719,23 @@ class _FloorFinder(ast.NodeVisitor):
             self.visit(stmt)
         self.depth -= bool(guarded)
         for handler in node.handlers:
+            # An `except` clause needs its own span for the same reason every
+            # statement gets one, but it cannot get one the same way:
+            # `ast.ExceptHandler` is not an `ast.stmt`, so `generic_visit`'s
+            # span branch never sees it, and `ast.Try` is excluded there too.
+            # Without this the exception type is recorded against whatever
+            # statement encloses the `try` — measured: inside a `def`, a
+            # `# floor-ok:` on the `except` line did not silence it while one
+            # on the `def` header did, and so did one on an unrelated `with`.
+            # A licence leaking outward from a header is the false-negative
+            # direction. At module level the old code was right by accident:
+            # `self.span` is None there and `_record` falls back to the hit's
+            # own line, which is why only a control written inside a block
+            # can fail.
+            outer = self.span
+            self.span = _header_span(handler)
             self.visit(handler)
+            self.span = outer
         for stmt in [*node.orelse, *node.finalbody]:
             self.visit(stmt)
 
@@ -822,12 +877,12 @@ class _FloorFinder(ast.NodeVisitor):
 
         Known limit, and it is the price of the fix: ``typing.get_type_hints()``
         re-evaluates a stringised annotation at runtime, and it raises on the
-        floor exactly as the eager spelling would. A library that does the
-        same to its own models (pydantic, and dataclasses only when asked)
-        turns a skipped annotation back into a use. No first-party file calls
-        it today — that was measured, not assumed — so the limit is recorded
-        here rather than guessed at with machinery that would have to know
-        which decorators resolve annotations.
+        floor exactly as the eager spelling would. A module that calls it —
+        or ``inspect.get_annotations`` — therefore keeps every annotation
+        read; see :data:`ANNOTATION_RESOLVERS`. What is left is a library
+        that resolves annotations for you, which no first-party file uses
+        today and which cannot be recognised without knowing what every
+        decorator does.
         """
         return not self.lazy_annotations
 
@@ -1655,6 +1710,64 @@ FIRES = {
         "import typing\n"
         "f = lambda x=typing.Self: x\n"
     ),
+    "a future import written after a second bare string, which cannot compile": (
+        # Only body[0] can be a docstring. A second bare string is an
+        # ordinary statement, so the future import after it is the same
+        # SyntaxError as one in a dead branch — and skipping every leading
+        # string would reopen that bypass with two tokens instead of one.
+        '"""The docstring."""\n'
+        '"and an ordinary string statement"\n'
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def f() -> typing.Self:\n"
+        "    pass\n"
+    ),
+    "a deferred annotation in a module that calls get_type_hints": (
+        # PEP 563 stores the annotation as a string; get_type_hints reads it
+        # back and evaluates it, which raises on 3.10.20 exactly as the
+        # eager spelling would. Measured, not reasoned about.
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def f() -> typing.Self:\n"
+        "    pass\n"
+        "HINTS = typing.get_type_hints(f)\n"
+    ),
+    "a deferred annotation where get_type_hints is imported bare": (
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "from typing import get_type_hints\n"
+        "def f() -> typing.Self:\n"
+        "    pass\n"
+        "HINTS = get_type_hints(f)\n"
+    ),
+    "an except clause under a comment on an enclosing def header": (
+        # A licence must not leak outward-in. Before `visit_Try` set a span
+        # for its handlers, a `# floor-ok:` on *any* enclosing statement
+        # silenced every `except` clause below it, and an unrelated `with`
+        # did it just as well as this `def`. Measured, then fixed.
+        "def f():  # floor-ok: this comment is not about the handler\n"
+        "    try:\n"
+        "        pass\n"
+        "    except ExceptionGroup:\n"
+        "        pass\n"
+    ),
+    "a deferred annotation where get_type_hints arrives by star import": (
+        # No ImportFrom names it, so only the bare-Name branch can see this.
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "from typing import *\n"
+        "def f() -> typing.Self:\n"
+        "    pass\n"
+        "HINTS = get_type_hints(f)\n"
+    ),
+    "a deferred annotation in a module that calls inspect.get_annotations": (
+        "from __future__ import annotations\n"
+        "import inspect\n"
+        "import typing\n"
+        "def f() -> typing.Self:\n"
+        "    pass\n"
+        "HINTS = inspect.get_annotations(f, eval_str=True)\n"
+    ),
 }
 
 
@@ -1741,6 +1854,18 @@ EXERCISES = {
     "a different __future__ feature, which does not defer annotations":
         "typing.Self",
     "a lambda default in a lazy module": "typing.Self",
+    "a future import written after a second bare string, which cannot compile":
+        "typing.Self",
+    "a deferred annotation in a module that calls get_type_hints":
+        "typing.Self",
+    "a deferred annotation where get_type_hints is imported bare":
+        "typing.Self",
+    "a deferred annotation where get_type_hints arrives by star import":
+        "typing.Self",
+    "an except clause under a comment on an enclosing def header":
+        "ExceptionGroup",
+    "a deferred annotation in a module that calls inspect.get_annotations":
+        "typing.Self",
 }
 
 #: Source that must NOT trip it. Each is a spelling this repo can actually run.
@@ -2126,6 +2251,17 @@ PASSES = {
         "class C:\n"
         "    def m(self, x=typing.Self):  # floor-ok: only bound on 3.11\n"
         "        return x\n"
+    ),
+    "an except clause marked on its own line inside a function": (
+        # `ast.ExceptHandler` is not an `ast.stmt`, so it never reached
+        # `generic_visit`'s span branch and `visit_Try` did not set one
+        # either. Written inside a `def` for the reason above: at module
+        # level `span` is None and the fallback is right by accident.
+        "def f():\n"
+        "    try:\n"
+        "        pass\n"
+        "    except ExceptionGroup:  # floor-ok: only raised on the 3.11 path\n"
+        "        pass\n"
     ),
 }
 
