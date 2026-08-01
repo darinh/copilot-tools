@@ -505,6 +505,53 @@ def _header_span(node: ast.stmt) -> tuple[int, int]:
     return node.lineno, max(node.lineno, end)
 
 
+def _has_lazy_annotations(tree: ast.AST) -> bool:
+    """Whether ``from __future__ import annotations`` is in effect.
+
+    Read from the *leading* statements only — a docstring, then future
+    statements — rather than from anywhere in the tree, because that is where
+    the compiler reads it and because ``ast.parse`` is more permissive than
+    ``compile``. Measured on 3.10.20: ``ast.parse`` accepts ``if False:
+    from __future__ import annotations`` without complaint while ``compile``
+    rejects it with "from __future__ imports must occur at the beginning of
+    the file". A scan that believed the parse would hand this file a
+    one-token bypass — a dead ``if False`` block anywhere in a module would
+    silence every annotation in it — which is the same defect the tokenizer
+    replaced a regex to close.
+
+    ``as`` is not required to be absent: measured on 3.10.20, ``from
+    __future__ import annotations as _a`` still enables the feature, because
+    the compiler matches the imported *name* and ignores the binding.
+    """
+    for node in getattr(tree, "body", []):
+        if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            continue  # the module docstring may precede a future statement
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            if any(alias.name == "annotations" for alias in node.names):
+                return True
+            continue  # another future feature; a further one may follow
+        return False
+    return False
+
+
+def _annotated_args(args: ast.arguments) -> list[ast.arg]:
+    """Every argument of a signature, in every position that can hold one.
+
+    ``ast.arguments`` keeps positional-only, ordinary, keyword-only and the
+    two star arguments in five separate places, and an annotation in any of
+    them is evaluated at ``def`` time. Enumerating four of the five is the
+    kind of gap that leaves a detector reporting a tree clean.
+
+    Returned in the order they are written — ``*args`` sits between the
+    ordinary and the keyword-only arguments in source, though not in the
+    node — so a reported line number never precedes one already reported.
+    """
+    slots = [*args.posonlyargs, *args.args, args.vararg, *args.kwonlyargs,
+             args.kwarg]
+    return [arg for arg in slots if arg is not None]
+
+
 def _literal_dict_keys(node: ast.expr) -> set[str]:
     """String keys of a literal dict, following nested ``**`` unpacks.
 
@@ -557,6 +604,12 @@ class _FloorFinder(ast.NodeVisitor):
     through an ordinary variable (``h = hashlib``) is *not* resolved — that is
     name resolution, which is a type checker, and the sibling probe scan
     records the same limit for aliases of ``Path``.
+
+    *Unevaluated annotations* are not uses at all; see
+    :meth:`_annotation_evaluated`. A name that only ever appears in an
+    annotation the interpreter never evaluates cannot raise on the floor, and
+    reporting it is a false positive on the correct spelling — the failure
+    mode that gets a scan switched off rather than fixed.
     """
 
     def __init__(self) -> None:
@@ -568,6 +621,8 @@ class _FloorFinder(ast.NodeVisitor):
         self.symbol_alias: dict[str, str] = {}
         self.typing_names: set[str] = {"typing"}
         self.augmented = 0
+        self.lazy_annotations = False
+        self.scope = "module"
 
     def scan(self, tree: ast.AST) -> None:
         """Collect aliases across the whole module, then walk it.
@@ -578,6 +633,7 @@ class _FloorFinder(ast.NodeVisitor):
         to appear later in the source, which is a property of layout rather
         than of the program.
         """
+        self.lazy_annotations = _has_lazy_annotations(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -729,6 +785,121 @@ class _FloorFinder(ast.NodeVisitor):
         self.visit(node.target)
         self.augmented -= 1
         self.visit(node.value)
+        self.span = outer
+
+    def _annotation_evaluated(self) -> bool:
+        """Whether an annotation *here* is evaluated by the interpreter.
+
+        Two ways an annotation never runs, both measured on 3.10.20 rather
+        than recalled:
+
+        * ``from __future__ import annotations`` (PEP 563) stringises every
+          annotation in the module, so ``def f() -> typing.Self: ...`` runs
+          on the floor. 45 of this repository's 57 first-party files carry
+          that import, and ``typing.Self`` and ``typing.Never`` have no use
+          site *except* an annotation — so this is not an exotic position,
+          it is the only position those two constructs have.
+        * A local annotation inside a function is not evaluated even without
+          the future import (PEP 526), including when its target is
+          complex: ``d['k']: typing.Self = 1`` inside a ``def`` runs, while
+          the subscript store it performs is ordinary code.
+
+        The scope test is ``function``, not "somewhere inside a function",
+        because a class body executes like module code no matter where it is
+        written. ``def f(): class C: x: typing.Self`` **raises** on the
+        floor, so a rule that let "inside a def" survive a ``ClassDef``
+        would silence a real violation. A nested ``def``'s own signature is
+        evaluated when the enclosing function runs, which is why only
+        :class:`ast.AnnAssign` consults the scope and the signature of a
+        ``def`` does not.
+
+        There is deliberately no ``visit_Lambda``. A lambda body is a
+        function scope, but it is an *expression*, so it cannot contain an
+        :class:`ast.AnnAssign` — the only node that reads the scope. An
+        override would be a branch no control could ever fail, and this file
+        already records what unexercised machinery costs. Its defaults are
+        reached by :meth:`generic_visit` like any other expression.
+
+        Known limit, and it is the price of the fix: ``typing.get_type_hints()``
+        re-evaluates a stringised annotation at runtime, and it raises on the
+        floor exactly as the eager spelling would. A library that does the
+        same to its own models (pydantic, and dataclasses only when asked)
+        turns a skipped annotation back into a use. No first-party file calls
+        it today — that was measured, not assumed — so the limit is recorded
+        here rather than guessed at with machinery that would have to know
+        which decorators resolve annotations.
+        """
+        return not self.lazy_annotations
+
+    def _visit_function(self, node: ast.AST) -> None:
+        """A ``def``/``async def``: decorators and defaults, then annotations.
+
+        Decorators and defaults are evaluated in the *enclosing* scope at
+        ``def`` time and are ordinary code, so they are visited before the
+        scope changes. Only the annotations are conditional.
+
+        The span is saved and restored here for the reason recorded on
+        :meth:`visit_AugAssign`: :meth:`generic_visit` sets ``self.span`` for
+        every statement it handles, and overriding a statement visitor takes
+        that statement off the path. Missing it does nothing at module level
+        and silently breaks ``# floor-ok:`` inside a function.
+        """
+        outer_span, outer_scope = self.span, self.scope
+        self.span = _header_span(node)
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        args = node.args
+        for default in [*args.defaults, *args.kw_defaults]:
+            if default is not None:
+                self.visit(default)
+        if self._annotation_evaluated():
+            for arg in _annotated_args(args):
+                if arg.annotation is not None:
+                    self.visit(arg.annotation)
+            if node.returns is not None:
+                self.visit(node.returns)
+        self.scope = "function"
+        for stmt in node.body:
+            self.visit(stmt)
+        self.scope = outer_scope
+        self.span = outer_span
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        """A class body is evaluated like module code, wherever it is written.
+
+        Decorators, bases and keywords are evaluated in the enclosing scope;
+        the body runs immediately, which is why the scope becomes ``class``
+        rather than staying ``function`` for a class defined inside a ``def``.
+        """
+        outer_span, outer_scope = self.span, self.scope
+        self.span = _header_span(node)
+        for child in [*node.decorator_list, *node.bases, *node.keywords]:
+            self.visit(child)
+        self.scope = "class"
+        for stmt in node.body:
+            self.visit(stmt)
+        self.scope = outer_scope
+        self.span = outer_span
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        """``x: typing.Self = value`` — the annotation and the value differ.
+
+        The value is ordinary code and is always visited; so is the target,
+        which for a complex target (``obj.x``, ``d['k']``) performs a real
+        store. Only the annotation is conditional. See
+        :meth:`_annotation_evaluated` for which conditions, and
+        :meth:`visit_AugAssign` for why the span is maintained here.
+        """
+        outer = self.span
+        self.span = _header_span(node)
+        self.visit(node.target)
+        if self._annotation_evaluated() and self.scope != "function":
+            self.visit(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
         self.span = outer
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
@@ -1374,7 +1545,118 @@ FIRES = {
         "from pathlib import Path\n"
         "Path.walk += 1\n"
     ),
+    # Round four, the neighbours of the unevaluated-annotation rule. Every
+    # one of these sits one keystroke from a position the scan now skips,
+    # and each raises on 3.10.20 — measured by executing it there, not by
+    # reading the visitor. They are the price of that rule: if skipping
+    # annotations ever widens by a field, these are what notice.
+    "a lazy module using the construct for real, outside an annotation": (
+        # `from __future__ import annotations` stringises annotations and
+        # nothing else. An ordinary expression in the same module is
+        # evaluated exactly as it always was.
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "alias = typing.Self\n"
+    ),
+    "a lazy module using the construct for real inside a function": (
+        # The function-local rule is about `x: T` statements, not about
+        # everything written inside a `def`.
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def f():\n"
+        "    return typing.Self\n"
+    ),
+    "the value of an annotated assignment, whose annotation is skipped": (
+        # `x: int = typing.Self` has an unevaluated annotation and a very
+        # evaluated value. A rule that skipped the statement rather than the
+        # annotation would lose this.
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def f():\n"
+        "    x: int = typing.Self\n"
+    ),
+    "a default argument in a lazy module, which is evaluated at def time": (
+        # Defaults live in the same `def` header as the annotations and are
+        # evaluated when the header runs. PEP 563 says nothing about them.
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def f(x=typing.Self):\n"
+        "    return x\n"
+    ),
+    "a class base in a lazy module": (
+        "from __future__ import annotations\n"
+        "import enum\n"
+        "class C(enum.StrEnum):\n"
+        "    pass\n"
+    ),
+    "a decorator in a lazy module": (
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "@typing.Self\n"
+        "def f():\n"
+        "    pass\n"
+    ),
+    "a from-import in a lazy module, which still imports at runtime": (
+        # The one that makes the remedy text honest. PEP 563 defers the
+        # *annotation*; the import that would supply the name is ordinary
+        # code and raises ImportError on 3.10.20.
+        "from __future__ import annotations\n"
+        "from typing import Self\n"
+        "def f() -> Self:\n"
+        "    return self\n"
+    ),
+    "an annotated class attribute, in a class written inside a function": (
+        # The trap the scope rule is built around. A class body executes
+        # like module code wherever it is written, so "inside a def" must
+        # not survive a ClassDef. Measured on 3.10.20: this raises
+        # AttributeError, while the same annotation directly in the `def`
+        # runs.
+        "import typing\n"
+        "def f():\n"
+        "    class C:\n"
+        "        x: typing.Self\n"
+        "    return C\n"
+    ),
+    "an annotated attribute of a class at module level": (
+        "import typing\n"
+        "class C:\n"
+        "    x: typing.Self\n"
+    ),
+    "a return annotation on a function nested in another function": (
+        # A nested `def`'s own header is evaluated when the outer function
+        # runs. Only AnnAssign is lazy by scope; a signature never is.
+        "import typing\n"
+        "def outer():\n"
+        "    def inner() -> typing.Self:\n"
+        "        pass\n"
+        "    return inner\n"
+    ),
+    "a future import in a dead branch, which the compiler rejects": (
+        # `ast.parse` accepts this and `compile` does not — measured on
+        # 3.10.20. Believing the parse would hand this file a one-token
+        # bypass: a dead `if False` block anywhere in a module would silence
+        # every annotation in it.
+        "if False:\n"
+        "    from __future__ import annotations\n"
+        "import typing\n"
+        "def f() -> typing.Self:\n"
+        "    pass\n"
+    ),
+    "a different __future__ feature, which does not defer annotations": (
+        "from __future__ import division\n"
+        "import typing\n"
+        "def f() -> typing.Self:\n"
+        "    pass\n"
+    ),
+    "a lambda default in a lazy module": (
+        # A lambda has no annotations to defer, and its defaults are
+        # evaluated where any other expression would be.
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "f = lambda x=typing.Self: x\n"
+    ),
 }
+
 
 #: Which construct each control in FIRES is a control *for*.
 #:
@@ -1437,6 +1719,28 @@ EXERCISES = {
     "a post-floor attribute augmented, which reads before it writes":
         "hashlib.file_digest",
     "a post-floor method augmented on the class": "pathlib.Path.walk",
+    "a lazy module using the construct for real, outside an annotation":
+        "typing.Self",
+    "a lazy module using the construct for real inside a function":
+        "typing.Self",
+    "the value of an annotated assignment, whose annotation is skipped":
+        "typing.Self",
+    "a default argument in a lazy module, which is evaluated at def time":
+        "typing.Self",
+    "a class base in a lazy module": "enum.StrEnum",
+    "a decorator in a lazy module": "typing.Self",
+    "a from-import in a lazy module, which still imports at runtime":
+        "typing.Self",
+    "an annotated class attribute, in a class written inside a function":
+        "typing.Self",
+    "an annotated attribute of a class at module level": "typing.Self",
+    "a return annotation on a function nested in another function":
+        "typing.Self",
+    "a future import in a dead branch, which the compiler rejects":
+        "typing.Self",
+    "a different __future__ feature, which does not defer annotations":
+        "typing.Self",
+    "a lambda default in a lazy module": "typing.Self",
 }
 
 #: Source that must NOT trip it. Each is a spelling this repo can actually run.
@@ -1670,6 +1974,159 @@ PASSES = {
         "# floor-ok: this branch is only reached from the 3.12-only fast path\n"
         "hashlib.file_digest(fh, 'sha256')\n"
     ),
+    # Round four: annotations the interpreter never evaluates. Every source
+    # below was executed on 3.10.20 and RAN. They are written unguarded and
+    # unannotated on purpose — under a `TYPE_CHECKING` block or a
+    # `# floor-ok:` comment the existing machinery would license them and
+    # the control would pass whether or not this rule existed.
+    "a return annotation in a module that defers annotations": (
+        # PEP 563. `typing.Self`'s own remedy is "the string literal", and
+        # under this import the plain spelling already *is* the string
+        # literal — so flagging it reports the remedy for the thing it is
+        # checking for. 45 of this repo's 57 first-party files carry the
+        # import, and typing.Self has no use site except an annotation.
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def f() -> typing.Self:\n"
+        "    return self\n"
+    ),
+    "every argument position of a deferred signature": (
+        # Five separate fields on ast.arguments. Enumerating four of them is
+        # the kind of gap that reports a tree clean.
+        "from __future__ import annotations\n"
+        "import asyncio\n"
+        "import enum\n"
+        "import typing\n"
+        "def f(a: typing.Self, /, b: typing.Never, *c: enum.StrEnum,\n"
+        "      d: asyncio.TaskGroup, **e: typing.Self):\n"
+        "    return a\n"
+    ),
+    "a deferred annotation that is a subscript, not a bare name": (
+        # The whole annotation is one string; nothing inside it is reached.
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def f() -> dict[str, typing.Self]:\n"
+        "    return {}\n"
+    ),
+    "a deferred return annotation on an async def": (
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "async def f() -> typing.Self:\n"
+        "    return self\n"
+    ),
+    "an annotated assignment in a module that defers annotations": (
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "x: typing.Self\n"
+    ),
+    "an annotated class attribute in a module that defers annotations": (
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "class C:\n"
+        "    x: typing.Self\n"
+    ),
+    "a deferred annotation on a complex target, whose store is real": (
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "class C:\n"
+        "    pass\n"
+        "c = C()\n"
+        "c.x: typing.Self = 1\n"
+    ),
+    "a local annotation inside a function, with no future import at all": (
+        # PEP 526: a local annotation is never evaluated, deferred or not.
+        # Written inside a `def` deliberately — the scope is the whole rule,
+        # and a module-level copy of this control could not see it.
+        "import typing\n"
+        "def f():\n"
+        "    x: typing.Self\n"
+        "    return 1\n"
+    ),
+    "a local annotation on a complex target inside a function": (
+        # The annotation is skipped; the attribute store beside it is not.
+        "import typing\n"
+        "class C:\n"
+        "    pass\n"
+        "def f():\n"
+        "    c = C()\n"
+        "    c.x: typing.Self = 1\n"
+    ),
+    "a local annotation on a subscript target inside a function": (
+        "import typing\n"
+        "def f():\n"
+        "    d = {}\n"
+        "    d['k']: typing.Self = 1\n"
+    ),
+    "a deferred annotation on a function nested inside a function": (
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def outer():\n"
+        "    def inner() -> typing.Self:\n"
+        "        return self\n"
+        "    return inner\n"
+    ),
+    "a deferred annotation in a class written inside a function": (
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def f():\n"
+        "    class C:\n"
+        "        x: typing.Self\n"
+        "    return C\n"
+    ),
+    "a future import written with an `as` binding": (
+        # Measured on 3.10.20: the compiler matches the imported name and
+        # ignores the binding, so this still defers annotations. A detector
+        # that required `asname is None` would report this module eager and
+        # flag a line that runs.
+        "from __future__ import annotations as _annotations\n"
+        "import typing\n"
+        "def f() -> typing.Self:\n"
+        "    return self\n"
+    ),
+    "a future import preceded by the module docstring": (
+        '"""A module that defers its annotations."""\n'
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def f() -> typing.Self:\n"
+        "    return self\n"
+    ),
+    "a future import sharing its statement with another feature": (
+        "from __future__ import division, annotations\n"
+        "import typing\n"
+        "def f() -> typing.Self:\n"
+        "    return self\n"
+    ),
+    # The span half. Every visitor added for the deferred-annotation rule is
+    # a statement visitor, and a statement visitor that does not maintain
+    # `self.span` takes its statement off the path `generic_visit` uses to
+    # set it — after which `# floor-ok:` silently stops working *inside a
+    # function* while still working at module level, where `span` is None
+    # and `_record` falls back to the hit's own line and is right by
+    # accident. That is why all three are written inside a `def`: a
+    # module-level copy of any of them passes either way.
+    "an annotated assignment marked on its own line inside a function": (
+        "import typing\n"
+        "def f():\n"
+        "    x: int = typing.Self  # floor-ok: only reached on the 3.11 path\n"
+    ),
+    "a class header marked on its own line inside a function": (
+        "import enum\n"
+        "def f():\n"
+        "    class C(enum.StrEnum):  # floor-ok: only built on the 3.11 path\n"
+        "        pass\n"
+    ),
+    "a def header marked on its own line inside a class body": (
+        # Deliberately inside a *class*, not inside another `def`. Nesting a
+        # `def` in a `def` cannot see this: if the def visitor stops setting
+        # the span, both defs stop setting it, `span` stays None all the way
+        # down, and `_record` falls back to the hit's own line — the right
+        # answer by accident, and a control that passes either way. A class
+        # body sets a span the method header must then override.
+        "import typing\n"
+        "class C:\n"
+        "    def m(self, x=typing.Self):  # floor-ok: only bound on 3.11\n"
+        "        return x\n"
+    ),
 }
 
 
@@ -1739,6 +2196,153 @@ def test_the_detector_stays_quiet(label: str) -> None:
     assert not hits, (
         f"the floor scan wrongly flagged {label!r}: {hits}\n{PASSES[label]}"
     )
+
+
+#: The language rules :meth:`_FloorFinder._annotation_evaluated` relies on,
+#: written so the *running* interpreter decides rather than a comment.
+#:
+#: Each source names ``_floor_absent``, which is not defined anywhere. If the
+#: position is evaluated the interpreter raises ``NameError``; if it is not,
+#: the source runs. That makes the premise version-independent: it holds on
+#: 3.10 and on 3.13 alike, so the assertion is the same on all eight CI legs
+#: rather than being a 3.10-only claim the other seven cannot check.
+#:
+#: A test written the other way — asserting that ``typing.Self`` raises —
+#: would pass vacuously everywhere above 3.11, which is where most of these
+#: runs happen.
+DEFERRED = {
+    "a return annotation, deferred":
+        "from __future__ import annotations\ndef f() -> _floor_absent: ...\n",
+    "an argument annotation, deferred":
+        "from __future__ import annotations\ndef f(x: _floor_absent): ...\n",
+    "an annotated assignment at module level, deferred":
+        "from __future__ import annotations\nx: _floor_absent\n",
+    "an annotated class attribute, deferred":
+        "from __future__ import annotations\nclass C:\n    x: _floor_absent\n",
+    "a future import bound with `as` still defers":
+        "from __future__ import annotations as _a\ndef f() -> _floor_absent: ...\n",
+    "a local annotation inside a function, with no future import":
+        "def f():\n    x: _floor_absent\nf()\n",
+    "a local annotation on a complex target, with no future import":
+        "class C: pass\ndef f():\n    c = C()\n    c.x: _floor_absent = 1\nf()\n",
+}
+
+EVALUATED = {
+    "a return annotation, not deferred":
+        "def f() -> _floor_absent: ...\n",
+    "an argument annotation, not deferred":
+        "def f(x: _floor_absent): ...\n",
+    "an annotated assignment at module level, not deferred":
+        "x: _floor_absent\n",
+    "an annotated class attribute, not deferred":
+        "class C:\n    x: _floor_absent\n",
+    "a class body written inside a function":
+        "def f():\n    class C:\n        x: _floor_absent\n    return C\nf()\n",
+    "the signature of a function nested in a function":
+        "def outer():\n    def inner() -> _floor_absent: ...\n    return inner\nouter()\n",
+    "a default argument in a module that defers annotations":
+        "from __future__ import annotations\ndef f(x=_floor_absent): ...\n",
+    "a decorator in a module that defers annotations":
+        "from __future__ import annotations\n@_floor_absent\ndef f(): ...\n",
+    "a class base in a module that defers annotations":
+        "from __future__ import annotations\nclass C(_floor_absent): pass\n",
+}
+
+
+def test_every_argument_position_is_read_when_annotations_are_eager() -> None:
+    """All five annotation slots on a signature, counted rather than unioned.
+
+    ``ast.arguments`` keeps positional-only, ordinary, keyword-only, ``*args``
+    and ``**kwargs`` in five separate fields. The deferred half of this pair
+    is the ``PASSES`` control that puts all five in one signature and asserts
+    silence — any position leaking there fails it. The eager half cannot be
+    written that way: a control that only asks whether *something* fired
+    stays green while four of the five positions go unread, which is exactly
+    how :func:`_annotated_args` would fail. So the lines are named.
+    """
+    source = (
+        "import typing\n"
+        "def f(a: typing.Self, /,\n"
+        "      b: typing.Self,\n"
+        "      *c: typing.Self,\n"
+        "      d: typing.Self,\n"
+        "      **e: typing.Self) -> typing.Self:\n"
+        "    return a\n"
+    )
+    hits = floor_violations(source)
+    assert [line for line, _ in hits] == [2, 3, 4, 5, 6, 6], (
+        f"expected one hit per annotated position and the return, got {hits}"
+    )
+
+
+@pytest.mark.parametrize("label", sorted(DEFERRED), ids=lambda s: s[:48])
+def test_the_interpreter_really_defers_what_the_scan_skips(label: str) -> None:
+    """The positions the scan stops reading are positions nothing evaluates."""
+    exec(compile(DEFERRED[label], f"<{label}>", "exec"), {})
+
+
+@pytest.mark.parametrize("label", sorted(EVALUATED), ids=lambda s: s[:48])
+def test_the_interpreter_really_evaluates_what_the_scan_still_reads(
+        label: str) -> None:
+    """And the neighbouring positions, which the scan must keep reading.
+
+    Without this half the premise is only ever confirmed, never bounded: a
+    rule that skipped *every* annotation would satisfy the deferred cases
+    above and silence all of these, and nothing here would object.
+    """
+    with pytest.raises(NameError):
+        exec(compile(EVALUATED[label], f"<{label}>", "exec"), {})
+
+
+def test_a_misplaced_future_import_is_not_a_module() -> None:
+    """``ast.parse`` accepts a future import that ``compile`` rejects.
+
+    This is why :func:`_has_lazy_annotations` reads the leading statements
+    rather than walking the tree. A walk would let a dead ``if False:``
+    block anywhere in a file mark the whole module deferred — a one-token
+    bypass for every annotation in it, in a file whose tokenizer exists to
+    close exactly that kind of hole.
+    """
+    source = ("if False:\n"
+              "    from __future__ import annotations\n"
+              "import typing\n"
+              "def f() -> typing.Self:\n"
+              "    pass\n")
+    ast.parse(source)  # the parser has no opinion
+    with pytest.raises(SyntaxError, match="beginning of the file"):
+        compile(source, "<misplaced>", "exec")
+    assert not _has_lazy_annotations(ast.parse(source)), (
+        "a future import the compiler rejects marked the module deferred"
+    )
+    assert floor_violations(source), (
+        "the scan trusted a future import that cannot legally be there"
+    )
+
+
+def test_the_deferred_rule_is_scoped_to_annotations() -> None:
+    """A deferred module still evaluates everything that is not an annotation.
+
+    The registers pin each spelling one at a time; this pins the shape of
+    the rule, so a change that widened "skip the annotation" into "skip the
+    statement" or "skip the module" fails here with a name rather than as a
+    count of controls that stopped firing.
+    """
+    deferred = "from __future__ import annotations\nimport typing\n"
+    skipped = floor_violations(deferred + "def f() -> typing.Self: ...\n")
+    assert not skipped, f"a deferred annotation was reported: {skipped}"
+
+    for label, tail in {
+        "an assignment": "v = typing.Self\n",
+        "a default": "def f(x=typing.Self): ...\n",
+        "a decorator": "@typing.Self\ndef f(): ...\n",
+        "the value of an annotated assignment": "v: int = typing.Self\n",
+        "a base class": "class C(typing.Self): pass\n",
+        "a call": "typing.Self()\n",
+    }.items():
+        hits = floor_violations(deferred + tail)
+        assert hits == [(3, "typing.Self")], (
+            f"deferring annotations also silenced {label}: {hits}\n{tail}"
+        )
 
 
 def test_every_registry_entry_has_a_control() -> None:
