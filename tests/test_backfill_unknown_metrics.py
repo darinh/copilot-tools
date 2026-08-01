@@ -755,12 +755,26 @@ NO_EVENT = "no shutdown here"
 HAS_EVENT = '{"kind": "session_shutdown"}'
 
 
-def test_both_key_generations_are_repaired_in_one_pass(db_path, logs, capsys):
-    """The mixed database is the normal case, not an edge case."""
+def test_both_key_generations_are_repaired_in_one_pass(db_path, logs, tmp_path,
+                                                       capsys):
+    """The mixed database is the normal case, not an edge case.
+
+    The modern row's log deliberately sits outside ``--logs`` with a
+    same-named decoy inside it, because that is the situation the full-path
+    key was introduced for -- a second log directory whose basenames repeat --
+    and because without it this test is evadable from both sides at once. A
+    repair that reduces every key to its basename reads the decoy; a repair
+    that ignores ``--logs`` and treats every key as absolute cannot find the
+    legacy row's log at all. Only handling both generations correctly clears
+    both rows.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
     legacy = logs / "process-legacy.log"
-    modern = logs / "process-modern.log"
+    modern = elsewhere / "process-modern.log"
     legacy.write_text(NO_EVENT, encoding="utf-8")
     modern.write_text(NO_EVENT, encoding="utf-8")
+    (logs / "process-modern.log").write_text(HAS_EVENT, encoding="utf-8")
     modern_key = operator_ingest.log_key(modern)
     assert modern_key != modern.name, (
         "test precondition: log_key must not be a basename")
