@@ -385,15 +385,17 @@ def _is_version_test(node: ast.expr) -> bool:
 def _feature_test_names(node: ast.expr) -> set[str]:
     """The attribute names an ``if`` test probes for existence.
 
-    ``hasattr(hashlib, "file_digest")`` yields ``{"file_digest", "hashlib"}``
-    — the attribute and the object it is asked about, since either can be the
-    thing that is missing. Three-argument ``getattr`` counts too: it is a
+    ``hasattr(hashlib, "file_digest")`` yields ``{"file_digest"}`` — the
+    probed *string* only. Three-argument ``getattr`` counts too: it is a
     feature test with a fallback, where the two-argument form is ordinary
     attribute access.
 
-    Only these names are licensed in the guarded branch. A ``hasattr`` about
-    something else guards nothing, which is the difference between a feature
-    test and a blanket exemption.
+    The object being probed is deliberately not included. It was, and a
+    reviewer showed that ``hasattr(config, "hashlib")`` therefore licensed
+    ``hashlib.file_digest`` — the token ``hashlib`` appeared on both sides
+    while the two expressions had nothing to do with each other. Matching on
+    tokens that appear *somewhere* in a name is the same error as a control
+    asserting that *something* fired.
     """
     names: set[str] = set()
     for child in ast.walk(node):
@@ -405,42 +407,43 @@ def _feature_test_names(node: ast.expr) -> set[str]:
             pass
         else:
             continue
-        target, attribute = child.args[0], child.args[1]
+        attribute = child.args[1]
         if isinstance(attribute, ast.Constant) and isinstance(attribute.value, str):
             names.add(attribute.value)
-        if isinstance(target, ast.Name):
-            names.add(target.id)
-        elif isinstance(target, ast.Attribute):
-            names.add(target.attr)
     return names
 
 
-def _is_type_checking_test(node: ast.expr) -> bool:
-    """Whether an ``if`` test is ``TYPE_CHECKING``.
+def _is_type_checking_test(node: ast.expr, typing_names: set[str]) -> bool:
+    """Whether an ``if`` test is ``typing.TYPE_CHECKING``.
 
     ``typing.TYPE_CHECKING`` is ``False`` at runtime and ``True`` only to a
     type checker, so the body never executes on any interpreter. A
     ``from typing import Self`` there is correct code on 3.10, and flagging it
     is the kind of false positive that gets a scan switched off. The ``else``
     branch of such an ``if`` *is* runtime code and is not licensed.
+
+    The receiver is checked. Any attribute called ``TYPE_CHECKING`` used to
+    qualify, so ``if config.TYPE_CHECKING:`` — an ordinary runtime flag that
+    happens to share the name — licensed everything in its body.
     """
     if isinstance(node, ast.Name):
         return node.id == "TYPE_CHECKING"
-    if isinstance(node, ast.Attribute):
-        return node.attr == "TYPE_CHECKING"
+    if isinstance(node, ast.Attribute) and node.attr == "TYPE_CHECKING":
+        return isinstance(node.value, ast.Name) and node.value.id in typing_names
     return False
 
 
 def _guard_names(construct: str) -> set[str]:
     """The names a ``hasattr`` would use to feature-test ``construct``.
 
-    Derived from the registry key rather than listed again, so a new entry
-    cannot arrive without them: ``pathlib.Path.is_dir(follow_symlinks=)``
-    yields ``{"follow_symlinks", "is_dir", "Path", "pathlib"}`` and
-    ``hashlib.file_digest`` yields ``{"file_digest", "hashlib"}``.
+    The *terminal* names only, derived from the registry key rather than
+    listed again: ``hashlib.file_digest`` yields ``{"file_digest"}`` and
+    ``pathlib.Path.is_dir(follow_symlinks=)`` yields ``{"is_dir",
+    "follow_symlinks"}``. Including the module and class names made the match
+    far too generous — see :func:`_feature_test_names`.
     """
     head, _, keyword = construct.partition("(")
-    names = {part for part in head.split(".") if part}
+    names = {head.split(".")[-1]} if head else set()
     if keyword:
         names.add(keyword.rstrip("=)"))
     return names
@@ -464,6 +467,23 @@ def _header_span(node: ast.stmt) -> tuple[int, int]:
     if body:
         end = min(end, body[0].lineno - 1)
     return node.lineno, max(node.lineno, end)
+
+
+def _literal_dict_keys(node: ast.expr) -> set[str]:
+    """String keys of a literal dict, following nested ``**`` unpacks.
+
+    ``{**{"follow_symlinks": False}}`` has the same keys as the dict inside
+    it. A nested unpack appears as a key of ``None``.
+    """
+    if not isinstance(node, ast.Dict):
+        return set()
+    names: set[str] = set()
+    for key, value in zip(node.keys, node.values):
+        if key is None:
+            names |= _literal_dict_keys(value)
+        elif isinstance(key, ast.Constant) and isinstance(key.value, str):
+            names.add(key.value)
+    return names
 
 
 class _FloorFinder(ast.NodeVisitor):
@@ -510,6 +530,7 @@ class _FloorFinder(ast.NodeVisitor):
         self.hits: list[tuple[int, str, tuple[int, int]]] = []
         self.module_alias: dict[str, str] = {}
         self.symbol_alias: dict[str, str] = {}
+        self.typing_names: set[str] = {"typing"}
 
     def scan(self, tree: ast.AST) -> None:
         """Collect aliases across the whole module, then walk it.
@@ -525,6 +546,8 @@ class _FloorFinder(ast.NodeVisitor):
                 for alias in node.names:
                     if alias.asname:
                         self.module_alias[alias.asname] = alias.name
+                    if alias.name.split(".")[0] == "typing":
+                        self.typing_names.add(alias.asname or "typing")
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ""
                 for alias in node.names:
@@ -536,6 +559,15 @@ class _FloorFinder(ast.NodeVisitor):
                         construct = ATTRIBUTE_GATED.get((tail, alias.name))
                     if construct is not None:
                         self.symbol_alias[alias.asname] = construct
+                    else:
+                        # `from os import path as p` imports a *module* under
+                        # a new name, so `p.splitroot(...)` is the same call
+                        # as `os.path.splitroot(...)`. Only the trailing
+                        # component is ever matched, so binding the bare name
+                        # is enough.
+                        self.module_alias[alias.asname] = alias.name
+                    if module == "typing" and alias.name == "TYPE_CHECKING":
+                        self.typing_names.add(alias.asname)
         self.visit(tree)
 
     def _record(self, node: ast.AST, construct: str) -> None:
@@ -563,30 +595,37 @@ class _FloorFinder(ast.NodeVisitor):
 
     def visit_If(self, node: ast.If) -> None:
         broad = _is_version_test(node.test)
-        typing_only = _is_type_checking_test(node.test)
+        typing_only = _is_type_checking_test(node.test, self.typing_names)
         named = _feature_test_names(node.test)
         outer = self.span
         self.span = _header_span(node)
         self.visit(node.test)
         self.span = outer
 
-        self.depth += bool(broad or typing_only)
+        # A named feature test licenses its construct in *both* branches, for
+        # the same reason a version test does: `if not hasattr(m, 'x'):
+        # fallback / else: use(m.x)` is the correct spelling and flagging it
+        # is a false positive, while reading the polarity is the start of
+        # writing a partial evaluator. The licence is still confined to the
+        # construct actually probed, which is what stops an unrelated
+        # `hasattr` from silencing anything.
         if named:
             self.licensed.append(named)
-        for stmt in node.body:
-            self.visit(stmt)
-        if named:
-            self.licensed.pop()
-        self.depth -= bool(broad or typing_only)
+        try:
+            self.depth += bool(broad or typing_only)
+            for stmt in node.body:
+                self.visit(stmt)
+            self.depth -= bool(broad or typing_only)
 
-        # The `else` of a version test is still a version-aware branch; the
-        # `else` of `if TYPE_CHECKING:` is ordinary runtime code and the
-        # `else` of a hasattr is the fallback, which must not use the thing
-        # that was found to be missing.
-        self.depth += bool(broad)
-        for stmt in node.orelse:
-            self.visit(stmt)
-        self.depth -= bool(broad)
+            # The `else` of a version test is still a version-aware branch;
+            # the `else` of `if TYPE_CHECKING:` is ordinary runtime code.
+            self.depth += bool(broad)
+            for stmt in node.orelse:
+                self.visit(stmt)
+            self.depth -= bool(broad)
+        finally:
+            if named:
+                self.licensed.pop()
 
     def generic_visit(self, node: ast.AST) -> None:
         if isinstance(node, ast.stmt) and not isinstance(node, (ast.Try, ast.If)):
@@ -601,18 +640,17 @@ class _FloorFinder(ast.NodeVisitor):
         """Keyword argument names, including literal ``**{...}`` unpacking.
 
         ``f(**{"follow_symlinks": False})`` is the same call as
-        ``f(follow_symlinks=False)`` and fails identically on the floor. A
-        non-literal unpack (``f(**opts)``) is invisible here and always will
-        be; a literal one is a spelling, not a computation.
+        ``f(follow_symlinks=False)`` and fails identically on the floor.
+        Nested literal dicts are flattened, so ``f(**{**{"k": v}})`` is read
+        too. A non-literal unpack (``f(**opts)``) is invisible here and
+        always will be; a literal one is a spelling, not a computation.
         """
         names = set()
         for keyword in node.keywords:
             if keyword.arg is not None:
                 names.add(keyword.arg)
-            elif isinstance(keyword.value, ast.Dict):
-                for key in keyword.value.keys:
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                        names.add(key.value)
+            else:
+                names |= _literal_dict_keys(keyword.value)
         return names
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -641,9 +679,13 @@ class _FloorFinder(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
-        construct = BUILTIN_GATED.get(node.id) or self.symbol_alias.get(node.id)
-        if construct is not None:
-            self._record(node, construct)
+        # Load context only. An alias register keyed by bare name flagged
+        # `fd = None` as a use of `hashlib.file_digest`, because rebinding a
+        # name reads as the name.
+        if isinstance(node.ctx, ast.Load):
+            construct = BUILTIN_GATED.get(node.id) or self.symbol_alias.get(node.id)
+            if construct is not None:
+                self._record(node, construct)
         self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
@@ -1165,6 +1207,34 @@ FIRES = {
         "else:\n"
         "    from typing import Self\n"
     ),
+    # Round two. Every one of these passed the fixes made in round one, and
+    # was again found by running the detector rather than reading it.
+    "reached through `from os import path as p`": (
+        # The module-alias fix handled `import os.path as osp` and stopped
+        # there. Both spellings bind a module object under a new name.
+        "from os import path as p\n"
+        "head, root, tail = p.splitroot('/a/b')\n"
+    ),
+    "under a TYPE_CHECKING that is somebody's runtime flag": (
+        # `if config.TYPE_CHECKING:` is an ordinary attribute that happens to
+        # share a name with typing's. The first version licensed any
+        # attribute called TYPE_CHECKING regardless of what it hung off.
+        "import hashlib\n"
+        "if config.TYPE_CHECKING:\n"
+        "    digest = hashlib.file_digest(fh, 'sha256')\n"
+    ),
+    "under a hasattr whose probed name merely appears in the construct": (
+        # `hasattr(config, 'hashlib')` and `hashlib.file_digest` share a
+        # token and nothing else. Matching on any component of the dotted
+        # name let the first one license the second.
+        "import hashlib\n"
+        "if hasattr(config, 'hashlib'):\n"
+        "    digest = hashlib.file_digest(fh, 'sha256')\n"
+    ),
+    "a gated keyword inside a nested literal ** unpack": (
+        "from pathlib import Path\n"
+        "Path('x').exists(**{**{'follow_symlinks': False}})\n"
+    ),
 }
 
 #: Which construct each control in FIRES is a control *for*.
@@ -1213,6 +1283,13 @@ EXERCISES = {
     "under a hasattr about something unrelated": "hashlib.file_digest",
     "in the else of a TYPE_CHECKING block, which is runtime code":
         "typing.Self",
+    "reached through `from os import path as p`": "os.path.splitroot",
+    "under a TYPE_CHECKING that is somebody's runtime flag":
+        "hashlib.file_digest",
+    "under a hasattr whose probed name merely appears in the construct":
+        "hashlib.file_digest",
+    "a gated keyword inside a nested literal ** unpack":
+        "pathlib.Path.exists(follow_symlinks=)",
 }
 
 #: Source that must NOT trip it. Each is a spelling this repo can actually run.
@@ -1256,6 +1333,36 @@ PASSES = {
         # alias is followed, and `os.path.join` is as old as os.path.
         "import os.path as osp\n"
         "target = osp.join('a', 'b')\n"
+    ),
+    "the negated hasattr spelling, where the use is in the else": (
+        # `if not hasattr(...): fallback` / `else: use` is the ordinary way
+        # to write this, and flagging it was a false positive. A named
+        # feature test licenses its construct in both branches for the same
+        # reason a version test does - reading the polarity is a partial
+        # evaluator, and the licence is confined to the probed name either
+        # way.
+        "import hashlib\n"
+        "if not hasattr(hashlib, 'file_digest'):\n"
+        "    digest = hashlib.new('sha256')\n"
+        "else:\n"
+        "    digest = hashlib.file_digest(fh, 'sha256')\n"
+    ),
+    "an aliased import rebound to something else afterwards": (
+        # `fd = None` is a Store, not a use. The alias register is keyed by
+        # bare name, so without a context check this read as a call to the
+        # gated symbol on the assignment line.
+        "import sys\n"
+        "if sys.version_info >= (3, 11):\n"
+        "    from hashlib import file_digest as fd\n"
+        "else:\n"
+        "    fd = None\n"
+    ),
+    "a runtime flag that happens to be called TYPE_CHECKING": (
+        # The mirror of the FIRES entry: narrowing TYPE_CHECKING to typing's
+        # must not stop it recognising typing's own, under an alias.
+        "import typing as t\n"
+        "if t.TYPE_CHECKING:\n"
+        "    from typing import Self\n"
     ),
     "behind an inverted sys.version_info test": (
         "import hashlib\n"
