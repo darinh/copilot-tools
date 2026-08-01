@@ -181,7 +181,27 @@ def _read_message(path: Path) -> dict | None | _Unreadable:
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
-        return UNREADABLE
+        # Not every failed read is transient. A directory named like a
+        # message, or a dangling symlink, will fail the same way for ever, so
+        # leaving it pending would jam the mailbox permanently rather than
+        # until a lock clears -- and the broad `except` this replaced did move
+        # those aside. That it is not a regular file is knowledge *about the
+        # file*, so it belongs with corruption.
+        #
+        # There is deliberately no `except FileNotFoundError` ahead of this. A
+        # genuinely vanished file needs no special case: `is_file()` is False,
+        # so it is called corrupt, and the move that follows fails harmlessly
+        # because there is nothing to move. Naming the case separately only
+        # read as clearer -- it put a dangling symlink, which is permanent, on
+        # the same branch as a race, which is not, and so jammed the mailbox
+        # in exactly the way this function exists to prevent.
+        try:
+            regular = path.is_file()
+        except OSError:
+            # The probe failed too, so nothing has been established. Keep the
+            # reading that cannot lose a message.
+            return UNREADABLE
+        return UNREADABLE if regular else None
     except ValueError:
         # Bytes that are not UTF-8 at all. Like malformed JSON this is
         # knowledge about the file and will not change on a retry, so it is

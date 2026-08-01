@@ -318,6 +318,90 @@ def test_a_file_that_can_neither_be_read_nor_moved_is_left_alone(tmp_path,
     assert operator_mail.pending_count(tmp_path, "beta") == 1
 
 
+def test_a_directory_named_like_a_message_does_not_jam_the_mailbox(tmp_path):
+    """Not every failed read is transient, and the trade only holds for the
+    ones that are.
+
+    Leaving unreadable files pending is right when the cause will clear -- a
+    lock, a permission being fixed. A directory named `*.json` fails the read
+    identically and for ever, so the same treatment would mean `pending_count`
+    reporting a message that can never be delivered, permanently. That it is
+    not a regular file is knowledge about the file, which puts it with
+    corruption rather than with an unreadable state. The broad `except` this
+    replaced did move it aside; narrowing the authority must not narrow the
+    reach.
+    """
+    _msg(tmp_path, text="good")
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    intruder = inbox / "20260731-directory.json"
+    intruder.mkdir()
+
+    assert [m["text"] for m in operator_mail.consume(tmp_path, "beta")] == \
+        ["good"]
+    assert not intruder.exists(), "the mailbox is jammed for ever"
+    assert operator_mail.pending_count(tmp_path, "beta") == 0
+
+
+def test_a_dangling_symlink_does_not_jam_the_mailbox(tmp_path):
+    """The other permanent shape, and the one that cost a review round.
+
+    A dangling symlink named `*.json` raises `FileNotFoundError` on read --
+    but it is not a message that vanished, it is a directory entry that will
+    raise identically for ever. An earlier draft of this fix gave
+    `FileNotFoundError` its own branch returning UNREADABLE, on the reasoning
+    that gone is not corrupt. That branch read as clearer and was worse: it
+    put the permanent case and the racing case together, so the symlink
+    stayed pending for ever -- the very jam this function exists to prevent,
+    reintroduced inside its fix. The classification has to follow what the
+    path IS, not which exception it raised.
+    """
+    _msg(tmp_path, text="good")
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    link = inbox / "20260731-dangling.json"
+    try:
+        link.symlink_to(tmp_path / "no-such-target.json")
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover
+        pytest.skip(f"symlinks not permitted here: {exc}")
+    assert link.is_symlink(), "premise: the entry exists"
+    assert not link.is_file(), "premise: it does not resolve to a file"
+
+    assert [m["text"] for m in operator_mail.consume(tmp_path, "beta")] == \
+        ["good"]
+    assert not link.is_symlink(), "the mailbox is jammed for ever"
+    assert operator_mail.pending_count(tmp_path, "beta") == 0
+
+
+def test_a_message_that_vanishes_mid_read_is_not_reported_as_delivered(
+    tmp_path, monkeypatch
+):
+    """A file taken by another reader between the scan and the read.
+
+    Nothing is lost and nothing is claimed: it is not returned as delivered,
+    and the move that follows finds nothing to move.
+    """
+    msg = _msg(tmp_path, text="taken")
+    _msg(tmp_path, text="good")
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    path = inbox / f"{msg['id']}.json"
+    real = Path.read_text
+    fired = []
+
+    def vanish(self, *args, **kwargs):
+        if self.resolve() == path.resolve():
+            fired.append(str(self))
+            Path.unlink(self)
+            raise FileNotFoundError(2, "No such file or directory")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", vanish)
+    delivered = [m["text"] for m in operator_mail.consume(tmp_path, "beta")]
+    assert fired, "premise: the read actually raced"
+    assert delivered == ["good"], "a message nobody read was reported read"
+    assert not (
+        operator_mail.archive_dir(tmp_path, "beta") / path.name
+    ).exists()
+
+
 def test_bytes_that_are_not_utf8_are_corruption_not_an_unreadable_state(
         tmp_path):
     """`read_text` decodes, so it raises `UnicodeDecodeError` -- a
