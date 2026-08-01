@@ -104,11 +104,27 @@ def _probe_source() -> str:
     The function body is read out of `operator.sh` rather than copied here,
     so this cannot go on passing against a function the script no longer
     contains.
+
+    The body is checked before it is used. If `_shell_function` ever returned
+    the wrong text -- or nothing -- the assembled probe would be
+    `resolve_script_dir() { }`, which is a bash *syntax* error, and every test
+    built on it would fail identically at `returncode == 0` while the control
+    that does not use it stayed green. That is indistinguishable from the
+    script being broken, and it points the reader at the wrong file. Failing
+    on the fixture says which one it is.
     """
+    body = _shell_function("resolve_script_dir")
+    assert body.strip(), (
+        "fixture: _shell_function extracted no body for resolve_script_dir "
+        f"from {OPERATOR_SH}; this is a harness failure, not a script failure")
+    assert "readlink" in body, (
+        "fixture: the extracted resolve_script_dir body does not call "
+        f"readlink, so the wrong text was pulled out of {OPERATOR_SH}: "
+        f"{body[:200]!r}")
     return (
         "set -euo pipefail\n"
         "resolve_script_dir() {\n"
-        + _shell_function("resolve_script_dir")
+        + body
         + "}\n"
         'SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"\n'
         'echo "SCRIPT_DIR=$SCRIPT_DIR"\n'
@@ -187,10 +203,61 @@ def test_script_dir_follows_a_symlink_the_way_the_rollback_installs_one(tmp_path
         "does not live there")
 
 
+@bash
+def test_a_symlink_cycle_fails_loudly_instead_of_answering_wrongly(tmp_path):
+    """The bounded loop must not hand back a plausible directory on give-up.
+
+    Adversarial review argued this branch is unreachable, because a cyclic
+    `BASH_SOURCE[0]` makes the kernel ELOOP at `exec` before bash loads the
+    script at all. That is probably right, and it is not a reason to leave the
+    branch returning a wrong answer: the entire defect this file exists for
+    was a resolver that answered confidently when it could not answer. So the
+    function is called directly with a cycle, which is the only way to reach
+    the branch, and the requirement is a non-zero status and a named cause --
+    not a directory.
+    """
+    run_from = tmp_path / "anywhere"
+    run_from.mkdir()
+    # Built with Python rather than `ln -s`, for the same reason the sibling
+    # symlink test does: msys `ln -s` copies instead of linking unless
+    # MSYS=winsymlinks:nativestrict, so the shell spelling skips on Windows
+    # and the assertion below would never have been executed anywhere this
+    # was developed.
+    loop_a = run_from / "loop_a"
+    loop_b = run_from / "loop_b"
+    try:
+        loop_a.symlink_to("loop_b")
+        loop_b.symlink_to("loop_a")
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    probe = tmp_path / "probe.sh"
+    probe.write_text(
+        "set -uo pipefail\n"
+        "resolve_script_dir() {\n"
+        + _shell_function("resolve_script_dir")
+        + "}\n"
+        '[ -L loop_a ] || { echo NOT_A_SYMLINK; exit 3; }\n'
+        'resolve_script_dir loop_a\n',
+        encoding="utf-8", newline="\n")
+
+    result = _run(tmp_path, run_from, probe)
+
+    if result.returncode == 3 or "NOT_A_SYMLINK" in result.stdout:
+        pytest.skip("this shell does not see the link as a symlink")
+    assert result.returncode != 0, (
+        "a symlink cycle resolved to a directory instead of failing; "
+        f"it reported {result.stdout.strip()!r}")
+    assert "symlink loop" in result.stderr.lower(), (
+        "the failure is silent -- nothing names the cause. stderr: "
+        f"{result.stderr.strip()!r}")
+    assert not result.stdout.strip(), (
+        "a path was printed alongside the failure, so a caller reading stdout "
+        f"still gets a wrong answer: {result.stdout.strip()!r}")
+
+
 ORIGINAL_LINE = (
     'SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"'
 )
-
 
 @bash
 def test_the_harness_catches_the_original_defect(tmp_path):

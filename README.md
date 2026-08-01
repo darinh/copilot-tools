@@ -46,7 +46,8 @@ strand a user without a working `operator`/`handoff` command.
 
 Here "legacy" means superseded, not abandoned. A rollback target is only worth
 having if it still runs, so the bash scripts stay under test: CI's "Shell
-script syntax" job parses every `*.sh` with `bash -n` on every push, and the
+script syntax" job parses every `*.sh` with `bash -n` on every pull request
+and every push to `main`, and the
 suite exercises `operator.sh` and `handoff.sh` directly —
 `tests/test_operator_sh_bash32.py`, `tests/test_handoff_sh.py`,
 `tests/test_operator_sh_help.py` and `tests/test_shell_bash32_conformance.py`
@@ -265,9 +266,9 @@ copilot-tools/
 ├── e2e_restart_loop.py            # End-to-end restart-loop check, real processes
 ├── setup.sh                       # POSIX bootstrap; finds Python, runs setup_tools
 ├── setup.ps1                      # Windows bootstrap; same, winget if no Python
-├── operator.sh                    # Legacy bash wrapper (Linux/WSL)
+├── operator.sh                    # Legacy bash wrapper (Linux/WSL/macOS)
 ├── operator-ingest.py             # Legacy log parser, used by operator.sh
-├── handoff.sh                     # Legacy bash handoff (Linux/WSL)
+├── handoff.sh                     # Legacy bash handoff (Linux/WSL/macOS)
 ├── diagnose-restart-deleter.sh    # Diagnostic: who deleted the restart directory
 ├── extensions/                    # Copilot CLI runtime extensions; see its README
 ├── skills/

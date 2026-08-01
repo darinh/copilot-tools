@@ -71,8 +71,20 @@ STALE_CLAIM = re.compile(
 # stops at sentence punctuation, because a negation in the previous sentence
 # denies nothing here: "This is not the Python path. The scripts are
 # unmaintained" is still a lie.
+#
+# The window is 20 characters and not 40, which is where it started. A negator
+# reaches across a comma into the *next clause* long before it reaches the next
+# sentence, and adversarial review put its finger on the class even though the
+# example it offered did not reproduce. Measured: at 40, "It is never simple,
+# the scripts are frozen" is read as a denial and the lie passes. Twenty is
+# chosen from both sides rather than by taste -- "operator.sh is not, in fact,
+# abandoned" needs 11 characters of reach and must keep it, that cross-clause
+# lie needs 25 and must lose it. Both are pinned as tests below, so the number
+# cannot drift back without something going red. Banning the comma outright was
+# the other candidate and is worse: it breaks the true sentence, which is the
+# failure mode that reintroduces the false one.
 NEGATED = re.compile(
-    r"\b(?:not|never|nor|isn't|aren't|rather than|far from)\b[^.;:!?]{0,40}$",
+    r"\b(?:not|never|nor|isn't|aren't|rather than|far from)\b[^.;:!?]{0,20}$",
     re.IGNORECASE,
 )
 
@@ -113,6 +125,45 @@ def _blocks(text: str) -> list[str]:
     return [block for block in re.split(r"\n[ \t]*\n", text) if block.strip()]
 
 
+# A block that continues the one above it rather than starting a new thought:
+# a list item, a blockquote, a table row, an indented continuation. Markdown
+# requires a blank line before a list, so "For `operator.sh`:" and the bullets
+# under it are *always* different blocks.
+CONTINUATION = re.compile(r"^(?:[-*+]\s|\d+[.)]\s|>|\||\s+\S)")
+HEADING = re.compile(r"^#{1,6}\s")
+
+
+def _attributed_blocks(text: str) -> list[str]:
+    """Blocks in which a claim would be *about* the bash scripts.
+
+    Paragraph scope fixed the bug that line scope missed, and then had one of
+    its own in the same shape one level up. "For ``operator.sh``:" followed by
+    a bulleted "it is unmaintained" puts the subject and the claim in adjacent
+    *blocks*, and a block-at-a-time scan finds neither block objectionable --
+    measured against the real implementation, that evasion returned zero
+    offences. So the subject carries forward, but only into blocks that are
+    syntactically continuations of it, and only until the next heading.
+
+    Carrying it into everything was the obvious alternative and is wrong: these
+    documents mention the bash scripts constantly, so a document-wide subject
+    makes every later claim about anything read as a claim about them, and a
+    guard that fires on true prose is one somebody deletes.
+    """
+    attributed: list[str] = []
+    carried = False
+    for block in _blocks(text):
+        first = block.lstrip("\n")
+        if HEADING.match(first):
+            carried = False
+        has_subject = bool(SUBJECT.search(block))
+        if has_subject or (carried and CONTINUATION.match(first)):
+            attributed.append(block)
+            carried = True
+        else:
+            carried = False
+    return attributed
+
+
 def _stale_claims(block: str) -> list[str]:
     """Claim tokens in `block` that are asserted rather than denied."""
     return [
@@ -143,6 +194,46 @@ def _fenced_lines(text: str) -> list[str]:
         if inside:
             lines.append(line)
     return lines
+
+
+SETUP_MENTION = re.compile(r"(?:^|[\s(`])\.?/?setup\.sh\b")
+
+# A mention of `setup.sh` that is telling the reader it moves them *off* the
+# bash scripts is the opposite of prescribing it, and the correct prose in
+# `docs/operator.md` does exactly that: "`./setup.sh` will not give you one --
+# it migrates `operator`/`handoff` *off* ...". Scanning prose without this
+# turns that warning into an offence, which is the same self-defeating shape
+# as a claim guard that rejects "superseded, not abandoned".
+MIGRATES_AWAY = re.compile(
+    r"\bmigrat\w+|\bwill not\b|\bwon't\b|\bdoes not\b|\bdo not\b|\bdon't\b"
+    r"|\bnever\b|\binstead of\b|\brather than\b|\bback to python\b",
+    re.IGNORECASE,
+)
+
+# A period inside `setup.sh` or `./setup.sh` is not the end of a sentence.
+# Requiring whitespace after the mark is what tells them apart.
+SENTENCE_END = re.compile(r"[.!?;](?=\s)")
+
+
+def _setup_prescriptions(body: str) -> list[str]:
+    """Sentences in `body` that offer ``setup.sh`` without saying it migrates.
+
+    Fenced lines are not special-cased because they no longer need to be: a
+    fenced command is a sentence with no prose in it, so it carries no
+    migrates-away marker and is reported. Scanning only fences -- which is
+    what this did first -- misses "you can restore the bash install by running
+    ./setup.sh", which is the same instruction with the backticks taken off.
+    """
+    flat = " ".join(body.split())
+    bounds = [m.start() for m in SENTENCE_END.finditer(flat)]
+    found: list[str] = []
+    for hit in SETUP_MENTION.finditer(flat):
+        start = max((b + 1 for b in bounds if b < hit.start()), default=0)
+        end = min((b for b in bounds if b >= hit.end()), default=len(flat))
+        sentence = flat[start:end].strip()
+        if not MIGRATES_AWAY.search(sentence):
+            found.append(sentence)
+    return found
 
 
 def _test_files_exercising(script: str) -> list[str]:
@@ -190,9 +281,8 @@ def test_the_scripts_really_are_exercised_by_the_suite(script):
 def test_no_shipped_document_calls_the_maintained_scripts_dead():
     offences = []
     for doc in _docs():
-        for block in _blocks(doc.read_text(encoding="utf-8", errors="replace")):
-            if not SUBJECT.search(block):
-                continue
+        for block in _attributed_blocks(
+                doc.read_text(encoding="utf-8", errors="replace")):
             for claim in _stale_claims(block):
                 offences.append(
                     f"{doc.relative_to(REPO).as_posix()}: {claim!r} in "
@@ -250,11 +340,10 @@ def test_the_readme_names_test_modules_that_exist_and_run_the_scripts():
             if not SUBJECT.search(summary) and not re.search(
                     r"roll(ing)? ?back", summary, re.IGNORECASE):
                 continue
-            for line in _fenced_lines(body):
-                if re.search(r"(?:^|[\s/])setup\.sh\b", line):
-                    offences.append(
-                        f"{doc.relative_to(REPO).as_posix()}: {summary!r} "
-                        f"tells the reader to run {line.strip()!r}")
+            for line in _setup_prescriptions(body):
+                offences.append(
+                    f"{doc.relative_to(REPO).as_posix()}: {summary!r} "
+                    f"tells the reader to run {line.strip()!r}")
     assert not offences, (
         "a rollback section prescribes setup.sh, which migrates away from the "
         "bash scripts:\n  " + "\n  ".join(offences))
@@ -288,10 +377,116 @@ def test_the_detector_fires_on_the_prose_that_actually_shipped(shipped):
     "| `operator.sh` / `handoff.sh` (bash, superseded, still maintained) |",
     "The original bash implementation is retained on disk for rollback but no "
     "longer installed fresh by `setup.sh`.",
-    "operator.sh                    # Legacy bash wrapper (Linux/WSL)",
+    "operator.sh                    # Legacy bash wrapper (Linux/WSL/macOS)",
 ])
 def test_the_detector_leaves_accurate_descriptions_alone(acceptable):
     """A guard that also rejects the true statement forces the false one back."""
     blocks = _blocks(acceptable)
     assert not any(STALE_CLAIM.search(b) for b in blocks), (
         f"the detector objects to an accurate description: {acceptable!r}")
+
+
+# ── Controls for the three holes adversarial review opened ──────────
+# Each of these was a live evasion in this file, measured against the real
+# implementation before it was fixed. They are kept as tests rather than
+# described in a comment because a fix nobody can re-run is a claim.
+
+
+def test_a_claim_in_a_list_beneath_its_subject_is_still_attributed():
+    """Paragraph scope had the same bug as line scope, one level up."""
+    doc = "For `operator.sh`:\n\n- It is unmaintained and you should not read it.\n"
+    offences = [c for b in _attributed_blocks(doc) for c in _stale_claims(b)]
+    assert offences == ["unmaintained"], (
+        "a subject introducing a list does not reach the claim in it")
+
+
+def test_the_subject_does_not_carry_into_unrelated_prose():
+    """The negative control for carrying it -- over-reach is the other failure.
+
+    A subject that carried to end-of-document would make this pass while
+    reporting the whole README, and a guard that fires on true prose gets
+    deleted rather than obeyed.
+    """
+    doc = ("For `operator.sh`:\n\n- it is fine\n\n"
+           "The templates directory is frozen for the release.\n")
+    offences = [c for b in _attributed_blocks(doc) for c in _stale_claims(b)]
+    assert offences == [], (
+        "the subject leaked into a paragraph that is not about the scripts")
+
+
+def test_a_heading_ends_the_subjects_reach():
+    doc = ("For `operator.sh`:\n\n## Templates\n\n"
+           "- this directory is unmaintained\n")
+    assert [c for b in _attributed_blocks(doc) for c in _stale_claims(b)] == []
+
+
+@pytest.mark.parametrize("denied", [
+    "Here 'legacy' means superseded, not abandoned",
+    "operator.sh is not, in fact, abandoned",
+    "The bash scripts are far from unmaintained",
+])
+def test_an_adjacent_denial_still_suppresses_the_claim(denied):
+    assert _stale_claims(denied) == [], (
+        f"the guard rejects a true statement: {denied!r}")
+
+
+@pytest.mark.parametrize("lie", [
+    # Cross-clause: the negator denies the *previous* clause, not this one.
+    # At the original 40-character window this one passed.
+    "It is never simple, the scripts are frozen",
+    "This is not the Python path. The scripts are unmaintained",
+    "This is not the final form, and operator.sh is abandoned",
+])
+def test_a_denial_of_something_else_does_not_suppress_the_claim(lie):
+    assert _stale_claims(lie), (
+        f"a negation elsewhere in the sentence hid a real claim: {lie!r}")
+
+
+def test_setup_sh_is_caught_in_prose_and_not_only_inside_fences():
+    """Scanning fenced lines only misses the instruction with its backticks off."""
+    body = "You can restore the bash install by running ./setup.sh again.\n"
+    assert _fenced_lines(body) == [], "premise: this text is not in a fence"
+    assert _setup_prescriptions(body), (
+        "a prose instruction to run setup.sh is not reported")
+
+
+def test_the_setup_sh_rule_leaves_the_warning_that_replaced_it_alone():
+    """The negative control, taken verbatim from the prose this branch ships.
+
+    Without denial-awareness the fix for the test above reports our own
+    correct warning as an offence, and the only way to green is to stop
+    warning -- which is how the original bad instruction got there.
+    """
+    body = ("**`./setup.sh` will not give you one** -- it migrates "
+            "`operator`/`handoff` *off* the bash scripts.\n")
+    assert SETUP_MENTION.search(" ".join(body.split())), "premise: it is mentioned"
+    assert _setup_prescriptions(body) == [], (
+        "the guard reports our own warning as if it prescribed setup.sh")
+
+
+def test_the_readme_ci_claim_matches_the_workflow():
+    """The README cites CI as evidence. Cite, then verify -- against the yaml.
+
+    "on every push" was false: `ci.yml` restricts both triggers to `main`, so
+    a push to a feature branch runs nothing. Two independent reviewers caught
+    it in prose this very module was written to keep honest, which is the
+    argument for checking the claim mechanically rather than proofreading it.
+    """
+    workflow = REPO / ".github" / "workflows" / "ci.yml"
+    assert workflow.is_file(), f"premise expired: no {workflow}"
+    ci = workflow.read_text(encoding="utf-8")
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+
+    assert "Shell script syntax" in ci, (
+        "premise expired: the README names a 'Shell script syntax' job that "
+        "ci.yml no longer defines")
+
+    triggers = ci.split("\njobs:")[0]
+    restricted = re.search(r"\n  push:\n\s+branches:\s*\[[^\]]*\]", triggers)
+    if restricted:
+        assert not re.search(r"on every push\b(?! to)", readme), (
+            "README says the shell job runs 'on every push', but ci.yml "
+            "restricts the push trigger to specific branches")
+        assert "push to `main`" in readme, (
+            "ci.yml restricts pushes to named branches; the README should say "
+            "which, rather than implying all of them")

@@ -54,9 +54,21 @@ resolve_script_dir() {
     # `readlink` with no flags is POSIX and resolves one hop, which is all BSD
     # offers; the loop is what `-f` was doing. Bounded, because a symlink
     # cycle here would hang the launcher rather than fail it.
+    #
+    # Exceeding the bound *fails* rather than breaking out and resolving
+    # whatever `src` happens to hold. Breaking would hand back a real,
+    # plausible-looking directory that is not this script's, which is the
+    # precise failure this whole function exists to delete -- and it would do
+    # it silently. Adversarial review argued the branch is unreachable, since
+    # a cyclic `BASH_SOURCE[0]` makes the kernel ELOOP at `exec` before bash
+    # ever loads the script; that is very likely right, and is exactly why
+    # this must not be the one place that answers a question it cannot answer.
     while [ -L "$src" ]; do
         hops=$((hops + 1))
-        [ "$hops" -le 40 ] || break
+        if [ "$hops" -gt 40 ]; then
+            printf '%s: symlink loop while resolving %s\n' "${0##*/}" "$1" >&2
+            return 1
+        fi
         dir="$(cd -P "$(dirname "$src")" && pwd)"
         src="$(readlink "$src")"
         case "$src" in
