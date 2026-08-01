@@ -52,7 +52,7 @@ import {
   primaryStrayReport,
   rootToWatch,
   scanCheckoutTree,
-  sessionBriefing,
+  sessionContext,
   strayReport,
   sweepDecision,
 } from "./guard.mjs";
@@ -183,9 +183,16 @@ const session = await joinSession({
         // briefing still names the intended location.
       }
       const root = await checkoutRoot(process.cwd());
+      const seeds = [];
       if (root) {
         const initial = await scanCheckoutTree(root);
         if (initial !== null) lastSeen.set(root, initial);
+        // Seeded AND reported. A stray present at seed time is invisible to
+        // every later hook by construction -- `observe` answers "what is
+        // new", and this never will be again -- so a session not told here is
+        // never told at all. `sessionContext` drops a null scan rather than
+        // reporting an empty checkout.
+        seeds.push({ strays: initial, root });
         // Seed the primary too, or its entire contents would read as new the
         // first time a command is run and every existing file in it would be
         // reported as this agent's doing.
@@ -193,9 +200,13 @@ const session = await joinSession({
         if (other) {
           const seedOther = await scanCheckoutTree(other);
           if (seedOther !== null) lastSeen.set(other, seedOther);
+          // The seed that motivated this: an agent working in a worktree is
+          // the one for whom strays in the primary are both invisible and
+          // most expensive, and `root` is not the primary for that agent.
+          seeds.push({ strays: seedOther, root: other, primary: true });
         }
       }
-      return { additionalContext: sessionBriefing(scratchDir) };
+      return { additionalContext: sessionContext(scratchDir, seeds) };
     },
 
     onPreToolUse: async (input) => {
