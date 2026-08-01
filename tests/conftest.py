@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import sys
 import warnings
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -127,6 +129,57 @@ def state_dir(tmp_path: Path) -> Path:
     d = tmp_path / "restart"
     d.mkdir(parents=True)
     return d
+
+
+@contextmanager
+def denied(monkeypatch, *paths, limit: int | None = None, counter=None):
+    """Make every stat of ``paths`` raise EACCES, as a revoked directory does.
+
+    Three call sites are patched, not one. ``Path.exists()`` reaches the
+    filesystem through ``os.stat`` -- and on 3.10 through a private pathlib
+    accessor that copies ``os.stat`` at import time -- while the tri-state
+    probes in ``copilot_operator`` call ``os.lstat`` directly. Deny only
+    ``os.lstat`` and code that still uses ``exists()`` sails through, so the
+    test grades nothing; deny only ``os.stat`` and the probes never see the
+    failure they exist to handle; miss the accessor and the whole thing is
+    vacuous on 3.10.
+
+    ``limit`` denies only the first N probes, which is how a transient failure
+    (a scanner holding a file open on Windows) actually behaves: the next poll
+    succeeds.
+    """
+    targets = {str(Path(p)) for p in paths}
+    seen = counter if counter is not None else {"n": 0}
+    real_stat, real_lstat = os.stat, os.lstat
+
+    def guard(real):
+        def probe(path, *args, **kwargs):
+            try:
+                key = str(Path(path))
+            except TypeError:
+                key = None
+            if key in targets and (limit is None or seen["n"] < limit):
+                seen["n"] += 1
+                raise PermissionError(13, "Permission denied")
+            return real(path, *args, **kwargs)
+        return probe
+
+    monkeypatch.setattr(os, "stat", guard(real_stat))
+    monkeypatch.setattr(os, "lstat", guard(real_lstat))
+    accessor = getattr(pathlib, "_NormalAccessor", None)
+    saved = {}
+    if accessor is not None:
+        for name, real in (("stat", real_stat), ("lstat", real_lstat)):
+            if hasattr(accessor, name):
+                saved[name] = getattr(accessor, name)
+                setattr(accessor, name, staticmethod(guard(real)))
+    try:
+        yield seen
+    finally:
+        for name, original in saved.items():
+            setattr(accessor, name, original)
+        monkeypatch.setattr(os, "stat", real_stat)
+        monkeypatch.setattr(os, "lstat", real_lstat)
 
 
 @pytest.fixture

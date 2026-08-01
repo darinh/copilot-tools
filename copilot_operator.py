@@ -29,6 +29,7 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import stat as stat_module
 import subprocess
 import sys
 import time
@@ -49,6 +50,7 @@ if _HERE not in sys.path:
 
 import operator_ingest                                       # noqa: E402
 import operator_mail                                         # noqa: E402
+from install_manifest import path_present                     # noqa: E402
 from operator_console import enable_utf8_output               # noqa: E402
 from operator_mux import (                                    # noqa: E402
     Mux, MuxError, MuxNotFoundError, safe_instance_id,
@@ -153,6 +155,170 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ── presence probes ─────────────────────────────────────────────
+# Every *read* in this module already treats "could not read" as a
+# non-answer (`except OSError: return None`). Presence checks were the
+# exception: `Path.exists`/`is_dir`/`is_file` raise on anything outside
+# pathlib's small ignore list -- EACCES, and on Windows a sharing violation
+# from a scanner holding the file open -- so a probe that used to be a
+# one-line question could end the process. In the supervisor's poll loop that
+# is fatal in the literal sense: the loop only catches KeyboardInterrupt, so
+# one unlucky stat on a marker file stops the unattended restarts this whole
+# program exists to provide. See :func:`install_manifest.path_present` for
+# which error codes lie in which direction.
+#
+# The tri-state answer is deliberate. "Cannot tell" must not share a return
+# value with "absent", because absent is what licenses overwriting a file or
+# concluding a session has ended.
+
+#: Paths already reported as unexaminable, so a permanent failure is logged
+#: once per process rather than once per poll.
+_PROBE_WARNED: set[str] = set()
+
+
+def dir_present(path: Path) -> bool | None:
+    """Whether ``path`` is a directory: True, False, or None for "cannot tell".
+
+    Follows symlinks, since a link to a directory is usable as one.
+    """
+    try:
+        return stat_module.S_ISDIR(os.stat(path).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except (OSError, ValueError):
+        return None
+
+
+def file_present(path: Path) -> bool | None:
+    """Whether ``path`` is a regular file: True, False, or None."""
+    try:
+        return stat_module.S_ISREG(os.stat(path).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except (OSError, ValueError):
+        return None
+
+
+class _Unplaceable:
+    """Sentinel: the lookup failed, which is not the same as finding nothing.
+
+    Handed back by ``_tracked_cwd_for_id`` so a caller deciding who is present
+    cannot mistake "the records would not open" for "there is no record".
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<unplaceable>"
+
+
+UNPLACEABLE = _Unplaceable()
+
+
+def remove_file(path: Path) -> bool:
+    """Delete ``path`` if we can; report whether it is gone.
+
+    ``unlink(missing_ok=True)`` only forgives a file that was already absent.
+    Every caller here is cleaning up state it no longer wants, and a marker
+    held open by a scanner or sitting on a denied path is a reason to move on,
+    not to end the process with a traceback -- least of all the supervisor's
+    shutdown path, which runs when something has already gone wrong.
+    """
+    try:
+        path.unlink()
+        return True
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError as exc:
+        log(f"  Could not remove {path.name}: {exc}")
+        return False
+
+
+@contextmanager
+def _exclusive_lock(path: Path):
+    """Yield True when this process took ``path`` as a lock, False otherwise.
+
+    ``O_CREAT|O_EXCL`` is the one creation primitive that is atomic on both
+    POSIX and Windows, which is what makes it a lock rather than another
+    check-then-act. A lock whose recorded pid is *readable* and dead is stale
+    -- the holder crashed mid-operation -- and is reclaimed once. A lock whose
+    owner cannot be read is not: ``os.open`` creates the file empty and the
+    pid lands a moment later, so an unparseable lock is most likely one being
+    taken right now, and deleting it would hand the same lock to two
+    processes. Refusing there can jam a lock whose holder died inside that
+    window; that is the trade, and a jam says so in the log while a double
+    acquisition does not.
+    """
+    acquired = False
+    try:
+        for _ in range(2):
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    recorded = path.read_text(encoding="utf-8").strip()
+                except OSError as exc:
+                    log(f"  Lock {path.name} exists and could not be read "
+                        f"({exc}) — treating it as held")
+                    break
+                try:
+                    holder = int(recorded)
+                except ValueError:
+                    log(f"  Lock {path.name} names no owner — treating it as "
+                        f"held. If nothing is running, remove {path}")
+                    break
+                if _pid_alive(holder):
+                    break
+                remove_file(path)
+                continue
+            except OSError:
+                break
+            else:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(str(os.getpid()))
+                acquired = True
+                break
+        yield acquired
+    finally:
+        if acquired:
+            remove_file(path)
+
+
+def marker_state(path: Path) -> bool | None:
+    """Tri-state read of a supervisor signal file, warning once per path.
+
+    None means the probe failed: the marker may or may not be set and the
+    caller has to decide what to do about not knowing. Most callers can wait
+    for the next poll; the one that cannot is crash recovery, which would
+    otherwise read "cannot tell" as "nobody asked me to stop".
+    """
+    present = path_present(path)
+    key = str(path)
+    if present is None:
+        if key not in _PROBE_WARNED:
+            _PROBE_WARNED.add(key)
+            log(f"  Could not examine {path.name} — treating it as unset and "
+                f"re-checking next poll")
+        return None
+    _PROBE_WARNED.discard(key)
+    return bool(present)
+
+
+def marker_set(path: Path) -> bool:
+    """True only when a marker file is definitely there.
+
+    Used by the supervisor for signal files it polls. A probe that cannot
+    answer reports "no signal yet" and lets the next poll ask again, which is
+    the only outcome that keeps the loop alive; the alternatives are killing
+    the supervisor with a traceback or acting on a signal nobody sent.
+
+    Callers that would take an irreversible branch on the False must use
+    ``marker_state`` instead: "no marker" and "no answer" only mean the same
+    thing when the consequence of being wrong is one more poll.
+    """
+    return marker_state(path) is True
+
+
 def set_tab_title(title: str) -> None:
     if sys.stdout.isatty():
         sys.stdout.write(f"\033]0;{title}\007")
@@ -195,34 +361,64 @@ def clear_tab_progress() -> None:
 atexit.register(clear_tab_progress)
 
 
+def _move_legacy(src: Path, dest: Path) -> bool:
+    """Move ``src`` onto ``dest``, gated and logged. True when it moved.
+
+    The gate is the destination being *definitely* absent: a destination that
+    merely cannot be examined must not be moved onto, because ``shutil.move``
+    replaces a file it lands on and the one copy of the user's metrics or
+    backups would be gone.
+
+    Failures are logged rather than passed over. This function moves the
+    user's data; "it silently did nothing" and "it silently did the wrong
+    thing" are indistinguishable afterwards if neither says anything.
+    """
+    state = path_present(dest)
+    if state is None:
+        log(f"  Not migrating {src.name}: could not examine {dest}")
+        return False
+    if state:
+        return False
+    try:
+        shutil.move(str(src), str(dest))
+        return True
+    except (OSError, shutil.Error) as exc:
+        log(f"  Could not migrate {src} to {dest}: {exc}")
+        return False
+
+
 def migrate_legacy_state() -> None:
-    """One-time move of state out of ~/.copilot, which the CLI deletes."""
+    """One-time move of state out of ~/.copilot, which the CLI deletes.
+
+    Held under an exclusive lock, because probing a destination and then
+    moving onto it are two syscalls and a tri-state probe only fixes the
+    first one. A machine running a loop per project starts many operators at
+    once; without the lock they interleave between the check and the move, and
+    on POSIX a directory that appeared absent to both ends up nested inside
+    itself rather than moved. The loser of the race finds the work already
+    done, which is the correct outcome for a one-time migration.
+    """
     RESTART_DIR.mkdir(parents=True, exist_ok=True)
-    moved = 0
-    if LEGACY_RESTART_DIR.is_dir() and LEGACY_RESTART_DIR != RESTART_DIR:
-        for src in list(LEGACY_RESTART_DIR.iterdir()):
-            dest = RESTART_DIR / src.name
-            if not dest.exists():
-                try:
-                    shutil.move(str(src), str(dest))
-                    moved += 1
-                except (OSError, shutil.Error):
-                    pass
-    for src, dest in ((LEGACY_LOG_FILE, LOG_FILE), (LEGACY_METRICS_DB, METRICS_DB)):
-        if src.is_file() and not dest.exists():
+    with _exclusive_lock(OPERATOR_HOME / "migrate.lock") as acquired:
+        if not acquired:
+            return
+        moved = 0
+        if dir_present(LEGACY_RESTART_DIR) and LEGACY_RESTART_DIR != RESTART_DIR:
             try:
-                shutil.move(str(src), str(dest))
-                moved += 1
-            except (OSError, shutil.Error):
-                pass
-    if LEGACY_BACKUPS_DIR.is_dir() and not BACKUPS_DIR.exists():
-        try:
-            shutil.move(str(LEGACY_BACKUPS_DIR), str(BACKUPS_DIR))
-            moved += 1
-        except (OSError, shutil.Error):
-            pass
-    if moved:
-        log(f"Migrated {moved} legacy state item(s) into {OPERATOR_HOME}")
+                legacy_items = list(LEGACY_RESTART_DIR.iterdir())
+            except OSError as exc:
+                log(f"  Could not list {LEGACY_RESTART_DIR}: {exc}")
+                legacy_items = []
+            for src in legacy_items:
+                moved += _move_legacy(src, RESTART_DIR / src.name)
+        for src, dest in ((LEGACY_LOG_FILE, LOG_FILE),
+                          (LEGACY_METRICS_DB, METRICS_DB)):
+            if file_present(src):
+                moved += _move_legacy(src, dest)
+        if dir_present(LEGACY_BACKUPS_DIR):
+            moved += _move_legacy(LEGACY_BACKUPS_DIR, BACKUPS_DIR)
+        if moved:
+            log(f"Migrated {moved} legacy state item(s) into {OPERATOR_HOME}")
 
 
 # ── instance ────────────────────────────────────────────────────
@@ -323,13 +519,24 @@ class Instance:
         os.replace(tmp, self.managed_file)
 
     def ownership(self) -> dict | None:
-        if not self.managed_file.exists():
+        # "Cannot examine" answers the same as "no claim": ownership is what
+        # authorizes destroying a session, so anything short of a claim we can
+        # actually read must refuse.
+        if path_present(self.managed_file) is not True:
             return None
         try:
             return json.loads(self.managed_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            # A legacy or truncated marker: present but tokenless.
+        except ValueError:
+            # A legacy or truncated marker: it read fine, it just says
+            # nothing. Present but tokenless.
             return {"token": None, "display_name": self.display_name}
+        except OSError:
+            # Something is there but we could not read it — a dangling
+            # symlink, a directory, a denied file. Returning the tokenless
+            # dict here would hand out ownership on the strength of a claim
+            # nobody managed to read, and ownership is what authorizes
+            # killing a session.
+            return None
 
     def owns_live_session(self) -> bool:
         """True only when this operator's claim matches a session that exists.
@@ -347,9 +554,13 @@ class Instance:
     def is_managed(self) -> bool:
         """True when this instance has operator state of any kind.
 
-        Used for listing and continuity only — never to authorize a kill.
+        Used for listing and continuity only — never to authorize a kill, so
+        state that cannot be examined counts as present: reporting "no such
+        instance" for state that is really there is the misleading answer, and
+        every destructive path re-checks ownership anyway.
         """
-        return self.managed_file.exists() or self.state_file.exists()
+        return (path_present(self.managed_file) is not False
+                or path_present(self.state_file) is not False)
 
     # -- persisted state
     def save_state(self, session_num: int, run_started: str, session_id: str = "") -> None:
@@ -361,7 +572,7 @@ class Instance:
         os.replace(tmp, self.state_file)
 
     def load_state(self) -> dict | None:
-        if not self.state_file.exists():
+        if path_present(self.state_file) is False:
             return None
         state: dict[str, str] = {}
         try:
@@ -391,15 +602,28 @@ class Instance:
                      self.pid_file, self.exit_file, self.session_file,
                      self.loop_pid_file, self.detach_marker, self.stop_marker,
                      self.loop_args_file, self.restart_lock_file):
-            path.unlink(missing_ok=True)
+            remove_file(path)
 
 
-def managed_instances() -> dict[str, dict]:
-    """Map instance id -> ownership metadata for every managed instance."""
+def read_managed_instances() -> dict[str, dict] | None:
+    """Managed instances, or None when the state directory could not be read.
+
+    The distinction matters to anything deciding *who is present*. An empty
+    map and a failed listing look identical to a caller and mean opposite
+    things, and one of them is a licence to act as though nobody else is
+    here.
+    """
     found: dict[str, dict] = {}
-    if not RESTART_DIR.is_dir():
+    present = dir_present(RESTART_DIR)
+    if present is None:
+        return None
+    if not present:
         return found
-    for path in RESTART_DIR.iterdir():
+    try:
+        entries = list(RESTART_DIR.iterdir())
+    except OSError:
+        return None
+    for path in entries:
         if path.suffix == ".managed":
             ident = path.name[: -len(".managed")]
         elif path.suffix == ".state":
@@ -415,6 +639,17 @@ def managed_instances() -> dict[str, dict]:
     return found
 
 
+def managed_instances() -> dict[str, dict]:
+    """Managed instances as far as they can be listed; unreadable reads empty.
+
+    Only for callers that display or look up a known id. Anything deciding
+    whether somebody *else* is here must use :func:`read_managed_instances`
+    and refuse on None.
+    """
+    found = read_managed_instances()
+    return {} if found is None else found
+
+
 # ── tab registry ────────────────────────────────────────────────
 # Windows Terminal (and most terminal emulators) expose no API to list their
 # own tabs, so the operator keeps its own record of which named instances were
@@ -422,14 +657,30 @@ def managed_instances() -> dict[str, dict]:
 # After a reboot or crash every process is gone, but this file survives, and
 # `operator restore` replays each entry in a fresh tab — the existing
 # auto-continue/--resume logic then picks the Copilot session back up.
-def load_tabs() -> dict[str, dict]:
-    if not TABS_FILE.exists():
+def read_tabs() -> dict | None:
+    """The tab registry, or None when it exists but could not be read.
+
+    The distinction matters because the registry is rewritten whole. Treating
+    an unreadable file as an empty one would let the next ``register_tab``
+    replace every other tab's restore record with a single entry.
+    """
+    if path_present(TABS_FILE) is False:
         return {}
     try:
         data = json.loads(TABS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return None
     return data if isinstance(data, dict) else {}
+
+
+def load_tabs() -> dict[str, dict]:
+    """The tab registry as far as it can be read; unreadable reads as empty.
+
+    Only for callers that display or filter. Anything that writes the file
+    back must use :func:`read_tabs` and refuse the write on None.
+    """
+    entries = read_tabs()
+    return {} if entries is None else entries
 
 
 def save_tabs(entries: dict[str, dict]) -> None:
@@ -453,7 +704,13 @@ def register_tab(instance: Instance, loop_mode: bool,
         return
     argv = ["--loop"] if loop_mode else []
     argv += ["--name", instance.display_name, *copilot_args]
-    entries = load_tabs()
+    entries = read_tabs()
+    if entries is None:
+        # Rewriting the file from what we could not read would drop every
+        # other tab. Losing one tab's restore record is the smaller loss.
+        log(f"  Could not read {TABS_FILE.name} — not recording this tab, so "
+            f"the tabs already in it survive")
+        return
     entries[instance.id] = {
         "display_name": instance.display_name,
         "cwd": str(cwd),
@@ -856,7 +1113,27 @@ def _usd(predicate: str = "1") -> str:
 
 
 def report_metrics(subcmd: str = "summary") -> int:
-    if not METRICS_DB.exists():
+    try:
+        return _report_metrics(subcmd)
+    except sqlite3.Error as exc:
+        # A file is there but sqlite cannot make sense of it: truncated,
+        # locked, or not a database at all. That is a bad report, not a
+        # crashed CLI.
+        print(f"Could not read the metrics database at {METRICS_DB}: {exc}",
+              file=sys.stderr)
+        return 1
+
+
+def _report_metrics(subcmd: str = "summary") -> int:
+    state = file_present(METRICS_DB)
+    if state is None:
+        # Connecting anyway would create a database at whatever the path
+        # really points at -- through a dangling symlink, that is a brand new
+        # empty file somewhere else and every query below fails on it.
+        print(f"Could not examine the metrics database at {METRICS_DB}.",
+              file=sys.stderr)
+        return 1
+    if not state:
         print(f"No metrics database found at {METRICS_DB}")
         print("Run the operator first to start collecting metrics.")
         return 1
@@ -963,28 +1240,37 @@ def report_metrics(subcmd: str = "summary") -> int:
 
 
 def show_run_summary(run_started: str) -> None:
-    if not run_started or not METRICS_DB.exists():
+    if not run_started or file_present(METRICS_DB) is not True:
         return
     print("\n═══ Operator Run Summary ═══\n")
-    rows, headers = _query(f"""
-        SELECT COUNT(*) AS sessions,
-               printf('%.1f', {_credits()}) AS credits,
-               printf('$%.2f', {_usd()}) AS est_cost,
-               COALESCE(SUM(api_time_seconds) || 's','—') AS total_api_time,
-               COALESCE({_fmt_duration_sql('SUM(session_time_seconds)')},'—') AS total_sess_time,
-               COALESCE('+' || SUM(lines_added) || ' -' || SUM(lines_removed),
-                        '—') AS total_changes
-        FROM sessions WHERE no_op = 0 AND ended_at >= ?
-    """, (run_started,))
+    try:
+        rows, headers = _query(f"""
+            SELECT COUNT(*) AS sessions,
+                   printf('%.1f', {_credits()}) AS credits,
+                   printf('$%.2f', {_usd()}) AS est_cost,
+                   COALESCE(SUM(api_time_seconds) || 's','—') AS total_api_time,
+                   COALESCE({_fmt_duration_sql('SUM(session_time_seconds)')},'—') AS total_sess_time,
+                   COALESCE('+' || SUM(lines_added) || ' -' || SUM(lines_removed),
+                            '—') AS total_changes
+            FROM sessions WHERE no_op = 0 AND ended_at >= ?
+        """, (run_started,))
+    except sqlite3.Error as exc:
+        # This runs on every shutdown path. A summary that cannot be read is
+        # not a reason to end a clean shutdown with a traceback.
+        print(f"  (metrics unavailable: {exc})")
+        return
     print(_table(rows, headers))
-    rows, headers = _query(f"""
-        SELECT m.model_name AS model,
-               printf('%.1f', COALESCE(SUM(m.nano_aiu),0) / {_NANO}.0) AS credits,
-               COUNT(*) AS uses
-        FROM model_usage m JOIN sessions s ON m.session_id = s.id
-        WHERE s.no_op = 0 AND s.ended_at >= ?
-        GROUP BY m.model_name ORDER BY SUM(m.nano_aiu) DESC
-    """, (run_started,))
+    try:
+        rows, headers = _query(f"""
+            SELECT m.model_name AS model,
+                   printf('%.1f', COALESCE(SUM(m.nano_aiu),0) / {_NANO}.0) AS credits,
+                   COUNT(*) AS uses
+            FROM model_usage m JOIN sessions s ON m.session_id = s.id
+            WHERE s.no_op = 0 AND s.ended_at >= ?
+            GROUP BY m.model_name ORDER BY SUM(m.nano_aiu) DESC
+        """, (run_started,))
+    except sqlite3.Error:
+        return
     if rows:
         print()
         print(_table(rows, headers))
@@ -1007,7 +1293,7 @@ def project_handoff_file(cwd: Path) -> Path | None:
     finds the project's real entry instead of reporting it unregistered.
     """
     catalog = project_catalog_path()
-    if not catalog.is_file():
+    if not file_present(catalog):
         return None
     target = str(primary_repo_root(cwd).resolve())
     if IS_WINDOWS:
@@ -1130,9 +1416,9 @@ def start_session(instance: Instance, copilot_args: list[str], session_num: int,
         argv += ["-i", preamble]
     argv = _ensure_usage_logging(argv)
 
-    instance.restart_marker.unlink(missing_ok=True)
-    instance.exit_file.unlink(missing_ok=True)
-    instance.session_file.unlink(missing_ok=True)
+    remove_file(instance.restart_marker)
+    remove_file(instance.exit_file)
+    remove_file(instance.session_file)
 
     spec = write_launch_spec(instance, argv, cwd, session_num)
 
@@ -1152,7 +1438,7 @@ def start_session(instance: Instance, copilot_args: list[str], session_num: int,
     for _ in range(30):
         if instance.copilot_pid() is not None:
             break
-        if instance.exit_file.exists():
+        if path_present(instance.exit_file) is True:
             break
         time.sleep(0.2)
 
@@ -1235,7 +1521,7 @@ def _running_loop_pid(instance: Instance) -> int | None:
         return None
     if _pid_alive(pid):
         return pid
-    instance.loop_pid_file.unlink(missing_ok=True)
+    remove_file(instance.loop_pid_file)
     return None
 
 
@@ -1252,8 +1538,12 @@ def is_copilot_running(instance: Instance) -> bool:
 
     Omitting ``pane_dead`` lets loop mode poll forever when the runner dies
     without writing its marker.
+
+    Only a marker we can actually see ends the session. A probe that fails
+    says nothing about whether Copilot is alive, and answering "exited" would
+    make the supervisor tear down and relaunch a perfectly healthy session.
     """
-    if instance.exit_file.exists():
+    if path_present(instance.exit_file) is True:
         return False
     if not MUX.has_session(instance.session):
         return False
@@ -1294,7 +1584,7 @@ def stop_session_gracefully(instance: Instance) -> None:
     MUX.kill_session(instance.session)
     # Give the runner a moment to finish writing metrics.
     for _ in range(10):
-        if instance.exit_file.exists():
+        if path_present(instance.exit_file) is True:
             break
         time.sleep(0.5)
 
@@ -1400,7 +1690,7 @@ def stop_operator(target: str | None = None) -> int:
                 print(f"Failed to stop session '{instance.session}'.", file=sys.stderr)
                 return 1
         instance.cleanup_files()
-        instance.state_file.unlink(missing_ok=True)
+        remove_file(instance.state_file)
         remove_tab(instance.id)
         log(f"Stopped: {target}")
         return 0
@@ -1420,7 +1710,7 @@ def stop_operator(target: str | None = None) -> int:
             log(f"  Failed to stop {ident}")
             continue
         inst.cleanup_files()
-        inst.state_file.unlink(missing_ok=True)
+        remove_file(inst.state_file)
         remove_tab(inst.id)
         log(f"Stopped: {ident}")
         count += 1
@@ -1461,36 +1751,10 @@ def _restart_handoff_lock(instance: Instance):
     """Serialise supervisor handoffs for one instance.
 
     Yields True when the lock was taken, False when another handoff is
-    already in progress. Uses O_CREAT|O_EXCL because it is the one primitive
-    that is atomic on both POSIX and Windows; a lock whose recorded pid is
-    gone is stale (the holder crashed) and is reclaimed.
+    already in progress.
     """
-    path = instance.restart_lock_file
-    acquired = False
-    try:
-        for _ in range(2):
-            try:
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                holder = None
-                try:
-                    holder = int(path.read_text(encoding="utf-8").strip())
-                except (OSError, ValueError):
-                    pass
-                if holder is not None and _pid_alive(holder):
-                    break
-                # Stale: the holder died mid-handoff. Reclaim and retry once.
-                path.unlink(missing_ok=True)
-                continue
-            else:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(str(os.getpid()))
-                acquired = True
-                break
+    with _exclusive_lock(instance.restart_lock_file) as acquired:
         yield acquired
-    finally:
-        if acquired:
-            path.unlink(missing_ok=True)
 
 
 def restart_loop(target: str | None) -> int:
@@ -1538,9 +1802,10 @@ def restart_loop(target: str | None) -> int:
         print("  That records the arguments, so future restarts can just use: "
               f"operator restart-loop {instance.display_name}", file=sys.stderr)
         return 1
-    if not Path(recorded_cwd).is_dir():
+    if dir_present(Path(recorded_cwd)) is False:
         # Spawning from the caller's cwd instead would silently point the
-        # instance at a different project.
+        # instance at a different project. A directory that merely cannot be
+        # examined is not known to be gone, so it does not earn this refusal.
         print(f"The directory '{target}' was started in no longer exists:",
               file=sys.stderr)
         print(f"  {recorded_cwd}", file=sys.stderr)
@@ -1574,7 +1839,7 @@ def _do_restart_loop(instance: Instance, user_args: list[str],
                 break
             time.sleep(0.5)
         else:
-            instance.detach_marker.unlink(missing_ok=True)
+            remove_file(instance.detach_marker)
             print(f"Loop supervisor for '{target}' did not stop within "
                   f"{budget}s. Session left untouched; no new supervisor "
                   f"started.", file=sys.stderr)
@@ -1585,8 +1850,11 @@ def _do_restart_loop(instance: Instance, user_args: list[str],
         # exited for its own reasons — most likely a concurrent `operator
         # stop`, which also takes the session down. Spawning an adopting
         # supervisor now would resurrect a session the user just stopped.
-        if instance.detach_marker.exists():
-            instance.detach_marker.unlink(missing_ok=True)
+        # A marker we cannot examine is not proof it was consumed, and the
+        # cost of guessing wrong here is a session coming back from the dead,
+        # so anything but a definite absence refuses.
+        if path_present(instance.detach_marker) is not False:
+            remove_file(instance.detach_marker)
             print(f"The supervisor for '{target}' exited without taking the "
                   f"restart request — something else stopped it.",
                   file=sys.stderr)
@@ -1679,7 +1947,7 @@ def forget_instance(target: str | None) -> int:
         print(f"No operator state for '{target}'.", file=sys.stderr)
         return 1
     instance.cleanup_files()
-    instance.state_file.unlink(missing_ok=True)
+    remove_file(instance.state_file)
     remove_tab(instance.id)
     print(f"Removed operator state for '{instance.display_name}'.")
     print("Any running session with that name was left untouched.")
@@ -1708,9 +1976,17 @@ def reload_instance(target: str | None) -> int:
               file=sys.stderr)
         return 1
     instance = Instance(target)
-    if not instance.spec_file.exists():
+    if path_present(instance.spec_file) is False:
         die(f"No launch spec found for '{target}' at {instance.spec_file}")
-    spec = json.loads(instance.spec_file.read_text(encoding="utf-8"))
+    try:
+        spec = json.loads(instance.spec_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        # The spec is about to be rewritten from what was read. Reading it as
+        # "empty" would replace a working launch spec with one that launches
+        # nothing, so a failed read has to stop the command instead.
+        die(f"Could not read the launch spec at {instance.spec_file}: {exc}")
+    if not isinstance(spec, dict):
+        die(f"The launch spec at {instance.spec_file} is not a JSON object.")
     argv = list(spec.get("argv", []))
     agent = extract_agent_from_args(argv)
     preamble = build_preamble(agent, instance)
@@ -1742,9 +2018,12 @@ def ingest_all_logs(force: bool = False) -> int:
 
 
 def _log_files() -> list[Path]:
-    if not COPILOT_LOG_DIR.is_dir():
+    if not dir_present(COPILOT_LOG_DIR):
         return []
-    return sorted(COPILOT_LOG_DIR.glob("process-*.log"))
+    try:
+        return sorted(COPILOT_LOG_DIR.glob("process-*.log"))
+    except OSError:
+        return []
 
 
 def manage_logs(args: list[str]) -> int:
@@ -2025,6 +2304,9 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
     and "I could not look" must not read the same as "nobody is here".
     Note that an *unavailable* multiplexer is not uncertainty: with no
     backend there are no sessions to miss, so that answers the empty list.
+    The same rule applies one record down: an unreadable launch spec, tab
+    registry or state directory refuses the census rather than quietly
+    dropping the instance it could not place.
     """
     try:
         if not MUX.available():
@@ -2033,7 +2315,18 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
     except (MuxError, OSError):
         return None
 
-    known = set(managed_instances()) | set(load_tabs())
+    # The population itself has to be readable. An unexaminable state
+    # directory or an unreadable tab registry would otherwise shrink `known`
+    # silently, and `known` is what decides whether an unplaceable instance
+    # is one of ours.
+    managed = read_managed_instances()
+    if managed is None:
+        return None
+    tabs = read_tabs()
+    if tabs is None:
+        return None
+
+    known = set(managed) | set(tabs)
     found: list[str] = []
     for ident in live:
         try:
@@ -2044,7 +2337,17 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
         else:
             pane_failed = False
         recorded = _tracked_cwd_for_id(ident)
-        if _dir_matches(pane, cwd) or _dir_matches(recorded, cwd):
+        if _dir_matches(pane, cwd):
+            found.append(ident)
+            continue
+        if recorded is UNPLACEABLE:
+            # The launch spec or the tab registry is there and would not be
+            # read. The pane did not place this instance here either, so the
+            # only honest answer is that we do not know who is in this
+            # directory — the same refusal as a failed pane lookup, one
+            # record further down.
+            return None
+        if _dir_matches(recorded, cwd):
             found.append(ident)
         elif pane_failed and ident in known:
             # The backend refused to say where this instance is and the
@@ -2241,7 +2544,7 @@ def run_single_session(instance: Instance, copilot_args: list[str],
     set_tab_progress(TAB_STEADY)
     MUX.attach(instance.session)
 
-    if MUX.has_session(instance.session) and not instance.exit_file.exists():
+    if MUX.has_session(instance.session) and path_present(instance.exit_file) is not True:
         print()
         print("Detached from copilot session.")
         print(f"  Re-attach: operator join {instance.display_name}")
@@ -2306,10 +2609,15 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
         if handoff_file is None:
             log("  Project is not registered in the catalog — no handoff file "
                 "is expected here")
-        elif not handoff_file.exists():
+        elif path_present(handoff_file) is False:
             crash_recovery = True
             log("  No handoff file found for this project — treating this as "
                 "crash recovery")
+        elif path_present(handoff_file) is None:
+            # Telling the agent a handoff is missing is a claim about the last
+            # session. A probe that failed has not established anything.
+            log(f"  Could not examine {handoff_file} — not reporting this as "
+                f"crash recovery")
 
     preamble = build_preamble(agent, instance, crash_recovery=crash_recovery)
 
@@ -2371,6 +2679,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     last_launched = 0
     launch_failures = 0
     crash_failures = 0
+    unknown_markers = 0
     resume_id_used = ""
     adopting = adopt
     instance.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
@@ -2448,7 +2757,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                         break
                     if not is_copilot_running(instance):
                         break
-                    if instance.detach_marker.exists() or instance.stop_marker.exists():
+                    if marker_set(instance.detach_marker) or marker_set(instance.stop_marker):
                         # A stop/detach request must not wait out session-id
                         # discovery: `operator restart-loop` blocks on this
                         # supervisor exiting, and a session that never reports
@@ -2467,11 +2776,11 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     # `operator restart-loop` both block waiting for this
                     # supervisor to act, so a whole poll interval of latency
                     # is paid by a human (or an agent) every time.
-                    if instance.stop_marker.exists():
+                    if marker_set(instance.stop_marker):
                         # `operator stop NAME` asked us to shut down and take the
                         # session with us — same as Ctrl+C, just triggered
                         # remotely since this loop now runs in the background.
-                        instance.stop_marker.unlink(missing_ok=True)
+                        remove_file(instance.stop_marker)
                         log(f"Session #{session_num}: stop requested — shutting down")
                         stop_session_gracefully(instance)
                         show_run_summary(run_started)
@@ -2479,11 +2788,11 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                             MUX.kill_session(instance.session)
                         instance.cleanup_files()
                         return 0
-                    if instance.detach_marker.exists():
+                    if marker_set(instance.detach_marker):
                         # `operator stop-loop NAME` asked us to stop supervising
                         # but leave the session running untouched. Also how
                         # `operator restart-loop` retires the old supervisor.
-                        instance.detach_marker.unlink(missing_ok=True)
+                        remove_file(instance.detach_marker)
                         sid = instance.read_session_id()
                         instance.save_state(session_num, run_started, sid)
                         log(f"Session #{session_num}: detach requested — leaving "
@@ -2493,7 +2802,27 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     if shutdown["requested"]:
                         raise KeyboardInterrupt
                     if not is_copilot_running(instance):
-                        if instance.restart_marker.exists():
+                        stop_state = marker_state(instance.stop_marker)
+                        detach_state = marker_state(instance.detach_marker)
+                        if stop_state is None or detach_state is None:
+                            # The session is gone and we cannot tell whether a
+                            # human asked for that. Relaunching would resurrect
+                            # a session someone stopped; assuming a stop would
+                            # abandon one that crashed. Re-poll instead and let
+                            # a readable marker settle it.
+                            unknown_markers += 1
+                            log(f"Session #{session_num}: copilot is not running but "
+                                f"the stop/detach markers cannot be examined "
+                                f"({unknown_markers}/{MAX_LAUNCH_FAILURES}) — "
+                                f"waiting rather than relaunching")
+                            if unknown_markers >= MAX_LAUNCH_FAILURES:
+                                log(f"  Giving up after {unknown_markers} consecutive "
+                                    f"unreadable checks — leaving the session alone")
+                                show_run_summary(run_started)
+                                return 1
+                            continue
+                        unknown_markers = 0
+                        if marker_set(instance.restart_marker):
                             log(f"Session #{session_num}: restart signal detected!")
                             crash_failures = 0
                         else:
@@ -2508,7 +2837,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                                 return 1
                         restart_requested = True
                         break
-                    if instance.restart_marker.exists():
+                    if marker_set(instance.restart_marker):
                         log(f"Session #{session_num}: restart signal detected!")
                         crash_failures = 0
                         restart_requested = True
@@ -2516,7 +2845,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
 
                 if restart_requested:
                     log("Restarting copilot...")
-                    instance.restart_marker.unlink(missing_ok=True)
+                    remove_file(instance.restart_marker)
                     stop_session_gracefully(instance)
                     instance.save_state(session_num, run_started)
                     session_num += 1
@@ -2550,7 +2879,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
         log("Operator shut down")
         return 0
     finally:
-        instance.loop_pid_file.unlink(missing_ok=True)
+        remove_file(instance.loop_pid_file)
 
 
 # ── help ────────────────────────────────────────────────────────
@@ -2754,7 +3083,7 @@ def show_help() -> int:
 
 
 # ── entry point ─────────────────────────────────────────────────
-def _tracked_cwd_for_id(ident: str) -> str | None:
+def _tracked_cwd_for_id(ident: str) -> str | None | _Unplaceable:
     """The directory a tracked/managed *instance id* is bound to, if known.
 
     Keyed on the id rather than the display name because the two are not
@@ -2762,20 +3091,35 @@ def _tracked_cwd_for_id(ident: str) -> str | None:
     id from something that is already an id produces a different, non-existent
     instance whose files are always missing — a lookup that fails silently and
     reports "location unknown" for an instance whose location is on disk.
+
+    Three answers, not two: a directory, ``None`` for "nothing on disk binds
+    this id anywhere", and ``UNPLACEABLE`` for "the records exist and would
+    not be read". Collapsing the third into the second is what lets a census
+    return a curated population as though it were complete.
     """
     spec = RESTART_DIR / f"{ident}.launch.json"
-    if spec.exists():
+    state = file_present(spec)
+    if state is None:
+        return UNPLACEABLE
+    if state:
         try:
-            return json.loads(spec.read_text(encoding="utf-8")).get("cwd")
-        except (OSError, ValueError):
-            pass
-    entry = load_tabs().get(ident)
+            cwd = json.loads(spec.read_text(encoding="utf-8")).get("cwd")
+        except ValueError:
+            cwd = None
+        except OSError:
+            return UNPLACEABLE
+        if cwd:
+            return cwd
+    tabs = read_tabs()
+    if tabs is None:
+        return UNPLACEABLE
+    entry = tabs.get(ident)
     if entry:
         return entry.get("cwd")
     return None
 
 
-def _tracked_cwd_for(name: str) -> str | None:
+def _tracked_cwd_for(name: str) -> str | None | _Unplaceable:
     """Best-effort lookup of the directory a tracked/managed instance name is
     already bound to, so a same-named directory elsewhere doesn't collide."""
     return _tracked_cwd_for_id(Instance(name).id)
@@ -2792,6 +3136,11 @@ def _name_conflicts(name: str, cwd: Path) -> bool:
     if not (MUX.available() and MUX.has_session(inst.session)):
         return False
     bound_to = _tracked_cwd_for(name)
+    if bound_to is UNPLACEABLE:
+        # Something is running under this name and we cannot show it is this
+        # directory. Sharing a name with an instance we cannot place is the
+        # expensive mistake here; suffixing the name is the cheap one.
+        return True
     return bound_to is not None and bound_to != str(cwd)
 
 
@@ -2998,11 +3347,12 @@ def instance_snapshot(instance: Instance) -> dict:
     except ValueError:
         session_num = 0
     spec: dict = {}
-    if instance.spec_file.exists():
-        try:
-            spec = json.loads(instance.spec_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            spec = {}
+    try:
+        loaded = json.loads(instance.spec_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        loaded = None
+    if isinstance(loaded, dict):
+        spec = loaded
     cwd = spec.get("cwd") or (load_tabs().get(instance.id) or {}).get("cwd") or ""
     session_live = MUX.available() and MUX.has_session(instance.session)
     return {
@@ -3067,7 +3417,7 @@ def _recorded_usage(cwd: str) -> str:
     Metrics are keyed by working directory rather than by instance name, so
     this is the project's total across every run — not just this one.
     """
-    if not cwd or not METRICS_DB.exists():
+    if not cwd or file_present(METRICS_DB) is not True:
         return ""
     try:
         rows, _ = _query(f"""
