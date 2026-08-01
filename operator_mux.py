@@ -19,6 +19,15 @@ Verified psmux divergences from tmux (psmux 3.3.7)
    characters keeps names identical across platforms.
 3. `list-sessions` exits 0 with empty output when no server is running, whereas
    tmux exits 1. Emptiness is therefore detected from output, never exit status.
+
+Server-lifecycle race (tmux, all platforms)
+-------------------------------------------
+The server exits once its last session is killed, and shutdown is not
+instantaneous. A `new-session` issued inside that window connects to a socket
+whose server is already leaving and fails with "server exited unexpectedly"
+even though the request was perfectly valid. Restarting a loop immediately
+after the previous one ended hits this in production, not only in tests, so
+`new_session` retries the transient signatures rather than surfacing them.
 """
 from __future__ import annotations
 
@@ -28,6 +37,7 @@ import platform
 import re
 import shutil
 import subprocess
+import time
 
 __all__ = [
     "MuxError",
@@ -64,6 +74,27 @@ _RESERVED = {
 _POPEN_KWARGS: dict[str, int] = (
     {"creationflags": subprocess.CREATE_NO_WINDOW} if platform.system() == "Windows" else {}
 )
+
+# Errors that mean "the server was going away", not "the request was bad".
+# Retrying these is safe because a fresh server is started by the next attempt;
+# anything not listed here is reported immediately so real failures stay loud.
+_TRANSIENT_SERVER_ERRORS = (
+    "server exited unexpectedly",
+    "lost server",
+    "error connecting to",
+    "no server running",
+)
+
+#: Total `new-session` attempts, and the base linear backoff between them. Three
+#: attempts spanning ~0.75s comfortably outlast a server shutdown while keeping
+#: a genuinely broken backend fast to report.
+_NEW_SESSION_ATTEMPTS = 3
+_NEW_SESSION_BACKOFF = 0.25
+
+
+def _is_transient_server_error(err: str) -> bool:
+    lowered = (err or "").casefold()
+    return any(signature in lowered for signature in _TRANSIENT_SERVER_ERRORS)
 
 
 class MuxError(Exception):
@@ -211,12 +242,29 @@ class Mux:
 
         argv is passed after `--` so the backend does not re-parse quoting;
         this preserves arguments containing spaces and quotes exactly.
+
+        A transient server-shutdown failure is retried (see the module
+        docstring); every other failure is raised on the first attempt so a
+        genuinely bad request is never hidden behind a delay.
         """
         if self.has_session(session):
             raise MuxSessionError(f"Session already exists: {session}")
-        _, err, rc = self._run(
-            "new-session", "-d", "-s", session, "-c", str(cwd), "--", *argv
-        )
+        err: str = ""
+        rc: int = 0
+        for attempt in range(_NEW_SESSION_ATTEMPTS):
+            _, err, rc = self._run(
+                "new-session", "-d", "-s", session, "-c", str(cwd), "--", *argv
+            )
+            if rc == 0 or not _is_transient_server_error(err):
+                break
+            # The dying server may still have created the session before the
+            # client lost it. Adopt that session instead of retrying, which
+            # would otherwise fail as a duplicate name.
+            if self.has_session(session):
+                rc = 0
+                break
+            if attempt + 1 < _NEW_SESSION_ATTEMPTS:
+                time.sleep(_NEW_SESSION_BACKOFF * (attempt + 1))
         if rc != 0:
             raise MuxSessionError(f"Failed to create session {session!r}: {err or rc}")
         # psmux can report success while creating nothing (notably for names
