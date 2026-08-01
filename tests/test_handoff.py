@@ -463,25 +463,28 @@ def test_preserve_treats_a_vanished_file_as_nothing_to_save(tmp_path, monkeypatc
     """The reader can consume the handoff between the probe and the stat.
 
     `None` is also what the ordinary absent path returns, so the return value
-    alone cannot say which branch ran -- and if this `path_present` patch ever
-    stopped reaching the name `preserve_prior_handoff` actually calls, the real
-    probe would answer False for this missing file and the assertion would pass
-    on the wrong branch, testing nothing. The `lstat` spy is what separates
-    them: it is only reached *past* the absent check, so it fires exactly when
-    the probe was overridden and not at all when the patch is dead.
+    alone cannot say which branch ran -- and if this patch ever stopped
+    reaching the name `preserve_prior_handoff` actually calls, the real probe
+    would answer False for this missing file and the assertion would pass on
+    the wrong branch, testing nothing. So the stand-in records its own calls:
+    it is consulted only if the patch is live, and once it answers True the
+    absent branch is closed, leaving the vanished-between-probe-and-stat race
+    as the only way back to `None`.
+
+    Spying on `ho.os.lstat` instead does *not* work, and the near-miss is worth
+    keeping: `ho.os` is the one shared `os` module, so a real `path_present` --
+    exactly the case this needs to catch -- calls `lstat` itself and populates
+    the spy on the way to the wrong branch.
     """
     target = tmp_path / "next-session.md"
-    seen = []
-    real_lstat = ho.os.lstat
-    monkeypatch.setattr(ho, "path_present", lambda p: True)
-    monkeypatch.setattr(ho.os, "lstat",
-                        lambda p, *a, **kw: (seen.append(Path(p)),
-                                             real_lstat(p, *a, **kw))[1])
+    consulted = []
+    monkeypatch.setattr(ho, "path_present",
+                        lambda p: (consulted.append(Path(p)), True)[1])
 
     assert ho.preserve_prior_handoff(target) is None
-    assert target in seen, \
-        "returned None without reaching the stat: the absent check answered, " \
-        "so the vanished-between-probe-and-stat race was never exercised"
+    assert target in consulted, \
+        "the stand-in probe was never called, so the real one answered " \
+        "'absent' and the race this test is named for was not exercised"
 
 
 def test_a_probe_that_says_absent_is_the_one_preserve_consults(tmp_path, monkeypatch):
