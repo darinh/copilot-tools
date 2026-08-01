@@ -198,9 +198,19 @@ def main():
             mux.new_session(rname, str(rdir),
                             [sys.executable, str(runner), str(spec)])
             deadline = time.time() + 60
+            # probe-ok: this harness is the assertion — a wrong False times
+            # out and the `check` on the next line reports it to the human
+            # who is watching the run, and a raise ends the harness with a
+            # traceback in front of that same human. Both are loud, which is
+            # the only property a diagnostic needs here.
             while time.time() < deadline and not (rdir / "verify.exit").exists():
                 time.sleep(0.5)
+            # probe-ok: the probe *is* the check; a wrong False fails it and a
+            # raise aborts the harness in front of the human running it.
             check("runner recorded exit", (rdir / "verify.exit").exists())
+            # probe-ok: a wrong False skips the metrics comparison below, and
+            # the check above has already failed by then; a raise stops the
+            # harness loudly, which is an acceptable outcome for a diagnostic.
             if rdb.exists():
                 with operator_ingest.connect(rdb) as conn:
                     rows = conn.execute(
