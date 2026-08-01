@@ -807,7 +807,8 @@ def report_metrics(subcmd: str = "summary") -> int:
                    COALESCE(premium_requests,0) AS legacy_pr,
                    COALESCE(api_time_seconds || 's','—') AS api_time,
                    COALESCE({_fmt_duration_sql('session_time_seconds')},'—') AS sess_time,
-                   '+' || COALESCE(lines_added,0) || ' -' || COALESCE(lines_removed,0) AS changes,
+                   COALESCE('+' || lines_added || ' -' || lines_removed,
+                            '—') AS changes,
                    COALESCE(substr(git_branch,1,20),'—') AS branch,
                    COALESCE(replace(work_dir, ?, '~'),'—') AS project
             FROM sessions WHERE no_op = 0 ORDER BY id DESC LIMIT 20
@@ -829,7 +830,7 @@ def report_metrics(subcmd: str = "summary") -> int:
                    printf('%.1f', {_credits()}) AS credits,
                    printf('$%.2f', {_usd()}) AS est_cost,
                    COUNT(*) AS sessions,
-                   COALESCE(SUM(api_time_seconds),0) || 's' AS total_api_time
+                   COALESCE(SUM(api_time_seconds) || 's','—') AS total_api_time
             FROM sessions WHERE no_op = 0 GROUP BY work_dir
             ORDER BY SUM(nano_aiu) DESC
         """, (home,))
@@ -893,9 +894,10 @@ def show_run_summary(run_started: str) -> None:
         SELECT COUNT(*) AS sessions,
                printf('%.1f', {_credits()}) AS credits,
                printf('$%.2f', {_usd()}) AS est_cost,
-               COALESCE(SUM(api_time_seconds),0) || 's' AS total_api_time,
-               COALESCE({_fmt_duration_sql('SUM(session_time_seconds)')},'0s') AS total_sess_time,
-               '+' || COALESCE(SUM(lines_added),0) || ' -' || COALESCE(SUM(lines_removed),0) AS total_changes
+               COALESCE(SUM(api_time_seconds) || 's','—') AS total_api_time,
+               COALESCE({_fmt_duration_sql('SUM(session_time_seconds)')},'—') AS total_sess_time,
+               COALESCE('+' || SUM(lines_added) || ' -' || SUM(lines_removed),
+                        '—') AS total_changes
         FROM sessions WHERE no_op = 0 AND ended_at >= ?
     """, (run_started,))
     print(_table(rows, headers))

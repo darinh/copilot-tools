@@ -125,9 +125,26 @@ databases work without migration.
 | `nano_aiu` | INTEGER NOT NULL DEFAULT 0 | **Billionths of an AI credit** — the current billing signal |
 | `tokens_input`, `tokens_cache_read`, `tokens_cache_write`, `tokens_output` | INTEGER NOT NULL DEFAULT 0 | Token counts by type |
 | `premium_requests` | INTEGER | Legacy request-based billing, retained for annual plans |
-| `api_time_seconds`, `session_time_seconds` | INTEGER | |
-| `lines_added`, `lines_removed` | INTEGER | |
+| `api_time_seconds`, `session_time_seconds` | INTEGER | NULL when unmeasured — see below |
+| `lines_added`, `lines_removed` | INTEGER | NULL when unmeasured — see below |
 | `raw_metrics` | TEXT | Rendered human-readable summary |
+
+Those four INTEGER columns are nullable on purpose. They are supplied only by the
+`session_shutdown` telemetry event, which current Copilot CLI versions usually do not write to the
+process log. Recording `0` there would be a fabricated measurement — "this session changed no code"
+would be indistinguishable from "nobody measured it", and every average over the column would be
+dragged toward zero by sessions that were never observed. Ingest writes NULL when the event is
+absent, `raw_metrics` says `unknown` rather than `0s`/`+0 -0`, and both report renderers
+(`copilot_operator.py` and `operator.sh report sessions`) display `—`. `SUM()` skips NULLs, so
+aggregates report totals over measured sessions only.
+
+`backfill_unknown_metrics.py` repairs rows written before this rule existed, clearing zeros only
+for sessions whose log genuinely lacks a shutdown event.
+
+The legacy bash ingester `operator-ingest.py` is deliberately unchanged. It refuses a log with no
+shutdown event (exit 2, recorded as `no_op`), so it cannot produce the fabricated zeros in the first
+place. `operator.sh`'s report *is* updated, because a rollback to the bash entry point reads the same
+database and would otherwise redisplay NULLs as `+0 -0`.
 
 ### `model_usage`
 
