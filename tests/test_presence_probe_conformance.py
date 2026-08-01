@@ -565,6 +565,34 @@ def test_every_annotation_carries_a_reason() -> None:
 
 
 # ── controls ────────────────────────────────────────────────────
+#: Which probe each control in FIRES is a control *for*.
+#:
+#: Pinned to FIRES by :func:`test_every_control_names_the_probe_it_exercises`.
+#: Without it the positive controls asserted only that the detector returned
+#: *something*: a reviewer swapped the sources of ``bare exists`` and ``bare
+#: is_dir`` and all sixteen controls stayed green, because each spelling was
+#: still detected under the other's name. A control aimed at the wrong
+#: detector still passes, and still reports the tree clean when the detector
+#: it was named for stops matching.
+EXERCISES = {
+    "bare exists": "exists",
+    "bare is_dir": "is_dir",
+    "bare is_file": "is_file",
+    "unbound form": "is_dir",
+    "reached through getattr": "is_dir",
+    "follow_symlinks left at its default": "is_dir",
+    "os.path.exists": "os.path.exists",
+    "os.path.isfile": "os.path.isfile",
+    "os.path.isdir": "os.path.isdir",
+    "os.path inside an OSError guard, which cannot help it": "os.path.isfile",
+    "a marker hidden in a string rather than a comment": "exists",
+    "inside a comprehension": "is_dir",
+    "inside a nested function": "is_file",
+    "in a try that catches something else": "exists",
+    "in the handler rather than the body": "is_dir",
+    "in the finally rather than the body": "is_dir",
+}
+
 #: Source that must trip the detector, one spelling per entry.
 FIRES = {
     "bare exists": "from pathlib import Path\nif Path('x').exists():\n    pass\n",
@@ -773,10 +801,28 @@ PASSES_ABOVE_FLOOR = {
 
 @pytest.mark.parametrize("name", sorted(FIRES))
 def test_every_detector_fires_on_source_that_has_the_defect(name: str) -> None:
-    assert unguarded_probes(FIRES[name]), (
+    hits = unguarded_probes(FIRES[name])
+    assert hits, (
         f"the detector did not fire on {name!r}. A detector that matches "
         f"nothing reports the whole tree clean, which reads exactly like "
         f"success."
+    )
+    fired = {probe for _line, probe in hits}
+    assert EXERCISES[name] in fired, (
+        f"the detector fired on {name!r}, but reported {sorted(fired)} "
+        f"rather than {EXERCISES[name]!r}. A control that only asserts "
+        f"*something* matched keeps passing after the detector it is named "
+        f"for stops working, as long as any other one covers the same source."
+    )
+
+
+def test_every_control_names_the_probe_it_exercises() -> None:
+    """EXERCISES and FIRES must describe the same set of controls."""
+    only_fires = sorted(set(FIRES) - set(EXERCISES))
+    only_exercises = sorted(set(EXERCISES) - set(FIRES))
+    assert not only_fires and not only_exercises, (
+        f"controls with no declared probe: {only_fires}\n"
+        f"declared probes with no control: {only_exercises}"
     )
 
 

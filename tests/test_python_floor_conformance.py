@@ -906,16 +906,59 @@ def test_the_population_filter_survives_a_worktree_path(tmp_path: Path) -> None:
     )
 
 
-def test_every_annotation_carries_a_reason() -> None:
-    """`# floor-ok:` with nothing after it is a silencer, not a judgement."""
-    for source_file in _first_party_python():
+def _annotation_defects(root: Path = REPO) -> list[tuple[str, int, str]]:
+    """Every ``# floor-ok:`` in ``root`` whose reason is too short to be one.
+
+    Takes a root so the rule can be exercised against a tree that actually
+    contains an annotation. Run against this repo it is currently empty —
+    nothing here needs the escape hatch yet — and an assertion over an empty
+    population passes no matter what it says. A reviewer proved that by
+    replacing the comparison with ``assert False`` and watching the test go
+    green, which is the same defect this file exists to stop, one level up.
+    """
+    out = []
+    for source_file in _first_party_python(root):
         for lineno, reason in annotated_uses(
                 source_file.read_text(encoding="utf-8")):
-            assert len(reason) >= MIN_REASON, (
-                f"{source_file.name}:{lineno} silences the floor scan without "
-                f"saying why (reason: {reason!r}). Say what stops this line "
-                f"being reached on Python {FLOOR[0]}.{FLOOR[1]}."
-            )
+            if len(reason) < MIN_REASON:
+                out.append((source_file.name, lineno, reason))
+    return out
+
+
+def test_every_annotation_carries_a_reason() -> None:
+    """`# floor-ok:` with nothing after it is a silencer, not a judgement."""
+    defects = _annotation_defects()
+    assert not defects, (
+        f"{len(defects)} annotation(s) silence the floor scan without saying "
+        f"why: {defects}. Say what stops the line being reached on "
+        f"Python {FLOOR[0]}.{FLOOR[1]}."
+    )
+
+
+def test_the_annotation_rule_would_catch_a_bare_marker(tmp_path: Path) -> None:
+    """The rule above, run against a tree that has annotations in it.
+
+    :func:`_annotation_defects` returns nothing for this repo, so the test
+    that consumes it cannot fail here for any reason — including the rule
+    being deleted. Both halves are pinned against a purpose-built tree: a
+    bare marker must be caught, and a real reason must not be.
+    """
+    body = ("import hashlib\n"
+            "digest = hashlib.file_digest(fh, 'sha256')  # floor-ok:{}\n")
+    (tmp_path / "bare.py").write_text(body.format(" x"), encoding="utf-8")
+    (tmp_path / "reasoned.py").write_text(
+        body.format(" only reached on the 3.12 leg, guarded by the caller"),
+        encoding="utf-8")
+
+    defects = _annotation_defects(tmp_path)
+    caught = {name for name, _lineno, _reason in defects}
+    assert "bare.py" in caught, (
+        "a `# floor-ok:` with a one-character reason was accepted; the "
+        "annotation rule is not running"
+    )
+    assert "reasoned.py" not in caught, (
+        f"a `# floor-ok:` with a real reason was rejected: {defects}"
+    )
 
 
 # ── the finding that started it ──────────────────────────────────
@@ -1124,6 +1167,54 @@ FIRES = {
     ),
 }
 
+#: Which construct each control in FIRES is a control *for*.
+#:
+#: Separate from FIRES so the sources stay readable, and pinned to it by
+#: :func:`test_every_control_names_the_construct_it_exercises` so the two
+#: cannot drift. Without this, a control asserted only that *something*
+#: fired: a reviewer swapped the sources of the ``datetime.UTC`` and
+#: ``ExceptionGroup`` entries and the whole suite stayed green, because each
+#: construct was still exercised *somewhere*. Coverage counted by union does
+#: not notice a control pointing at the wrong detector, and a control aimed
+#: at the wrong detector is not a control.
+EXERCISES = {
+    "exists with follow_symlinks": "pathlib.Path.exists(follow_symlinks=)",
+    "is_dir with follow_symlinks, the spelling PASSES certified":
+        "pathlib.Path.is_dir(follow_symlinks=)",
+    "is_file with follow_symlinks": "pathlib.Path.is_file(follow_symlinks=)",
+    "relative_to with walk_up": "pathlib.Path.relative_to(walk_up=)",
+    "Path.walk": "pathlib.Path.walk",
+    "hashlib.file_digest unguarded": "hashlib.file_digest",
+    "tomllib import": "tomllib",
+    "tomllib from-import": "tomllib",
+    "datetime.UTC": "datetime.UTC",
+    "datetime.UTC by from-import": "datetime.UTC",
+    "enum.StrEnum": "enum.StrEnum",
+    "typing.Self": "typing.Self",
+    "typing.Self by from-import": "typing.Self",
+    "typing.Never": "typing.Never",
+    "typing.assert_never": "typing.assert_never",
+    "asyncio.TaskGroup": "asyncio.TaskGroup",
+    "contextlib.chdir": "contextlib.chdir",
+    "itertools.batched": "itertools.batched",
+    "os.path.splitroot": "os.path.splitroot",
+    "ExceptionGroup": "ExceptionGroup",
+    "BaseExceptionGroup": "ExceptionGroup",
+    "in a try that catches something else": "hashlib.file_digest",
+    "in an if that tests something else": "hashlib.file_digest",
+    "a marker hidden in a string rather than a comment": "hashlib.file_digest",
+    "inside a comprehension": "itertools.batched",
+    "inside a nested function": "hashlib.file_digest",
+    "reached through a module alias": "os.path.splitroot",
+    "imported under an alias inside a guard, then used outside it":
+        "hashlib.file_digest",
+    "a gated keyword passed as a literal ** unpack":
+        "pathlib.Path.exists(follow_symlinks=)",
+    "under a hasattr about something unrelated": "hashlib.file_digest",
+    "in the else of a TYPE_CHECKING block, which is runtime code":
+        "typing.Self",
+}
+
 #: Source that must NOT trip it. Each is a spelling this repo can actually run.
 PASSES = {
     "hashlib.file_digest behind hasattr, as install_manifest spells it": (
@@ -1249,6 +1340,33 @@ def test_the_detector_fires(label: str) -> None:
         f"  This construct is newer than {FLOOR[0]}.{FLOOR[1]} and the scan "
         f"walked past it."
     )
+    fired = {construct for _line, construct in hits}
+    assert EXERCISES[label] in fired, (
+        f"the floor scan fired on {label!r}, but on {sorted(fired)} rather "
+        f"than {EXERCISES[label]!r}:\n{FIRES[label]}"
+        f"  A control that only asserts *something* matched will keep passing "
+        f"after the detector it is named for stops working, as long as any "
+        f"other detector happens to cover the same source."
+    )
+
+
+def test_every_control_names_the_construct_it_exercises() -> None:
+    """EXERCISES and FIRES must describe the same set of controls.
+
+    Two registers keyed alike drift apart silently, so the identity is
+    pinned rather than trusted. Without it, a control could be added with no
+    declared construct and quietly fall back to "fired on something".
+    """
+    only_fires = sorted(set(FIRES) - set(EXERCISES))
+    only_exercises = sorted(set(EXERCISES) - set(FIRES))
+    assert not only_fires and not only_exercises, (
+        f"controls with no declared construct: {only_fires}\n"
+        f"declared constructs with no control: {only_exercises}"
+    )
+    unknown = sorted(set(EXERCISES.values()) - set(CONSTRUCTS))
+    assert not unknown, (
+        f"controls declare constructs that are not in the registry: {unknown}"
+    )
 
 
 @pytest.mark.parametrize("label", sorted(PASSES), ids=lambda s: s[:48])
@@ -1266,10 +1384,14 @@ def test_every_registry_entry_has_a_control() -> None:
     The registry is where a detector silently stops matching: an entry can be
     added, mis-keyed, and never fire, and nothing about a passing suite
     distinguishes that from a clean tree.
+
+    Read from EXERCISES rather than from what the controls happen to trip.
+    The earlier version unioned the constructs actually reported across all
+    of FIRES, which meant a control could exercise the wrong detector and
+    still count towards coverage — a reviewer swapped the sources of two
+    entries and this test, and every per-control test, stayed green.
     """
-    exercised = set()
-    for source in FIRES.values():
-        exercised.update(construct for _line, construct in floor_violations(source))
+    exercised = set(EXERCISES.values())
     missing = sorted(set(CONSTRUCTS) - exercised - _below_floor_constructs())
     assert not missing, (
         f"{len(missing)} registry entr(y/ies) are never exercised by a "
