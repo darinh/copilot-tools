@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,114 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# Directories a test must never write into. The repo root and skills/ are
+# tracked, so an artifact dropped there gets swept up by `git add -A`.
+# Each entry is (directory, recursive). The repo root is scanned top-level
+# only -- recursing it would walk .git, docs/ and sibling worktrees on every
+# test -- while skills/ is small, tracked, and has actually been polluted, so
+# it is walked in full.
+_GUARDED_DIRS: tuple[tuple[Path, bool], ...] = (
+    (ROOT, False),
+    (ROOT / "skills", True),
+)
+
+# The user's real projects directory is deliberately NOT guarded by default.
+# Peer agents and the operator itself legitimately write handoff files there
+# (see handoff_tool.write_handoff), so a concurrent write would blame whichever
+# test happened to be running -- manufacturing exactly the misattribution this
+# guard exists to prevent. Opt in only for a run with no other live agents.
+if os.environ.get("COPILOT_TOOLS_GUARD_HOME") == "1":
+    _GUARDED_DIRS += ((Path.home() / ".copilot" / "projects", True),)
+
+# Churn that is not a test artifact: tooling caches and developer worktrees.
+_GUARD_IGNORED = frozenset({".git", ".pytest_cache", "__pycache__", ".worktrees"})
+
+
+def _snapshot_guarded() -> dict[Path, tuple[bool, frozenset[str]]]:
+    """Record whether each guarded directory exists and what it contains.
+
+    Existence is tracked separately from contents so that a test which creates
+    a guarded directory and leaves it empty is still caught -- an empty new
+    directory and a missing one are not the same thing.
+    """
+    snapshot: dict[Path, tuple[bool, frozenset[str]]] = {}
+    for directory, recursive in _GUARDED_DIRS:
+        if not directory.is_dir():
+            snapshot[directory] = (False, frozenset())
+            continue
+        try:
+            snapshot[directory] = (True, frozenset(_entries(directory, recursive)))
+        except OSError as exc:
+            # An unreadable directory must not take the whole suite down, but a
+            # blind spot that nobody is told about is how leaks survive in the
+            # first place. Degrade to "exists, contents unknown" and say so.
+            warnings.warn(
+                f"artifact guard could not read {directory}: {exc}. "
+                "Strays under it will not be detected for this test.",
+                stacklevel=2,
+            )
+            snapshot[directory] = (True, frozenset())
+    return snapshot
+
+
+def _entries(directory: Path, recursive: bool) -> set[str]:
+    """Names directly under ``directory``, or every path beneath it."""
+    if not recursive:
+        return {e.name for e in os.scandir(directory)} - _GUARD_IGNORED
+
+    def _reraise(exc: OSError) -> None:
+        raise exc
+
+    found: set[str] = set()
+    # os.walk swallows traversal errors by default, which would silently skip
+    # an unreadable subtree and report it as clean.
+    for parent, dirnames, filenames in os.walk(directory, onerror=_reraise):
+        dirnames[:] = [d for d in dirnames if d not in _GUARD_IGNORED]
+        base = Path(parent)
+        for name in dirnames + [f for f in filenames if f not in _GUARD_IGNORED]:
+            found.add((base / name).relative_to(directory).as_posix())
+    return found
+
+
+def _find_strays(
+    before: dict[Path, tuple[bool, frozenset[str]]],
+    after: dict[Path, tuple[bool, frozenset[str]]],
+) -> list[str]:
+    """Return paths present in ``after`` that were absent from ``before``."""
+    strays: set[str] = set()
+    for directory, (exists, names) in after.items():
+        existed, seen = before.get(directory, (False, frozenset()))
+        if exists and not existed:
+            strays.add(str(directory))
+        strays.update(str(directory / name) for name in names - seen)
+    return sorted(strays)
+
+
+def _stray_report(nodeid: str, strays: list[str]) -> str:
+    listed = "\n  ".join(strays)
+    return (
+        f"{nodeid} left files outside tmp_path:\n  {listed}\n"
+        "Tests must write only into tmp_path. Point the code under test at "
+        "an injected root (monkeypatch.chdir(tmp_path) or an explicit path "
+        "argument) instead of letting it resolve against the current "
+        "working directory."
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_stray_artifacts(request: pytest.FixtureRequest):
+    """Fail the test that leaves files behind, naming it and the artifact.
+
+    Attribution is the whole point: an artifact discovered later cannot be
+    traced back to a producer, which is how stray files survive cleanup and
+    reappear. Failing here pins the leak to a nodeid at the moment it happens.
+    """
+    before = _snapshot_guarded()
+    yield
+    strays = _find_strays(before, _snapshot_guarded())
+    if strays:
+        raise AssertionError(_stray_report(request.node.nodeid, strays))
 
 
 @pytest.fixture
