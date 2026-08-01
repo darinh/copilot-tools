@@ -205,6 +205,28 @@ def test_missing_logs_flag_still_spares_partly_measured_rows(db_path, logs):
     assert read_row(db_path, "process-gone.log")["session_time_seconds"] == 1800
 
 
+def test_a_widened_second_run_keeps_the_first_backup(db_path, logs):
+    """Run two clears rows run one did not, so its backup is not a superset."""
+    add_session(db_path, "process-nolog.log")
+    add_session(db_path, "process-haslog.log")
+    (logs / "process-haslog.log").write_text("no shutdown here",
+                                             encoding="utf-8")
+
+    backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+    backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply",
+         "--missing-logs"])
+
+    first = db_path.with_name(db_path.name + ".bak-prezero")
+    second = db_path.with_name(db_path.name + ".bak-prezero.2")
+    assert second.exists(), "second run must not reuse the first backup name"
+    assert read_row(first, "process-haslog.log")["lines_added"] == 0, (
+        "the first backup is the only record of what run one cleared")
+    assert read_row(second, "process-haslog.log")["lines_added"] is None
+    assert read_row(second, "process-nolog.log")["lines_added"] == 0
+
+
 def test_partial_zeros_are_not_touched(db_path, logs):
     """Only all-four-zero rows match the fabrication pattern."""
     add_session(db_path, "process-3.log", added=4)
