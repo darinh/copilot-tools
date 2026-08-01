@@ -11,6 +11,7 @@ edits here take effect on the next session).
 | `lint-on-edit`         | `onPostToolUse` | Runs ESLint or `ruff` on the changed file when the project supports it. |
 | `security-shield`      | `onPreToolUse`  | Blocks destructive shell commands (`rm -rf /`, force-push to `main`, fork bombs, etc.) and obvious secret commits. |
 | `test-enforcer`        | `onPreToolUse`  | Blocks `git commit` if source files were modified without tests in the same session. |
+| `checkout-guard`       | session start + `onPreToolUse` + `onPostToolUse` | Names a scratch directory, reports untracked artifacts the moment they appear in the checkout, and blocks a blanket `git add -A` / `git stash -u` while they are outstanding. |
 | `architecture-enforcer` | `onPostToolUse` | Surfaces import-boundary violations defined in a per-project `.copilot-architecture.json`. |
 
 ## Knobs
@@ -19,6 +20,78 @@ edits here take effect on the next session).
 |---------|--------|
 | `COPILOT_AUTO_OPEN_DISABLE=1` | Disables `open-in-vs-code`. |
 | `COPILOT_TEST_ENFORCER_BYPASS=1` | Lets `git commit` through even with untested source changes. |
+| `COPILOT_CHECKOUT_GUARD_DISABLE=1` | Turns `checkout-guard` off entirely. |
+
+## checkout-guard
+
+Agents write ad-hoc probe scripts, and a probe script with a relative path
+writes into whatever checkout the agent happens to be in. Three agents once
+spent an evening on a pile of directories nobody could attribute, concluding
+the test suite had a working-directory bug. It did not. The artifacts came from
+adversarial review subagents reproducing bugs — nine directories from a single
+review round, named after a reviewer's own loop variable.
+
+The rule "probe scripts write to a temp directory" was already written down.
+Writing it down did not work, so this extension enforces it:
+
+- **Session start** creates `<tmp>/copilot-scratch/session-<pid>` and tells the
+  agent the path, so the correct place to write is discoverable rather than
+  merely mandated. The briefing says to pass the same path to subagents,
+  because their shell commands land in the parent's checkout.
+- **After every command that can run code** — including `task`, since a
+  subagent's writes are invisible to the parent otherwise — the checkout is
+  rescanned and anything new is reported immediately, while the producer is
+  still known. Attribution is the point: an artifact found later fits every
+  explanation equally well.
+- **A blanket `git add -A`, or a `git stash` taking untracked files, is denied**
+  while artifacts are outstanding. Staging a path by name is always allowed —
+  including `git add -A keep.txt`, because git itself scopes `-A` to the
+  pathspec and leaves the stray untracked. The aim is not to stop an artifact
+  being committed, it is to stop one being committed *unnoticed* — so the
+  escape hatch is to name the file, which is what turns it into a decision.
+
+Two things it does deliberately:
+
+- **It asks git what is ignored** (`check-ignore`) instead of carrying its own
+  list of build-output directory names. A first draft hardcoded `target/` as
+  conventional build output; `target/` was one of the two real artifacts in
+  this repository at the time. A guard that holds its own opinion about what
+  counts as noise will disagree with the project silently.
+- **It scans for directories holding no files at any depth**, which `git
+  status` cannot see at all — git does not track empty directories. Both real
+  artifacts found in this repository were empty directories sitting in a tree
+  git called clean. A directory holding only *ignored* files is not reported:
+  git is silent about that one on purpose, and reading the two silences the
+  same way made the guard complain about the project's own build cache.
+
+Files written with the `create`/`edit` tools are never treated as artifacts.
+Those are the sanctioned way to author content, and that is the discriminator
+between a file the agent decided to write and a shell command's side effect.
+
+**What it does not catch.** The command inspection is static: it reads the
+command string, it does not evaluate it. `$(echo git) add -A` runs git and is
+not detected, and cannot be without executing the substitution. Literal
+invocations are covered, including through `sudo`/`env` wrappers, environment
+assignment prefixes, shell grouping, command substitution and a shell runner's
+`-c` string — but an agent determined to evade this can. That is the correct
+trade: the guard is aimed at inattention, not evasion. Nobody reaches for
+command substitution by accident, and guessing costs a blocked command that
+was legitimate. The report on `onPostToolUse` has no such hole — it observes
+the filesystem after the fact, whatever produced the change.
+
+It fails open everywhere. A guard that breaks a session is worse than the
+artifacts it prevents.
+
+### Tests
+
+```
+node --test extensions/checkout-guard/guard.test.mjs
+```
+
+Also run from the Python suite by `tests/test_extensions.py`, which skips when
+node is absent, and by the `Extension syntax and logic` CI job. The integration
+tests build real git repositories under the OS temp directory — a test suite
+for a litter guard that littered would be its own counterexample.
 
 ## architecture-enforcer config
 

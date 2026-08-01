@@ -90,3 +90,26 @@ jobs:
       - name: setup.sh migration tests
         timeout-minutes: 10
         run: bash tests/test_setup_sh.sh
+
+  extensions:
+    # extensions/ ships JavaScript that runs inside every Copilot session on a
+    # developer's machine, and until this job existed no part of the pipeline
+    # ever loaded it. Every file could have been syntactically invalid and the
+    # whole matrix would still have been green.
+    name: Extension syntax and logic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: node --check every extension
+        run: |
+          status=0
+          while IFS= read -r -d '' f; do
+            node --check "$f" || { echo "FAIL $f"; status=1; }
+          done < <(find extensions -name '*.mjs' -print0)
+          exit $status
+
+      - name: checkout-guard unit and integration tests
+        timeout-minutes: 5
+        run: node --test extensions/checkout-guard/guard.test.mjs
+

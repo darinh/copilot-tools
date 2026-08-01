@@ -68,6 +68,88 @@ The commands are identical on every platform; only the path separators differ.
 
 ---
 
+## Scratch Files — Never in the Checkout
+
+Throwaway work goes in a temp directory. Never in a git checkout.
+
+This means every probe script, every reproduction you write to confirm a bug,
+every scratch copy of a file you want to diff against, and every fixture you
+made to try something out. A script with a relative path writes wherever the
+process happens to be, and for an agent that is almost always someone's
+checkout.
+
+```bash
+scratch=$(mktemp -d)                     # bash
+```
+```powershell
+$scratch = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ([guid]::NewGuid()))
+```
+
+**Tell your subagents the same thing, by name.** They run their own shell in
+your checkout, and you never see the commands they issue — only the result. A
+reviewer prompt that says "do not write outside tmp" is worth the one line it
+costs.
+
+### Why this is a rule and not a preference
+
+Three agents once spent an evening diagnosing a working-directory bug in a test
+suite, on the evidence of directories that kept appearing in a shared checkout.
+There was no bug. The directories came from the agents' own review subagents
+reproducing defects — nine of them from a single review round, named after a
+reviewer's loop variable. Two runs and a grep would have refuted the theory in
+four minutes; nobody ran them, because the artifacts *felt* like proof.
+
+The generalisable form is worth more than the rule: **an explanation that fits
+the evidence is not the same as the explanation.** When you find evidence of a
+problem, reproduce the mechanism before you explain the artifact — a plausible
+story will stop you looking.
+
+Two practical consequences:
+
+- **Clean up before you finish, not later.** An artifact discovered afterwards
+  has no provenance, and everything fits it equally well. That is what makes
+  these expensive, not the disk space.
+- **`git status` will not save you.** Git does not track empty directories, so
+  an empty stray is invisible to it. A checkout can report perfectly clean with
+  artifacts sitting in its root.
+
+If the `checkout-guard` extension is installed it enforces this: it names a
+scratch directory at session start, reports new untracked paths the moment they
+appear, and refuses a blanket `git add -A` while they are outstanding. Staging
+a path by name always works — the point is to stop artifacts being committed
+*unnoticed*, not to stop them being committed.
+
+---
+
+## Handing a Worktree to a Subagent
+
+**Commit before you delegate. Staging is not enough.**
+
+A reviewer subagent once ran `git stash` inside another agent's worktree and
+destroyed 454 lines of uncommitted work, mentioning it in passing in an
+otherwise clean review. `git status` came back empty and `git stash list` was
+empty too — the stash had been dropped. It was recovered only because the work
+had been `git add`-ed, so the blobs still existed as dangling objects:
+
+```bash
+git fsck --unreachable
+git cat-file -p <blob>          # grep for a string unique to your change
+```
+
+A reviewer that runs `git checkout` or `git reset --hard` instead leaves
+nothing to recover at all.
+
+- **Commit first.** A commit is the only state a subagent cannot casually
+  destroy. Point reviewers at `git diff main...HEAD`, not `git diff --staged`.
+- **Forbid mutating git commands explicitly, by name** — `stash`, `checkout`,
+  `reset`, `clean`, `restore`, `rebase`, `commit`, `add`. "Don't write files
+  outside tmp" does not cover git plumbing, which writes no new files.
+- **Verify the worktree before you read the findings.** If a subagent mentions
+  in passing that something of yours was lost, stop and check `git status` and
+  `git stash list` before acting on anything else it said.
+
+---
+
 ## Project Configuration System
 
 Each project can have a persistent configuration stored outside the repo at `~/.copilot/projects/`.
@@ -506,3 +588,5 @@ When multiple agents collaborate on a feature, coordinate via a shared SQLite da
 - Don't hardcode configuration values — use config files or environment variables
 - Don't edit files in the primary checkout — create a worktree first
 - Don't commit directly on `main` — branch, work in a worktree, then merge back
+- Don't write probe scripts, reproductions or scratch copies into a checkout — use a temp directory
+- Don't hand a worktree to a subagent with uncommitted work in it — commit first
