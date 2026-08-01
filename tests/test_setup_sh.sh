@@ -445,6 +445,17 @@ fi
 # probe (and execs the real one for everything else) turns a millisecond gap
 # into seconds. The test waits for the operator backup to appear -- proof the
 # mv has happened -- and only then signals.
+#
+# What this covers, precisely: that the trap is armed before the first rename.
+# What it does NOT cover: that the backup path is published before the rename
+# rather than after it. A reviewer caught the overclaim, and a control settled
+# it -- move the publish back into the caller but leave the trap early, and
+# this scenario still passes, because the signal lands during the SECOND
+# link's canon probe, by which time the first link's path has been recorded
+# either way. That half of the fix is not observable from a test: the gap it
+# closes is between two adjacent bash statements with no subprocess in
+# between, so there is nothing to widen and no portable way to deliver a
+# signal inside it. It is argued in the comments at the publish site instead.
 new_scenario "scenario13"
 mkdir -p "${SCENARIO_HOME}/.local/bin" "${SCENARIO_HOME}/fakebin"
 REAL_PYTHON="$(command -v python3 || command -v python)"

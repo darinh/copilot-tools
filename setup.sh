@@ -185,18 +185,21 @@ stash_legacy_link() {
         while [[ -e "${backup}.${n}" || -L "${backup}.${n}" ]]; do n=$((n+1)); done
         backup="${backup}.${n}"
     fi
-    mv "$link" "$backup"
-    # Published in the same breath as the mv, and by the function rather than
-    # by the caller. restore_legacy_links reads these globals, so a signal
-    # arriving after the mv but before an assignment back in the caller would
-    # find them empty and restore nothing -- leaving the user's only copy
-    # sitting under a backup name with no record that it was ever moved. The
-    # gap is small; the loss it produces is permanent and silent.
+    # Published BEFORE the rename, not after it. Publishing after leaves a
+    # window -- small, but reachable -- where the file has moved and nothing
+    # records where it went, so a signal there fires a correctly-armed trap
+    # that restores nothing and the user's only copy is orphaned under a name
+    # they have no reason to look for. Publishing first inverts the failure:
+    # the rollback can now be armed a moment too EARLY instead of a moment too
+    # late, and restore_legacy_links checks that the backup actually exists,
+    # which is what makes too-early harmless. There is no third option in
+    # bash; an assignment and a rename cannot be made one operation.
     if [[ "$name" == "operator" ]]; then
         OPERATOR_BACKUP="$backup"; OPERATOR_KIND="$kind"
     else
         HANDOFF_BACKUP="$backup"; HANDOFF_KIND="$kind"
     fi
+    mv "$link" "$backup"
     if [[ "$kind" == "legacy" ]]; then
         info "Set aside legacy symlink ${link} -> ${target} (finalized after install succeeds)"
     else
@@ -206,11 +209,17 @@ stash_legacy_link() {
 
 restore_legacy_links() {
     local reason="$1"
-    if [[ -n "$OPERATOR_BACKUP" ]]; then
+    # Guarded on the backup existing, not merely on the variable being set.
+    # The path is published before the rename that creates it (see above), so
+    # this can be reached with a name recorded but nothing yet moved -- in
+    # which case the original is still exactly where the user left it and the
+    # right thing to do is nothing. -L as well as -e: a symlink whose target
+    # is gone still has to be moved back.
+    if [[ -n "$OPERATOR_BACKUP" && ( -e "$OPERATOR_BACKUP" || -L "$OPERATOR_BACKUP" ) ]]; then
         mv "$OPERATOR_BACKUP" "${LOCAL_BIN}/operator"
         warn "Restored ${LOCAL_BIN}/operator ($reason)"
     fi
-    if [[ -n "$HANDOFF_BACKUP" ]]; then
+    if [[ -n "$HANDOFF_BACKUP" && ( -e "$HANDOFF_BACKUP" || -L "$HANDOFF_BACKUP" ) ]]; then
         mv "$HANDOFF_BACKUP" "${LOCAL_BIN}/handoff"
         warn "Restored ${LOCAL_BIN}/handoff ($reason)"
     fi
