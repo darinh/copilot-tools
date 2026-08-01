@@ -1057,17 +1057,24 @@ run_loop_mode() {
 
     local copilot_args=("--yolo" "--autopilot" "--no-ask-user" "--effort" "high" "--experimental")
 
+    # `${a[@]+"${a[@]}"}` everywhere `user_args` is expanded, not `"${a[@]}"`.
+    # macOS ships bash 3.2, where an empty array is *unset* rather than
+    # set-and-empty, so `"${user_args[@]}"` under the `set -u` on line 28 is an
+    # unbound-variable error rather than zero words. `operator --loop` with no
+    # arguments of its own is the plainest way to reach that, and it died here
+    # before touching anything. bash 4.4 and later have no such quirk, which is
+    # why this only ever showed up on macOS.
     local agent_name
-    agent_name=$(extract_agent_from_args "${user_args[@]}")
+    agent_name=$(extract_agent_from_args ${user_args[@]+"${user_args[@]}"})
     local has_agent=false
-    for arg in "${user_args[@]}"; do
+    for arg in ${user_args[@]+"${user_args[@]}"}; do
         [[ "$arg" == "--agent" || "$arg" == --agent=* ]] && has_agent=true
     done
     if [[ "$has_agent" == false ]]; then
         copilot_args+=("--agent" "$agent_name")
     fi
 
-    copilot_args+=("${user_args[@]}")
+    copilot_args+=(${user_args[@]+"${user_args[@]}"})
 
     SCRIPT_PREAMBLE=$(build_preamble "$agent_name")
 
@@ -1343,10 +1350,14 @@ main() {
         rm -f "$STATE_FILE"
     fi
 
+    # Guarded expansion, for the bash 3.2 reason documented in run_loop_mode().
+    # `copilot_args` above starts empty and stays empty for a bare `operator`
+    # or `operator --loop`, so on stock macOS bash both of these died here
+    # before the session ever started.
     if [[ "$loop_mode" == true ]]; then
-        run_loop_mode "${copilot_args[@]}"
+        run_loop_mode ${copilot_args[@]+"${copilot_args[@]}"}
     else
-        run_single_session "${copilot_args[@]}"
+        run_single_session ${copilot_args[@]+"${copilot_args[@]}"}
     fi
 }
 
