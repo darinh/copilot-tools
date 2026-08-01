@@ -6,7 +6,10 @@ marker so the loop picks up a fresh session. Cross-platform.
 
 A handoff that is still sitting unread when the next one is written is copied
 into ``superseded/`` beside it rather than overwritten -- see
-``preserve_prior_handoff``.
+``preserve_prior_handoff``. A handoff written on a contended path carries a
+notice saying so in its own bytes -- see ``NOTICE_UNSERIALISED`` -- because the
+stderr warnings belong to the session that is ending, and the party who needs
+to know is the one that reads what was left behind.
 
 Differences from the bash predecessor:
 
@@ -67,6 +70,39 @@ IS_WINDOWS = platform.system() == "Windows"
 CATALOG = projects_root() / "catalog.csv"
 # Where a handoff that was never read goes instead of into the bit bucket.
 SUPERSEDED_DIRNAME = "superseded"
+# The three facts a reader of one of these files cannot otherwise recover.
+#
+# Everything the tool knows about a contended handoff is currently said on
+# stderr, which belongs to the session that is about to end -- so the one
+# party who never learns of it is the next session, whose whole job is to read
+# what is left behind. A file in `superseded/` looks the same whether it is an
+# ordinary unread predecessor, a copy banked while a peer was mid-publish, or
+# a handoff that was never published at all; only the last two mean "this may
+# be newer than the `next-session.md` next to it".
+#
+# So the notice goes in the bytes. It survives the session, it travels with
+# the file it describes, and it is addressed to the agent who finds it rather
+# than to the one who caused it.
+NOTICE_UNSERIALISED = (
+    "> **⚠ Published without the handoff lock.** Another handoff for this\n"
+    "> project was in progress, so this one was written unserialised and a\n"
+    "> concurrent writer may have replaced it since. A copy of this handoff\n"
+    "> was banked in `superseded/`. Read `superseded/` alongside this file:\n"
+    "> a handoff in there may be newer than this one."
+)
+NOTICE_BANKED_UNSERIALISED = (
+    "> **⚠ Banked copy — this handoff may never have reached\n"
+    "> `next-session.md`.** The handoff lock was held by another writer, so\n"
+    "> this session published unserialised and banked these words here first.\n"
+    "> If `next-session.md` does not contain them, a concurrent handoff won\n"
+    "> the race and this copy is the one that was lost."
+)
+NOTICE_BANKED_UNPUBLISHED = (
+    "> **⚠ Banked copy — this handoff was never published.** The handoff\n"
+    "> already at `next-session.md` could not be preserved first, so it was\n"
+    "> not replaced and these words were banked here instead. This copy is\n"
+    "> newer than the `next-session.md` beside it."
+)
 # A handoff is a few kilobytes of prose. Anything past this is not one, and
 # slurping it to "preserve" it would be the denial of service, not the fix.
 MAX_PRESERVE_BYTES = 8 * 1024 * 1024
@@ -611,8 +647,19 @@ def infer_instance(project_root, mux: Mux) -> str | None:
 
 
 def render(status: str, in_progress: str, next_steps: str,
-           context: str, prompt: str) -> str:
-    parts = ["# Session Handoff", "", "## Status", status, ""]
+           context: str, prompt: str, notice: str = "") -> str:
+    """The handoff document.
+
+    ``notice`` is a block the *tool* has to say about the circumstances of the
+    write -- see :data:`NOTICE_UNSERIALISED`. It sits under the title rather
+    than above it so the file is still a handoff document to anything that
+    keys on the ``# Session Handoff`` header, and above ``## Status`` so a
+    reader meets it before the content it qualifies.
+    """
+    parts = ["# Session Handoff", ""]
+    if notice:
+        parts += [notice, ""]
+    parts += ["## Status", status, ""]
     if in_progress:
         parts += ["## In Progress", in_progress, ""]
     parts += ["## Next Steps", next_steps, ""]
@@ -703,9 +750,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # Rendered before the lock is taken: it cannot fail on the filesystem, and
     # holding a shared lock across work that does not need it is how a
-    # millisecond lock becomes a contended one.
-    body = render(args.status, args.in_progress, args.next_steps,
-                  args.context, args.prompt)
+    # millisecond lock becomes a contended one. `render_body` is kept so the
+    # contended paths below can re-render the same words carrying a notice --
+    # still pure string work, still nothing that can fail under the lock.
+    def render_body(notice: str = "") -> str:
+        return render(args.status, args.in_progress, args.next_steps,
+                      args.context, args.prompt, notice=notice)
+
+    body = render_body()
+    published = body
 
     with handoff_lock(handoff_file) as locked:
         if not locked:
@@ -716,8 +769,16 @@ def main(argv: list[str] | None = None) -> int:
             # this process's preserve and its rename, and then be overwritten
             # by it. So this session's context is banked first: whatever the
             # race does to `next-session.md`, the words exist on disk.
+            #
+            # Both copies say so in their own bytes. The warnings below go to
+            # stderr, which belongs to the session that is ending; the next
+            # session -- the one that has to decide whether the file it is
+            # reading is the newest -- would otherwise get no sign at all.
+            published = render_body(NOTICE_UNSERIALISED)
             try:
-                spare = _archive(handoff_file, body.encode("utf-8"))
+                spare = _archive(
+                    handoff_file,
+                    render_body(NOTICE_BANKED_UNSERIALISED).encode("utf-8"))
             except OSError as exc:
                 spare = None
                 print(f"Warning: could not take the handoff lock, and could "
@@ -735,7 +796,9 @@ def main(argv: list[str] | None = None) -> int:
             # choosing between two files that both still exist rather than
             # being told which one was destroyed on its behalf.
             try:
-                spare = _archive(handoff_file, body.encode("utf-8"))
+                spare = _archive(
+                    handoff_file,
+                    render_body(NOTICE_BANKED_UNPUBLISHED).encode("utf-8"))
             except OSError as bank_exc:
                 die(f"{exc}\nThis handoff could not be banked either "
                     f"({bank_exc}); it is printed below so it is not lost.\n\n"
@@ -746,7 +809,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"and had not been read.\n"
                   f"         It has been preserved at {saved}",
                   file=sys.stderr)
-        write_atomic(handoff_file, body)
+        write_atomic(handoff_file, published)
     try:
         marker.touch()
     except OSError as exc:
