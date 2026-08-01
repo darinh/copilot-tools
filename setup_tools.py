@@ -1327,8 +1327,8 @@ UNDETERMINED = "undetermined"
 #: identical seeded settings and identical probe extension, differing only in
 #: the flag, with the flag deciding. Without that pair, "the extension did not
 #: load" is equally well explained by the harness having broken the loader.
-#: The method and the reproduction are being written up separately so this
-#: can be re-measured after a CLI update rather than re-argued.
+#: The method and the reproduction are in ``docs/experimental-default.md`` so
+#: this can be re-measured after a CLI update rather than re-argued.
 _UNSET_IS_OFF = (
     "an unset 'experimental' loads no extensions (measured on CLI 1.0.77; the "
     "CLI documents no default and never writes one, so this does not resolve "
