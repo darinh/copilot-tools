@@ -11,6 +11,8 @@ set -uo pipefail
 REAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SANDBOX_ROOT="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX_ROOT"' EXIT
+# Mirrors LEGACY_BACKUP_SUFFIX in setup.sh.
+LEGACY_BAK=".copilot-tools-legacy-bak"
 
 PASS=0
 FAIL=0
@@ -86,6 +88,45 @@ run_setup() {
     HOME="$SCENARIO_HOME" PATH="${SCENARIO_HOME}/.local/bin:${PATH}" \
         bash "${SCENARIO_CHECKOUT}/setup.sh" --yes >"${SANDBOX_ROOT}/last_output.log" 2>&1
     echo $?
+}
+
+# Same sandbox as run_setup, but with the arguments under test, and with an
+# optional EXTRA_PATH entry for the scenarios that turn on whether some *other*
+# operator/handoff is resolvable on PATH.
+run_setup_with() {
+    HOME="$SCENARIO_HOME" \
+        PATH="${SCENARIO_HOME}/.local/bin:${EXTRA_PATH:+${EXTRA_PATH}:}${PATH}" \
+        bash "${SCENARIO_CHECKOUT}/setup.sh" "$@" >"${SANDBOX_ROOT}/last_output.log" 2>&1
+    echo $?
+}
+
+# A stub standing in for setup_tools.py in a QUERY mode (--status/--check-only/
+# --help): it reports and exits, and installs nothing. $1 is the exit code --
+# report_status() returns 1 for a machine that is merely out of date or whose
+# extensions are inert, which is a report and not a failure.
+write_query_stub() {
+    cat > "${SCENARIO_CHECKOUT}/setup_tools.py" <<PYEOF
+import sys
+print("stub setup_tools.py: reporting only, installing nothing")
+sys.exit(${1})
+PYEOF
+}
+
+# Both legacy symlinks, as a machine mid-migration has them.
+link_legacy() {
+    mkdir -p "${SCENARIO_HOME}/.local/bin"
+    ln -s "${SCENARIO_CHECKOUT}/operator.sh" "${SCENARIO_HOME}/.local/bin/operator"
+    ln -s "${SCENARIO_CHECKOUT}/handoff.sh" "${SCENARIO_HOME}/.local/bin/handoff"
+}
+
+# True only if both legacy symlinks are exactly as link_legacy left them and no
+# backup file is lying around -- i.e. nothing touched them at all.
+legacy_links_untouched() {
+    [[ -L "${SCENARIO_HOME}/.local/bin/operator" ]] \
+        && [[ "$(readlink "${SCENARIO_HOME}/.local/bin/operator")" == "${SCENARIO_CHECKOUT}/operator.sh" ]] \
+        && [[ -L "${SCENARIO_HOME}/.local/bin/handoff" ]] \
+        && [[ "$(readlink "${SCENARIO_HOME}/.local/bin/handoff")" == "${SCENARIO_CHECKOUT}/handoff.sh" ]] \
+        && [[ -z "$(find "${SCENARIO_HOME}/.local/bin" -name '*bak*' 2>/dev/null)" ]]
 }
 
 echo "═══ setup.sh functional tests ═══"
@@ -275,6 +316,200 @@ else
     else
         fail "Ctrl-C mid-install restores the legacy symlinks instead of stranding the user"
         echo "  (exit status was ${interrupted_rc})"
+        echo "----- output -----"; cat "${SANDBOX_ROOT}/last_output.log"; echo "------------------"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Query-only modes (--status / --check-only / --help).
+#
+# These ask setup_tools.py a question and install nothing, so none of the
+# migration machinery above should run for them. Every one of these scenarios
+# is a measured pre-fix behaviour, not a hypothetical:
+#   * --status whose report exited 1 was relabelled "Python setup failed"
+#     and rolled back, when nothing had failed and nothing was being installed;
+#   * --status whose report exited 0, on a machine with an `operator` further
+#     along PATH, DELETED ~/.local/bin/operator outright and reported a
+#     successful migration;
+#   * --help exited 1 after printing two false "does not resolve on PATH"
+#     errors.
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Scenario 8: --status whose report exits non-zero is forwarded, not
+# relabelled as a setup failure, and touches nothing ──
+new_scenario "scenario8"
+link_legacy
+write_query_stub 1
+EXTRA_PATH="" status=$(run_setup_with --status)
+if [[ "$status" == "1" ]] \
+    && legacy_links_untouched \
+    && ! grep -q "Python setup failed" "${SANDBOX_ROOT}/last_output.log" \
+    && ! grep -q "Set aside" "${SANDBOX_ROOT}/last_output.log"; then
+    pass "--status forwards a non-zero report verbatim and never migrates"
+else
+    fail "--status forwards a non-zero report verbatim and never migrates"
+    echo "----- output -----"; cat "${SANDBOX_ROOT}/last_output.log"; echo "------------------"
+fi
+
+# ── Scenario 9: --status on a machine that also has `operator` elsewhere on
+# PATH must not delete ~/.local/bin/{operator,handoff} ──
+# This is the destructive case: `command -v operator` answered "yes" from the
+# other directory, which setup.sh read as "the install succeeded" and used to
+# justify deleting the legacy backup -- the only remaining copy.
+new_scenario "scenario9"
+link_legacy
+mkdir -p "${SCENARIO_HOME}/elsewhere"
+printf '#!/usr/bin/env bash\necho other operator\n' > "${SCENARIO_HOME}/elsewhere/operator"
+printf '#!/usr/bin/env bash\necho other handoff\n' > "${SCENARIO_HOME}/elsewhere/handoff"
+chmod +x "${SCENARIO_HOME}/elsewhere/operator" "${SCENARIO_HOME}/elsewhere/handoff"
+write_query_stub 0
+EXTRA_PATH="${SCENARIO_HOME}/elsewhere" status=$(run_setup_with --status)
+if [[ "$status" == "0" ]] \
+    && legacy_links_untouched \
+    && ! grep -q "Migrated" "${SANDBOX_ROOT}/last_output.log"; then
+    pass "--status does not delete commands when another one is on PATH"
+else
+    fail "--status does not delete commands when another one is on PATH"
+    echo "----- output -----"; cat "${SANDBOX_ROOT}/last_output.log"; echo "------------------"
+fi
+
+# ── Scenario 10: --help answers and exits 0 without inventing PATH errors ──
+new_scenario "scenario10"
+link_legacy
+write_query_stub 0
+EXTRA_PATH="" status=$(run_setup_with --help)
+if [[ "$status" == "0" ]] \
+    && legacy_links_untouched \
+    && ! grep -q "does not resolve on PATH" "${SANDBOX_ROOT}/last_output.log"; then
+    pass "--help reports without migrating or inventing PATH errors"
+else
+    fail "--help reports without migrating or inventing PATH errors"
+    echo "----- output -----"; cat "${SANDBOX_ROOT}/last_output.log"; echo "------------------"
+fi
+
+# ── Scenario 11: --check-only gets the same treatment as --status ──
+new_scenario "scenario11"
+link_legacy
+write_query_stub 1
+EXTRA_PATH="" status=$(run_setup_with --check-only)
+if [[ "$status" == "1" ]] \
+    && legacy_links_untouched \
+    && ! grep -q "Python setup failed" "${SANDBOX_ROOT}/last_output.log"; then
+    pass "--check-only forwards its report verbatim and never migrates"
+else
+    fail "--check-only forwards its report verbatim and never migrates"
+    echo "----- output -----"; cat "${SANDBOX_ROOT}/last_output.log"; echo "------------------"
+fi
+
+# ── Scenario 12: an INSTALL that installs nothing at ~/.local/bin rolls back,
+# even though another `operator` resolves on PATH ──
+# The flag list in scenario 8-11 only covers the query modes known today. This
+# covers the mechanism underneath them: finalization must turn on "did this
+# install put a command where the original was set aside", not on the narrower
+# "does some command by that name resolve on PATH". Reachable in install mode
+# too -- e.g. --skip-package deploys extensions and templates but runs no pip,
+# so it creates no console scripts.
+new_scenario "scenario12"
+link_legacy
+mkdir -p "${SCENARIO_HOME}/elsewhere"
+printf '#!/usr/bin/env bash\necho other operator\n' > "${SCENARIO_HOME}/elsewhere/operator"
+printf '#!/usr/bin/env bash\necho other handoff\n' > "${SCENARIO_HOME}/elsewhere/handoff"
+chmod +x "${SCENARIO_HOME}/elsewhere/operator" "${SCENARIO_HOME}/elsewhere/handoff"
+cat > "${SCENARIO_CHECKOUT}/setup_tools.py" <<'PYEOF'
+print("stub setup_tools.py: an install that creates no console scripts")
+PYEOF
+EXTRA_PATH="${SCENARIO_HOME}/elsewhere" status=$(run_setup_with --yes)
+if [[ "$status" != "0" ]] \
+    && [[ -L "${SCENARIO_HOME}/.local/bin/operator" ]] \
+    && [[ "$(readlink "${SCENARIO_HOME}/.local/bin/operator")" == "${SCENARIO_CHECKOUT}/operator.sh" ]] \
+    && [[ -L "${SCENARIO_HOME}/.local/bin/handoff" ]] \
+    && [[ "$(readlink "${SCENARIO_HOME}/.local/bin/handoff")" == "${SCENARIO_CHECKOUT}/handoff.sh" ]] \
+    && ! grep -q "Migrated" "${SANDBOX_ROOT}/last_output.log"; then
+    pass "an install that creates no console scripts rolls back instead of deleting them"
+else
+    fail "an install that creates no console scripts rolls back instead of deleting them"
+    echo "----- output -----"; cat "${SANDBOX_ROOT}/last_output.log"; echo "------------------"
+fi
+
+# ── Scenario 13: Ctrl-C DURING the stash, before the install starts ──
+# Scenario 7 covers an interrupt once the install is running. This covers the
+# earlier interval: after the first `mv` has moved a command aside, but before
+# the stashing step has finished. The trap used to be armed only after BOTH
+# links were stashed, so a signal in between killed the script with the
+# operator already renamed to a .bak and nothing left at ~/.local/bin/operator
+# -- the user's only copy, orphaned under a name they have no reason to look
+# for, with no error saying so.
+#
+# The window is made deterministic rather than raced: `canon` shells out to
+# python twice per symlink, so a fake python3 that sleeps for exactly that
+# probe (and execs the real one for everything else) turns a millisecond gap
+# into seconds. The test waits for the operator backup to appear -- proof the
+# mv has happened -- and only then signals.
+#
+# What this covers, precisely: that the trap is armed before the first rename.
+# What it does NOT cover: that the backup path is published before the rename
+# rather than after it. A reviewer caught the overclaim, and a control settled
+# it -- move the publish back into the caller but leave the trap early, and
+# this scenario still passes, because the signal lands during the SECOND
+# link's canon probe, by which time the first link's path has been recorded
+# either way. That half of the fix is not observable from a test: the gap it
+# closes is between two adjacent bash statements with no subprocess in
+# between, so there is nothing to widen and no portable way to deliver a
+# signal inside it. It is argued in the comments at the publish site instead.
+new_scenario "scenario13"
+mkdir -p "${SCENARIO_HOME}/.local/bin" "${SCENARIO_HOME}/fakebin"
+REAL_PYTHON="$(command -v python3 || command -v python)"
+cat > "${SCENARIO_HOME}/fakebin/python3" <<FAKEEOF
+#!/usr/bin/env bash
+# Slow ONLY for canon()'s realpath probe: find_python's version check and the
+# installer itself must stay fast, or this stops being a test of the stash
+# window and becomes a test of the timeout.
+for a in "\$@"; do
+    case "\$a" in
+        *realpath*) sleep 2 ;;
+    esac
+done
+exec "${REAL_PYTHON}" "\$@"
+FAKEEOF
+chmod +x "${SCENARIO_HOME}/fakebin/python3"
+link_legacy
+write_stub_setup_tools "succeed"
+set -m
+HOME="$SCENARIO_HOME" PATH="${SCENARIO_HOME}/fakebin:${SCENARIO_HOME}/.local/bin:${PATH}" \
+    bash "${SCENARIO_CHECKOUT}/setup.sh" --yes >"${SANDBOX_ROOT}/last_output.log" 2>&1 &
+stash_pid=$!
+set +m
+operator_bak="${SCENARIO_HOME}/.local/bin/operator${LEGACY_BAK}"
+stashed=""
+for _ in $(seq 1 200); do
+    if [[ -L "$operator_bak" || -e "$operator_bak" ]]; then stashed=yes; break; fi
+    # Stop waiting if the script exited -- otherwise a setup.sh that never
+    # stashed at all would be reported as a timeout rather than as the
+    # different failure it is.
+    kill -0 "$stash_pid" 2>/dev/null || break
+    sleep 0.05
+done
+if [[ -z "$stashed" ]]; then
+    fail "Ctrl-C during the stash restores the command instead of orphaning it"
+    echo "  (the operator backup never appeared; the stash window was never entered)"
+    echo "----- output -----"; cat "${SANDBOX_ROOT}/last_output.log"; echo "------------------"
+else
+    pgid="$(ps -o pgid= -p "$stash_pid" 2>/dev/null | tr -d ' ')"
+    kill -INT "-${pgid:-$stash_pid}" 2>/dev/null
+    wait "$stash_pid" 2>/dev/null
+    stash_rc=$?
+    if [[ -L "${SCENARIO_HOME}/.local/bin/operator" ]] \
+        && [[ "$(readlink "${SCENARIO_HOME}/.local/bin/operator")" == "${SCENARIO_CHECKOUT}/operator.sh" ]] \
+        && [[ ! -e "$operator_bak" ]] \
+        && [[ -L "${SCENARIO_HOME}/.local/bin/handoff" ]] \
+        && [[ "$stash_rc" -ne 0 ]]; then
+        pass "Ctrl-C during the stash restores the command instead of orphaning it"
+    else
+        fail "Ctrl-C during the stash restores the command instead of orphaning it"
+        echo "  (exit status was ${stash_rc}; operator is $(
+            if [[ -L "${SCENARIO_HOME}/.local/bin/operator" ]]; then echo "a symlink"
+            elif [[ -e "${SCENARIO_HOME}/.local/bin/operator" ]]; then echo "a regular file"
+            else echo "MISSING -- orphaned at ${operator_bak}"; fi))"
         echo "----- output -----"; cat "${SANDBOX_ROOT}/last_output.log"; echo "------------------"
     fi
 fi

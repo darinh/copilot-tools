@@ -1855,6 +1855,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="setup_tools",
         description="Configure your environment for the copilot-tools toolkit.",
+        # Abbreviation is off because setup.sh and setup.ps1 have to decide,
+        # before running this, whether the invocation is a QUESTION
+        # (--status/--check-only/--help, which install nothing) or an install.
+        # They match exact spellings. With abbreviation on, `--stat` reaches
+        # --status here while reading as an install there, so the two layers
+        # disagree about what the user asked for -- and the install path moves
+        # the user's ~/.local/bin/{operator,handoff} aside. Turning it off
+        # makes the agreement structural instead of a list that has to be kept
+        # in sync with this one.
+        allow_abbrev=False,
     )
     parser.add_argument("--yes", action="store_true",
                         help="Assume yes for overwrite prompts")

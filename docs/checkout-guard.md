@@ -31,11 +31,6 @@ flip it out from under every other one.
 python setup_tools.py --status
 ```
 
-Call it directly, as above. `./setup.sh --status` and `./setup.ps1 --status`
-forward the flag but relabel any non-zero exit as `Python setup failed`, which
-is wrong here in both directions: nothing failed, and setup cannot fix it —
-this toolkit never writes `settings.json`.
-
 reports both halves of the question, and exits non-zero if either fails:
 
 ```
@@ -49,6 +44,18 @@ Deployed extensions:
 
 `operator` passes `--experimental` on every launch unless the caller ruled on
 it. If you start `copilot` by hand, pass it yourself.
+
+`./setup.sh --status` and `./setup.ps1 --status` forward the flag, and forward
+the exit code back unlabelled. A non-zero `--status` is a report — the machine
+is out of date, or its extensions are inert — not a failure of setup, which
+could not fix it in any case since this toolkit never writes `settings.json`.
+Both entrypoints treat `--status`, `--check-only` and `--help` as questions and
+run none of their install machinery for them. They used to call any non-zero
+answer `Python setup failed`, and `setup.sh` went further: it ran its
+legacy-migration steps for a question, so a `--status` on a machine that also
+had `operator` further along `PATH` **deleted** `~/.local/bin/{operator,handoff}`
+and reported a successful migration. See scenarios 8–12 in
+`tests/test_setup_sh.sh`.
 
 Three states, kept apart on purpose. `experimental mode is on` and
 `experimental mode is OFF` are measurements; `could not tell whether extensions
