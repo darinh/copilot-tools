@@ -6,6 +6,15 @@
 // predicate that never matched anything at all, and a test that cannot tell
 // those apart passes just as happily when the guard is broken. Two agents
 // shipped exactly that shape in one evening on this repository.
+//
+// The same rule, in the direction that is easier to miss: an assertion that a
+// scan OMITS something needs a positive assertion through THE SAME CALL, not
+// merely somewhere in the same test. A control on a neighbouring function
+// proves that function ran; it says nothing about the one being asserted
+// about, so `!found.includes(x)` still passes when `found` is empty for a
+// reason nobody intended. Two tests in this file were vacuous for exactly that
+// reason and were caught by mutation, not by reading -- for a negative claim,
+// the premise is that the mechanism can fire at all.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -826,6 +835,13 @@ test("the worktree exclusion is derived from git, not from the .worktrees name",
     const found = await scanCheckoutTree(primary);
     assert.ok(!found.some((p) => p.startsWith("scratch-checkout")),
       `a worktree is a checkout wherever it lives: ${JSON.stringify(found)}`);
+    // Control, through the SAME call. Without it this test passes when
+    // `scanCheckoutTree` returns [] for any reason at all -- the positives
+    // above are on `nestedWorktreePrefixes`, a different function, and cannot
+    // establish that the scan being asserted about ran.
+    await writeFile(join(primary, "probe.py"), "scratch\n");
+    assert.ok((await scanCheckoutTree(primary)).includes("probe.py"),
+      "control: this scan does report a real stray in this same tree");
   });
 });
 
@@ -946,6 +962,12 @@ test("the worktree exclusion applies to the tree the agent is working in too", a
     const found = await scanCheckoutTree(primary);
     assert.ok(!found.some((p) => p.startsWith("peer-checkout")),
       `the scan the extension uses excludes it: ${JSON.stringify(found)}`);
+    // Control, through the SAME call. The positive above is on `scanCheckout`;
+    // an assertion about what `scanCheckoutTree` omits proves nothing until
+    // something establishes that `scanCheckoutTree` reports anything.
+    await writeFile(join(primary, "probe.py"), "scratch\n");
+    assert.ok((await scanCheckoutTree(primary)).includes("probe.py"),
+      "control: the filtered scan is not simply blind");
   });
 });
 
