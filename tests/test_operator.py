@@ -141,6 +141,115 @@ def test_has_agent_flag(args, expected):
     assert op.has_agent_flag(args) is expected
 
 
+# ── extensions load only in experimental mode ───────────────────
+@pytest.mark.parametrize("defaults", [
+    ["--yolo"],
+    [],
+    ["--yolo", "--no-experimental"],
+])
+def test_with_experimental_always_adds_the_flag(defaults):
+    """Unconditionally, and last, so anything appended after it wins.
+
+    Deciding by inspecting the caller's arguments is what the first version of
+    this did, and it could not tell a flag from a value: `-p --no-experimental`
+    reads as a ruling and suppressed the injected flag.
+    """
+    assert op.with_experimental(defaults) == [*defaults, "--experimental"]
+
+
+def _capture_launch_args(monkeypatch):
+    """Record the argv the operator would hand to copilot."""
+    seen = []
+
+    def fake_start_session(instance, args, session_num, remain_on_exit=False, preamble=""):
+        seen.append(args)
+        instance.exit_file.write_text("0", encoding="utf-8")
+        instance.stop_marker.touch()
+
+    monkeypatch.setattr(op, "start_session", fake_start_session)
+    monkeypatch.setattr(op, "handle_existing_session", lambda instance: None)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+    return seen
+
+
+def _run_single(monkeypatch, args):
+    seen = _capture_launch_args(monkeypatch)
+    monkeypatch.setattr(op.MUX, "attach", lambda session: None)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
+    monkeypatch.setattr(op, "wait_for_exit", lambda instance, timeout=10: True)
+    op.run_single_session(op.Instance("exp-single"), args)
+    assert seen, "the session never launched, so nothing about its args was tested"
+    return seen[0]
+
+
+def test_single_session_launches_copilot_in_experimental_mode(monkeypatch):
+    """Runtime extensions load only in experimental mode.
+
+    Without the flag the CLI loads no extensions AND reports nothing about it,
+    so `checkout-guard` is absent in exactly the shape of a guard that ran and
+    found the checkout clean. Measured, not assumed: sessions on this machine
+    ran over an hour with no guard in the shared primary checkout.
+    """
+    assert _run_single(monkeypatch, []).count("--experimental") == 1
+
+
+def test_loop_mode_launches_copilot_in_experimental_mode(monkeypatch):
+    seen = _capture_launch_args(monkeypatch)
+
+    op.run_loop_mode(op.Instance("exp-loop"), ["--agent", "test:agent"], is_fresh=True)
+
+    assert seen, "the loop never launched, so nothing about its args was tested"
+    assert seen[0].count("--experimental") == 1
+
+
+@pytest.mark.parametrize("mode", ["single", "loop"])
+def test_an_explicit_no_experimental_comes_after_the_injected_flag(monkeypatch, mode):
+    """Control: the operator supplies a default it does not force.
+
+    The CLI resolves conflicting spellings last-wins -- measured against CLI
+    1.0.77, both orders -- so the opt-out only survives if the user's argument
+    is positioned after the injected one. Asserting on order rather than on
+    absence is what makes this a real control now that injection is
+    unconditional.
+    """
+    if mode == "single":
+        launched = _run_single(monkeypatch, ["--no-experimental"])
+    else:
+        seen = _capture_launch_args(monkeypatch)
+        op.run_loop_mode(op.Instance("exp-loop-off"),
+                         ["--agent", "test:agent", "--no-experimental"], is_fresh=True)
+        assert seen, "the loop never launched, so nothing about its args was tested"
+        launched = seen[0]
+
+    assert launched.count("--experimental") == 1
+    assert launched.index("--experimental") < launched.index("--no-experimental")
+
+
+@pytest.mark.parametrize("mode", ["single", "loop"])
+@pytest.mark.parametrize("value_flag", ["-p", "-i", "--prompt"])
+def test_a_ruling_shaped_option_value_does_not_suppress_the_flag(
+        monkeypatch, mode, value_flag):
+    """Regression: `-p --no-experimental` is a prompt, not a decision.
+
+    The first version of this feature scanned every forwarded token, so a
+    value that merely looked like a ruling silently cancelled the injected
+    flag -- putting the session back in the guardless state with no signal,
+    which is the exact failure this feature exists to abolish.
+    """
+    user_args = [value_flag, "--no-experimental"]
+    if mode == "single":
+        launched = _run_single(monkeypatch, user_args)
+    else:
+        seen = _capture_launch_args(monkeypatch)
+        op.run_loop_mode(op.Instance("exp-loop-val"),
+                         ["--agent", "test:agent", *user_args], is_fresh=True)
+        assert seen, "the loop never launched, so nothing about its args was tested"
+        launched = seen[0]
+
+    assert launched.count("--experimental") == 1
+    assert launched.index("--experimental") < launched.index(value_flag)
+
+
 # ── preamble ────────────────────────────────────────────────────
 def test_preamble_is_platform_neutral():
     """The preamble is read by an agent that may be on Windows, so it must not
