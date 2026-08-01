@@ -98,16 +98,27 @@ mail.
 ```bash
 operator send --from <your-instance> --to <their-instance> "message"
 
-operator inbox                 # read yours (marks them read)
+operator inbox <your-instance>  # read YOUR mail (marks it read)
 operator inbox --peek          # read without marking
 operator inbox --history       # what was already delivered
-operator inbox --json          # machine-readable
 operator inbox payments-api    # read a specific instance's mailbox
 operator send --from a --to b -- "--peek is the flag"   # dash-leading text
 ```
 
 ### Rules that matter
 
+- **Always pass your own name.** With no NAME the mailbox is named after the
+  *directory*, not after you — that default exists to name a session you are
+  starting. In a checkout you share with another agent it resolves to the same
+  name for everyone, and reading consumes: you would eat a peer's mail and
+  leave a mailbox indistinguishable from an empty one. The operator now refuses
+  a nameless destructive read when another instance is live here (or in a
+  worktree under it), when the derived name belongs to a session working
+  somewhere else, or when it cannot tell who is live at all. It cannot detect a
+  *sleeping* peer, so the habit is the real fix. Your name is in your session
+  preamble ("Operator instance: ...").
+- **`--json` is a destructive read too.** The mailbox is consumed before the
+  output is formatted. Only `--peek` and `--history` leave mail alone.
 - **`--from` and `--to` are both required.** The recipient needs to know who
   wrote and where to send the answer. Your own instance name is in your session
   preamble ("Operator instance: ...").
@@ -146,8 +157,9 @@ whom what.
   409 on duplicate" beats a paragraph of narrative.
 - **Answer your mail.** A parallel agent blocked on your reply is burning
   sessions doing nothing.
-- Check `operator inbox` when you start work, and again before you write a
-  handoff — a handoff that ignores a pending question wastes the next session.
+- Check `operator inbox <your-name>` when you start work, and again before you
+  write a handoff — a handoff that ignores a pending question wastes the next
+  session.
 - Don't use mail to carry what a file carries better. Point at a path.
 - Tell the other agent when you are done, or when you have changed something on
   your side of the contract. It has no other way to find out.
@@ -167,5 +179,5 @@ operator send --from checkout-service --to payments-api \
   "You own ~/repos/payments-api only. Build POST /charges taking {amount_cents, currency, idempotency_key} and returning {id, status}; 409 on a repeated idempotency_key. Do not edit checkout-service. Message me when the contract is live."
 
 # 3. Carry on with your own work, and check for the answer
-operator inbox
+operator inbox checkout-service
 ```

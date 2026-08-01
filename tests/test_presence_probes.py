@@ -9,25 +9,24 @@ third. In this program that mattered three ways:
 * the tab registry is rewritten whole from what was read, so reading it as
   empty erases every other tab.
 
-The mock here denies ``os.stat`` *and* ``os.lstat`` -- and, on 3.10, the
-private ``pathlib`` accessor that binds ``os.stat`` at import time. All three
-because the old code and the new code reach the filesystem by different
-routes: ``Path.exists()`` goes through ``os.stat`` (via that accessor on
-3.10), while ``path_present`` calls ``os.lstat`` directly. Deny only
-``os.lstat`` and the unfixed code sails through, so the test grades nothing;
-deny only ``os.stat`` and the fixed code never sees the failure it exists to
-handle.
+The mock lives in ``conftest.denied`` and is shared with the mail-CLI census
+tests. It denies ``os.stat``, ``os.lstat`` and -- on 3.10 -- the private
+``pathlib`` accessor that binds ``os.stat`` at import time. All three, because
+the old code and the new code reach the filesystem by different routes:
+``Path.exists()`` goes through ``os.stat`` (via that accessor on 3.10), while
+``path_present`` calls ``os.lstat`` directly. Deny only ``os.lstat`` and the
+unfixed code sails through, so the test grades nothing; deny only ``os.stat``
+and the fixed code never sees the failure it exists to handle.
 """
 from __future__ import annotations
 
 import json
 import os
-import pathlib
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from conftest import denied
 
 import copilot_operator as op
 
@@ -48,51 +47,6 @@ def isolated_state(tmp_path, monkeypatch):
     op._PROBE_WARNED.clear()
     yield tmp_path
     op._PROBE_WARNED.clear()
-
-
-@contextmanager
-def denied(monkeypatch, *paths, limit: int | None = None, counter=None):
-    """Make every stat of ``paths`` raise EACCES, as a revoked directory does.
-
-    ``limit`` denies only the first N probes, which is how a transient failure
-    (a scanner holding the file open on Windows) actually behaves: the next
-    poll succeeds.
-    """
-    targets = {str(Path(p)) for p in paths}
-    seen = counter if counter is not None else {"n": 0}
-    real_stat, real_lstat = os.stat, os.lstat
-
-    def guard(real):
-        def probe(path, *args, **kwargs):
-            try:
-                key = str(Path(path))
-            except TypeError:
-                key = None
-            if key in targets and (limit is None or seen["n"] < limit):
-                seen["n"] += 1
-                raise PermissionError(13, "Permission denied")
-            return real(path, *args, **kwargs)
-        return probe
-
-    monkeypatch.setattr(os, "stat", guard(real_stat))
-    monkeypatch.setattr(os, "lstat", guard(real_lstat))
-    # Python 3.10's pathlib copies os.stat into a private accessor class at
-    # import time, so patching os.stat alone never reaches Path.exists() and
-    # the whole suite would pass against the unfixed code on 3.10.
-    accessor = getattr(pathlib, "_NormalAccessor", None)
-    saved = {}
-    if accessor is not None:
-        for name, real in (("stat", real_stat), ("lstat", real_lstat)):
-            if hasattr(accessor, name):
-                saved[name] = getattr(accessor, name)
-                setattr(accessor, name, staticmethod(guard(real)))
-    try:
-        yield seen
-    finally:
-        for name, original in saved.items():
-            setattr(accessor, name, original)
-        monkeypatch.setattr(os, "stat", real_stat)
-        monkeypatch.setattr(os, "lstat", real_lstat)
 
 
 def _can_symlink(tmp_path: Path) -> bool:

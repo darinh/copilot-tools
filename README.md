@@ -165,7 +165,7 @@ operator list
 # Start a loop without attaching, then message it
 operator --loop --headless --name payments-api --agent=anvil:anvil
 operator send --from backend --to payments-api "POST /charges returns {id, status}"
-operator inbox
+operator inbox backend
 
 # Usage reports
 operator report costs
