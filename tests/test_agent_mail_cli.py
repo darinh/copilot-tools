@@ -108,6 +108,46 @@ def test_unquoted_message_words_are_joined(idle_recipient):
     assert msg["text"] == "several words"
 
 
+# ── unknown options are refused, not absorbed ───────────────────
+def test_send_refuses_an_unknown_option_rather_than_sending_it_as_text(
+        idle_recipient, capsys):
+    """A typo'd flag used to become message body.
+
+    The sender who wrote `--dry-run` believed nothing was delivered; the
+    recipient got a message. Refusing is the only outcome that matches both
+    of their expectations.
+    """
+    assert op.send_message(
+        ["--from", "alpha", "--to", "beta", "--dry-run", "hi"]) == 2
+    assert "unknown option '--dry-run'" in capsys.readouterr().err
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 0
+
+
+def test_send_takes_flag_shaped_text_after_a_double_dash(idle_recipient):
+    """`--force` inside a message is text, and does not also arm the flag."""
+    assert op.send_message(
+        ["--from", "alpha", "--to", "beta", "--", "--force", "is", "the",
+         "flag"]) == 0
+    (msg,) = operator_mail.pending(op.OPERATOR_HOME, "beta")
+    assert msg["text"] == "--force is the flag"
+
+
+def test_send_does_not_mistake_message_text_for_a_help_request(idle_recipient):
+    """`-h` in the body must be delivered, not swallowed by the help path."""
+    assert op.send_message(["--from", "alpha", "--to", "beta", "-h", "means",
+                            "help"]) == 0
+    (msg,) = operator_mail.pending(op.OPERATOR_HOME, "beta")
+    assert msg["text"] == "-h means help"
+
+
+def test_send_help_prints_usage_on_stdout_and_sends_nothing(idle_recipient,
+                                                            capsys):
+    assert op.send_message(["--help"]) == 0
+    out = capsys.readouterr()
+    assert "Usage: operator send" in out.out
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 0
+
+
 # ── recipient validation ────────────────────────────────────────
 def test_unknown_recipient_is_refused_and_lists_real_names(monkeypatch, capsys):
     monkeypatch.setattr(op, "MUX", RecordingMux())
@@ -248,6 +288,57 @@ def test_inbox_history_shows_already_read_messages(idle_recipient, capsys):
 def test_inbox_is_empty_not_an_error_for_a_quiet_instance(idle_recipient, capsys):
     assert op.show_inbox(["beta"]) == 0
     assert "No messages." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("bad", ["--peak", "--unraed", "--help-me", "-x"])
+def test_inbox_refuses_an_unknown_option_and_keeps_the_mail(bad, idle_recipient,
+                                                            capsys):
+    """Reading archives what it shows, so a typo must not fall through.
+
+    `--peak` for `--peek` used to be indistinguishable from a plain read: the
+    mailbox was consumed and the next reader saw an empty inbox with no way
+    to tell that from never having had mail.
+    """
+    op.send_message(["--from", "alpha", "--to", "beta", "do not eat me"])
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+    capsys.readouterr()
+
+    assert op.show_inbox(["beta", bad]) == 2
+    err = capsys.readouterr().err
+    assert f"unknown option '{bad}'" in err
+    assert "No mail was read." in err
+
+    # Still deliverable, not merely still counted.
+    assert op.show_inbox(["beta"]) == 0
+    assert "do not eat me" in capsys.readouterr().out
+
+
+def test_inbox_refuses_two_mailboxes_rather_than_silently_picking_one(
+        idle_recipient, capsys):
+    op.send_message(["--from", "alpha", "--to", "beta", "still here"])
+    capsys.readouterr()
+    assert op.show_inbox(["beta", "gamma"]) == 2
+    assert "one mailbox at a time" in capsys.readouterr().err
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+
+
+def test_inbox_help_prints_usage_and_reads_nothing(idle_recipient, capsys):
+    op.send_message(["--from", "alpha", "--to", "beta", "unread still"])
+    capsys.readouterr()
+    assert op.show_inbox(["--help"]) == 0
+    assert "Usage: operator inbox" in capsys.readouterr().out
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+
+
+def test_inbox_help_from_main_does_not_touch_this_directorys_mailbox(
+        idle_recipient, monkeypatch, capsys):
+    """`operator inbox --help` used to read (and archive) the default mailbox."""
+    monkeypatch.setattr(op, "default_instance_name", lambda: "beta")
+    op.send_message(["--from", "alpha", "--to", "beta", "survives help"])
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+    capsys.readouterr()
+    assert op.main(["inbox", "--help"]) == 0
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
 
 
 def test_inbox_defaults_to_the_instance_for_this_directory(idle_recipient,
