@@ -140,6 +140,313 @@ def test_backup_captures_rows_still_in_the_wal(db_path, logs):
         holder.close()
 
 
+def test_connect_waits_as_long_as_every_other_writer(db_path):
+    """The operator holds this database open from a live loop.
+
+    ``sqlite3.connect``'s own default is 5000ms, so "has a busy timeout" is
+    not the property worth asserting -- the script had one. The property is
+    that it waits as long as ``operator_ingest`` does, because a repair that
+    gives up first is a repair that fails on ``--apply``, after the dry run
+    has already told the user it is safe.
+    """
+    add_session(db_path, "process-1.log")
+    conn = backfill_unknown_metrics.connect(db_path)
+    try:
+        timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    finally:
+        conn.close()
+    assert timeout_ms == int(operator_ingest.BUSY_TIMEOUT * 1000)
+    assert timeout_ms > 5000, "stdlib default; the whole point is to beat it"
+
+
+def test_apply_waits_out_a_concurrent_writer(db_path, logs):
+    """A held write lock must delay the repair, not defeat it.
+
+    This is a regression guard, not proof of the timeout fix -- it passes
+    against the old 5000ms default too, because the lock here is held for
+    well under 5s. What it pins is that the repair survives contention at all
+    rather than aborting half-applied.
+
+    The elapsed-time assertion is what stops it being vacuous: without it this
+    passes just as happily when the lock was never held.
+    """
+    import threading
+    import time
+
+    add_session(db_path, "process-1.log")
+    (logs / "process-1.log").write_text("no shutdown here", encoding="utf-8")
+
+    hold = 0.75
+    holder = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("UPDATE sessions SET session_num = 99")
+    released = threading.Event()
+
+    def release():
+        holder.commit()
+        released.set()
+
+    timer = threading.Timer(hold, release)
+    started = time.monotonic()
+    timer.start()
+    try:
+        rc = backfill_unknown_metrics.main(
+            ["--db", str(db_path), "--logs", str(logs), "--apply"])
+    finally:
+        elapsed = time.monotonic() - started
+        timer.cancel()
+        if not released.is_set():
+            holder.commit()
+        holder.close()
+
+    assert rc == 0
+    assert elapsed >= hold, (
+        f"finished in {elapsed:.2f}s, so the write lock was never contended "
+        f"and this test proves nothing")
+    assert read_row(db_path, "process-1.log")["lines_added"] is None
+
+
+def test_a_row_remeasured_mid_run_is_not_erased(db_path, logs, capsys,
+                                                monkeypatch):
+    """Scanning logs takes long enough for a live operator to re-ingest one of
+    these sessions -- and a re-ingest is exactly the event that replaces the
+    zeros with real measurements. Clearing on the strength of a stale scan
+    would destroy the only copy of data that had just arrived.
+
+    The backup runs between the scan and the write, so it is the honest place
+    to simulate the interleaving.
+    """
+    add_session(db_path, "process-1.log")
+    (logs / "process-1.log").write_text("no shutdown here", encoding="utf-8")
+
+    original = backfill_unknown_metrics.write_backup
+
+    def remeasure(conn, dest):
+        original(conn, dest)
+        other = sqlite3.connect(db_path, timeout=10)
+        try:
+            other.execute(
+                "UPDATE sessions SET api_time_seconds = 12, "
+                "session_time_seconds = 340, lines_added = 7, "
+                "lines_removed = 2, raw_metrics = ? WHERE log_file = ?",
+                ("API time spent: 12s", "process-1.log"))
+            other.commit()
+        finally:
+            other.close()
+
+    monkeypatch.setattr(backfill_unknown_metrics, "write_backup", remeasure)
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert rc == 0
+    row = read_row(db_path, "process-1.log")
+    assert row["api_time_seconds"] == 12, "erased a real measurement"
+    assert row["lines_added"] == 7
+    assert row["raw_metrics"] == "API time spent: 12s"
+    assert "Cleared 0 row(s)" in capsys.readouterr().out
+
+
+def test_the_summary_and_the_columns_land_together(db_path, logs):
+    """Both writes are one transaction, so a row can never be left with a
+    '0s' summary next to a NULL column.
+
+    Named for what it actually pins. It does NOT prove the TOCTOU fix -- it
+    passes against the old non-transactional code too, because nothing here
+    interleaves a competing writer. ``test_a_row_remeasured_mid_run_is_not_
+    erased`` is the test that discriminates.
+    """
+    add_session(db_path, "process-1.log")
+    (logs / "process-1.log").write_text("no shutdown here", encoding="utf-8")
+
+    backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    row = read_row(db_path, "process-1.log")
+    assert row["api_time_seconds"] is None
+    assert "API time spent: unknown" in row["raw_metrics"]
+    assert "API time spent: 0s" not in row["raw_metrics"]
+
+
+def test_a_log_that_gains_a_shutdown_event_mid_run_is_not_erased(
+        db_path, logs, capsys, monkeypatch):
+    """The verdict has two halves and the write must re-check both.
+
+    All-zero on its own is not evidence: a short session really can measure 0s
+    of API time, a 0-second duration and no line changes -- that is exactly
+    what ``test_measured_zeros_are_left_alone`` pins. So if the log acquires a
+    shutdown event after the scan read it, those zeros have become measured
+    data, and clearing them on the strength of the zero test alone destroys
+    the very thing the log check exists to protect.
+    """
+    add_session(db_path, "process-1.log")
+    log = logs / "process-1.log"
+    log.write_text("no shutdown here", encoding="utf-8")
+
+    original = backfill_unknown_metrics.write_backup
+
+    def measure(conn, dest):
+        original(conn, dest)
+        log.write_text('{"kind": "session_shutdown"}', encoding="utf-8")
+
+    monkeypatch.setattr(backfill_unknown_metrics, "write_backup", measure)
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert rc == 0
+    row = read_row(db_path, "process-1.log")
+    assert row["api_time_seconds"] == 0, "erased zeros a shutdown event backs"
+    assert row["raw_metrics"] == ZEROED_RAW
+    assert "Cleared 0 row(s)" in capsys.readouterr().out
+
+
+def test_a_shutdown_event_added_within_one_clock_tick_is_still_caught(
+        db_path, logs, capsys, monkeypatch):
+    """The mtime half of the fingerprint cannot be relied on alone.
+
+    Windows' system clock ticks around every 15ms, far slower than a file can
+    be rewritten, so a log modified immediately after the scan can carry the
+    scan's own timestamp. Pinning the timestamp to a fixed value makes that
+    collision certain instead of occasional -- the size half is what has to
+    catch it.
+    """
+    import os
+
+    add_session(db_path, "process-1.log")
+    log = logs / "process-1.log"
+    log.write_text("no shutdown here", encoding="utf-8")
+    frozen = log.stat().st_mtime_ns
+
+    original = backfill_unknown_metrics.write_backup
+
+    def measure(conn, dest):
+        original(conn, dest)
+        log.write_text('{"kind": "session_shutdown"}', encoding="utf-8")
+        os.utime(log, ns=(frozen, frozen))
+        assert log.stat().st_mtime_ns == frozen, (
+            "test precondition: the timestamp collision must be real")
+
+    monkeypatch.setattr(backfill_unknown_metrics, "write_backup", measure)
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert rc == 0
+    assert read_row(db_path, "process-1.log")["api_time_seconds"] == 0
+    assert "Cleared 0 row(s)" in capsys.readouterr().out
+
+
+def test_a_log_that_gains_its_event_during_the_scan_read_is_not_erased(
+        db_path, logs, capsys, monkeypatch):
+    """The fingerprint has to be taken before the evidence is read, not after.
+
+    Reading the log is the slow part of the scan, so it is the likeliest
+    moment for a live operator to append the shutdown event. Fingerprinting
+    after the read records the file in its NEW state while the verdict
+    reflects the OLD one -- the two agree at write time, and the check that
+    exists to catch precisely this waves it through.
+    """
+    add_session(db_path, "process-1.log")
+    log = logs / "process-1.log"
+    log.write_text("no shutdown here", encoding="utf-8")
+
+    def read_and_grow(path):
+        path.read_text(encoding="utf-8", errors="replace")
+        path.write_text('{"kind": "session_shutdown"}', encoding="utf-8")
+        return False  # what the read saw: no event, a moment too early
+
+    monkeypatch.setattr(
+        backfill_unknown_metrics, "log_has_shutdown_event", read_and_grow)
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert rc == 0
+    row = read_row(db_path, "process-1.log")
+    assert row["api_time_seconds"] == 0, (
+        "erased a row whose log grew its shutdown event mid-read")
+    assert row["raw_metrics"] == ZEROED_RAW
+    assert "Cleared 0 row(s)" in capsys.readouterr().out
+
+
+def test_no_file_io_happens_while_the_write_lock_is_held(db_path, logs,
+                                                         monkeypatch):
+    """A repair must not become an outage.
+
+    The operator waits BUSY_TIMEOUT (15s) for the database. Statting
+    thousands of logs inside one BEGIN IMMEDIATE can outlast that on a
+    network mount or a loaded disk, so the live loop dies of a lock this
+    script was holding. Each row gets its own short transaction instead, and
+    the stat happens outside it.
+    """
+    add_session(db_path, "process-1.log")
+    (logs / "process-1.log").write_text("no shutdown here", encoding="utf-8")
+
+    stats_under_lock = []
+    real_fingerprint = backfill_unknown_metrics.log_fingerprint
+
+    def watched(path):
+        stats_under_lock.append(conn_holder["conn"].in_transaction)
+        return real_fingerprint(path)
+
+    conn_holder = {}
+    real_connect = backfill_unknown_metrics.connect
+
+    def remember(db):
+        conn_holder["conn"] = real_connect(db)
+        return conn_holder["conn"]
+
+    monkeypatch.setattr(backfill_unknown_metrics, "connect", remember)
+    monkeypatch.setattr(backfill_unknown_metrics, "log_fingerprint", watched)
+
+    backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert stats_under_lock, "test precondition: no stat was observed at all"
+    assert not any(stats_under_lock), (
+        "a log was statted while holding the write lock")
+    assert read_row(db_path, "process-1.log")["lines_added"] is None
+
+
+def test_clears_more_rows_than_sqlite_takes_parameters(db_path, logs, capsys):
+    """A user with a long history has more damaged rows than SQLite has
+    parameter slots -- the limit is 999 before 3.32. Binding every id into one
+    statement makes the repair fail precisely for the people who need it most.
+
+    Honest caveat: this cannot fail on a modern SQLite, where the limit is
+    32766, so locally it is a guard rather than a proof. It earns its place on
+    the older interpreters this project still supports (>=3.10) and on any
+    system SQLite that predates 3.32.
+    """
+    operator_ingest.init_db(db_path)
+    with operator_ingest.connect(db_path) as conn:
+        for n in range(1200):
+            name = f"process-bulk-{n}.log"
+            conn.execute(
+                """
+                INSERT INTO sessions (session_num, log_file, started_at,
+                                      ended_at, api_time_seconds,
+                                      session_time_seconds, lines_added,
+                                      lines_removed, raw_metrics)
+                VALUES (?, ?, 'x', 'y', 0, 0, 0, 0, ?)
+                """,
+                (n, name, ZEROED_RAW))
+            (logs / name).write_text("no shutdown here", encoding="utf-8")
+        conn.commit()
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert rc == 0
+    assert "Cleared 1200 row(s)" in capsys.readouterr().out
+    with operator_ingest.connect(db_path) as conn:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE api_time_seconds = 0"
+        ).fetchone()[0]
+    assert remaining == 0
+
+
 def test_measured_zeros_are_left_alone(db_path, logs):
     """A session that really did change nothing keeps its zeros."""
     add_session(db_path, "process-2.log")

@@ -184,6 +184,63 @@ def test_ingest_stores_per_model_credits(tmp_path, db_path):
     assert rows["gpt-5.4"] == 1_000_000_000
 
 
+def test_ingest_stores_per_model_cache_write_tokens(tmp_path, db_path):
+    """Cache-write is the most expensive token type per million, so a
+    per-model breakdown that omits it cannot explain where credits went.
+
+    The parser has always computed this figure; it was collected into the
+    per-model entry and then dropped on the floor because ``model_usage`` had
+    no column to bind it to.
+    """
+    log = tmp_path / "process-1700000000000-2.log"
+    log.write_text(
+        usage_response(model="claude-opus-5", cache_write=32371)
+        + usage_response(model="gpt-5.4", cache_write=1_500_000),
+        encoding="utf-8",
+    )
+    operator_ingest.ingest_file(log, db_path)
+    with operator_ingest.connect(db_path) as conn:
+        rows = {r["model_name"]: r["tokens_cache_write"] for r in
+                conn.execute(
+                    "SELECT model_name, tokens_cache_write FROM model_usage")}
+    assert rows["claude-opus-5"] == 32371
+    assert rows["gpt-5.4"] == 1_500_000
+
+
+def test_per_model_cache_write_stays_summable(tmp_path, db_path):
+    """Its three sibling columns hold fmt_tokens() output, where SUM() reads
+    "32.4k" as 32 and reports a plausible, wrong total. This column is for
+    auditing spend, so it stores the integer."""
+    log = tmp_path / "process-1700000000000-5.log"
+    log.write_text(
+        usage_response(model="claude-opus-5", cache_write=32371)
+        + usage_response(model="gpt-5.4", cache_write=1_500_000),
+        encoding="utf-8",
+    )
+    operator_ingest.ingest_file(log, db_path)
+    with operator_ingest.connect(db_path) as conn:
+        total = conn.execute(
+            "SELECT SUM(tokens_cache_write) FROM model_usage").fetchone()[0]
+    assert total == 1_532_371
+
+
+def test_per_model_cache_write_is_not_confused_with_cache_read(tmp_path, db_path):
+    """Two adjacent columns holding the same number prove nothing. These are
+    billed at 12.5x different rates, so they must come from different fields."""
+    log = tmp_path / "process-1700000000000-3.log"
+    log.write_text(
+        usage_response(model="claude-opus-5", cache_read=4000, cache_write=7000),
+        encoding="utf-8",
+    )
+    operator_ingest.ingest_file(log, db_path)
+    with operator_ingest.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT tokens_cached, tokens_cache_write FROM model_usage"
+        ).fetchone()
+    assert row["tokens_cached"] == "4.0k"
+    assert row["tokens_cache_write"] == 7000
+
+
 def test_legacy_premium_logs_still_ingest(tmp_path, db_path):
     """Annual plans stayed on premium requests, so old logs must still work."""
     from conftest import make_log
@@ -220,10 +277,51 @@ def test_schema_migrates_an_existing_database(tmp_path):
 
     with operator_ingest.connect(db) as c:
         cols = {r["name"] for r in c.execute("PRAGMA table_info(sessions)")}
+        model_cols = {r["name"] for r in c.execute("PRAGMA table_info(model_usage)")}
         row = c.execute("SELECT premium_requests, nano_aiu FROM sessions").fetchone()
     assert {"nano_aiu", "tokens_input", "tokens_output"} <= cols
+    assert {"nano_aiu", "tokens_cache_write"} <= model_cols
     assert row["premium_requests"] == 42, "existing history must be preserved"
     assert row["nano_aiu"] == 0
+
+
+def test_migrated_database_accepts_a_per_model_insert(tmp_path):
+    """Adding a column to the schema string is only half a migration.
+
+    An existing database is upgraded by ALTER TABLE, and the INSERT names its
+    columns explicitly, so a column present in ``SCHEMA`` but absent from
+    ``_ADDED_COLUMNS`` would make every ingest fail against a real user's
+    database while passing every test that starts from a fresh one.
+    """
+    import sqlite3
+
+    db = tmp_path / "old2.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        # The pre-billing-change schema: SCHEMA minus every column listed in
+        # _ADDED_COLUMNS, which is exactly what a user's database looks like.
+        "CREATE TABLE sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "session_num INTEGER NOT NULL, log_file TEXT UNIQUE, "
+        "no_op INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL, "
+        "ended_at TEXT NOT NULL, work_dir TEXT, git_branch TEXT, "
+        "premium_requests INTEGER, api_time_seconds INTEGER, "
+        "session_time_seconds INTEGER, lines_added INTEGER, "
+        "lines_removed INTEGER, raw_metrics TEXT);"
+        "CREATE TABLE model_usage (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "session_id INTEGER NOT NULL, model_name TEXT NOT NULL, "
+        "tokens_in TEXT, tokens_out TEXT, tokens_cached TEXT, "
+        "premium_requests INTEGER);"
+    )
+    conn.commit()
+    conn.close()
+
+    log = tmp_path / "process-1700000000000-4.log"
+    log.write_text(usage_response(cache_write=9000), encoding="utf-8")
+    assert operator_ingest.ingest_file(log, db).startswith("OK")
+
+    with operator_ingest.connect(db) as c:
+        assert c.execute(
+            "SELECT tokens_cache_write FROM model_usage").fetchone()[0] == 9000
 
 
 # ── launch behavior ─────────────────────────────────────────────
