@@ -50,11 +50,21 @@ import os
 import sys
 from pathlib import Path
 
-#: Set to any non-empty value to install anyway. It exists because "this
-#: scan is wrong about my checkout" must have an answer that is not "edit the
-#: build backend", and because the negative controls in the test suite need a
-#: supported way to reach the setuptools hooks from a worktree.
+#: Set to any value other than a plain denial to install anyway. It exists
+#: because "this scan is wrong about my checkout" must have an answer that is
+#: not "edit the build backend", and because the negative controls in the test
+#: suite need a supported way to reach the setuptools hooks from a worktree.
 OVERRIDE_ENV = "COPILOT_TOOLS_ALLOW_WORKTREE_INSTALL"
+
+#: Values of :data:`OVERRIDE_ENV` that are *not* consent. ``bool("0")`` is
+#: ``True``, so the obvious truthiness test reads ``FOO=0`` -- which is how a
+#: script says "leave the guard on" -- as permission to disable the guard. An
+#: override whose off switch turns it on is worse than no override.
+DENIALS = frozenset({"", "0", "false", "no", "off"})
+
+
+def _override_granted() -> bool:
+    return os.environ.get(OVERRIDE_ENV, "").strip().lower() not in DENIALS
 
 #: :func:`classify_checkout` verdicts. ``UNKNOWN`` is a third value rather
 #: than a fold into either neighbour: a read that failed has to stay
@@ -83,10 +93,34 @@ def _normalise(path: Path) -> Path:
 
     ``Path.resolve`` is the obvious spelling and the wrong one here: it stats,
     which can raise, and it follows symlinks, which would rewrite a deliberate
-    link into its target and change what the message says. Nothing downstream
-    needs the real path -- only a printable, comparable one.
+    link into its target and change what the message says. It is also not more
+    correct in the case that tempts you to reach for it -- a relative
+    ``gitdir:`` under a symlinked checkout -- because the verdict there comes
+    from the path *shape*, which lexical normalisation preserves exactly, and
+    the remedy path is corroborated against the filesystem before it is
+    printed (see :func:`primary_checkout_of`). A lexical path that turns out
+    not to exist therefore costs a generic remedy line, never a wrong one.
     """
     return Path(os.path.normpath(str(path)))
+
+
+def _as_path(raw: str) -> Path | None:
+    """``Path(raw)`` for a string that came out of a file, or ``None``.
+
+    NUL is rejected explicitly rather than by catching what ``Path`` throws,
+    because *when* it throws is a version detail: on the 3.10 floor this
+    project supports, ``Path("\\0")`` constructs happily and the
+    ``ValueError`` arrives later, from whichever filesystem call touches it
+    first -- inside a PEP 517 hook, where an unhandled exception reads as a
+    broken package rather than as the unreadable checkout it is. Checking the
+    string is the one spelling that behaves the same on every version.
+    """
+    if "\x00" in raw:
+        return None
+    try:
+        return Path(raw)
+    except (OSError, ValueError):
+        return None
 
 
 def primary_checkout_of(gitdir: Path) -> Path | None:
@@ -111,10 +145,12 @@ def primary_checkout_of(gitdir: Path) -> Path | None:
     try:
         raw = (gitdir / "commondir").read_text(encoding="utf-8",
                                                errors="replace").strip()
-    except OSError:
+    except (OSError, ValueError):
         raw = ""
     if raw:
-        candidate = Path(raw)
+        candidate = _as_path(raw)
+        if candidate is None:
+            return None
         common = candidate if candidate.is_absolute() else gitdir / candidate
     if common is None:
         common = gitdir.parent.parent
@@ -135,8 +171,8 @@ def _probe(path: Path) -> bool | None:
     durable checkout, while an unreadable one is no evidence at all.
     """
     try:
-        return path.exists()  # probe-ok: the OSError case is the None below
-    except OSError:
+        return path.exists()  # probe-ok: the failure case is the None below
+    except (OSError, ValueError):
         return None
 
 
@@ -175,7 +211,7 @@ def classify_checkout(source_dir: str | os.PathLike[str]) -> tuple[str, str]:
     dot_git = source / ".git"
     try:
         is_file = dot_git.is_file()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return UNKNOWN, f"{dot_git} could not be examined ({exc})"
     if not is_file:
         # A directory (primary checkout) or nothing at all (an unpacked sdist,
@@ -183,12 +219,15 @@ def classify_checkout(source_dir: str | os.PathLike[str]) -> tuple[str, str]:
         return PRIMARY, ""
     try:
         text = dot_git.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return UNKNOWN, f"{dot_git} is a file that could not be read ({exc})"
     target = _gitdir_line(text)
     if target is None:
         return UNKNOWN, f"{dot_git} is a file with no 'gitdir:' line"
-    gitdir = Path(target)
+    gitdir = _as_path(target)
+    if gitdir is None:
+        return UNKNOWN, f"{dot_git} is a file whose 'gitdir:' line is not a " \
+                        f"usable path"
     if not gitdir.is_absolute():
         gitdir = source / gitdir
     gitdir = _normalise(gitdir)
@@ -263,7 +302,7 @@ def check_editable_source(source_dir: str | os.PathLike[str] | None = None) -> N
     directory set to the root of the source tree, which is why the default is
     ``.`` -- the backend is never told the source directory any other way.
     """
-    if os.environ.get(OVERRIDE_ENV, ""):
+    if _override_granted():
         return
     source = Path(source_dir) if source_dir is not None else Path.cwd()
     verdict, detail = classify_checkout(source)
@@ -279,10 +318,11 @@ def check_editable_source(source_dir: str | os.PathLike[str] | None = None) -> N
 def _setuptools():
     """The wrapped backend, imported on use rather than at module scope.
 
-    Import-time would be the ordinary spelling, but this module is also
-    imported by ``setup_tools`` for :func:`classify_checkout`, and that runs on
-    a machine whose whole problem may be that packaging is not installed yet.
-    A guard that cannot be imported is a guard that gets deleted.
+    Import-time would be the ordinary spelling. It is avoided so that reading
+    this module -- to test it, or to find out what refused an install -- never
+    depends on packaging being installed in the interpreter doing the reading.
+    A guard that cannot be imported without the thing it guards is a guard
+    that gets deleted the first time somebody meets it in a bare environment.
     """
     from setuptools import build_meta
     return build_meta

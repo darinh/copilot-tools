@@ -272,12 +272,41 @@ def test_the_override_allows_an_install_from_a_worktree(tmp_path, monkeypatch):
     assert guard.check_editable_source(root) is None
 
 
-def test_an_empty_override_does_not_count(tmp_path, monkeypatch):
-    """``FOO=`` in a shell profile is not consent."""
+@pytest.mark.parametrize("value", ["", "0", "false", "False", "no", "off",
+                                   "  0  "])
+def test_a_denial_is_not_consent(value, tmp_path, monkeypatch):
+    """``bool("0")`` is ``True``, so the obvious truthiness test reads
+    ``COPILOT_TOOLS_ALLOW_WORKTREE_INSTALL=0`` -- a script saying "leave the
+    guard on" -- as permission to switch it off."""
     root = _checkout(tmp_path / "wt", "gitdir: /repo/.git/worktrees/feat-x\n")
-    monkeypatch.setenv(guard.OVERRIDE_ENV, "")
+    monkeypatch.setenv(guard.OVERRIDE_ENV, value)
     with pytest.raises(guard.EditableInstallFromWorktree):
         guard.check_editable_source(root)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "please"])
+def test_anything_that_is_not_a_denial_is_consent(value, tmp_path, monkeypatch):
+    """The negative control. A denial list that swallowed every value would
+    pass the test above and disable the override entirely."""
+    root = _checkout(tmp_path / "wt", "gitdir: /repo/.git/worktrees/feat-x\n")
+    monkeypatch.setenv(guard.OVERRIDE_ENV, value)
+    assert guard.check_editable_source(root) is None
+
+
+def test_a_nul_byte_in_the_git_file_is_refused_not_crashed(tmp_path):
+    """On 3.10 -- the floor this project supports -- ``Path`` raises
+    ``ValueError`` on an embedded NUL. Unhandled inside a PEP 517 hook that
+    reads as a broken package rather than as an unreadable checkout."""
+    root = _checkout(tmp_path / "corrupt", "gitdir: /repo/\x00/worktrees/x\n")
+    verdict, detail = guard.classify_checkout(root)
+    assert verdict == guard.UNKNOWN
+    assert "not a usable path" in detail
+
+
+def test_a_nul_byte_in_commondir_yields_no_guess(tmp_path):
+    gitdir = _worktree_gitdir(tmp_path / "repo", "feat-x")
+    (gitdir / "commondir").write_text("..\x00/..\n", encoding="utf-8")
+    assert guard.primary_checkout_of(gitdir) is None
 
 
 def test_the_source_defaults_to_the_working_directory(tmp_path, monkeypatch):
@@ -435,6 +464,9 @@ def test_a_real_git_worktree_is_refused(tmp_path):
 # ── setup's half: do not ask for the install the backend would refuse ───
 
 def test_setup_installs_the_repo_root_when_it_is_the_primary_checkout(monkeypatch):
+    """The no-op branch, and by itself indistinguishable from the behaviour
+    this replaced -- which is what makes it the control for the two tests
+    below rather than evidence on its own."""
     import setup_tools
 
     monkeypatch.setattr(setup_tools.project_paths, "primary_repo_root",

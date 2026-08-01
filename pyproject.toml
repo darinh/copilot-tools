@@ -52,6 +52,12 @@ py-modules = [
 
 # The version lives in one module so packaging metadata and the install
 # manifest cannot disagree about what is installed.
+#
+# `worktree_guard_backend` is build-time only and is declared above anyway,
+# deliberately: `backend-path = ["."]` means an sdist that omits that file
+# cannot be built from at all, and declaring it is the mechanism that puts it
+# in the sdist -- verified by a build_sdist/install round trip. The cost is
+# one 10 KB module in site-packages under a name nothing else would want.
 [tool.setuptools.dynamic]
 version = { attr = "copilot_tools_version.__version__" }
 
