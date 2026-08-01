@@ -61,6 +61,19 @@ one spelling is that spelling's history:
 lstat-based. They are the fix, not the defect, and are deliberately not
 flagged.
 
+**But ``follow_symlinks=`` is not available on this project's floor.**
+``pyproject.toml`` declares 3.10 and CI runs 3.10; ``Path.exists`` grew the
+keyword in 3.12 and ``is_dir``/``is_file`` in 3.13, so writing it here is a
+``TypeError``, not a fix. That is a separate rule with a separate scan —
+``tests/test_python_floor_conformance.py`` — and the two compose: this file
+says the call is not two-valued, that one says you cannot write it yet.
+Reach for ``install_manifest.path_present()`` or ``os.stat(p,
+follow_symlinks=False)``, which has been lstat-based since 3.3. The
+keyword spelling is kept below in ``PASSES_ABOVE_FLOOR`` rather than
+``PASSES``, because it sat in the negative control certifying correctness
+for a whole release cycle while raising on every interpreter this project
+supports.
+
 The annotation is deliberately cheap to write and impossible to write
 silently: it appears in the diff, it carries a reason, and this file's
 ``test_every_annotation_carries_a_reason`` refuses an empty one. The point is
@@ -120,7 +133,7 @@ NOT_SOURCE = (".git", ".worktrees", "node_modules", "__pycache__",
               ".specify", "build", "dist")
 
 
-def _shipped_modules() -> list[Path]:
+def _shipped_modules(root: Path = REPO) -> list[Path]:
     """The Python this repository ships and runs.
 
     Top-level ``*.py`` is the whole of it: ``extensions/`` is JavaScript,
@@ -136,16 +149,22 @@ def _shipped_modules() -> list[Path]:
     them would be several hundred annotations that all say the same thing,
     and an exemption list that large stops being read.
 
-    Filtered on the path *relative to the repo*. Every agent on this project
+    Filtered on the path relative to ``root``. Every agent on this project
     works in ``<repo>/.worktrees/<branch>/``, so an absolute-path filter
     matches ``.worktrees`` for every file in the tree, the population comes
     back empty, and an empty population passes every "no module contains X"
     assertion in this file. That is not hypothetical — it is what the sibling
     bash scan did when it was first written.
+
+    ``root`` is a parameter so that claim can be *tested* rather than
+    described. Without it the only exercise of the filter is whether this
+    checkout happens to live under a ``.worktrees`` path — true for an agent,
+    false on CI, so the assertion lapses exactly where the suite runs eight
+    times. See :func:`test_the_population_filter_survives_a_worktree_path`.
     """
     return sorted(
-        p for p in REPO.glob("*.py")
-        if not any(part in NOT_SOURCE for part in p.relative_to(REPO).parts)
+        p for p in root.glob("*.py")
+        if not any(part in NOT_SOURCE for part in p.relative_to(root).parts)
     )
 
 
@@ -240,6 +259,14 @@ def _probe_name(func: ast.expr, call: ast.Call) -> str | None:
     ``follow_symlinks=False`` is deliberately *not* a probe. It makes the
     call ``lstat``-based, which is the fix rather than the defect, so
     flagging it would demand a guard against a failure mode it does not have.
+
+    That is a claim about *semantics*, and it stays true. It is not a claim
+    about *availability*: the keyword arrived in 3.12 for ``exists`` and 3.13
+    for ``is_dir``/``is_file``, above this project's 3.10 floor, so a call
+    written this way raises ``TypeError`` before its symlink behaviour ever
+    matters. ``tests/test_python_floor_conformance.py`` is what says so —
+    keeping the two questions in two scans is why this one does not have to
+    know what interpreter you are on.
     """
     if _lstat_based(call):
         return None
@@ -494,6 +521,37 @@ def test_the_population_is_not_empty_and_holds_the_modules_we_ship() -> None:
         )
 
 
+def test_the_population_filter_survives_a_worktree_path(tmp_path: Path) -> None:
+    """A repo living under ``.worktrees/`` must still have a population.
+
+    The test above cannot make this claim: it reads whichever checkout is
+    running it, so it only exercises the trap when that checkout happens to
+    sit under a ``.worktrees`` path. True for an agent, false on CI — the
+    assertion lapses exactly where the suite runs eight times.
+
+    Found by mutation-testing the sibling floor scan, which has the same
+    filter: switching it back to the absolute path failed nothing, because
+    the tree under test was an export in a temp directory. Re-run from a
+    directory containing ``.worktrees``, the same mutation emptied the
+    population at once. The mutation had not been caught, it had been asked
+    somewhere it made no difference — so the question is now asked against a
+    tree built for it.
+    """
+    root = tmp_path / ".worktrees" / "some-branch"
+    root.mkdir(parents=True)
+    (root / "setup_tools.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "__pycache__").mkdir()
+    (root / "__pycache__" / "stale.py").write_text("z = 3\n", encoding="utf-8")
+
+    found = {p.name for p in _shipped_modules(root)}
+    assert found == {"setup_tools.py"}, (
+        f"a repository checked out under a `.worktrees` path yielded "
+        f"{found or 'nothing'}. The filter is matching against the absolute "
+        f"path, so every module in every agent's worktree is excluded and "
+        f"the population is empty - which passes every assertion above."
+    )
+
+
 def test_every_annotation_carries_a_reason() -> None:
     """`# probe-ok:` with nothing after it is a silencer, not a judgement."""
     for module in _shipped_modules():
@@ -507,6 +565,34 @@ def test_every_annotation_carries_a_reason() -> None:
 
 
 # ── controls ────────────────────────────────────────────────────
+#: Which probe each control in FIRES is a control *for*.
+#:
+#: Pinned to FIRES by :func:`test_every_control_names_the_probe_it_exercises`.
+#: Without it the positive controls asserted only that the detector returned
+#: *something*: a reviewer swapped the sources of ``bare exists`` and ``bare
+#: is_dir`` and all sixteen controls stayed green, because each spelling was
+#: still detected under the other's name. A control aimed at the wrong
+#: detector still passes, and still reports the tree clean when the detector
+#: it was named for stops matching.
+EXERCISES = {
+    "bare exists": "exists",
+    "bare is_dir": "is_dir",
+    "bare is_file": "is_file",
+    "unbound form": "is_dir",
+    "reached through getattr": "is_dir",
+    "follow_symlinks left at its default": "is_dir",
+    "os.path.exists": "os.path.exists",
+    "os.path.isfile": "os.path.isfile",
+    "os.path.isdir": "os.path.isdir",
+    "os.path inside an OSError guard, which cannot help it": "os.path.isfile",
+    "a marker hidden in a string rather than a comment": "exists",
+    "inside a comprehension": "is_dir",
+    "inside a nested function": "is_file",
+    "in a try that catches something else": "exists",
+    "in the handler rather than the body": "is_dir",
+    "in the finally rather than the body": "is_dir",
+}
+
 #: Source that must trip the detector, one spelling per entry.
 FIRES = {
     "bare exists": "from pathlib import Path\nif Path('x').exists():\n    pass\n",
@@ -589,11 +675,18 @@ FIRES = {
     ),
 }
 
-#: Source that must NOT trip it. Each is a spelling the repo actually uses.
+#: Source that must NOT trip it. Each is a spelling the repo actually uses,
+#: **and can actually run on the floor** — see ``PASSES_ABOVE_FLOOR`` below
+#: for the spellings that are correct but not yet available.
 PASSES = {
-    "lstat-based by keyword": (
-        "from pathlib import Path\n"
-        "if Path('x').is_dir(follow_symlinks=False):\n"
+    "os.stat with follow_symlinks=False, lstat-based since 3.3": (
+        "import os\n"
+        "import stat\n"
+        "try:\n"
+        "    mode = os.stat('x', follow_symlinks=False).st_mode\n"
+        "except OSError:\n"
+        "    mode = None\n"
+        "if mode is not None and stat.S_ISDIR(mode):\n"
         "    pass\n"
     ),
     "os.path.islink is lstat-based and is the fix, not the defect": (
@@ -669,19 +762,102 @@ PASSES = {
     ),
 }
 
+#: Correct spellings that this project **cannot use yet**.
+#:
+#: ``follow_symlinks=False`` genuinely makes a probe ``lstat``-based, so
+#: :func:`_lstat_based` is right to stop calling it a two-valued probe — that
+#: is a statement about semantics, and it is true on any interpreter that has
+#: the keyword. What is *not* true is that it is available: ``Path.exists``
+#: grew it in 3.12 and ``is_dir``/``is_file`` in 3.13, while
+#: ``pyproject.toml`` declares 3.10 and CI runs 3.10 on three operating
+#: systems. Measured on both CI interpreters, ``is_dir(follow_symlinks=False)``
+#: raises ``TypeError`` on each.
+#:
+#: It sat in ``PASSES`` for a whole release cycle — this file's negative
+#: control, the register that certifies the *fix*, endorsing a call that
+#: crashes everywhere the project runs. That is the second wrong entry this
+#: register has held (``os.path.exists`` was the first), and both survived for
+#: the same reason: a negative control is the one place a mistake does not
+#: look like one. It does not fail, it does not warn, and it reads as a
+#: decision somebody made.
+#:
+#: So the two claims are separated. These entries still assert that the probe
+#: detector stays quiet, because that part was always true. What they no
+#: longer do is claim you may write this.
+#: ``tests/test_python_floor_conformance.py`` pins the split from outside,
+#: in both directions: every ``PASSES`` entry must be floor-clean, and every
+#: entry here must be floor-*dirty*. Parking a crash in the safe register
+#: fails there, and so does leaving a spelling here after the floor rises
+#: past it — which is what finally gets these entries promoted rather than
+#: forgotten.
+PASSES_ABOVE_FLOOR = {
+    "lstat-based by keyword (Path.exists 3.12+, is_dir/is_file 3.13+)": (
+        "from pathlib import Path\n"
+        "if Path('x').is_dir(follow_symlinks=False):\n"
+        "    pass\n"
+    ),
+}
+
 
 @pytest.mark.parametrize("name", sorted(FIRES))
 def test_every_detector_fires_on_source_that_has_the_defect(name: str) -> None:
-    assert unguarded_probes(FIRES[name]), (
+    hits = unguarded_probes(FIRES[name])
+    assert hits, (
         f"the detector did not fire on {name!r}. A detector that matches "
         f"nothing reports the whole tree clean, which reads exactly like "
         f"success."
     )
+    fired = {probe for _line, probe in hits}
+    assert EXERCISES[name] in fired, (
+        f"the detector fired on {name!r}, but reported {sorted(fired)} "
+        f"rather than {EXERCISES[name]!r}. A control that only asserts "
+        f"*something* matched keeps passing after the detector it is named "
+        f"for stops working, as long as any other one covers the same source."
+    )
 
 
-@pytest.mark.parametrize("name", sorted(PASSES))
+def test_every_control_names_the_probe_it_exercises() -> None:
+    """EXERCISES and FIRES must describe the same set of controls."""
+    only_fires = sorted(set(FIRES) - set(EXERCISES))
+    only_exercises = sorted(set(EXERCISES) - set(FIRES))
+    assert not only_fires and not only_exercises, (
+        f"controls with no declared probe: {only_fires}\n"
+        f"declared probes with no control: {only_exercises}"
+    )
+
+
+def test_every_probe_in_the_registry_has_a_control() -> None:
+    """A probe nothing exercises is a line of documentation.
+
+    The floor scan grew this check first and this file did not, which left
+    the older and more load-bearing of the two registers unpinned: a
+    reviewer added ``is_symlink`` to PROBES and all 52 tests stayed green.
+    An entry can be added, mis-keyed, and never fire, and a passing suite
+    looks exactly the same as a clean tree.
+
+    ``os.path`` probes are named ``os.path.<fn>`` by the detector, so the two
+    registers are compared in the spelling each is reported in.
+    """
+    declared = set(EXERCISES.values())
+    expected = set(PROBES) | {f"os.path.{name}" for name in OSPATH_PROBES}
+    missing = sorted(expected - declared)
+    assert not missing, (
+        f"{len(missing)} probe(s) in the registry are never exercised by a "
+        f"positive control, so nothing would notice if the detector stopped "
+        f"matching them: {missing}\n"
+        f"  Add an entry to FIRES and EXERCISES for each."
+    )
+    unknown = sorted(declared - expected)
+    assert not unknown, (
+        f"controls declare probes that are not in the registry: {unknown}"
+    )
+
+
+@pytest.mark.parametrize(
+    "name", [*sorted(PASSES), *sorted(PASSES_ABOVE_FLOOR)])
 def test_the_correct_spellings_still_pass(name: str) -> None:
-    assert not unguarded_probes(PASSES[name]), (
+    source = PASSES.get(name) or PASSES_ABOVE_FLOOR[name]
+    assert not unguarded_probes(source), (
         f"the detector fired on {name!r}, which is the shape this repo asks "
         f"for. A scan that rejects the fix teaches people to disable it."
     )
