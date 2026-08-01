@@ -315,6 +315,17 @@ ATTRIBUTE_GATED = {
 #: construction (``Path('x').walk()``). A local variable holding a ``Path``
 #: is not, for the same reason the sibling probe scan does not resolve a
 #: local alias of ``Path``: a rule that has to follow names is a type checker.
+#:
+#: Matched on the *attribute access*, not on the call, because that is where
+#: the interpreter fails: ``Path.walk`` raises ``AttributeError`` on 3.10 the
+#: moment it is evaluated, whether or not a call follows. Keying it to a call
+#: made this the only detector here that could be stepped around by not
+#: calling — ``hashlib.file_digest`` is attribute-gated and was already caught
+#: bare, so ``fd = hashlib.file_digest`` fired while ``walk = Path.walk`` did
+#: not. The bare spelling is not hypothetical: saving a method off the class
+#: before monkeypatching it (``real_read_text = Path.read_text``) is the
+#: dominant idiom in this repo's own tests, and it is spelled out in full at
+#: the reference site, so seeing it needs no name resolution at all.
 METHOD_GATED = {"walk": "pathlib.Path.walk"}
 
 #: Spellings of the pathlib classes, shared with the probe scan's reasoning.
@@ -673,9 +684,6 @@ class _FloorFinder(ast.NodeVisitor):
             for name in self._keyword_names(node):
                 if name in gated:
                     self._record(node, gated[name])
-            construct = METHOD_GATED.get(func.attr)
-            if construct is not None and _is_pathlib_receiver(func.value):
-                self._record(node, construct)
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
@@ -689,6 +697,13 @@ class _FloorFinder(ast.NodeVisitor):
             construct = ATTRIBUTE_GATED.get((name, node.attr))
             if construct is not None:
                 self._record(node, construct)
+        # Method-gated names are matched here rather than at the call, so a
+        # reference that is never called is still a use. `Path.walk(p)` is a
+        # Call whose `func` is this very node, so the called form is covered
+        # by the same branch and reported once, not twice.
+        construct = METHOD_GATED.get(node.attr)
+        if construct is not None and _is_pathlib_receiver(parent):
+            self._record(node, construct)
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -1248,6 +1263,29 @@ FIRES = {
         "from pathlib import Path\n"
         "Path('x').exists(**{**{'follow_symlinks': False}})\n"
     ),
+    # Round three, found by measuring which spellings this repo actually
+    # writes rather than by reading the visitor. `Path.walk` was the only
+    # construct here keyed to a *call*, so not calling it stepped around the
+    # detector — while `fd = hashlib.file_digest`, two lines away in the same
+    # scan, was caught bare.
+    "Path.walk saved off the class without being called": (
+        # `real_x = Path.method` is the monkeypatch idiom at 13 sites in
+        # tests/, so this is the shape a post-floor pathlib method would
+        # actually arrive in. `Path.walk` raises AttributeError on 3.10 at
+        # this line, before there is any call to flag.
+        "from pathlib import Path\n"
+        "real_walk = Path.walk\n"
+    ),
+    "Path.walk bound off a construction, then called through the binding": (
+        # The receiver is a construction rather than the class, and the call
+        # that would have been flagged is spelled `walker()` — a bare name,
+        # which nothing here resolves. Line 2 is the only chance the scan
+        # gets, and it is enough: the construct is spelled out in full there.
+        "from pathlib import Path\n"
+        "walker = Path('x').walk\n"
+        "for root, dirs, files in walker():\n"
+        "    pass\n"
+    ),
 }
 
 #: Which construct each control in FIRES is a control *for*.
@@ -1303,6 +1341,9 @@ EXERCISES = {
         "hashlib.file_digest",
     "a gated keyword inside a nested literal ** unpack":
         "pathlib.Path.exists(follow_symlinks=)",
+    "Path.walk saved off the class without being called": "pathlib.Path.walk",
+    "Path.walk bound off a construction, then called through the binding":
+        "pathlib.Path.walk",
 }
 
 #: Source that must NOT trip it. Each is a spelling this repo can actually run.
@@ -1446,6 +1487,23 @@ PASSES = {
         "for node in tree.walk():\n"
         "    pass\n"
     ),
+    "a pathlib method older than the floor, saved off the class": (
+        # The negative half of "Path.walk saved off the class". Matching the
+        # bare attribute rather than the call must not turn this repo's own
+        # monkeypatch idiom into a violation: `real_read_text =
+        # Path.read_text` appears at 13 sites in tests/ and `read_text` is as
+        # old as pathlib. Without this, widening the detector to references
+        # would have flagged a fifth of the test suite.
+        "from pathlib import Path\n"
+        "real_read_text = Path.read_text\n"
+        "real_iterdir = Path.iterdir\n"
+    ),
+    "a bare walk attribute on something that is not a pathlib object": (
+        # `tree.walk()` is already pinned above; this is the same receiver
+        # rule for the uncalled form, which is now a separate code path.
+        "handler = tree.walk\n"
+        "other = os.walk\n"
+    ),
     "an annotated use with a real reason": (
         "import hashlib\n"
         "# floor-ok: this branch is only reached from the 3.12-only fast path\n"
@@ -1470,6 +1528,27 @@ def test_the_detector_fires(label: str) -> None:
         f"  A control that only asserts *something* matched will keep passing "
         f"after the detector it is named for stops working, as long as any "
         f"other detector happens to cover the same source."
+    )
+
+
+def test_a_called_method_is_reported_once() -> None:
+    """``Path('x').walk()`` is one violation, not one per node that sees it.
+
+    The method detector moved from the call to the attribute the call hangs
+    off, and a call's ``func`` *is* that attribute — so a version keeping
+    both branches reports the same construct on the same line twice. Every
+    other assertion in this file asks only whether a hit exists, so a
+    duplicate is invisible to all of them and shows up only in the list a
+    developer is handed. "Fires" and "fires once" are different claims and
+    until now only the first was being made.
+    """
+    hits = floor_violations(
+        "from pathlib import Path\n"
+        "for root, dirs, files in Path('x').walk():\n"
+        "    pass\n"
+    )
+    assert hits == [(2, "pathlib.Path.walk")], (
+        f"expected exactly one hit for the called form, got {hits}"
     )
 
 
