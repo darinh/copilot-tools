@@ -369,9 +369,12 @@ an unread predecessor, which is otherwise the same kind of file under the same
 kind of name — and only one of the two can be *newer* than the handoff beside
 it. Neither notice asserts an outcome, because both are written before their
 outcome is known: the published one is chosen before the bank is attempted and
-the banked one before the publish is attempted, and either can then fail.
+the banked one before the publish is attempted, and either can then fail. Nor
+does either name a cause: the lock is not taken when a peer holds it, when a
+lock left by a dead process has not yet aged out, and when the directory will
+not take a lock file at all, and from the stamp site those are the same fact.
 
-So: after a `Warning: another handoff is in progress for this project`, the
+So: after a `Warning: could not take the handoff lock for this project`, the
 file at `next-session.md` is still not guaranteed to be the most recent
 handoff, and the other one may exist only in `superseded/`. Read both. The one
 case with nothing left to record it is the spare that could not be banked —

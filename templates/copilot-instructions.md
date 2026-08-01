@@ -345,8 +345,8 @@ That makes it a rule at both ends of a session:
   picking up. A banked copy that says it may never have reached
   `next-session.md` is a handoff that may be *newer* than the one you are
   holding; anything else in there is an unread predecessor, and is older.
-- **Ending**: if `handoff` printed a warning — that another handoff was in
-  progress, or that it could not bank a spare copy — say so in your final
+- **Ending**: if `handoff` printed a warning — that it could not take the
+  handoff lock, or that it could not bank a spare copy — say so in your final
   message. The first case is now recorded in the files themselves as well; the
   second is not, because the failure *was* that no file could be written, and
   that warning goes to stderr and dies with your session.

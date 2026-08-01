@@ -1119,6 +1119,53 @@ def test_the_banked_notice_does_not_claim_the_publish_happened(
     assert "this session published" not in ho.NOTICE_BANKED_UNSERIALISED
 
 
+def test_the_unserialised_notices_do_not_claim_a_peer_was_writing(
+        env, monkeypatch):
+    """A missing lock is not evidence of a concurrent handoff.
+
+    ``handoff_lock`` yields False for three different reasons: a lock still
+    held at the deadline, a lock file that could not be written, and a
+    directory that will not take a lock file at all. Only the first is even
+    possibly a live peer -- and not reliably, because a lock left behind by a
+    process that died reads exactly like one held by a process that is working.
+
+    This drives the least ambiguous of the three: ``os.open`` refuses the lock
+    path outright, so there is provably no other writer, and a notice saying
+    "another handoff is in progress" would be a plain falsehood in a file whose
+    only purpose is to be believed.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-38\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-38"
+    project_dir.mkdir(parents=True)
+
+    real_open = ho.os.open
+
+    def refuse_the_lock(path, *args, **kwargs):
+        if str(path).endswith(".lock"):
+            raise PermissionError("this directory will not take a lock file")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(ho.os, "open", refuse_the_lock)
+    assert ho.main([
+        "--instance", "proj", "--status", "NO PEER ANYWHERE", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    published = (project_dir / "next-session.md").read_text(encoding="utf-8")
+    assert ho.NOTICE_UNSERIALISED in published, \
+        "the lock was not taken, so the reader must still be warned"
+    # The notices, named, because the assertion above passes for any wording.
+    for notice in (ho.NOTICE_UNSERIALISED, ho.NOTICE_BANKED_UNSERIALISED):
+        lowered = notice.lower()
+        for claim in ("another handoff", "another writer", "in progress",
+                      "was held by", "concurrent handoff was"):
+            assert claim not in lowered, (
+                f"{claim!r} asserts a cause the tool cannot know at the point "
+                f"it writes this notice")
+
+
 def test_a_failed_spare_copy_does_not_stop_the_handoff(env, monkeypatch):
     """Insurance is a second chance, never a reason to lose the first one."""
     env["catalog"].write_text(

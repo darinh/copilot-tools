@@ -94,18 +94,28 @@ SUPERSEDED_DIRNAME = "superseded"
 # about to be abandoned. They are phrased as what was *attempted* and what the
 # reader should therefore check, which is true on every path that reaches
 # them.
+#
+# The same rule reaches backwards: **a notice may not assert the cause of the
+# contention either.** ``handoff_lock`` yields False for three different
+# reasons -- a lock still held at the deadline, a directory that will not take
+# a lock file at all, and a lock file that could not be written and so was
+# removed -- and only the first is even possibly a live peer, since a lock
+# left by a process that died reads exactly like one held by a process that is
+# working. A second review round found notices asserting "another handoff was
+# in progress" on all three. What is knowable at the stamp site is that the
+# lock was not taken, and that is what they say.
 NOTICE_UNSERIALISED = (
-    "> **⚠ Published without the handoff lock.** Another handoff for this\n"
-    "> project was in progress. This file was written unserialised, so it may\n"
-    "> have overwritten a concurrent handoff — or been overwritten by one\n"
-    "> since. Read `superseded/` alongside this file before deciding what you\n"
-    "> are picking up: a copy in there marked as banked may be newer than\n"
-    "> this one."
+    "> **⚠ Published without the handoff lock.** The lock that serialises\n"
+    "> handoffs for this project could not be taken, so this file was written\n"
+    "> unserialised: it may have overwritten a concurrent handoff — or been\n"
+    "> overwritten by one since. Read `superseded/` alongside this file before\n"
+    "> deciding what you are picking up: a copy in there marked as banked may\n"
+    "> be newer than this one."
 )
 NOTICE_BANKED_UNSERIALISED = (
     "> **⚠ Banked copy — these words may never have reached\n"
-    "> `next-session.md`.** The handoff lock was held by another writer, so\n"
-    "> this session banked its context here *before* attempting to publish\n"
+    "> `next-session.md`.** The handoff lock could not be taken, so this\n"
+    "> session banked its context here *before* attempting to publish\n"
     "> unserialised. If `next-session.md` does not contain these words, the\n"
     "> publish was abandoned or a concurrent handoff replaced it, and this\n"
     "> copy is the only one there is."
@@ -802,7 +812,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Warning: could not take the handoff lock, and could "
                       f"not bank a spare copy either: {exc}", file=sys.stderr)
             if spare is not None:
-                print(f"Warning: another handoff is in progress for this "
+                print(f"Warning: could not take the handoff lock for this "
                       f"project. Writing anyway; a copy of this one is banked "
                       f"at {spare}", file=sys.stderr)
         try:
