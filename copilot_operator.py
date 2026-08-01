@@ -25,6 +25,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -560,6 +561,73 @@ def _read_remote_tabs(distro: str) -> dict[str, dict]:
     return data if isinstance(data, dict) else {}
 
 
+# Characters a PowerShell command-mode token may contain and still be passed
+# through verbatim. The set is deliberately small: `#` starts a comment that
+# swallows every later argument, a leading `@` is splatting, `$` interpolates,
+# and a comma builds an array literal -- `x,` reaches the process as `x` and
+# `a, b` reaches it as two arguments. Anything outside this set is quoted,
+# which is never wrong, only noisier.
+_PS_BARE = re.compile(r"\A[A-Za-z0-9_+=:./\\-]+\Z")
+
+
+def _ps_quote(arg: str) -> str:
+    """Quote one argument for a PowerShell ``-Command`` string.
+
+    Single quotes make PowerShell treat the token as a literal, so a Windows
+    path's backslashes and a `$` in an argument survive intact; the only
+    escape inside them is a doubled `''`.
+
+    One class of argument cannot be fixed here: Windows PowerShell
+    re-serialises arguments into a command line before handing them to a
+    native executable, and that layer drops an empty argument and the
+    stop-parsing token ``--%``, and mishandles an embedded double quote.
+    Escaping the quote as ``\\"`` repairs the simple case and corrupts
+    ``a\\"b`` -- backslashes before a quote follow a separate doubling rule --
+    so these are known, deliberate limitations rather than bugs to patch.
+    """
+    if _PS_BARE.match(arg):
+        return arg
+    return "'" + arg.replace("'", "''") + "'"
+
+
+def _as_text(value, default: str) -> str:
+    """A registry field as a string, falling back when it is anything else."""
+    return value if isinstance(value, str) else default
+
+
+def _relaunch_command(argv: list[str], quote) -> str:
+    """The `operator ...` command line that restores one tab.
+
+    The registry stores argv as a list, so rebuilding it with a plain
+    ``" ".join`` silently loses every argument boundary: a tab started as
+    ``--name "my project"`` comes back as ``--name my project``, which restores
+    a differently-named instance, and an argument containing an apostrophe
+    produces an unbalanced quote that kills the shell before `operator` runs.
+    """
+    return " ".join(["operator", *(quote(str(a)) for a in argv)])
+
+
+def _wsl_escape(command: str) -> str:
+    """Neutralise the expansion WSL performs before bash ever parses the string.
+
+    ``wsl.exe -- bash -lic <string>`` does not hand the string to bash intact:
+    WSL rebuilds a command line on the Linux side and runs it through
+    ``/bin/bash -c`` -- a bare ``wsl.exe -d D -- /usr/bin/printf ...`` still
+    fails with a *bash* syntax error, which is how you can tell. Word structure
+    survives that pass, so `shlex.quote` alone looks like it works, but `$` and
+    backticks are expanded inside what should be a single-quoted literal. A
+    tracked argument of ``$(rm -rf ~)`` would therefore *run* during restore,
+    and one containing a lone backtick aborts the tab with an unmatched-quote
+    error. Escaping these three characters makes the pass a no-op; the real
+    parse then sees exactly the quoted string `shlex.quote` produced.
+
+    Verified empirically against Ubuntu-24.04 over 25 hostile arguments,
+    including ``$(echo PWNED)``, ```echo PWNED```, ``$HOME``, ``\\$HOME``,
+    ``$(``, ``a\\`b`` and a trailing backslash.
+    """
+    return command.replace("\\", "\\\\").replace("$", "\\$").replace("`", "\\`")
+
+
 def _build_wt_command(entries: list[tuple[str, dict]]) -> list[str]:
     """Build a single `wt.exe` argv that opens one tab per entry."""
     wt = shutil.which("wt.exe") or shutil.which("wt")
@@ -571,21 +639,29 @@ def _build_wt_command(entries: list[tuple[str, dict]]) -> list[str]:
             cmd += [";", "new-tab"]
         else:
             cmd += ["new-tab"]
-        title = meta.get("display_name", "operator")
+        # Every field here comes from a file the user can hand-edit, so none of
+        # it can be trusted to be the type it should be: a dict reaching
+        # subprocess raises TypeError, which the launch path does not expect.
+        title = _as_text(meta.get("display_name"), "operator")
         cmd += ["--title", title]
         argv = meta.get("argv", [])
-        distro = meta.get("wsl_distro", "")
-        cwd = meta.get("cwd", "")
+        if not isinstance(argv, list):
+            # A hand-edited registry could hold a string here; iterating that
+            # would relaunch the tab one character per argument.
+            argv = []
+        distro = _as_text(meta.get("wsl_distro"), "")
+        cwd = _as_text(meta.get("cwd"), "")
         if distro:
-            inner = "operator " + " ".join(argv) if argv else "operator"
             cmd += ["-d", cwd or "~", "wsl.exe", "-d", distro]
             if cwd:
                 cmd += ["--cd", cwd]
-            cmd += ["--", "bash", "-lic", inner]
+            cmd += ["--", "bash", "-lic",
+                    _wsl_escape(_relaunch_command(argv, shlex.quote))]
         else:
             if cwd:
                 cmd += ["-d", cwd]
-            cmd += ["powershell", "-NoExit", "-Command", "operator " + " ".join(argv)]
+            cmd += ["powershell", "-NoExit", "-Command",
+                    _relaunch_command(argv, _ps_quote)]
     return cmd
 
 
@@ -713,7 +789,7 @@ def restore_tabs(args: list[str]) -> int:
 
     try:
         subprocess.Popen(cmd, close_fds=True)
-    except OSError as exc:
+    except (OSError, TypeError) as exc:
         die(f"Failed to launch Windows Terminal: {exc}")
     print("\nLaunched. Each tab resumes its own Copilot session as it starts.")
     return 0

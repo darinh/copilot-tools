@@ -434,6 +434,18 @@ WSL-based instances are relaunched as `wsl.exe -d <Distro> --cd <path> --
 bash -lic "operator ..."` inside their own tab; native instances are relaunched
 as `powershell -NoExit -Command "operator ..."` in the recorded directory.
 
+The registry stores the command line as a list of arguments, and each one is
+re-quoted for the shell that will read it — POSIX quoting for `bash -lic`,
+PowerShell literal quoting for `-Command` — so an argument containing spaces,
+apostrophes or parentheses (`--name "my project"`) comes back as the same
+single argument rather than being re-split. On the WSL side the string is also
+escaped against the expansion pass WSL performs before bash sees it, so a
+tracked `$(...)`, backtick or `$VAR` is restored literally instead of being
+executed. Three cases remain unsupported: a semicolon, because `wt.exe` reads
+`;` as its own tab separator, and — on the native PowerShell path only — an
+empty argument, a literal double quote, or `--%`, all of which Windows
+PowerShell drops or corrupts on the way into a native process.
+
 ## Parallel agents and messaging
 
 An operator instance is a **full Copilot CLI in its own process**, not a
