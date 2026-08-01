@@ -494,3 +494,17 @@ def test_needs_update_is_true_when_something_is_missing(tmp_path):
     report = im.status(im.empty_manifest(),
                        [("k", "template", source, tmp_path / "gone.md")])
     assert im.needs_update(report) is True
+
+
+def test_digest_of_an_unexaminable_path_is_none_rather_than_a_traceback():
+    """``Path.is_dir`` raises on a permission denial rather than answering it,
+    and a destination that is a link into a directory the user cannot traverse
+    reaches here having already passed ``path_present`` -- lstat succeeds on
+    the link, stat through it does not. Being unable to take a digest is not a
+    reason to abort a whole setup run: None already means "cannot prove setup
+    wrote this", which every caller treats as a reason to ask."""
+    class _Denied:
+        def is_dir(self):
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+    assert im.digest_for(_Denied()) is None

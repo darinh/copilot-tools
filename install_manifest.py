@@ -85,9 +85,10 @@ def path_present(path: Path) -> bool | None:
     the entire setup run, and every other artifact goes uninstalled for a
     reason the traceback does not name.
 
-    It *returns False* for the errnos that list does hold: WINERROR 21, a drive
-    that exists but is not ready, which is what a disconnected network home
-    looks like; ELOOP; and EBADF. Each reports a path that is not absent as
+    It *returns False* for the codes those two lists do hold: WINERROR 21 (in
+    ``_IGNORED_WINERRORS``), a drive that exists but is not ready, which is
+    what a disconnected network home looks like; and ELOOP and EBADF (in
+    ``_IGNORED_ERRNOS``). Each reports a path that is not absent as
     absent, and absent is the one state that lets an installer write without
     asking.
 
@@ -142,7 +143,10 @@ def tree_digest(root: Path) -> str | None:
     on directory iteration order — which differs between filesystems and would
     otherwise make a tree look modified after merely being copied.
     """
-    if not root.is_dir():
+    try:
+        if not root.is_dir():
+            return None
+    except OSError:
         return None
     digest = hashlib.new(ALGORITHM)
     try:
@@ -163,12 +167,22 @@ def tree_digest(root: Path) -> str | None:
 
 
 def digest_for(path: Path) -> str | None:
-    """Digest of a file or a directory, whichever ``path`` names."""
-    if path.is_dir():
-        return tree_digest(path)
-    if path.exists():
-        return file_digest(path)
-    return None
+    """Digest of a file or a directory, whichever ``path`` names.
+
+    Both probes are guarded. ``Path.is_dir`` and ``Path.exists`` raise on a
+    permission denial rather than answering it, and a destination that is a
+    link into a directory the user cannot traverse reaches here having already
+    passed :func:`path_present` — ``lstat`` succeeded on the link itself while
+    ``stat`` through it does not. Being unable to take a digest is not a reason
+    to abort a whole setup run: None already means "cannot prove setup wrote
+    this", which every caller treats as a reason to ask rather than to write.
+    """
+    try:
+        if path.is_dir():
+            return tree_digest(path)
+    except OSError:
+        return None
+    return file_digest(path)
 
 
 # ── version ordering ─────────────────────────────────────────────

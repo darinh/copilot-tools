@@ -1045,7 +1045,7 @@ def _discard(path: Path) -> None:
         pass
 
 
-def _replace_tree(staged: Path, dest: Path) -> None:
+def _replace_tree(staged: Path, dest: Path, *, expect_absent: bool = False) -> None:
     """Move ``staged`` onto ``dest``, keeping ``dest`` recoverable throughout.
 
     The old copy is renamed aside rather than deleted, because deletion is the
@@ -1057,6 +1057,15 @@ def _replace_tree(staged: Path, dest: Path) -> None:
     the operation that fails when something inside is still open, which is
     precisely when stopping is the right answer.
 
+    ``expect_absent`` says the caller never asked the user about ``dest``,
+    because at the moment it classified there was nothing there to ask about.
+    Consent is scoped to the state it was given for: if something has appeared
+    since — the CLI has been observed recreating directories under
+    ``~/.copilot`` — replacing it silently spends an authorisation nobody
+    granted, and the aside copy is discarded on success, so the thing that
+    appeared would be gone. Refusing costs a reinstall; the alternative costs
+    whatever was there.
+
     If the swap fails the old copy is renamed back. If *that* fails too, or if
     the process dies between the two renames, the only copy is left under the
     aside name — which :func:`_reconcile_scratch` restores before anything else
@@ -1066,6 +1075,10 @@ def _replace_tree(staged: Path, dest: Path) -> None:
     _discard(previous)
     moved = False
     if _present(dest):
+        if expect_absent:
+            raise FileExistsError(
+                f"{dest} appeared after setup found it absent; nothing was "
+                "replaced")
         os.replace(dest, previous)
         moved = True
     try:
@@ -1087,12 +1100,22 @@ def _reconcile_scratch(dest: Path) -> None:
     until somebody notices. And the scratch names are directories holding a
     ``SKILL.md``, so leaving them in the skills directory invites the CLI to
     load a half-written copy as a skill in its own right.
+
+    The staged copy is read before it is discarded, because its mere existence
+    answers a question nothing else can. :func:`_replace_tree` renames it *onto*
+    the destination, so a swap that finished leaves none behind. Finding one
+    means the swap did not finish — and then something at ``dest`` is not the
+    install this scratch belongs to, whoever put it there, which makes the
+    aside copy still the user's only one. Discarding it on the strength of
+    "well, something is at the destination" is how both copies are lost.
     """
-    _discard(dest.with_name(f".{dest.name}.installing"))
+    staged = dest.with_name(f".{dest.name}.installing")
+    swap_unfinished = install_manifest.path_present(staged) is not False
     previous = dest.with_name(f".{dest.name}.previous")
     if install_manifest.path_present(previous) is not True:
         # Absent, or there but unexaminable — either way there is nothing here
         # that can be safely moved back.
+        _discard(staged)
         return
     dest_present = install_manifest.path_present(dest)
     if dest_present is None:
@@ -1100,13 +1123,21 @@ def _reconcile_scratch(dest: Path) -> None:
         # could destroy a finished install, and discarding the aside copy could
         # destroy the only one. Leave both and let the caller report.
         return
-    if dest_present:
-        _discard(previous)
+    if not dest_present:
+        try:
+            os.replace(previous, dest)
+        except OSError:
+            # The aside copy is the only one; leaving it named oddly beats
+            # discarding it because it could not be renamed back.
+            return
+        _discard(staged)
         return
-    try:
-        os.replace(previous, dest)
-    except OSError:
-        pass
+    if swap_unfinished:
+        # Both copies survive, litter and all. Tidiness is the thing being
+        # traded away here, and it is the cheaper of the two.
+        return
+    _discard(previous)
+    _discard(staged)
 
 
 #: Files copied from ``templates/`` into ``~/.copilot``.
@@ -1224,8 +1255,10 @@ def install_extensions(assume_yes: bool = False, manifest: dict | None = None) -
         state = install_manifest.classify(manifest, key, dest,
                                           install_manifest.tree_digest(src))
         if state == install_manifest.UNREADABLE:
-            # _link_directory would read the destination as free and try to
-            # create a link over it. Nothing here is worth finding out that way.
+            # _link_directory reads an unexaminable destination as occupied and
+            # goes on to ask `dest.is_dir()`, which raises rather than answers
+            # on a permission denial — aborting the whole run over one
+            # extension. Nothing here is worth finding out that way.
             _warn_unreadable(f"extension '{src.name}'", dest)
             continue
         try:
@@ -1245,6 +1278,17 @@ def install_extensions(assume_yes: bool = False, manifest: dict | None = None) -
 
 
 def install_templates(assume_yes: bool = False, manifest: dict | None = None) -> None:
+    """Copy the template files into ``~/.copilot``.
+
+    The copy never goes *through* a link. ``shutil.copyfile`` opens the
+    destination for writing, which follows a symlink and lands the repository's
+    copy in the link's target — a path outside ``~/.copilot`` that the user
+    chose and setup was never offered. Consent to overwrite ``dest`` is consent
+    about ``dest``, so the link is removed and a real file is written in its
+    place, which is what the other two installers already do by renaming the
+    destination aside. Every other write here is inside the directory setup
+    owns; this was the one that could reach out of it.
+    """
     print("\nInstalling templates...")
     COPILOT_DIR.mkdir(parents=True, exist_ok=True)
     manifest = install_manifest.empty_manifest() if manifest is None else manifest
@@ -1265,6 +1309,12 @@ def install_templates(assume_yes: bool = False, manifest: dict | None = None) ->
         if not _resolve_overwrite(state, label, dest, assume_yes):
             warn(f"Skipped {label} (kept existing)")
             continue
+        if _is_link(dest):
+            try:
+                _remove_dest(dest)
+            except OSError as exc:
+                warn(f"{label}: not installed ({exc})")
+                continue
         shutil.copyfile(src, dest)
         install_manifest.record(manifest, key, dest, kind="template",
                                 digest=source_digest)
@@ -1327,7 +1377,8 @@ def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> No
         try:
             _discard(staged)
             shutil.copytree(src, staged)
-            _replace_tree(staged, dest)
+            _replace_tree(staged, dest,
+                          expect_absent=state == install_manifest.ABSENT)
         except OSError as exc:
             warn(f"{label}: not installed ({exc})")
             _reconcile_scratch(dest)

@@ -1303,3 +1303,146 @@ def test_a_dangling_link_at_a_destination_is_not_written_through(install_env,
 
     assert asked, "setup wrote through a link into a path the user never named"
     assert not elsewhere.exists()
+
+
+def test_yes_does_not_write_through_a_dangling_link(install_env):
+    """``--yes`` consents to overwriting the destination, not to writing
+    somewhere else. ``shutil.copyfile`` follows the link and lands the
+    repository's copy in the target's location, outside ~/.copilot entirely,
+    where nothing will ever look for it and setup's own manifest will describe
+    a file that is not where it says."""
+    repo, home, _ = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    elsewhere = home.parent / "elsewhere.md"
+    dest = home / "copilot-instructions.md"
+    try:
+        os.symlink(elsewhere, dest)
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("this platform will not create symlinks")
+    (repo / "templates" / "copilot-instructions.md").write_text("v2",
+                                                                encoding="utf-8")
+
+    setup_tools.install_templates(assume_yes=True,
+                                  manifest=install_manifest.empty_manifest())
+
+    assert not elsewhere.exists(), "setup wrote outside the directory it owns"
+    assert dest.read_text(encoding="utf-8") == "v2"
+    assert not dest.is_symlink()
+
+
+def test_yes_does_not_write_through_a_link_to_a_real_file(install_env):
+    """The same defect with something to lose: a user who points their
+    instructions at a dotfiles repo gets that file rewritten by a setup run
+    they believed only touched ~/.copilot."""
+    repo, home, _ = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    dotfiles = home.parent / "dotfiles.md"
+    dotfiles.write_text("THE USER'S DOTFILES COPY", encoding="utf-8")
+    dest = home / "copilot-instructions.md"
+    try:
+        os.symlink(dotfiles, dest)
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("this platform will not create symlinks")
+    (repo / "templates" / "copilot-instructions.md").write_text("v2",
+                                                                encoding="utf-8")
+
+    setup_tools.install_templates(assume_yes=True,
+                                  manifest=install_manifest.empty_manifest())
+
+    assert dotfiles.read_text(encoding="utf-8") == "THE USER'S DOTFILES COPY"
+    assert dest.read_text(encoding="utf-8") == "v2"
+
+
+def test_reconcile_keeps_the_aside_copy_while_a_staged_copy_survives(tmp_path):
+    """The mark of a finished swap is that no staged copy is left: _replace_tree
+    renames it *onto* the destination. So a staged copy that is still there
+    says the swap did not finish, and then whatever occupies the destination
+    is not the install this scratch belongs to -- the CLI has been observed
+    recreating directories under ~/.copilot -- which leaves the aside copy the
+    user's only one. Discarding it because 'something is at the destination'
+    loses both."""
+    dest = tmp_path / "demo"
+    dest.mkdir()
+    (dest / "SKILL.md").write_text("recreated by somebody else", encoding="utf-8")
+    staged = tmp_path / ".demo.installing"
+    staged.mkdir()
+    (staged / "SKILL.md").write_text("the copy that never landed", encoding="utf-8")
+    previous = tmp_path / ".demo.previous"
+    previous.mkdir()
+    (previous / "SKILL.md").write_text("THE USER'S ONLY COPY", encoding="utf-8")
+
+    setup_tools._reconcile_scratch(dest)
+
+    assert previous.is_dir(), "the user's only copy was discarded on a guess"
+    assert (previous / "SKILL.md").read_text(encoding="utf-8") == \
+        "THE USER'S ONLY COPY"
+
+
+def test_reconcile_discards_the_aside_copy_once_the_swap_has_landed(tmp_path):
+    """The counterpart, so the guard above cannot be satisfied by never
+    discarding anything: no staged copy plus an occupied destination is a swap
+    that completed and died before its own cleanup. The aside copy really is
+    obsolete then, and leaving a directory holding a SKILL.md beside the
+    skills directory invites the CLI to load it as a skill of its own."""
+    dest = tmp_path / "demo"
+    dest.mkdir()
+    (dest / "SKILL.md").write_text("the installed copy", encoding="utf-8")
+    previous = tmp_path / ".demo.previous"
+    previous.mkdir()
+    (previous / "SKILL.md").write_text("superseded", encoding="utf-8")
+
+    setup_tools._reconcile_scratch(dest)
+
+    assert not previous.exists()
+
+
+def test_reconcile_restores_the_aside_copy_when_the_destination_is_gone(tmp_path):
+    """The original reason this function exists: a process killed between the
+    two renames leaves the user's copy under the aside name and nothing at the
+    destination."""
+    dest = tmp_path / "demo"
+    previous = tmp_path / ".demo.previous"
+    previous.mkdir()
+    (previous / "SKILL.md").write_text("restore me", encoding="utf-8")
+    staged = tmp_path / ".demo.installing"
+    staged.mkdir()
+
+    setup_tools._reconcile_scratch(dest)
+
+    assert (dest / "SKILL.md").read_text(encoding="utf-8") == "restore me"
+    assert not staged.exists()
+
+
+def test_replace_refuses_a_destination_that_appeared_after_it_was_found_absent(
+        tmp_path):
+    """Consent is scoped to the state it was given for. Nothing was there when
+    setup classified, so nobody was asked; if something has appeared since,
+    replacing it spends an authorisation that was never granted -- and the
+    aside copy is discarded on success, so the thing that appeared is gone."""
+    dest = tmp_path / "demo"
+    dest.mkdir()
+    (dest / "SKILL.md").write_text("APPEARED MID-RUN", encoding="utf-8")
+    staged = tmp_path / ".demo.installing"
+    staged.mkdir()
+    (staged / "SKILL.md").write_text("the new copy", encoding="utf-8")
+
+    with pytest.raises(OSError):
+        setup_tools._replace_tree(staged, dest, expect_absent=True)
+
+    assert (dest / "SKILL.md").read_text(encoding="utf-8") == "APPEARED MID-RUN"
+
+
+def test_replace_still_swaps_when_the_destination_was_expected(tmp_path):
+    """The counterpart: the refusal above must not be reachable on the path the
+    user did consent to, or every overwrite becomes an error."""
+    dest = tmp_path / "demo"
+    dest.mkdir()
+    (dest / "SKILL.md").write_text("old", encoding="utf-8")
+    staged = tmp_path / ".demo.installing"
+    staged.mkdir()
+    (staged / "SKILL.md").write_text("new", encoding="utf-8")
+
+    setup_tools._replace_tree(staged, dest, expect_absent=False)
+
+    assert (dest / "SKILL.md").read_text(encoding="utf-8") == "new"
+    assert not (tmp_path / ".demo.previous").exists()
