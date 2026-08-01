@@ -17,9 +17,11 @@ psmux implements tmux's command surface and installs a `tmux` alias, so the same
 code path serves every platform. Override the choice with
 `COPILOT_OPERATOR_MUX` if you need a specific binary.
 
-> The original bash `operator.sh` is retained unchanged for existing Linux and
-> WSL users. The Python implementation described here is the supported entry
-> point on all platforms.
+> The original bash `operator.sh` is retained as a rollback path for existing
+> Linux and WSL users, and is still actively maintained — see
+> [Platform Support](../README.md#platform-support) for what that does and
+> does not cover. The Python implementation described here is the supported
+> entry point on all platforms.
 
 ## Prerequisites
 
@@ -45,15 +47,27 @@ extensions, and installs configuration templates. It is safe to rerun and will
 not overwrite edited configuration without asking.
 
 <details>
-<summary>Legacy bash install (Linux/WSL only)</summary>
+<summary>Rolling back to the bash implementation (Linux/WSL/macOS)</summary>
+
+The bash scripts are a rollback target, not an install option, and
+**`./setup.sh` will not give you one** — it migrates `operator`/`handoff` *off*
+the bash scripts and onto the Python console scripts, which is the opposite of
+what this section is for. A reader who followed the old version of these
+instructions got the supported install and no error, which is why that stood
+for as long as it did.
+
+Roll back by pointing the symlinks at the scripts yourself:
 
 ```bash
-# From the copilot-tools repo
-./setup.sh
-
-# Or manually
 ln -sf /path/to/copilot-tools/operator.sh ~/.local/bin/operator
+ln -sf /path/to/copilot-tools/handoff.sh ~/.local/bin/handoff
 ```
+
+Re-running `./setup.sh` afterwards migrates them back to Python, by design. The
+scripts are kept parsing and running so this stays a real escape hatch — CI runs
+`bash -n` over every `*.sh`, and the suite exercises these two directly,
+including a bash 3.2 conformance scan for macOS — but they receive bug fixes
+only, never new features.
 </details>
 
 ## Architecture
