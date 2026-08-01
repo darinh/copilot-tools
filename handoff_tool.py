@@ -83,19 +83,38 @@ SUPERSEDED_DIRNAME = "superseded"
 # So the notice goes in the bytes. It survives the session, it travels with
 # the file it describes, and it is addressed to the agent who finds it rather
 # than to the one who caused it.
+#
+# **Each notice is written before its own outcome is known, so none of them
+# may assert one.** Both are attached ahead of the events they describe: the
+# published notice is chosen before the spare copy is attempted, and the
+# banked notice is written before the publish is attempted -- and either can
+# then fail. Adversarial review found both halves of that, independently: a
+# published file claiming "a copy was banked" when the bank had just raised,
+# and a banked copy claiming "this session published" when the publish was
+# about to be abandoned. They are phrased as what was *attempted* and what the
+# reader should therefore check, which is true on every path that reaches
+# them.
 NOTICE_UNSERIALISED = (
     "> **⚠ Published without the handoff lock.** Another handoff for this\n"
-    "> project was in progress, so this one was written unserialised and a\n"
-    "> concurrent writer may have replaced it since. A copy of this handoff\n"
-    "> was banked in `superseded/`. Read `superseded/` alongside this file:\n"
-    "> a handoff in there may be newer than this one."
+    "> project was in progress. This file was written unserialised, so it may\n"
+    "> have overwritten a concurrent handoff — or been overwritten by one\n"
+    "> since. Read `superseded/` alongside this file before deciding what you\n"
+    "> are picking up: a copy in there marked as banked may be newer than\n"
+    "> this one."
 )
 NOTICE_BANKED_UNSERIALISED = (
-    "> **⚠ Banked copy — this handoff may never have reached\n"
+    "> **⚠ Banked copy — these words may never have reached\n"
     "> `next-session.md`.** The handoff lock was held by another writer, so\n"
-    "> this session published unserialised and banked these words here first.\n"
-    "> If `next-session.md` does not contain them, a concurrent handoff won\n"
-    "> the race and this copy is the one that was lost."
+    "> this session banked its context here *before* attempting to publish\n"
+    "> unserialised. If `next-session.md` does not contain these words, the\n"
+    "> publish was abandoned or a concurrent handoff replaced it, and this\n"
+    "> copy is the only one there is."
+)
+NOTICE_BANKED_UNPUBLISHED = (
+    "> **⚠ Banked copy — this handoff was never published.** The handoff\n"
+    "> already at `next-session.md` could not be preserved first, so it was\n"
+    "> not replaced and these words were banked here instead. This copy is\n"
+    "> newer than the `next-session.md` beside it."
 )
 NOTICE_BANKED_UNPUBLISHED = (
     "> **⚠ Banked copy — this handoff was never published.** The handoff\n"
@@ -774,6 +793,11 @@ def main(argv: list[str] | None = None) -> int:
             # stderr, which belongs to the session that is ending; the next
             # session -- the one that has to decide whether the file it is
             # reading is the newest -- would otherwise get no sign at all.
+            #
+            # `published` is chosen here, before the bank is attempted, and is
+            # deliberately not revised when the bank fails: the notice claims
+            # nothing about the spare copy, precisely so that it stays true
+            # whichever way the next few lines go.
             published = render_body(NOTICE_UNSERIALISED)
             try:
                 spare = _archive(
@@ -795,6 +819,13 @@ def main(argv: list[str] | None = None) -> int:
             # first, and only then does the tool give up, so the operator is
             # choosing between two files that both still exist rather than
             # being told which one was destroyed on its behalf.
+            #
+            # On the unlocked path this is the *second* bank of the same
+            # words, and that is deliberate rather than tidy: the first copy
+            # was insurance against a race, this one records that the publish
+            # was abandoned, and the two notices are complementary because
+            # neither claims an outcome. Two identical bodies in `superseded/`
+            # cost a reader nothing; a missing one costs a session.
             try:
                 spare = _archive(
                     handoff_file,

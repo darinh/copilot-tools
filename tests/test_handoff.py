@@ -1032,6 +1032,93 @@ def test_a_preserved_predecessor_is_never_stamped(env, monkeypatch):
     assert archived[0].read_text(encoding="utf-8") == original
 
 
+def test_the_published_notice_does_not_depend_on_the_spare_copy(
+        env, monkeypatch):
+    """It is chosen before the bank is attempted, so it cannot report one.
+
+    Adversarial review found the first version of this: `published` was set to
+    a notice reading "a copy of this handoff was banked in `superseded/`" and
+    then the bank raised, leaving `next-session.md` pointing a reader at a
+    copy that does not exist -- and, worse, at a `superseded/` whose only
+    occupant is the preserved predecessor, which is *older*. The notice now
+    claims nothing about the spare, which is the only phrasing that is true on
+    both branches.
+    """
+    def publish(guid, bank_works):
+        env["catalog"].write_text(
+            f'"{env["project"].resolve()}",{guid}\n', encoding="utf-8")
+        project_dir = env["home"] / ".copilot" / "projects" / guid
+        project_dir.mkdir(parents=True)
+        (project_dir / "next-session.md.lock").write_text(
+            "held", encoding="utf-8")
+        real_archive = ho._archive
+        if not bank_works:
+            monkeypatch.setattr(
+                ho, "_archive",
+                lambda f, p: (_ for _ in ()).throw(OSError("no room")))
+        try:
+            assert ho.main([
+                "--instance", "proj", "--status", "SAME WORDS", "--next", "n",
+                "--project-root", str(env["project"]),
+            ]) == 0
+        finally:
+            monkeypatch.setattr(ho, "_archive", real_archive)
+        return (project_dir / "next-session.md").read_text(encoding="utf-8")
+
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    banked = publish("guid-35", bank_works=True)
+    unbanked = publish("guid-36", bank_works=False)
+
+    assert banked == unbanked, (
+        "the published handoff differs by whether the spare copy succeeded, "
+        "so it is making a claim about the spare that one of the two cases "
+        "will falsify")
+    # And the literal false statement, named, because "they are equal" would
+    # also be satisfied by both of them being wrong in the same way.
+    assert "was banked" not in ho.NOTICE_UNSERIALISED
+
+
+def test_the_banked_notice_does_not_claim_the_publish_happened(
+        env, monkeypatch):
+    """It is written before the publish is attempted, and the publish can abort.
+
+    Lock held *and* the predecessor unpreservable: the spare is banked, then
+    `preserve_prior_handoff` refuses and the tool dies without publishing. A
+    banked copy asserting "this session published unserialised" is then simply
+    false -- and it contradicts the second copy banked moments later on the
+    same invocation, which correctly says the handoff was never published.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-37\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-37"
+    project_dir.mkdir(parents=True)
+    (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
+    prior = project_dir / "next-session.md"
+    prior.write_text("PREDECESSOR", encoding="utf-8")
+
+    def refuse(handoff_file):
+        raise ho.PreserveError("cannot preserve")
+
+    monkeypatch.setattr(ho, "preserve_prior_handoff", refuse)
+    with pytest.raises(SystemExit):
+        ho.main(["--instance", "proj", "--status", "ABANDONED PUBLISH",
+                 "--next", "n", "--project-root", str(env["project"])])
+
+    # The publish never happened, so nothing may say that it did.
+    assert prior.read_text(encoding="utf-8") == "PREDECESSOR"
+    banked = [p.read_text(encoding="utf-8")
+              for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]
+    assert len(banked) == 2, \
+        "both banks should have run on this path: insurance, then the refusal"
+    assert all("ABANDONED PUBLISH" in text for text in banked)
+    assert any(ho.NOTICE_BANKED_UNSERIALISED in text for text in banked)
+    assert any(ho.NOTICE_BANKED_UNPUBLISHED in text for text in banked)
+    assert "this session published" not in ho.NOTICE_BANKED_UNSERIALISED
+
+
 def test_a_failed_spare_copy_does_not_stop_the_handoff(env, monkeypatch):
     """Insurance is a second chance, never a reason to lose the first one."""
     env["catalog"].write_text(
