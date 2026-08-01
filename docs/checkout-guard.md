@@ -198,12 +198,19 @@ node --test extensions/checkout-guard/guard.test.mjs
 ```
 
 The split is deliberate and load-bearing, but it is a split by *testability*,
-not by size. `extension.mjs` calls `joinSession` at import, so the test suite
-cannot import it at all: everything it holds — the tracked-path maps, `observe`,
-the bodies of `onSessionStart` / `onPreToolUse` / `onPostToolUse` — is covered
-by `node --check` and by nothing else. That is the reason every *decision* is
-pushed into `guard.mjs`, where a test can reach it, and why logic accumulating
-in `extension.mjs` is a smell rather than a convenience.
+not by size. `extension.mjs` calls `joinSession` at import, so importing it has
+a side effect and the test suite cannot reach it at all: everything it holds —
+the tracked-path maps, `observe`, the bodies of `onSessionStart` /
+`onPreToolUse` / `onPostToolUse` — is covered by `node --check` and by nothing
+else. The untestability is structural, not incidental.
+
+That makes the line a real budget rather than a style preference: **anything
+moved into `guard.mjs` gains 80 tests, and anything that stays gains a parse
+check.** `extension.mjs` is 293 lines against `guard.mjs`'s 1116, and some of
+those 293 — `MAX_TRACKED`, the `lastSeen` / `outstanding` / `authored` /
+`primaryRoots` maps, `relativeToCheckout` — are pure data and pure functions
+with no reason to sit on the uncovered side. Logic accumulating in
+`extension.mjs` is a debt, not a convenience.
 
 Because `guard.mjs` is where the decisions live, `setup_tools.py` parses every
 `.mjs` in a deployed extension rather than just the entrypoint: `node --check`
