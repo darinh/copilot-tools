@@ -42,7 +42,7 @@ import os
 import subprocess
 import sys
 import time
-from pathlib import Path, PurePath, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 # `operator_ingest` is imported lazily below. When this module runs as the
 # installed `operator-runner` console script rather than by path, an editable
@@ -268,7 +268,13 @@ def _is_safe_component(name: object) -> bool:
         return False
     if "\x00" in name or name in (".", ".."):
         return False
-    return PurePath(name).name == name and PurePosixPath(name).name == name
+    # Both flavours explicitly. `PurePath` would be wrong here: it is an alias
+    # that becomes `PureWindowsPath` on Windows and `PurePosixPath` on POSIX,
+    # so on Linux both halves of this test would be the same test, and
+    # `..\\escaped` -- an ordinary filename there, a traversal on Windows --
+    # would be accepted by a runner whose spec may have been written on either.
+    return (PureWindowsPath(name).name == name
+            and PurePosixPath(name).name == name)
 
 
 def _fallback_identity(spec_path: Path, spec: object) -> tuple[Path, str]:
