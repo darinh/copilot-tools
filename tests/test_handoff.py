@@ -48,6 +48,25 @@ def test_render_includes_supplied_optional_sections():
         assert heading in out
 
 
+def test_render_places_a_notice_under_the_title_and_above_the_status():
+    """Position is the whole of its usefulness.
+
+    Above the title it would stop the file being a handoff document to
+    anything keying on the header; below `## Status` a reader meets the
+    content before the caveat that qualifies it.
+    """
+    out = ho.render("s", "", "n", "", "", notice="> NOTE")
+    assert out.index("# Session Handoff") < out.index("> NOTE") < out.index("## Status")
+
+
+def test_render_without_a_notice_is_byte_identical_to_before():
+    """No notice must mean no trace of one -- not even a blank line."""
+    assert ho.render("s", "wip", "n", "ctx", "p", notice="") == \
+        ho.render("s", "wip", "n", "ctx", "p")
+    assert ho.render("s", "", "n", "", "") == \
+        "# Session Handoff\n\n## Status\ns\n\n## Next Steps\nn\n"
+
+
 # ── path handling ───────────────────────────────────────────────
 def test_same_or_within_matches_self_and_children(tmp_path):
     assert ho.same_or_within(str(tmp_path), str(tmp_path))
@@ -854,6 +873,297 @@ def test_handoff_banks_a_spare_copy_when_it_cannot_take_the_lock(
     banked = [p.read_text(encoding="utf-8")
               for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]
     assert any("CONTENDED CONTEXT" in text for text in banked)
+
+
+def test_an_unserialised_publish_says_so_in_the_file_it_publishes(
+        env, monkeypatch):
+    """The reader is the party the stderr warning never reaches.
+
+    A handoff written without the lock may be replaced by the concurrent
+    writer moments later, so `next-session.md` cannot be trusted to be the
+    newest one -- and until this notice existed, nothing in it said so. The
+    session that caused the race sees a warning on stderr and then ends; the
+    session that has to act on the consequence reads only the file.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-30\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-30"
+    project_dir.mkdir(parents=True)
+    (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
+
+    assert ho.main([
+        "--instance", "proj", "--status", "RACED CONTEXT", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    published = (project_dir / "next-session.md").read_text(encoding="utf-8")
+    assert "RACED CONTEXT" in published
+    assert ho.NOTICE_UNSERIALISED in published
+    # The published file is not the banked copy and must not claim to be one:
+    # a reader told "this may never have reached next-session.md" by the very
+    # file at next-session.md learns nothing it can act on.
+    assert ho.NOTICE_BANKED_UNSERIALISED not in published
+
+
+def test_the_banked_copy_says_it_may_never_have_been_published(
+        env, monkeypatch):
+    """A file in `superseded/` cannot otherwise be told apart from a predecessor.
+
+    Both arrive by the same route and are named by the same scheme. Only one
+    of them may be *newer* than the handoff beside it, and that is exactly the
+    thing a reader has to know before deciding what to pick up.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-31\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-31"
+    project_dir.mkdir(parents=True)
+    (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
+
+    assert ho.main([
+        "--instance", "proj", "--status", "BANKED CONTEXT", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    banked = [p.read_text(encoding="utf-8")
+              for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]
+    assert any("BANKED CONTEXT" in text and ho.NOTICE_BANKED_UNSERIALISED in text
+               for text in banked)
+    assert not any(ho.NOTICE_UNSERIALISED in text for text in banked)
+
+
+def test_a_handoff_that_was_never_published_says_so_in_its_banked_copy(
+        env, monkeypatch):
+    """This copy is not a loser of a race -- it is the only copy there is.
+
+    The predecessor could not be preserved, so it was not replaced: the words
+    banked here never reached `next-session.md` at all, and the file sitting
+    there is strictly older than this one.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-32\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-32"
+    project_dir.mkdir(parents=True)
+    prior = project_dir / "next-session.md"
+    prior.write_text("UNREADABLE PREDECESSOR", encoding="utf-8")
+
+    def refuse(handoff_file):
+        raise ho.PreserveError("cannot preserve")
+
+    monkeypatch.setattr(ho, "preserve_prior_handoff", refuse)
+    with pytest.raises(SystemExit):
+        ho.main(["--instance", "proj", "--status", "NEVER PUBLISHED",
+                 "--next", "n", "--project-root", str(env["project"])])
+
+    assert prior.read_text(encoding="utf-8") == "UNREADABLE PREDECESSOR"
+    banked = [p.read_text(encoding="utf-8")
+              for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]
+    assert any("NEVER PUBLISHED" in text and ho.NOTICE_BANKED_UNPUBLISHED in text
+               for text in banked)
+
+
+def test_an_uncontended_handoff_carries_no_notice(env, monkeypatch):
+    """The control that stops the notice becoming furniture.
+
+    A banner printed on every handoff is one a reader learns to skip, and then
+    it is worth nothing on the one occasion it is true. The ordinary path --
+    lock taken, nothing waiting -- must produce the same bytes it always did.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-33\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    assert ho.main([
+        "--instance", "proj", "--status", "ordinary", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-33"
+    published = (project_dir / "next-session.md").read_text(encoding="utf-8")
+    assert published == ho.render("ordinary", "", "n", "", "")
+    for notice in (ho.NOTICE_UNSERIALISED, ho.NOTICE_BANKED_UNSERIALISED,
+                   ho.NOTICE_BANKED_UNPUBLISHED):
+        assert notice not in published
+
+
+def test_the_three_notices_are_pairwise_distinct():
+    """Otherwise every assertion above proves less than it appears to.
+
+    Three tests each pin "this file carries notice X and not notice Y". If two
+    of the notices were the same string -- a copy-paste away -- those
+    assertions would contradict each other and one of them would be asserting
+    a tautology. Identity is the property they all rest on, so it is asserted
+    once, directly.
+    """
+    notices = [ho.NOTICE_UNSERIALISED, ho.NOTICE_BANKED_UNSERIALISED,
+               ho.NOTICE_BANKED_UNPUBLISHED]
+    assert len(set(notices)) == 3
+    for notice in notices:
+        # A notice a reader can mistake for handoff prose is not a notice.
+        assert notice.startswith("> ")
+        assert notice.strip()
+
+
+def test_a_preserved_predecessor_is_never_stamped(env, monkeypatch):
+    """The notice describes *this* write. Somebody else's bytes are evidence.
+
+    `preserve_prior_handoff` archives a predecessor verbatim, and a stamp
+    added there would be this tool editing a file whose whole point is that it
+    was not altered.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-34\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-34"
+    project_dir.mkdir(parents=True)
+    original = "# Session Handoff\n\nthe predecessor's own words"
+    (project_dir / "next-session.md").write_text(original, encoding="utf-8")
+
+    assert ho.main([
+        "--instance", "proj", "--status", "successor", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    archived = list((project_dir / ho.SUPERSEDED_DIRNAME).iterdir())
+    assert len(archived) == 1
+    assert archived[0].read_text(encoding="utf-8") == original
+
+
+def test_the_published_notice_does_not_depend_on_the_spare_copy(
+        env, monkeypatch):
+    """It is chosen before the bank is attempted, so it cannot report one.
+
+    Adversarial review found the first version of this: `published` was set to
+    a notice reading "a copy of this handoff was banked in `superseded/`" and
+    then the bank raised, leaving `next-session.md` pointing a reader at a
+    copy that does not exist -- and, worse, at a `superseded/` whose only
+    occupant is the preserved predecessor, which is *older*. The notice now
+    claims nothing about the spare, which is the only phrasing that is true on
+    both branches.
+    """
+    def publish(guid, bank_works):
+        env["catalog"].write_text(
+            f'"{env["project"].resolve()}",{guid}\n', encoding="utf-8")
+        project_dir = env["home"] / ".copilot" / "projects" / guid
+        project_dir.mkdir(parents=True)
+        (project_dir / "next-session.md.lock").write_text(
+            "held", encoding="utf-8")
+        real_archive = ho._archive
+        if not bank_works:
+            monkeypatch.setattr(
+                ho, "_archive",
+                lambda f, p: (_ for _ in ()).throw(OSError("no room")))
+        try:
+            assert ho.main([
+                "--instance", "proj", "--status", "SAME WORDS", "--next", "n",
+                "--project-root", str(env["project"]),
+            ]) == 0
+        finally:
+            monkeypatch.setattr(ho, "_archive", real_archive)
+        return (project_dir / "next-session.md").read_text(encoding="utf-8")
+
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    banked = publish("guid-35", bank_works=True)
+    unbanked = publish("guid-36", bank_works=False)
+
+    assert banked == unbanked, (
+        "the published handoff differs by whether the spare copy succeeded, "
+        "so it is making a claim about the spare that one of the two cases "
+        "will falsify")
+    # And the literal false statement, named, because "they are equal" would
+    # also be satisfied by both of them being wrong in the same way.
+    assert "was banked" not in ho.NOTICE_UNSERIALISED
+
+
+def test_the_banked_notice_does_not_claim_the_publish_happened(
+        env, monkeypatch):
+    """It is written before the publish is attempted, and the publish can abort.
+
+    Lock held *and* the predecessor unpreservable: the spare is banked, then
+    `preserve_prior_handoff` refuses and the tool dies without publishing. A
+    banked copy asserting "this session published unserialised" is then simply
+    false -- and it contradicts the second copy banked moments later on the
+    same invocation, which correctly says the handoff was never published.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-37\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-37"
+    project_dir.mkdir(parents=True)
+    (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
+    prior = project_dir / "next-session.md"
+    prior.write_text("PREDECESSOR", encoding="utf-8")
+
+    def refuse(handoff_file):
+        raise ho.PreserveError("cannot preserve")
+
+    monkeypatch.setattr(ho, "preserve_prior_handoff", refuse)
+    with pytest.raises(SystemExit):
+        ho.main(["--instance", "proj", "--status", "ABANDONED PUBLISH",
+                 "--next", "n", "--project-root", str(env["project"])])
+
+    # The publish never happened, so nothing may say that it did.
+    assert prior.read_text(encoding="utf-8") == "PREDECESSOR"
+    banked = [p.read_text(encoding="utf-8")
+              for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]
+    assert len(banked) == 2, \
+        "both banks should have run on this path: insurance, then the refusal"
+    assert all("ABANDONED PUBLISH" in text for text in banked)
+    assert any(ho.NOTICE_BANKED_UNSERIALISED in text for text in banked)
+    assert any(ho.NOTICE_BANKED_UNPUBLISHED in text for text in banked)
+    assert "this session published" not in ho.NOTICE_BANKED_UNSERIALISED
+
+
+def test_the_unserialised_notices_do_not_claim_a_peer_was_writing(
+        env, monkeypatch):
+    """A missing lock is not evidence of a concurrent handoff.
+
+    ``handoff_lock`` yields False for three different reasons: a lock still
+    held at the deadline, a lock file that could not be written, and a
+    directory that will not take a lock file at all. Only the first is even
+    possibly a live peer -- and not reliably, because a lock left behind by a
+    process that died reads exactly like one held by a process that is working.
+
+    This drives the least ambiguous of the three: ``os.open`` refuses the lock
+    path outright, so there is provably no other writer, and a notice saying
+    "another handoff is in progress" would be a plain falsehood in a file whose
+    only purpose is to be believed.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-38\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-38"
+    project_dir.mkdir(parents=True)
+
+    real_open = ho.os.open
+
+    def refuse_the_lock(path, *args, **kwargs):
+        if str(path).endswith(".lock"):
+            raise PermissionError("this directory will not take a lock file")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(ho.os, "open", refuse_the_lock)
+    assert ho.main([
+        "--instance", "proj", "--status", "NO PEER ANYWHERE", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    published = (project_dir / "next-session.md").read_text(encoding="utf-8")
+    assert ho.NOTICE_UNSERIALISED in published, \
+        "the lock was not taken, so the reader must still be warned"
+    # The notices, named, because the assertion above passes for any wording.
+    for notice in (ho.NOTICE_UNSERIALISED, ho.NOTICE_BANKED_UNSERIALISED):
+        lowered = notice.lower()
+        for claim in ("another handoff", "another writer", "in progress",
+                      "was held by", "concurrent handoff was"):
+            assert claim not in lowered, (
+                f"{claim!r} asserts a cause the tool cannot know at the point "
+                f"it writes this notice")
 
 
 def test_a_failed_spare_copy_does_not_stop_the_handoff(env, monkeypatch):
