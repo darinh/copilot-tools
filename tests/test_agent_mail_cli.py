@@ -12,6 +12,7 @@ import shlex
 from pathlib import Path
 
 import pytest
+from conftest import denied
 
 import copilot_operator as op
 import operator_mail
@@ -811,6 +812,138 @@ def test_no_multiplexer_means_no_live_sessions_rather_than_no_answer(
         tmp_path, monkeypatch):
     monkeypatch.setattr(op, "MUX", RecordingMux(installed=False))
     assert op.live_instance_ids_under(tmp_path) == []
+
+
+def test_a_launch_spec_that_will_not_open_fails_the_census(tmp_path,
+                                                           monkeypatch):
+    """The record exists and cannot be read: that is not "unrecorded".
+
+    A peer whose pane sits elsewhere is placed by its launch spec. If reading
+    that spec fails and the failure is typed as "no recorded directory", the
+    peer drops out of the census and the list that comes back looks complete
+    -- the same hole as a swallowed pane lookup, one record further down.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent-x", launch=project)
+    spec = op.RESTART_DIR / f"{peer.id}.launch.json"
+    mux = RecordingMux(sessions=[peer.id],
+                       paths={peer.id: str(tmp_path / "elsewhere")})
+    monkeypatch.setattr(op, "MUX", mux)
+
+    with denied(monkeypatch, spec) as seen:
+        assert op.live_instance_ids_under(project) is None
+    assert seen["n"] > 0, "the denial never fired; the test proves nothing"
+
+
+def test_a_pane_that_places_a_peer_here_does_not_need_the_spec(tmp_path,
+                                                               monkeypatch):
+    """The counterpart: an unreadable spec is only uncertainty when it is the
+    thing that would have answered. A pane already in this directory settles
+    it, so the census must not refuse."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent-x", launch=project)
+    spec = op.RESTART_DIR / f"{peer.id}.launch.json"
+    mux = RecordingMux(sessions=[peer.id], paths={peer.id: str(project)})
+    monkeypatch.setattr(op, "MUX", mux)
+
+    with denied(monkeypatch, spec):
+        assert op.live_instance_ids_under(project) == [peer.id]
+
+
+def test_an_unreadable_tab_registry_fails_the_census(tmp_path, monkeypatch):
+    """``load_tabs`` reports an unreadable registry as an empty one. The
+    census asks a different question -- who is here -- and an empty answer to
+    that is a claim, so it has to consult the tri-state read instead."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent-x", launch=None)
+    op.TABS_FILE.write_text(json.dumps({peer.id: {"cwd": str(project)}}),
+                            encoding="utf-8")
+    mux = RecordingMux(sessions=[peer.id],
+                       paths={peer.id: str(tmp_path / "elsewhere")})
+    monkeypatch.setattr(op, "MUX", mux)
+
+    real_read_text = Path.read_text
+    seen = {"n": 0}
+
+    def unreadable(self, *args, **kwargs):
+        if str(self) == str(op.TABS_FILE):
+            seen["n"] += 1
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    try:
+        assert op.live_instance_ids_under(project) is None
+    finally:
+        monkeypatch.setattr(Path, "read_text", real_read_text)
+    assert seen["n"] > 0, "the denial never fired; the test proves nothing"
+
+
+def test_an_unexaminable_state_directory_fails_the_census(tmp_path,
+                                                          monkeypatch):
+    """`known` decides whether an unplaceable session is one of ours. If the
+    state directory cannot be listed, `known` shrinks silently and the answer
+    is drawn from a population that is missing members."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent-x", launch=None)
+    mux = RecordingMux(sessions=[peer.id], paths={peer.id: None})
+    monkeypatch.setattr(op, "MUX", mux)
+
+    with denied(monkeypatch, op.RESTART_DIR) as seen:
+        assert op.live_instance_ids_under(project) is None
+    assert seen["n"] > 0, "the denial never fired; the test proves nothing"
+
+
+def test_a_state_directory_that_will_not_list_fails_the_census(tmp_path,
+                                                               monkeypatch):
+    """Statting the directory is not reading it.
+
+    ``managed_instances`` swallowed a failed ``iterdir`` into an empty map, so
+    a directory that stats fine and lists EACCES still produced a confident
+    census drawn from a population missing its members.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent-x", launch=None)
+    mux = RecordingMux(sessions=[peer.id], paths={peer.id: None})
+    monkeypatch.setattr(op, "MUX", mux)
+    assert op.live_instance_ids_under(project) == [peer.id]
+
+    real_iterdir = Path.iterdir
+    seen = {"n": 0}
+
+    def unlistable(self):
+        if str(self) == str(op.RESTART_DIR):
+            seen["n"] += 1
+            raise PermissionError(13, "Permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", unlistable)
+    try:
+        assert op.live_instance_ids_under(project) is None
+    finally:
+        monkeypatch.setattr(Path, "iterdir", real_iterdir)
+    assert seen["n"] > 0, "the denial never fired; the test proves nothing"
+
+
+def test_a_name_bound_somewhere_we_cannot_read_is_treated_as_taken(
+        tmp_path, monkeypatch):
+    """`_name_conflicts` guards against two agents sharing a name. An
+    unreadable binding is not proof the name is free."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent-x", launch=project)
+    spec = op.RESTART_DIR / f"{peer.id}.launch.json"
+    monkeypatch.setattr(op, "MUX", RecordingMux(sessions=[peer.id]))
+
+    assert op._name_conflicts("agent-x", project) is False
+    with denied(monkeypatch, spec, op.TABS_FILE):
+        assert op._name_conflicts("agent-x", project) is True
+
 
 
 def test_a_machine_with_no_multiplexer_can_still_read_its_own_mail(
