@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS model_usage (
     tokens_in TEXT,
     tokens_out TEXT,
     tokens_cached TEXT,
+    tokens_cache_write TEXT,
     premium_requests INTEGER,
     nano_aiu INTEGER NOT NULL DEFAULT 0
 );
@@ -98,6 +99,7 @@ _ADDED_COLUMNS = {
     },
     "model_usage": {
         "nano_aiu": "INTEGER NOT NULL DEFAULT 0",
+        "tokens_cache_write": "TEXT",
     },
 }
 
@@ -633,8 +635,9 @@ def ingest_file(
                 """
                 INSERT INTO model_usage (session_id, model_name, tokens_in,
                                          tokens_out, tokens_cached,
+                                         tokens_cache_write,
                                          premium_requests, nano_aiu)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -642,6 +645,7 @@ def ingest_file(
                     fmt_tokens(md.get("input_tokens", 0)),
                     fmt_tokens(md.get("output_tokens", 0)),
                     fmt_tokens(md.get("cache_read_tokens", 0)),
+                    fmt_tokens(md.get("cache_write_tokens", 0)),
                     int(md.get("request_cost", 0) or 0),
                     int(md.get("nano_aiu", 0) or 0),
                 ),
