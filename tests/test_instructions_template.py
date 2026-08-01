@@ -506,18 +506,33 @@ def test_the_placeholder_map_matches_the_placeholders_in_the_document():
     already fails loudly. The other direction is the silent one: an entry
     left behind after the document dropped it makes the map look like it is
     doing more work than it is, and the next reader trusts it.
+
+    Both shapes of key are checked. The two non-brace entries substitute a
+    literal fragment (``tests_before = N``), and ``str.replace`` returns the
+    string unchanged when the fragment is absent -- so if the document ever
+    reworded them they would go on sitting in the map, substituting nothing,
+    with no brace left over for ``_substitute`` to complain about.
     """
     text = TEMPLATE.read_text(encoding="utf-8")
     documented = set()
+    corpus = []
     for heading in ("Session History", "Parallel Agents"):
         section = _section(text, heading)
         for chunk in _blocks(section, info="sql") + _inline_code(section):
             documented.update(re.findall(r"\{[^}\n]*\}", chunk))
+            corpus.append(chunk)
+    corpus = "\n".join(corpus)
+    assert corpus, "no SQL found to check the placeholder map against"
     mapped = {key for key in _SQL_PLACEHOLDERS if key.startswith("{")}
     assert documented == mapped, (
         "_SQL_PLACEHOLDERS is out of step with the document:\n"
         f"  in the document, unmapped: {sorted(documented - mapped)}\n"
         f"  mapped but no longer used: {sorted(mapped - documented)}"
+    )
+    dead = sorted(key for key in _SQL_PLACEHOLDERS if key not in corpus)
+    assert not dead, (
+        "these _SQL_PLACEHOLDERS entries substitute nothing -- the document "
+        f"no longer contains them: {dead}"
     )
 
 
