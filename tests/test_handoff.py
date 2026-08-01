@@ -1,7 +1,11 @@
 """Tests for the handoff tool."""
 from __future__ import annotations
 
+import os
+import stat
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -306,6 +310,632 @@ def test_write_atomic_temp_names_do_not_collide_between_writers(tmp_path, monkey
     assert target.read_text(encoding="utf-8") == "b"
 
 
+# ── preserving an unread handoff ────────────────────────────────
+def test_preserve_does_nothing_when_no_handoff_is_waiting(tmp_path):
+    """The normal case: the reader consumed the last one, so the slot is free.
+
+    Counterpart to the tests below -- a guard that archived unconditionally
+    would satisfy every one of them while filling `superseded/` with copies of
+    files nobody was about to lose.
+    """
+    target = tmp_path / "next-session.md"
+    assert ho.preserve_prior_handoff(target) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_preserve_copies_an_unread_handoff_verbatim(tmp_path):
+    target = tmp_path / "next-session.md"
+    target.write_text("# Session Handoff\n\ncaf\u00e9 \U0001f600", encoding="utf-8")
+
+    saved = ho.preserve_prior_handoff(target)
+
+    assert saved is not None
+    assert saved.parent == tmp_path / ho.SUPERSEDED_DIRNAME
+    assert saved.read_text(encoding="utf-8") == "# Session Handoff\n\ncaf\u00e9 \U0001f600"
+
+
+def test_preserve_leaves_the_original_in_place(tmp_path):
+    """Copy, never move: the source must survive until the copy exists.
+
+    A move would open a window in which the only copy of the handoff is in
+    flight, which is the failure this function exists to prevent.
+    """
+    target = tmp_path / "next-session.md"
+    target.write_text("ORIGINAL", encoding="utf-8")
+    ho.preserve_prior_handoff(target)
+    assert target.read_text(encoding="utf-8") == "ORIGINAL"
+
+
+def test_preserve_skips_an_empty_handoff(tmp_path):
+    target = tmp_path / "next-session.md"
+    target.write_text("   \n\n", encoding="utf-8")
+    assert ho.preserve_prior_handoff(target) is None
+    assert not (tmp_path / ho.SUPERSEDED_DIRNAME).exists()
+
+
+def test_preserve_never_writes_over_an_existing_archive(tmp_path, monkeypatch):
+    """O_EXCL, not truncate. An archiver that clobbers archives is not one."""
+    target = tmp_path / "next-session.md"
+    target.write_text("SECOND", encoding="utf-8")
+    archive_dir = tmp_path / ho.SUPERSEDED_DIRNAME
+    archive_dir.mkdir()
+    (archive_dir / "taken.md").write_text("FIRST", encoding="utf-8")
+
+    names = iter(["taken.md", "free.md"])
+    monkeypatch.setattr(ho, "_superseded_name", lambda p: next(names))
+
+    saved = ho.preserve_prior_handoff(target)
+
+    assert (archive_dir / "taken.md").read_text(encoding="utf-8") == "FIRST"
+    assert saved == archive_dir / "free.md"
+    assert saved.read_text(encoding="utf-8") == "SECOND"
+
+
+def test_preserve_gives_up_rather_than_reusing_a_name(tmp_path, monkeypatch):
+    target = tmp_path / "next-session.md"
+    target.write_text("SECOND", encoding="utf-8")
+    archive_dir = tmp_path / ho.SUPERSEDED_DIRNAME
+    archive_dir.mkdir()
+    (archive_dir / "only.md").write_text("FIRST", encoding="utf-8")
+    monkeypatch.setattr(ho, "_superseded_name", lambda p: "only.md")
+
+    with pytest.raises(ho.PreserveError):
+        ho.preserve_prior_handoff(target)
+    assert (archive_dir / "only.md").read_text(encoding="utf-8") == "FIRST"
+    assert target.read_text(encoding="utf-8") == "SECOND"
+
+
+def test_preserve_refuses_a_path_it_cannot_examine(tmp_path, monkeypatch):
+    """Unreadable is not absent, and absent is what licenses the overwrite."""
+    target = tmp_path / "next-session.md"
+    target.write_text("UNREACHABLE", encoding="utf-8")
+
+    def denied(path, *a, **kw):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(ho.os, "lstat", denied)
+    monkeypatch.setattr(ho, "path_present", lambda p: None)
+    with pytest.raises(ho.PreserveError):
+        ho.preserve_prior_handoff(target)
+    assert target.read_text(encoding="utf-8") == "UNREACHABLE"
+
+
+def test_preserve_refuses_a_handoff_it_cannot_read(tmp_path, monkeypatch):
+    target = tmp_path / "next-session.md"
+    target.write_text("UNREADABLE", encoding="utf-8")
+    real_open = ho.os.open
+
+    def denied(path, *a, **kw):
+        if Path(path) == target:
+            raise PermissionError(13, "denied")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(ho.os, "open", denied)
+    with pytest.raises(ho.PreserveError):
+        ho.preserve_prior_handoff(target)
+    assert not (tmp_path / ho.SUPERSEDED_DIRNAME).exists()
+    assert target.read_text(encoding="utf-8") == "UNREADABLE"
+
+
+def test_preserve_rechecks_the_type_on_the_descriptor_it_reads(
+        tmp_path, monkeypatch):
+    """The file measured by `lstat` can be a fifo by the time it is opened.
+
+    `read_bytes` re-opens by name, so the check would have described a file
+    that is no longer there. The type is therefore re-established on the open
+    descriptor, which nothing can substitute.
+    """
+    target = tmp_path / "next-session.md"
+    target.write_text("was a regular file", encoding="utf-8")
+
+    class FifoStat:
+        st_mode = stat.S_IFIFO | 0o644
+        st_size = 0
+        st_ino = 0
+        st_dev = 0
+
+    monkeypatch.setattr(ho.os, "fstat", lambda fd: FifoStat())
+    with pytest.raises(ho.PreserveError):
+        ho.preserve_prior_handoff(target)
+    assert not (tmp_path / ho.SUPERSEDED_DIRNAME).exists()
+
+
+def test_preserve_refuses_a_file_that_grows_past_the_limit_while_read(
+        tmp_path, monkeypatch):
+    """The size can change between the fstat and the read."""
+    target = tmp_path / "next-session.md"
+    target.write_text("x" * 500, encoding="utf-8")
+
+    class SmallStat:
+        st_mode = stat.S_IFREG | 0o644
+        st_size = 1
+        st_ino = 0
+        st_dev = 0
+
+    monkeypatch.setattr(ho, "MAX_PRESERVE_BYTES", 10)
+    monkeypatch.setattr(ho.os, "fstat", lambda fd: SmallStat())
+    with pytest.raises(ho.PreserveError):
+        ho.preserve_prior_handoff(target)
+    assert not (tmp_path / ho.SUPERSEDED_DIRNAME).exists()
+
+
+def test_preserve_treats_a_vanished_file_as_nothing_to_save(tmp_path, monkeypatch):
+    """The reader can consume the handoff between the probe and the stat."""
+    target = tmp_path / "next-session.md"
+    monkeypatch.setattr(ho, "path_present", lambda p: True)
+    assert ho.preserve_prior_handoff(target) is None
+
+
+def test_preserve_refuses_a_directory(tmp_path):
+    target = tmp_path / "next-session.md"
+    target.mkdir()
+    with pytest.raises(ho.PreserveError):
+        ho.preserve_prior_handoff(target)
+    assert target.is_dir()
+
+
+def test_preserve_refuses_something_that_is_not_a_regular_file(tmp_path, monkeypatch):
+    """A fifo would hang the process forever; a device node would be destroyed."""
+    target = tmp_path / "next-session.md"
+    target.write_text("x", encoding="utf-8")
+    real_lstat = ho.os.lstat
+
+    class FakeStat:
+        st_mode = stat.S_IFIFO | 0o644
+        st_size = 0
+
+    monkeypatch.setattr(ho.os, "lstat",
+                        lambda p, *a, **kw: FakeStat()
+                        if Path(p) == target else real_lstat(p, *a, **kw))
+    with pytest.raises(ho.PreserveError):
+        ho.preserve_prior_handoff(target)
+
+
+def test_preserve_refuses_an_implausibly_large_handoff(tmp_path, monkeypatch):
+    target = tmp_path / "next-session.md"
+    target.write_text("x" * 200, encoding="utf-8")
+    monkeypatch.setattr(ho, "MAX_PRESERVE_BYTES", 10)
+    with pytest.raises(ho.PreserveError):
+        ho.preserve_prior_handoff(target)
+    assert target.read_text(encoding="utf-8") == "x" * 200
+
+
+def test_a_refusal_to_overwrite_still_banks_this_sessions_handoff(
+        env, monkeypatch):
+    """Protecting the dead session must not be paid for with the live one.
+
+    When the predecessor cannot be preserved the tool gives up rather than
+    replacing it -- but it writes this session's words down first, so the
+    operator ends up with two files that both exist instead of being told
+    which one was destroyed on its behalf.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-17\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-17"
+    project_dir.mkdir(parents=True)
+    prior = project_dir / "next-session.md"
+    prior.write_text("UNREADABLE PREDECESSOR", encoding="utf-8")
+    real_open = ho.os.open
+
+    def denied(path, *a, **kw):
+        if Path(path) == prior:
+            raise PermissionError(13, "denied")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(ho.os, "open", denied)
+    with pytest.raises(SystemExit):
+        ho.main(["--instance", "proj", "--status", "LIVE SESSION WORDS",
+                 "--next", "n", "--project-root", str(env["project"])])
+
+    assert prior.read_text(encoding="utf-8") == "UNREADABLE PREDECESSOR"
+    banked = [p.read_text(encoding="utf-8")
+              for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]
+    assert any("LIVE SESSION WORDS" in text for text in banked), \
+        "the live session's handoff was lost to protect the dead one"
+
+
+def test_a_refusal_that_cannot_bank_prints_the_handoff_instead(
+        env, monkeypatch, capsys):
+    """Last resort: stderr is still somewhere the words exist."""
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-18\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-18"
+    project_dir.mkdir(parents=True)
+    (project_dir / "next-session.md").write_text("PRIOR", encoding="utf-8")
+
+    def refuse(handoff_file):
+        raise ho.PreserveError("nope")
+
+    def no_bank(handoff_file, payload):
+        raise OSError("no room")
+
+    monkeypatch.setattr(ho, "preserve_prior_handoff", refuse)
+    monkeypatch.setattr(ho, "_archive", no_bank)
+    with pytest.raises(SystemExit):
+        ho.main(["--instance", "proj", "--status", "ONLY COPY LEFT",
+                 "--next", "n", "--project-root", str(env["project"])])
+    assert "ONLY COPY LEFT" in capsys.readouterr().err
+
+
+def test_preserve_refuses_a_file_swapped_under_the_descriptor(
+        tmp_path, monkeypatch):
+    """O_NOFOLLOW is 0 on Windows, so identity is re-checked on the descriptor."""
+    target = tmp_path / "next-session.md"
+    target.write_text("ORIGINAL", encoding="utf-8")
+
+    class OtherFile:
+        st_mode = stat.S_IFREG | 0o644
+        st_size = 8
+        st_ino = 999999
+        st_dev = 7
+
+    monkeypatch.setattr(ho.os, "fstat", lambda fd: OtherFile())
+    monkeypatch.setattr(ho.os, "lstat", lambda p, *a, **kw: _RealFile())
+    with pytest.raises(ho.PreserveError):
+        ho.preserve_prior_handoff(target)
+    assert not (tmp_path / ho.SUPERSEDED_DIRNAME).exists()
+    assert target.read_text(encoding="utf-8") == "ORIGINAL"
+
+
+class _RealFile:
+    st_mode = stat.S_IFREG | 0o644
+    st_size = 8
+    st_ino = 111111
+    st_dev = 7
+
+
+def test_an_unknown_file_index_is_not_read_as_a_match(tmp_path):
+    """Windows can report zero. An unanswered question is not a yes."""
+    class Zero:
+        st_ino = 0
+        st_dev = 0
+
+    class Known:
+        st_ino = 42
+        st_dev = 1
+
+    assert ho._swapped(Zero(), Known()) is False
+    assert ho._swapped(Known(), Zero()) is False
+    assert ho._swapped(Known(), Known()) is False
+
+
+def test_preserve_records_a_symlink_and_removes_it(tmp_path):
+    """The link's target survives; the link does not, and says so.
+
+    The link has to go before the publish, not during it: on Windows a symlink
+    to a directory is a directory entry and `os.replace` refuses to replace
+    one, which would kill the handoff to protect a target that was never in
+    danger. The target is never opened -- it could be a fifo, or a terabyte.
+    """
+    elsewhere = tmp_path / "elsewhere.md"
+    elsewhere.write_text("TARGET CONTENT", encoding="utf-8")
+    target = tmp_path / "next-session.md"
+    try:
+        target.symlink_to(elsewhere)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not permitted here")
+
+    saved = ho.preserve_prior_handoff(target)
+
+    assert saved is not None
+    body = saved.read_text(encoding="utf-8")
+    assert "elsewhere.md" in body
+    assert "TARGET CONTENT" not in body
+    assert elsewhere.read_text(encoding="utf-8") == "TARGET CONTENT"
+    assert not target.is_symlink(), "the link must be gone before the publish"
+
+
+def test_preserve_removes_a_symlink_that_points_at_a_directory(tmp_path):
+    """The Windows case: a directory symlink is a directory entry.
+
+    `MoveFileEx` refuses to replace one, so leaving it in place would make the
+    publish die with a bare access-denied and lose the live session's context.
+    It also does not come off with `unlink` there -- it needs `rmdir`.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep.txt").write_text("KEEP", encoding="utf-8")
+    target = tmp_path / "next-session.md"
+    try:
+        target.symlink_to(elsewhere, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not permitted here")
+
+    saved = ho.preserve_prior_handoff(target)
+
+    assert saved is not None
+    assert not target.is_symlink(), "the directory link must be gone"
+    assert (elsewhere / "keep.txt").read_text(encoding="utf-8") == "KEEP"
+
+
+def test_handoff_over_a_symlink_still_publishes(env, monkeypatch):
+    """End to end: the symlink case must not become a failed handoff."""
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-14\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-14"
+    project_dir.mkdir(parents=True)
+    elsewhere = env["home"] / "elsewhere"
+    elsewhere.mkdir()
+    try:
+        (project_dir / "next-session.md").symlink_to(
+            elsewhere, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not permitted here")
+
+    assert ho.main([
+        "--instance", "proj", "--status", "published", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+    handoff = project_dir / "next-session.md"
+    assert not handoff.is_symlink()
+    assert "published" in handoff.read_text(encoding="utf-8")
+    assert elsewhere.is_dir()
+
+
+def test_preserve_survives_a_symlink_target_that_is_not_utf8(tmp_path):
+    """POSIX link targets are bytes; Python hands them back as surrogates.
+
+    Encoding those strictly raises UnicodeEncodeError, which is not an OSError
+    and would leave the tool as a traceback rather than a message.
+    """
+    if os.name == "nt":
+        pytest.skip("Windows paths are text")
+    target = tmp_path / "next-session.md"
+    try:
+        os.symlink(os.fsdecode(b"/tmp/\xff\xferaw"), target)
+    except (OSError, NotImplementedError, UnicodeError):
+        pytest.skip("symlinks not permitted here")
+
+    saved = ho.preserve_prior_handoff(target)
+
+    assert saved is not None
+    assert saved.read_bytes()
+
+
+
+# ── serialising concurrent handoffs ─────────────────────────────
+def test_lock_is_exclusive_while_held(tmp_path, monkeypatch):
+    """Two agents, one project. The second must not walk into the first.
+
+    Preserving without serialising only changes which session is destroyed:
+    A copies the predecessor aside, B copies the same predecessor aside and
+    publishes, A publishes over B, and B was never archived because it did not
+    exist when A looked.
+    """
+    handoff = tmp_path / "next-session.md"
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.1)
+    with ho.handoff_lock(handoff) as first:
+        assert first is True
+        with ho.handoff_lock(handoff) as second:
+            assert second is False
+
+
+def test_lock_is_released_for_the_next_writer(tmp_path):
+    handoff = tmp_path / "next-session.md"
+    with ho.handoff_lock(handoff) as first:
+        assert first is True
+    with ho.handoff_lock(handoff) as second:
+        assert second is True
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_lock_is_released_when_the_handoff_fails(tmp_path):
+    """`die` raises SystemExit from inside the block -- the lock must not stay."""
+    handoff = tmp_path / "next-session.md"
+    with pytest.raises(SystemExit):
+        with ho.handoff_lock(handoff):
+            sys.exit(1)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_stale_lock_is_reclaimed(tmp_path, monkeypatch):
+    """A process that died between taking the lock and dropping it."""
+    handoff = tmp_path / "next-session.md"
+    lock = tmp_path / "next-session.md.lock"
+    lock.write_text("999999", encoding="utf-8")
+    old = time.time() - (ho.LOCK_STALE_SECONDS + 60)
+    os.utime(lock, (old, old))
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 5.0)
+    with ho.handoff_lock(handoff) as acquired:
+        assert acquired is True
+
+
+def test_lock_does_not_spin_forever_on_an_unremovable_stale_lock(
+        tmp_path, monkeypatch):
+    handoff = tmp_path / "next-session.md"
+    lock = tmp_path / "next-session.md.lock"
+    lock.write_text("999999", encoding="utf-8")
+    old = time.time() - (ho.LOCK_STALE_SECONDS + 60)
+    os.utime(lock, (old, old))
+
+    def refuse(self, *a, **kw):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.2)
+    started = time.monotonic()
+    with ho.handoff_lock(handoff) as acquired:
+        assert acquired is False
+    assert time.monotonic() - started < 5
+
+
+def test_lock_release_does_not_remove_someone_elses_lock(tmp_path):
+    """The reclaim can hand the lock on while the first holder is still inside.
+
+    A holder that unlinks on the way out without checking would then delete a
+    lock its successor is relying on, and a third writer would walk in.
+    """
+    handoff = tmp_path / "next-session.md"
+    lock = tmp_path / "next-session.md.lock"
+    with ho.handoff_lock(handoff) as acquired:
+        assert acquired is True
+        lock.write_text("someone-elses-token 4242 now\n", encoding="utf-8")
+    assert lock.exists(), "released a lock this process no longer owned"
+    assert "someone-elses-token" in lock.read_text(encoding="utf-8")
+
+
+def test_lock_is_not_left_behind_when_its_metadata_cannot_be_written(
+        tmp_path, monkeypatch):
+    """A lock nobody can prove ownership of would block writers until it aged out."""
+    handoff = tmp_path / "next-session.md"
+
+    def boom(*a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ho.os, "fdopen", boom)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.1)
+    with ho.handoff_lock(handoff) as acquired:
+        assert acquired is False
+    assert list(tmp_path.iterdir()) == [], "stranded lock left behind"
+
+
+def test_handoff_banks_a_spare_copy_when_it_cannot_take_the_lock(
+        env, monkeypatch):
+    """The unlocked path is the one where another writer can still overwrite us.
+
+    So the words go on disk before the race can have them: whatever happens to
+    `next-session.md`, this session's context exists somewhere.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-15\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-15"
+    project_dir.mkdir(parents=True)
+    (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
+
+    assert ho.main([
+        "--instance", "proj", "--status", "CONTENDED CONTEXT", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    banked = [p.read_text(encoding="utf-8")
+              for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]
+    assert any("CONTENDED CONTEXT" in text for text in banked)
+
+
+def test_a_failed_spare_copy_does_not_stop_the_handoff(env, monkeypatch):
+    """Insurance is a second chance, never a reason to lose the first one."""
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-16\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-16"
+    project_dir.mkdir(parents=True)
+    (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
+
+    def boom(handoff_file, payload):
+        raise OSError("no room")
+
+    monkeypatch.setattr(ho, "_archive", boom)
+    assert ho.main([
+        "--instance", "proj", "--status", "written regardless", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+    assert "written regardless" in (
+        project_dir / "next-session.md").read_text(encoding="utf-8")
+
+
+def test_handoff_still_writes_when_the_lock_cannot_be_taken(env, monkeypatch):
+    """Deliberate policy, pinned so nobody "fixes" it into a refusal.
+
+    A handoff that refuses to run because a lock is held discards the context
+    of the session that is running now -- a certain loss, to avoid a race whose
+    remaining window is the few microseconds between this process's own
+    preserve and its own rename.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-11\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-11"
+    project_dir.mkdir(parents=True)
+    (project_dir / "next-session.md.lock").write_text("1", encoding="utf-8")
+
+    assert ho.main([
+        "--instance", "proj", "--status", "written anyway", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+    assert "written anyway" in (
+        project_dir / "next-session.md").read_text(encoding="utf-8")
+
+
+def test_handoff_leaves_no_lock_behind(env, monkeypatch):
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-12\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    ho.main([
+        "--instance", "proj", "--status", "s", "--next", "n",
+        "--project-root", str(env["project"]),
+    ])
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-12"
+    assert [p.name for p in project_dir.iterdir()] == ["next-session.md"]
+
+
+def test_a_second_writer_cannot_enter_the_section_while_one_is_open(
+        env, monkeypatch):
+    """The interleaving itself, driven from two threads.
+
+    The first handoff stops between preserving and publishing. The second must
+    not get past the lock in that window; if it did, the first would then
+    publish over it and the second's context would exist in neither the handoff
+    nor `superseded/`.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-13\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-13"
+    project_dir.mkdir(parents=True)
+    handoff = project_dir / "next-session.md"
+    handoff.write_text("PREDECESSOR", encoding="utf-8")
+
+    holding = threading.Event()
+    let_go = threading.Event()
+    real_write_atomic = ho.write_atomic
+    first = {"done": False}
+
+    def paused_write(path, text):
+        if not first["done"]:
+            first["done"] = True
+            holding.set()
+            let_go.wait(timeout=10)
+        return real_write_atomic(path, text)
+
+    monkeypatch.setattr(ho, "write_atomic", paused_write)
+
+    def run_first():
+        ho.main(["--instance", "proj", "--status", "FIRST", "--next", "n",
+                 "--project-root", str(env["project"])])
+
+    worker = threading.Thread(target=run_first, daemon=True)
+    worker.start()
+    assert holding.wait(timeout=10), "first handoff never reached the write"
+
+    second_got_in = threading.Event()
+
+    def run_second():
+        with ho.handoff_lock(handoff) as acquired:
+            if acquired:
+                second_got_in.set()
+
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.3)
+    contender = threading.Thread(target=run_second, daemon=True)
+    contender.start()
+    contender.join(timeout=10)
+    assert not second_got_in.is_set(), \
+        "a second handoff entered the critical section while one was open"
+
+    let_go.set()
+    worker.join(timeout=10)
+    assert "FIRST" in handoff.read_text(encoding="utf-8")
+    archived = [p.read_text(encoding="utf-8")
+                for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]
+    assert any("PREDECESSOR" in text for text in archived)
+
+
 # ── end to end ──────────────────────────────────────────────────
 def test_handoff_writes_file_and_marker(env, monkeypatch, capsys):
     env["catalog"].write_text(
@@ -407,3 +1037,115 @@ def test_infer_instance_matches_by_cwd(env, monkeypatch):
         lambda self, s: str(env["project"]) if s == "alpha" else "/elsewhere",
     )
     assert ho.infer_instance(env["project"], ho.Mux()) == "alpha"
+
+
+def test_handoff_does_not_destroy_an_unread_predecessor(env, monkeypatch):
+    """The property, stated without reference to how it is achieved.
+
+    Every other test here names `preserve_prior_handoff` or
+    `SUPERSEDED_DIRNAME`, so against the code before the fix they all fail with
+    `AttributeError` -- which proves only that a symbol is new. This one talks
+    to `main` alone and asks the question that actually matters: after a second
+    handoff, is the first one still somewhere? Before the fix it is not, and
+    this fails on the behaviour rather than on a missing name.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-10\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-10"
+    project_dir.mkdir(parents=True)
+    handoff = project_dir / "next-session.md"
+    handoff.write_text("# Session Handoff\n\nthe first agent's context",
+                       encoding="utf-8")
+
+    assert ho.main([
+        "--instance", "proj",
+        "--status", "the second agent's context",
+        "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    assert "the second agent's context" in handoff.read_text(encoding="utf-8")
+    surviving = [p.read_text(encoding="utf-8", errors="replace")
+                 for p in project_dir.rglob("*") if p.is_file()]
+    assert any("the first agent's context" in text for text in surviving), \
+        "the unread handoff was destroyed"
+
+
+def test_handoff_preserves_an_unread_predecessor(env, monkeypatch, capsys):
+    """Two handoffs, no reader in between -- and neither one is lost."""
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-7\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-7"
+    project_dir.mkdir(parents=True)
+    handoff = project_dir / "next-session.md"
+    handoff.write_text("# Session Handoff\n\nthe first agent's context",
+                       encoding="utf-8")
+
+    rc = ho.main([
+        "--instance", "proj",
+        "--status", "the second agent's context",
+        "--next", "n",
+        "--project-root", str(env["project"]),
+    ])
+
+    assert rc == 0
+    assert "the second agent's context" in handoff.read_text(encoding="utf-8")
+    archives = list((project_dir / ho.SUPERSEDED_DIRNAME).iterdir())
+    assert len(archives) == 1
+    assert "the first agent's context" in archives[0].read_text(encoding="utf-8")
+    assert "had not been read" in capsys.readouterr().err
+
+
+def test_handoff_leaves_no_archive_when_nothing_was_waiting(env, monkeypatch):
+    """The common path stays clean -- no directory, no warning, no noise.
+
+    Named nothing from the fix, so it holds before and after it: an archiver
+    that fired unconditionally would break this while passing every test that
+    asserts preservation.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-8\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+
+    assert ho.main([
+        "--instance", "proj", "--status", "s", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-8"
+    assert [p.name for p in project_dir.iterdir()] == ["next-session.md"]
+
+
+def test_handoff_refuses_rather_than_destroying_what_it_cannot_preserve(
+        env, monkeypatch):
+    """No archive, no overwrite. The predecessor survives a failed handoff.
+
+    The mock denies any *new* directory under the project dir rather than one
+    named by the fix, so before the fix it simply never fires -- and the
+    assertion then fails because the handoff was overwritten, which is the
+    behaviour under test.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-9\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-9"
+    project_dir.mkdir(parents=True)
+    handoff = project_dir / "next-session.md"
+    handoff.write_text("PRECIOUS", encoding="utf-8")
+
+    real_mkdir = Path.mkdir
+
+    def refuse(self, *a, **kw):
+        if self != project_dir and project_dir in self.parents:
+            raise PermissionError(13, "denied")
+        return real_mkdir(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "mkdir", refuse)
+    with pytest.raises(SystemExit):
+        ho.main([
+            "--instance", "proj", "--status", "s", "--next", "n",
+            "--project-root", str(env["project"]),
+        ])
+    assert handoff.read_text(encoding="utf-8") == "PRECIOUS"
