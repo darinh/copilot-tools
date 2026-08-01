@@ -937,3 +937,69 @@ def test_a_gate_slug_must_be_matched_by_a_table_row(template):
     assert broken != template, "the substitution found nothing to replace"
     with pytest.raises(AssertionError, match="telepathy"):
         test_every_gated_section_is_offered_in_the_feature_table(broken)
+
+
+# Eight-four-four-four-twelve hex digits: what uuid.uuid4() prints, and what an
+# agent told to "generate a GUID" will recognise as one it may reuse.
+_LOOKS_LIKE_A_REAL_GUID = re.compile(
+    r"\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b")
+
+
+def test_no_example_in_the_template_is_a_usable_guid(template):
+    """Nothing here may look like a GUID somebody could paste into the catalog.
+
+    The template shows the format of ``~/.copilot/projects/catalog.csv`` a few
+    lines above an instruction to add an entry to it, and its reader is a model
+    that does what it is told. A well-formed value next to a write instruction
+    is a value that gets written -- and that file is the user's data, mapping
+    every project on the machine, with nothing in this toolkit able to rebuild
+    it. It has already been destroyed once tonight, by a different route.
+
+    So the example is checked for being unusable rather than for being present:
+    a test that the placeholder text appears would pass while a second, real
+    GUID sat beside it.
+    """
+    found = _LOOKS_LIKE_A_REAL_GUID.findall(template)
+    assert not found, (
+        f"{TEMPLATE.name} contains {found!r}, which a reader can paste into a "
+        "real catalog. Examples must be malformed on purpose -- see the note "
+        "under the csv block.")
+
+
+def test_the_catalog_example_still_shows_two_columns(template):
+    """The malformed GUIDs must not have cost the example its shape.
+
+    Guarded because the fix for the test above is one careless edit away from
+    deleting the block, and an empty ``csv`` fence would satisfy that test
+    perfectly.
+    """
+    blocks = _blocks(template, "csv")
+    assert blocks, "the catalog example block is gone or its info string changed"
+    rows = [line for line in blocks[0].splitlines() if line.strip()]
+    assert len(rows) >= 2, f"the catalog example lost its rows: {rows!r}"
+    for row in rows:
+        # Split, not rpartition: rpartition finds the LAST comma, so a
+        # three-column row leaves a non-empty piece either side and passes
+        # while showing a format the parser does not accept.
+        columns = row.split(",")
+        assert len(columns) == 2, f"not a two-column row: {row!r}"
+        assert all(c.strip() for c in columns), f"empty column in: {row!r}"
+
+
+def test_the_template_forbids_rewriting_the_catalog(template):
+    """Saying "append" is the part of this that does the work.
+
+    Malformed example GUIDs stop an agent reusing a value; they do nothing
+    about the larger hazard, which is an agent reading a fenced example beside
+    a vague "add entry" and writing the block AS the file. That destroys the
+    catalog whatever the example contains. The prohibition is the fix, so it is
+    the thing worth holding in place.
+    """
+    catalog_text = template.split("### Catalog", 1)
+    assert len(catalog_text) == 2, "the Catalog section heading moved or went"
+    body = catalog_text[1]
+    assert "append" in body.lower(), (
+        "the Catalog section no longer tells the agent to APPEND; a bare "
+        "'add entry' beside a fenced example is read as 'write this file'")
+    assert "never rewrite" in template.lower(), (
+        "the prohibition on rewriting catalog.csv is gone")
