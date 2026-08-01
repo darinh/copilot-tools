@@ -59,6 +59,18 @@ it asking nicely. It is a vibe-wish, not a sandbox. Nothing prevents it from
 editing any file it can reach, and it will not know it strayed. If the boundary
 actually matters, use separate repositories.
 
+Sharing a project also puts two writers on one handoff file, and that has a
+consequence you cannot derive from the protocol: when two `handoff` calls race
+and one cannot take the lock, it publishes anyway rather than throw away a live
+session, and the losing handoff can end up only in
+`~/.copilot/projects/{guid}/superseded/`. So in a shared project
+`next-session.md` is not guaranteed to be the newest handoff. If `handoff`
+warned that another was in progress, say so in your final message — that
+warning goes to stderr and dies with your session — and read `superseded/`
+alongside `next-session.md` when you start. Neither archive is ever pruned;
+[the mechanism and both residual windows are in
+`docs/operator.md`](../../docs/operator.md#superseded-handoffs).
+
 ## Starting one
 
 Run from the directory the new agent should own:
