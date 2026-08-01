@@ -140,18 +140,16 @@ canon() { "$PYTHON_BIN" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))
 # Either way the original is renamed (never deleted outright), so a failed
 # or interrupted Python install below can never strand the user without a
 # working `operator`/`handoff` command: see restore_legacy_links() and the
-# INT/TERM trap right after this step.
+# INT/TERM trap, both of which are set up before the first rename happens.
 echo "Checking ~/.local/bin/{operator,handoff} before installing..."
 mkdir -p "$LOCAL_BIN"
 OPERATOR_BACKUP=""; OPERATOR_KIND=""
 HANDOFF_BACKUP=""; HANDOFF_KIND=""
 
 stash_legacy_link() {
-    # Sets STASH_RESULT to the backup path and STASH_KIND to "legacy" or
-    # "foreign" if something was set aside, or both to "" if there was
-    # nothing at $link to begin with.
-    STASH_RESULT=""
-    STASH_KIND=""
+    # Records the backup path and kind into OPERATOR_BACKUP/OPERATOR_KIND or
+    # HANDOFF_BACKUP/HANDOFF_KIND, or leaves them empty if there was nothing
+    # at $link to begin with.
     local name="$1" script="$2" link="${LOCAL_BIN}/${1}"
 
     if [[ -L "$link" && ! -e "$link" ]]; then
@@ -188,23 +186,23 @@ stash_legacy_link() {
         backup="${backup}.${n}"
     fi
     mv "$link" "$backup"
+    # Published in the same breath as the mv, and by the function rather than
+    # by the caller. restore_legacy_links reads these globals, so a signal
+    # arriving after the mv but before an assignment back in the caller would
+    # find them empty and restore nothing -- leaving the user's only copy
+    # sitting under a backup name with no record that it was ever moved. The
+    # gap is small; the loss it produces is permanent and silent.
+    if [[ "$name" == "operator" ]]; then
+        OPERATOR_BACKUP="$backup"; OPERATOR_KIND="$kind"
+    else
+        HANDOFF_BACKUP="$backup"; HANDOFF_KIND="$kind"
+    fi
     if [[ "$kind" == "legacy" ]]; then
         info "Set aside legacy symlink ${link} -> ${target} (finalized after install succeeds)"
     else
         warn "${link} doesn't point at this checkout's ${script} — moved existing '${name}' aside to ${backup} so it won't be silently overwritten (not auto-deleted)"
     fi
-    STASH_RESULT="$backup"
-    STASH_KIND="$kind"
 }
-
-stash_legacy_link operator operator.sh
-OPERATOR_BACKUP="$STASH_RESULT"; OPERATOR_KIND="$STASH_KIND"
-stash_legacy_link handoff handoff.sh
-HANDOFF_BACKUP="$STASH_RESULT"; HANDOFF_KIND="$STASH_KIND"
-if [[ -z "$OPERATOR_BACKUP" && -z "$HANDOFF_BACKUP" ]]; then
-    info "Nothing at ~/.local/bin/{operator,handoff} yet"
-fi
-echo ""
 
 restore_legacy_links() {
     local reason="$1"
@@ -218,9 +216,20 @@ restore_legacy_links() {
     fi
 }
 
-# A Ctrl-C (or kill) between the stash above and the commit/rollback below
-# must not leave the user with neither the old command nor the new one.
+# Armed BEFORE the first stash, not after both of them. A Ctrl-C (or kill)
+# between the stash below and the commit/rollback further down must not leave
+# the user with neither the old command nor the new one -- and the interval
+# that matters starts at the first `mv`, not once both have returned. Arming
+# it here is safe because both backup variables are empty until a stash fills
+# one in, and restore_legacy_links does nothing with an empty one.
 trap 'restore_legacy_links "setup interrupted"; exit 130' INT TERM
+
+stash_legacy_link operator operator.sh
+stash_legacy_link handoff handoff.sh
+if [[ -z "$OPERATOR_BACKUP" && -z "$HANDOFF_BACKUP" ]]; then
+    info "Nothing at ~/.local/bin/{operator,handoff} yet"
+fi
+echo ""
 
 # ── Step 3: Hand off to the cross-platform Python installer ────
 # Installs the operator/handoff/operator-ingest console scripts, runtime

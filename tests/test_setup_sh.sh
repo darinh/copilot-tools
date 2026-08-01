@@ -11,6 +11,8 @@ set -uo pipefail
 REAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SANDBOX_ROOT="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX_ROOT"' EXIT
+# Mirrors LEGACY_BACKUP_SUFFIX in setup.sh.
+LEGACY_BAK=".copilot-tools-legacy-bak"
 
 PASS=0
 FAIL=0
@@ -427,6 +429,78 @@ if [[ "$status" != "0" ]] \
 else
     fail "an install that creates no console scripts rolls back instead of deleting them"
     echo "----- output -----"; cat "${SANDBOX_ROOT}/last_output.log"; echo "------------------"
+fi
+
+# ── Scenario 13: Ctrl-C DURING the stash, before the install starts ──
+# Scenario 7 covers an interrupt once the install is running. This covers the
+# earlier interval: after the first `mv` has moved a command aside, but before
+# the stashing step has finished. The trap used to be armed only after BOTH
+# links were stashed, so a signal in between killed the script with the
+# operator already renamed to a .bak and nothing left at ~/.local/bin/operator
+# -- the user's only copy, orphaned under a name they have no reason to look
+# for, with no error saying so.
+#
+# The window is made deterministic rather than raced: `canon` shells out to
+# python twice per symlink, so a fake python3 that sleeps for exactly that
+# probe (and execs the real one for everything else) turns a millisecond gap
+# into seconds. The test waits for the operator backup to appear -- proof the
+# mv has happened -- and only then signals.
+new_scenario "scenario13"
+mkdir -p "${SCENARIO_HOME}/.local/bin" "${SCENARIO_HOME}/fakebin"
+REAL_PYTHON="$(command -v python3 || command -v python)"
+cat > "${SCENARIO_HOME}/fakebin/python3" <<FAKEEOF
+#!/usr/bin/env bash
+# Slow ONLY for canon()'s realpath probe: find_python's version check and the
+# installer itself must stay fast, or this stops being a test of the stash
+# window and becomes a test of the timeout.
+for a in "\$@"; do
+    case "\$a" in
+        *realpath*) sleep 2 ;;
+    esac
+done
+exec "${REAL_PYTHON}" "\$@"
+FAKEEOF
+chmod +x "${SCENARIO_HOME}/fakebin/python3"
+link_legacy
+write_stub_setup_tools "succeed"
+set -m
+HOME="$SCENARIO_HOME" PATH="${SCENARIO_HOME}/fakebin:${SCENARIO_HOME}/.local/bin:${PATH}" \
+    bash "${SCENARIO_CHECKOUT}/setup.sh" --yes >"${SANDBOX_ROOT}/last_output.log" 2>&1 &
+stash_pid=$!
+set +m
+operator_bak="${SCENARIO_HOME}/.local/bin/operator${LEGACY_BAK}"
+stashed=""
+for _ in $(seq 1 200); do
+    if [[ -L "$operator_bak" || -e "$operator_bak" ]]; then stashed=yes; break; fi
+    # Stop waiting if the script exited -- otherwise a setup.sh that never
+    # stashed at all would be reported as a timeout rather than as the
+    # different failure it is.
+    kill -0 "$stash_pid" 2>/dev/null || break
+    sleep 0.05
+done
+if [[ -z "$stashed" ]]; then
+    fail "Ctrl-C during the stash restores the command instead of orphaning it"
+    echo "  (the operator backup never appeared; the stash window was never entered)"
+    echo "----- output -----"; cat "${SANDBOX_ROOT}/last_output.log"; echo "------------------"
+else
+    pgid="$(ps -o pgid= -p "$stash_pid" 2>/dev/null | tr -d ' ')"
+    kill -INT "-${pgid:-$stash_pid}" 2>/dev/null
+    wait "$stash_pid" 2>/dev/null
+    stash_rc=$?
+    if [[ -L "${SCENARIO_HOME}/.local/bin/operator" ]] \
+        && [[ "$(readlink "${SCENARIO_HOME}/.local/bin/operator")" == "${SCENARIO_CHECKOUT}/operator.sh" ]] \
+        && [[ ! -e "$operator_bak" ]] \
+        && [[ -L "${SCENARIO_HOME}/.local/bin/handoff" ]] \
+        && [[ "$stash_rc" -ne 0 ]]; then
+        pass "Ctrl-C during the stash restores the command instead of orphaning it"
+    else
+        fail "Ctrl-C during the stash restores the command instead of orphaning it"
+        echo "  (exit status was ${stash_rc}; operator is $(
+            if [[ -L "${SCENARIO_HOME}/.local/bin/operator" ]]; then echo "a symlink"
+            elif [[ -e "${SCENARIO_HOME}/.local/bin/operator" ]]; then echo "a regular file"
+            else echo "MISSING -- orphaned at ${operator_bak}"; fi))"
+        echo "----- output -----"; cat "${SANDBOX_ROOT}/last_output.log"; echo "------------------"
+    fi
 fi
 
 echo ""
