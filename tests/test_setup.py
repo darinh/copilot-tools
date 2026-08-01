@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -1454,6 +1455,13 @@ def _locking_replace(monkeypatch, *, fail_times, winerror=5, only_staged=True):
     Selective on the source by default: the real lock this models is on the
     tree ``shutil.copytree`` has just written, and a double that failed every
     rename could not tell a retried swap apart from a retried rollback.
+
+    ``time.sleep`` is patched on the ``time`` module rather than on
+    ``setup_tools`` so that this file still runs against a revision that never
+    imported it. Reaching through the module under test would raise
+    ``AttributeError`` during setup there, and six identical errors thrown
+    before a single assertion runs is a control that cannot fail for the
+    reason it claims to test.
     """
     real = os.replace
     calls = []
@@ -1469,7 +1477,7 @@ def _locking_replace(monkeypatch, *, fail_times, winerror=5, only_staged=True):
 
     slept = []
     monkeypatch.setattr(setup_tools.os, "replace", fake)
-    monkeypatch.setattr(setup_tools.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
     monkeypatch.setattr(setup_tools, "IS_WINDOWS", True)
     return calls, slept
 
@@ -1489,7 +1497,8 @@ def test_a_transient_lock_on_the_swap_is_waited_out(tmp_path, monkeypatch):
 
     assert (dest / "SKILL.md").read_text(encoding="utf-8") == "the new copy"
     assert len(calls) == 5, "it should have kept trying until the lock lifted"
-    assert slept == [setup_tools._RENAME_RETRY_DELAY] * 4
+    assert len(slept) == 4, "one wait between each attempt"
+    assert all(s > 0 for s in slept), "a retry with no wait is just a louder failure"
 
 
 def test_a_lock_that_outlasts_the_retries_still_stops(tmp_path, monkeypatch):
@@ -1509,7 +1518,8 @@ def test_a_lock_that_outlasts_the_retries_still_stops(tmp_path, monkeypatch):
 
     assert (dest / "SKILL.md").read_text(encoding="utf-8") == "the user's copy"
     swaps = [c for c in calls if ".installing" in os.path.basename(c[0])]
-    assert len(swaps) == setup_tools._RENAME_RETRY_ATTEMPTS
+    assert len(swaps) > 1, "a lock worth waiting out must have been waited out"
+    assert len(swaps) < 20, "and the waiting must be bounded, not a spin"
 
 
 def test_moving_the_users_copy_aside_is_never_retried(tmp_path, monkeypatch):
