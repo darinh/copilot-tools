@@ -826,6 +826,33 @@ def test_every_control_names_the_probe_it_exercises() -> None:
     )
 
 
+def test_every_probe_in_the_registry_has_a_control() -> None:
+    """A probe nothing exercises is a line of documentation.
+
+    The floor scan grew this check first and this file did not, which left
+    the older and more load-bearing of the two registers unpinned: a
+    reviewer added ``is_symlink`` to PROBES and all 52 tests stayed green.
+    An entry can be added, mis-keyed, and never fire, and a passing suite
+    looks exactly the same as a clean tree.
+
+    ``os.path`` probes are named ``os.path.<fn>`` by the detector, so the two
+    registers are compared in the spelling each is reported in.
+    """
+    declared = set(EXERCISES.values())
+    expected = set(PROBES) | {f"os.path.{name}" for name in OSPATH_PROBES}
+    missing = sorted(expected - declared)
+    assert not missing, (
+        f"{len(missing)} probe(s) in the registry are never exercised by a "
+        f"positive control, so nothing would notice if the detector stopped "
+        f"matching them: {missing}\n"
+        f"  Add an entry to FIRES and EXERCISES for each."
+    )
+    unknown = sorted(declared - expected)
+    assert not unknown, (
+        f"controls declare probes that are not in the registry: {unknown}"
+    )
+
+
 @pytest.mark.parametrize(
     "name", [*sorted(PASSES), *sorted(PASSES_ABOVE_FLOOR)])
 def test_the_correct_spellings_still_pass(name: str) -> None:

@@ -396,6 +396,19 @@ def _feature_test_names(node: ast.expr) -> set[str]:
     while the two expressions had nothing to do with each other. Matching on
     tokens that appear *somewhere* in a name is the same error as a control
     asserting that *something* fired.
+
+    The receiver is not checked in the other direction either, which is an
+    accepted limit rather than an oversight: ``hasattr(sys, "file_digest")``
+    licenses ``hashlib.file_digest``, because both name ``file_digest`` and
+    nothing here knows that ``sys`` is the wrong object to ask. Tying the
+    guard to the receiver as well would need the receiver of the *use* site
+    too, and that is name resolution again — the aliased-module case alone
+    (``hasattr(hl, "file_digest")`` where ``hl`` is ``hashlib``) would start
+    producing false positives on correct code. Between a scan that misses
+    ``hasattr(sys, "file_digest")``, which nobody writes, and one that flags
+    a real guard because the module was imported under a name, the first is
+    the cheaper mistake. The guard was never a proof; it is evidence that
+    the author thought about whether that name exists.
     """
     names: set[str] = set()
     for child in ast.walk(node):
@@ -1350,12 +1363,15 @@ PASSES = {
     "an aliased import rebound to something else afterwards": (
         # `fd = None` is a Store, not a use. The alias register is keyed by
         # bare name, so without a context check this read as a call to the
-        # gated symbol on the assignment line.
+        # gated symbol on the assignment line. The rebinding sits deliberately
+        # OUTSIDE the version guard: the first version of this control put it
+        # in the `else`, where the whole branch is licensed anyway, so the
+        # control could not tell whether the context check was there at all -
+        # a mutation removing the check survived it.
         "import sys\n"
         "if sys.version_info >= (3, 11):\n"
         "    from hashlib import file_digest as fd\n"
-        "else:\n"
-        "    fd = None\n"
+        "fd = None\n"
     ),
     "a runtime flag that happens to be called TYPE_CHECKING": (
         # The mirror of the FIRES entry: narrowing TYPE_CHECKING to typing's
