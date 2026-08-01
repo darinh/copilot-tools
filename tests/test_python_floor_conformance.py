@@ -712,11 +712,24 @@ class _FloorFinder(ast.NodeVisitor):
 
         The value is visited outside the flag: it is an ordinary expression
         and its own contexts mean what they say.
+
+        The span is set here for the same reason :meth:`generic_visit` sets
+        it for every other statement. Overriding the visitor took this
+        statement off that path, and at module level nothing showed: ``span``
+        is ``None`` there and :meth:`_record` falls back to the hit's own
+        line, which is the right answer by accident. Inside a function the
+        enclosing ``def`` has already set a span, so the annotation lookup
+        was handed the ``def`` line and a ``# floor-ok:`` on the augmented
+        assignment stopped working. Both ``+=`` controls were written at
+        module level, so none of them could see it — a reviewer did.
         """
+        outer = self.span
+        self.span = _header_span(node)
         self.augmented += 1
         self.visit(node.target)
         self.augmented -= 1
         self.visit(node.value)
+        self.span = outer
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         # A Store is not a use, with one exception. Measured on 3.10.20:
@@ -1623,6 +1636,34 @@ PASSES = {
         "for Path.walk in []:\n"
         "    pass\n"
         "first, Path.walk = 1, 2\n"
+    ),
+    "an augmented assignment annotated inside a function, above the line": (
+        # Both `+=` controls in FIRES sit at module level, where `self.span`
+        # is None and `_record` falls back to the hit's own line - so they
+        # pass whether or not `visit_AugAssign` maintains a span. Inside a
+        # function the enclosing `def` has already set one, and overriding
+        # the visitor took this statement off `generic_visit`'s span path,
+        # so the annotation lookup was handed the `def` line. The scope is
+        # the whole point of this control: at module level it proves nothing.
+        "import hashlib\n"
+        "def f():\n"
+        "    # floor-ok: only reached from the 3.11 fast path\n"
+        "    hashlib.file_digest += 1\n"
+    ),
+    "an augmented assignment annotated inside a function, on the line": (
+        # The inline half: `_annotation_in` looks in the statement's own
+        # header span as well as the block above it, and the header span is
+        # exactly what was wrong.
+        "from pathlib import Path\n"
+        "def f():\n"
+        "    Path.walk += 1  # floor-ok: 3.12-only fast path\n"
+    ),
+    "an augmented assignment guarded by a version test inside a function": (
+        "import sys\n"
+        "import hashlib\n"
+        "def f():\n"
+        "    if sys.version_info >= (3, 11):\n"
+        "        hashlib.file_digest += 1\n"
     ),
     "an annotated use with a real reason": (
         "import hashlib\n"
