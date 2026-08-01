@@ -234,6 +234,56 @@ def remove_file(path: Path) -> bool:
         return False
 
 
+@contextmanager
+def _exclusive_lock(path: Path):
+    """Yield True when this process took ``path`` as a lock, False otherwise.
+
+    ``O_CREAT|O_EXCL`` is the one creation primitive that is atomic on both
+    POSIX and Windows, which is what makes it a lock rather than another
+    check-then-act. A lock whose recorded pid is *readable* and dead is stale
+    -- the holder crashed mid-operation -- and is reclaimed once. A lock whose
+    owner cannot be read is not: ``os.open`` creates the file empty and the
+    pid lands a moment later, so an unparseable lock is most likely one being
+    taken right now, and deleting it would hand the same lock to two
+    processes. Refusing there can jam a lock whose holder died inside that
+    window; that is the trade, and a jam says so in the log while a double
+    acquisition does not.
+    """
+    acquired = False
+    try:
+        for _ in range(2):
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    recorded = path.read_text(encoding="utf-8").strip()
+                except OSError as exc:
+                    log(f"  Lock {path.name} exists and could not be read "
+                        f"({exc}) — treating it as held")
+                    break
+                try:
+                    holder = int(recorded)
+                except ValueError:
+                    log(f"  Lock {path.name} names no owner — treating it as "
+                        f"held. If nothing is running, remove {path}")
+                    break
+                if _pid_alive(holder):
+                    break
+                remove_file(path)
+                continue
+            except OSError:
+                break
+            else:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(str(os.getpid()))
+                acquired = True
+                break
+        yield acquired
+    finally:
+        if acquired:
+            remove_file(path)
+
+
 def marker_state(path: Path) -> bool | None:
     """Tri-state read of a supervisor signal file, warning once per path.
 
@@ -311,44 +361,64 @@ def clear_tab_progress() -> None:
 atexit.register(clear_tab_progress)
 
 
+def _move_legacy(src: Path, dest: Path) -> bool:
+    """Move ``src`` onto ``dest``, gated and logged. True when it moved.
+
+    The gate is the destination being *definitely* absent: a destination that
+    merely cannot be examined must not be moved onto, because ``shutil.move``
+    replaces a file it lands on and the one copy of the user's metrics or
+    backups would be gone.
+
+    Failures are logged rather than passed over. This function moves the
+    user's data; "it silently did nothing" and "it silently did the wrong
+    thing" are indistinguishable afterwards if neither says anything.
+    """
+    state = path_present(dest)
+    if state is None:
+        log(f"  Not migrating {src.name}: could not examine {dest}")
+        return False
+    if state:
+        return False
+    try:
+        shutil.move(str(src), str(dest))
+        return True
+    except (OSError, shutil.Error) as exc:
+        log(f"  Could not migrate {src} to {dest}: {exc}")
+        return False
+
+
 def migrate_legacy_state() -> None:
     """One-time move of state out of ~/.copilot, which the CLI deletes.
 
-    Every move is gated on the destination being *definitely* absent. A
-    destination that merely cannot be examined must not be moved onto: on a
-    file, ``shutil.move`` replaces it, and the one copy of the user's metrics
-    or backups would be gone.
+    Held under an exclusive lock, because probing a destination and then
+    moving onto it are two syscalls and a tri-state probe only fixes the
+    first one. A machine running a loop per project starts many operators at
+    once; without the lock they interleave between the check and the move, and
+    on POSIX a directory that appeared absent to both ends up nested inside
+    itself rather than moved. The loser of the race finds the work already
+    done, which is the correct outcome for a one-time migration.
     """
     RESTART_DIR.mkdir(parents=True, exist_ok=True)
-    moved = 0
-    if dir_present(LEGACY_RESTART_DIR) and LEGACY_RESTART_DIR != RESTART_DIR:
-        try:
-            legacy_items = list(LEGACY_RESTART_DIR.iterdir())
-        except OSError:
-            legacy_items = []
-        for src in legacy_items:
-            dest = RESTART_DIR / src.name
-            if path_present(dest) is False:
-                try:
-                    shutil.move(str(src), str(dest))
-                    moved += 1
-                except (OSError, shutil.Error):
-                    pass
-    for src, dest in ((LEGACY_LOG_FILE, LOG_FILE), (LEGACY_METRICS_DB, METRICS_DB)):
-        if file_present(src) and path_present(dest) is False:
+    with _exclusive_lock(OPERATOR_HOME / "migrate.lock") as acquired:
+        if not acquired:
+            return
+        moved = 0
+        if dir_present(LEGACY_RESTART_DIR) and LEGACY_RESTART_DIR != RESTART_DIR:
             try:
-                shutil.move(str(src), str(dest))
-                moved += 1
-            except (OSError, shutil.Error):
-                pass
-    if dir_present(LEGACY_BACKUPS_DIR) and path_present(BACKUPS_DIR) is False:
-        try:
-            shutil.move(str(LEGACY_BACKUPS_DIR), str(BACKUPS_DIR))
-            moved += 1
-        except (OSError, shutil.Error):
-            pass
-    if moved:
-        log(f"Migrated {moved} legacy state item(s) into {OPERATOR_HOME}")
+                legacy_items = list(LEGACY_RESTART_DIR.iterdir())
+            except OSError as exc:
+                log(f"  Could not list {LEGACY_RESTART_DIR}: {exc}")
+                legacy_items = []
+            for src in legacy_items:
+                moved += _move_legacy(src, RESTART_DIR / src.name)
+        for src, dest in ((LEGACY_LOG_FILE, LOG_FILE),
+                          (LEGACY_METRICS_DB, METRICS_DB)):
+            if file_present(src):
+                moved += _move_legacy(src, dest)
+        if dir_present(LEGACY_BACKUPS_DIR):
+            moved += _move_legacy(LEGACY_BACKUPS_DIR, BACKUPS_DIR)
+        if moved:
+            log(f"Migrated {moved} legacy state item(s) into {OPERATOR_HOME}")
 
 
 # ── instance ────────────────────────────────────────────────────
@@ -535,15 +605,24 @@ class Instance:
             remove_file(path)
 
 
-def managed_instances() -> dict[str, dict]:
-    """Map instance id -> ownership metadata for every managed instance."""
+def read_managed_instances() -> dict[str, dict] | None:
+    """Managed instances, or None when the state directory could not be read.
+
+    The distinction matters to anything deciding *who is present*. An empty
+    map and a failed listing look identical to a caller and mean opposite
+    things, and one of them is a licence to act as though nobody else is
+    here.
+    """
     found: dict[str, dict] = {}
-    if not dir_present(RESTART_DIR):
+    present = dir_present(RESTART_DIR)
+    if present is None:
+        return None
+    if not present:
         return found
     try:
         entries = list(RESTART_DIR.iterdir())
     except OSError:
-        return found
+        return None
     for path in entries:
         if path.suffix == ".managed":
             ident = path.name[: -len(".managed")]
@@ -558,6 +637,17 @@ def managed_instances() -> dict[str, dict]:
             except (OSError, ValueError):
                 pass
     return found
+
+
+def managed_instances() -> dict[str, dict]:
+    """Managed instances as far as they can be listed; unreadable reads empty.
+
+    Only for callers that display or look up a known id. Anything deciding
+    whether somebody *else* is here must use :func:`read_managed_instances`
+    and refuse on None.
+    """
+    found = read_managed_instances()
+    return {} if found is None else found
 
 
 # ── tab registry ────────────────────────────────────────────────
@@ -1661,36 +1751,10 @@ def _restart_handoff_lock(instance: Instance):
     """Serialise supervisor handoffs for one instance.
 
     Yields True when the lock was taken, False when another handoff is
-    already in progress. Uses O_CREAT|O_EXCL because it is the one primitive
-    that is atomic on both POSIX and Windows; a lock whose recorded pid is
-    gone is stale (the holder crashed) and is reclaimed.
+    already in progress.
     """
-    path = instance.restart_lock_file
-    acquired = False
-    try:
-        for _ in range(2):
-            try:
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                holder = None
-                try:
-                    holder = int(path.read_text(encoding="utf-8").strip())
-                except (OSError, ValueError):
-                    pass
-                if holder is not None and _pid_alive(holder):
-                    break
-                # Stale: the holder died mid-handoff. Reclaim and retry once.
-                remove_file(path)
-                continue
-            else:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(str(os.getpid()))
-                acquired = True
-                break
+    with _exclusive_lock(instance.restart_lock_file) as acquired:
         yield acquired
-    finally:
-        if acquired:
-            remove_file(path)
 
 
 def restart_loop(target: str | None) -> int:
@@ -2255,13 +2319,14 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
     # directory or an unreadable tab registry would otherwise shrink `known`
     # silently, and `known` is what decides whether an unplaceable instance
     # is one of ours.
-    if dir_present(RESTART_DIR) is None:
+    managed = read_managed_instances()
+    if managed is None:
         return None
     tabs = read_tabs()
     if tabs is None:
         return None
 
-    known = set(managed_instances()) | set(tabs)
+    known = set(managed) | set(tabs)
     found: list[str] = []
     for ident in live:
         try:

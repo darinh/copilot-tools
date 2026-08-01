@@ -898,6 +898,38 @@ def test_an_unexaminable_state_directory_fails_the_census(tmp_path,
     assert seen["n"] > 0, "the denial never fired; the test proves nothing"
 
 
+def test_a_state_directory_that_will_not_list_fails_the_census(tmp_path,
+                                                               monkeypatch):
+    """Statting the directory is not reading it.
+
+    ``managed_instances`` swallowed a failed ``iterdir`` into an empty map, so
+    a directory that stats fine and lists EACCES still produced a confident
+    census drawn from a population missing its members.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent-x", launch=None)
+    mux = RecordingMux(sessions=[peer.id], paths={peer.id: None})
+    monkeypatch.setattr(op, "MUX", mux)
+    assert op.live_instance_ids_under(project) == [peer.id]
+
+    real_iterdir = Path.iterdir
+    seen = {"n": 0}
+
+    def unlistable(self):
+        if str(self) == str(op.RESTART_DIR):
+            seen["n"] += 1
+            raise PermissionError(13, "Permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", unlistable)
+    try:
+        assert op.live_instance_ids_under(project) is None
+    finally:
+        monkeypatch.setattr(Path, "iterdir", real_iterdir)
+    assert seen["n"] > 0, "the denial never fired; the test proves nothing"
+
+
 def test_a_name_bound_somewhere_we_cannot_read_is_treated_as_taken(
         tmp_path, monkeypatch):
     """`_name_conflicts` guards against two agents sharing a name. An

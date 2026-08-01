@@ -1,0 +1,2028 @@
+diff --git a/copilot_operator.py b/copilot_operator.py
+index c90d9a5..236fedb 100644
+--- a/copilot_operator.py
++++ b/copilot_operator.py
+@@ -29,6 +29,7 @@ import shlex
+ import shutil
+ import signal
+ import sqlite3
++import stat as stat_module
+ import subprocess
+ import sys
+ import time
+@@ -49,6 +50,7 @@ if _HERE not in sys.path:
+ 
+ import operator_ingest                                       # noqa: E402
+ import operator_mail                                         # noqa: E402
++from install_manifest import path_present                     # noqa: E402
+ from operator_console import enable_utf8_output               # noqa: E402
+ from operator_mux import (                                    # noqa: E402
+     Mux, MuxError, MuxNotFoundError, safe_instance_id,
+@@ -153,6 +155,157 @@ def utcnow() -> str:
+     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+ 
+ 
++# ── presence probes ─────────────────────────────────────────────
++# Every *read* in this module already treats "could not read" as a
++# non-answer (`except OSError: return None`). Presence checks were the
++# exception: `Path.exists`/`is_dir`/`is_file` raise on anything outside
++# pathlib's small ignore list -- EACCES, and on Windows a sharing violation
++# from a scanner holding the file open -- so a probe that used to be a
++# one-line question could end the process. In the supervisor's poll loop that
++# is fatal in the literal sense: the loop only catches KeyboardInterrupt, so
++# one unlucky stat on a marker file stops the unattended restarts this whole
++# program exists to provide. See :func:`install_manifest.path_present` for
++# which error codes lie in which direction.
++#
++# The tri-state answer is deliberate. "Cannot tell" must not share a return
++# value with "absent", because absent is what licenses overwriting a file or
++# concluding a session has ended.
++
++#: Paths already reported as unexaminable, so a permanent failure is logged
++#: once per process rather than once per poll.
++_PROBE_WARNED: set[str] = set()
++
++
++def dir_present(path: Path) -> bool | None:
++    """Whether ``path`` is a directory: True, False, or None for "cannot tell".
++
++    Follows symlinks, since a link to a directory is usable as one.
++    """
++    try:
++        return stat_module.S_ISDIR(os.stat(path).st_mode)
++    except (FileNotFoundError, NotADirectoryError):
++        return False
++    except (OSError, ValueError):
++        return None
++
++
++def file_present(path: Path) -> bool | None:
++    """Whether ``path`` is a regular file: True, False, or None."""
++    try:
++        return stat_module.S_ISREG(os.stat(path).st_mode)
++    except (FileNotFoundError, NotADirectoryError):
++        return False
++    except (OSError, ValueError):
++        return None
++
++
++class _Unplaceable:
++    """Sentinel: the lookup failed, which is not the same as finding nothing.
++
++    Handed back by ``_tracked_cwd_for_id`` so a caller deciding who is present
++    cannot mistake "the records would not open" for "there is no record".
++    """
++
++    __slots__ = ()
++
++    def __repr__(self) -> str:  # pragma: no cover - debugging aid
++        return "<unplaceable>"
++
++
++UNPLACEABLE = _Unplaceable()
++
++
++def remove_file(path: Path) -> bool:
++    """Delete ``path`` if we can; report whether it is gone.
++
++    ``unlink(missing_ok=True)`` only forgives a file that was already absent.
++    Every caller here is cleaning up state it no longer wants, and a marker
++    held open by a scanner or sitting on a denied path is a reason to move on,
++    not to end the process with a traceback -- least of all the supervisor's
++    shutdown path, which runs when something has already gone wrong.
++    """
++    try:
++        path.unlink()
++        return True
++    except (FileNotFoundError, NotADirectoryError):
++        return True
++    except OSError as exc:
++        log(f"  Could not remove {path.name}: {exc}")
++        return False
++
++
++@contextmanager
++def _exclusive_lock(path: Path):
++    """Yield True when this process took ``path`` as a lock, False otherwise.
++
++    ``O_CREAT|O_EXCL`` is the one creation primitive that is atomic on both
++    POSIX and Windows, which is what makes it a lock rather than another
++    check-then-act. A lock whose recorded pid is gone is stale -- the holder
++    crashed mid-operation -- and is reclaimed once.
++    """
++    acquired = False
++    try:
++        for _ in range(2):
++            try:
++                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
++            except FileExistsError:
++                holder = None
++                try:
++                    holder = int(path.read_text(encoding="utf-8").strip())
++                except (OSError, ValueError):
++                    pass
++                if holder is not None and _pid_alive(holder):
++                    break
++                remove_file(path)
++                continue
++            except OSError:
++                break
++            else:
++                with os.fdopen(fd, "w", encoding="utf-8") as fh:
++                    fh.write(str(os.getpid()))
++                acquired = True
++                break
++        yield acquired
++    finally:
++        if acquired:
++            remove_file(path)
++
++
++def marker_state(path: Path) -> bool | None:
++    """Tri-state read of a supervisor signal file, warning once per path.
++
++    None means the probe failed: the marker may or may not be set and the
++    caller has to decide what to do about not knowing. Most callers can wait
++    for the next poll; the one that cannot is crash recovery, which would
++    otherwise read "cannot tell" as "nobody asked me to stop".
++    """
++    present = path_present(path)
++    key = str(path)
++    if present is None:
++        if key not in _PROBE_WARNED:
++            _PROBE_WARNED.add(key)
++            log(f"  Could not examine {path.name} — treating it as unset and "
++                f"re-checking next poll")
++        return None
++    _PROBE_WARNED.discard(key)
++    return bool(present)
++
++
++def marker_set(path: Path) -> bool:
++    """True only when a marker file is definitely there.
++
++    Used by the supervisor for signal files it polls. A probe that cannot
++    answer reports "no signal yet" and lets the next poll ask again, which is
++    the only outcome that keeps the loop alive; the alternatives are killing
++    the supervisor with a traceback or acting on a signal nobody sent.
++
++    Callers that would take an irreversible branch on the False must use
++    ``marker_state`` instead: "no marker" and "no answer" only mean the same
++    thing when the consequence of being wrong is one more poll.
++    """
++    return marker_state(path) is True
++
++
+ def set_tab_title(title: str) -> None:
+     if sys.stdout.isatty():
+         sys.stdout.write(f"\033]0;{title}\007")
+@@ -195,34 +348,64 @@ def clear_tab_progress() -> None:
+ atexit.register(clear_tab_progress)
+ 
+ 
++def _move_legacy(src: Path, dest: Path) -> bool:
++    """Move ``src`` onto ``dest``, gated and logged. True when it moved.
++
++    The gate is the destination being *definitely* absent: a destination that
++    merely cannot be examined must not be moved onto, because ``shutil.move``
++    replaces a file it lands on and the one copy of the user's metrics or
++    backups would be gone.
++
++    Failures are logged rather than passed over. This function moves the
++    user's data; "it silently did nothing" and "it silently did the wrong
++    thing" are indistinguishable afterwards if neither says anything.
++    """
++    state = path_present(dest)
++    if state is None:
++        log(f"  Not migrating {src.name}: could not examine {dest}")
++        return False
++    if state:
++        return False
++    try:
++        shutil.move(str(src), str(dest))
++        return True
++    except (OSError, shutil.Error) as exc:
++        log(f"  Could not migrate {src} to {dest}: {exc}")
++        return False
++
++
+ def migrate_legacy_state() -> None:
+-    """One-time move of state out of ~/.copilot, which the CLI deletes."""
++    """One-time move of state out of ~/.copilot, which the CLI deletes.
++
++    Held under an exclusive lock, because probing a destination and then
++    moving onto it are two syscalls and a tri-state probe only fixes the
++    first one. A machine running a loop per project starts many operators at
++    once; without the lock they interleave between the check and the move, and
++    on POSIX a directory that appeared absent to both ends up nested inside
++    itself rather than moved. The loser of the race finds the work already
++    done, which is the correct outcome for a one-time migration.
++    """
+     RESTART_DIR.mkdir(parents=True, exist_ok=True)
+-    moved = 0
+-    if LEGACY_RESTART_DIR.is_dir() and LEGACY_RESTART_DIR != RESTART_DIR:
+-        for src in list(LEGACY_RESTART_DIR.iterdir()):
+-            dest = RESTART_DIR / src.name
+-            if not dest.exists():
+-                try:
+-                    shutil.move(str(src), str(dest))
+-                    moved += 1
+-                except (OSError, shutil.Error):
+-                    pass
+-    for src, dest in ((LEGACY_LOG_FILE, LOG_FILE), (LEGACY_METRICS_DB, METRICS_DB)):
+-        if src.is_file() and not dest.exists():
++    with _exclusive_lock(OPERATOR_HOME / "migrate.lock") as acquired:
++        if not acquired:
++            return
++        moved = 0
++        if dir_present(LEGACY_RESTART_DIR) and LEGACY_RESTART_DIR != RESTART_DIR:
+             try:
+-                shutil.move(str(src), str(dest))
+-                moved += 1
+-            except (OSError, shutil.Error):
+-                pass
+-    if LEGACY_BACKUPS_DIR.is_dir() and not BACKUPS_DIR.exists():
+-        try:
+-            shutil.move(str(LEGACY_BACKUPS_DIR), str(BACKUPS_DIR))
+-            moved += 1
+-        except (OSError, shutil.Error):
+-            pass
+-    if moved:
+-        log(f"Migrated {moved} legacy state item(s) into {OPERATOR_HOME}")
++                legacy_items = list(LEGACY_RESTART_DIR.iterdir())
++            except OSError as exc:
++                log(f"  Could not list {LEGACY_RESTART_DIR}: {exc}")
++                legacy_items = []
++            for src in legacy_items:
++                moved += _move_legacy(src, RESTART_DIR / src.name)
++        for src, dest in ((LEGACY_LOG_FILE, LOG_FILE),
++                          (LEGACY_METRICS_DB, METRICS_DB)):
++            if file_present(src):
++                moved += _move_legacy(src, dest)
++        if dir_present(LEGACY_BACKUPS_DIR):
++            moved += _move_legacy(LEGACY_BACKUPS_DIR, BACKUPS_DIR)
++        if moved:
++            log(f"Migrated {moved} legacy state item(s) into {OPERATOR_HOME}")
+ 
+ 
+ # ── instance ────────────────────────────────────────────────────
+@@ -323,13 +506,24 @@ class Instance:
+         os.replace(tmp, self.managed_file)
+ 
+     def ownership(self) -> dict | None:
+-        if not self.managed_file.exists():
++        # "Cannot examine" answers the same as "no claim": ownership is what
++        # authorizes destroying a session, so anything short of a claim we can
++        # actually read must refuse.
++        if path_present(self.managed_file) is not True:
+             return None
+         try:
+             return json.loads(self.managed_file.read_text(encoding="utf-8"))
+-        except (OSError, ValueError):
+-            # A legacy or truncated marker: present but tokenless.
++        except ValueError:
++            # A legacy or truncated marker: it read fine, it just says
++            # nothing. Present but tokenless.
+             return {"token": None, "display_name": self.display_name}
++        except OSError:
++            # Something is there but we could not read it — a dangling
++            # symlink, a directory, a denied file. Returning the tokenless
++            # dict here would hand out ownership on the strength of a claim
++            # nobody managed to read, and ownership is what authorizes
++            # killing a session.
++            return None
+ 
+     def owns_live_session(self) -> bool:
+         """True only when this operator's claim matches a session that exists.
+@@ -347,9 +541,13 @@ class Instance:
+     def is_managed(self) -> bool:
+         """True when this instance has operator state of any kind.
+ 
+-        Used for listing and continuity only — never to authorize a kill.
++        Used for listing and continuity only — never to authorize a kill, so
++        state that cannot be examined counts as present: reporting "no such
++        instance" for state that is really there is the misleading answer, and
++        every destructive path re-checks ownership anyway.
+         """
+-        return self.managed_file.exists() or self.state_file.exists()
++        return (path_present(self.managed_file) is not False
++                or path_present(self.state_file) is not False)
+ 
+     # -- persisted state
+     def save_state(self, session_num: int, run_started: str, session_id: str = "") -> None:
+@@ -361,7 +559,7 @@ class Instance:
+         os.replace(tmp, self.state_file)
+ 
+     def load_state(self) -> dict | None:
+-        if not self.state_file.exists():
++        if path_present(self.state_file) is False:
+             return None
+         state: dict[str, str] = {}
+         try:
+@@ -391,15 +589,19 @@ class Instance:
+                      self.pid_file, self.exit_file, self.session_file,
+                      self.loop_pid_file, self.detach_marker, self.stop_marker,
+                      self.loop_args_file, self.restart_lock_file):
+-            path.unlink(missing_ok=True)
++            remove_file(path)
+ 
+ 
+ def managed_instances() -> dict[str, dict]:
+     """Map instance id -> ownership metadata for every managed instance."""
+     found: dict[str, dict] = {}
+-    if not RESTART_DIR.is_dir():
++    if not dir_present(RESTART_DIR):
+         return found
+-    for path in RESTART_DIR.iterdir():
++    try:
++        entries = list(RESTART_DIR.iterdir())
++    except OSError:
++        return found
++    for path in entries:
+         if path.suffix == ".managed":
+             ident = path.name[: -len(".managed")]
+         elif path.suffix == ".state":
+@@ -422,16 +624,32 @@ def managed_instances() -> dict[str, dict]:
+ # After a reboot or crash every process is gone, but this file survives, and
+ # `operator restore` replays each entry in a fresh tab — the existing
+ # auto-continue/--resume logic then picks the Copilot session back up.
+-def load_tabs() -> dict[str, dict]:
+-    if not TABS_FILE.exists():
++def read_tabs() -> dict | None:
++    """The tab registry, or None when it exists but could not be read.
++
++    The distinction matters because the registry is rewritten whole. Treating
++    an unreadable file as an empty one would let the next ``register_tab``
++    replace every other tab's restore record with a single entry.
++    """
++    if path_present(TABS_FILE) is False:
+         return {}
+     try:
+         data = json.loads(TABS_FILE.read_text(encoding="utf-8"))
+     except (OSError, ValueError):
+-        return {}
++        return None
+     return data if isinstance(data, dict) else {}
+ 
+ 
++def load_tabs() -> dict[str, dict]:
++    """The tab registry as far as it can be read; unreadable reads as empty.
++
++    Only for callers that display or filter. Anything that writes the file
++    back must use :func:`read_tabs` and refuse the write on None.
++    """
++    entries = read_tabs()
++    return {} if entries is None else entries
++
++
+ def save_tabs(entries: dict[str, dict]) -> None:
+     OPERATOR_HOME.mkdir(parents=True, exist_ok=True)
+     tmp = TABS_FILE.with_suffix(".json.tmp")
+@@ -453,7 +671,13 @@ def register_tab(instance: Instance, loop_mode: bool,
+         return
+     argv = ["--loop"] if loop_mode else []
+     argv += ["--name", instance.display_name, *copilot_args]
+-    entries = load_tabs()
++    entries = read_tabs()
++    if entries is None:
++        # Rewriting the file from what we could not read would drop every
++        # other tab. Losing one tab's restore record is the smaller loss.
++        log(f"  Could not read {TABS_FILE.name} — not recording this tab, so "
++            f"the tabs already in it survive")
++        return
+     entries[instance.id] = {
+         "display_name": instance.display_name,
+         "cwd": str(cwd),
+@@ -856,7 +1080,27 @@ def _usd(predicate: str = "1") -> str:
+ 
+ 
+ def report_metrics(subcmd: str = "summary") -> int:
+-    if not METRICS_DB.exists():
++    try:
++        return _report_metrics(subcmd)
++    except sqlite3.Error as exc:
++        # A file is there but sqlite cannot make sense of it: truncated,
++        # locked, or not a database at all. That is a bad report, not a
++        # crashed CLI.
++        print(f"Could not read the metrics database at {METRICS_DB}: {exc}",
++              file=sys.stderr)
++        return 1
++
++
++def _report_metrics(subcmd: str = "summary") -> int:
++    state = file_present(METRICS_DB)
++    if state is None:
++        # Connecting anyway would create a database at whatever the path
++        # really points at -- through a dangling symlink, that is a brand new
++        # empty file somewhere else and every query below fails on it.
++        print(f"Could not examine the metrics database at {METRICS_DB}.",
++              file=sys.stderr)
++        return 1
++    if not state:
+         print(f"No metrics database found at {METRICS_DB}")
+         print("Run the operator first to start collecting metrics.")
+         return 1
+@@ -963,28 +1207,37 @@ def report_metrics(subcmd: str = "summary") -> int:
+ 
+ 
+ def show_run_summary(run_started: str) -> None:
+-    if not run_started or not METRICS_DB.exists():
++    if not run_started or file_present(METRICS_DB) is not True:
+         return
+     print("\n═══ Operator Run Summary ═══\n")
+-    rows, headers = _query(f"""
+-        SELECT COUNT(*) AS sessions,
+-               printf('%.1f', {_credits()}) AS credits,
+-               printf('$%.2f', {_usd()}) AS est_cost,
+-               COALESCE(SUM(api_time_seconds) || 's','—') AS total_api_time,
+-               COALESCE({_fmt_duration_sql('SUM(session_time_seconds)')},'—') AS total_sess_time,
+-               COALESCE('+' || SUM(lines_added) || ' -' || SUM(lines_removed),
+-                        '—') AS total_changes
+-        FROM sessions WHERE no_op = 0 AND ended_at >= ?
+-    """, (run_started,))
++    try:
++        rows, headers = _query(f"""
++            SELECT COUNT(*) AS sessions,
++                   printf('%.1f', {_credits()}) AS credits,
++                   printf('$%.2f', {_usd()}) AS est_cost,
++                   COALESCE(SUM(api_time_seconds) || 's','—') AS total_api_time,
++                   COALESCE({_fmt_duration_sql('SUM(session_time_seconds)')},'—') AS total_sess_time,
++                   COALESCE('+' || SUM(lines_added) || ' -' || SUM(lines_removed),
++                            '—') AS total_changes
++            FROM sessions WHERE no_op = 0 AND ended_at >= ?
++        """, (run_started,))
++    except sqlite3.Error as exc:
++        # This runs on every shutdown path. A summary that cannot be read is
++        # not a reason to end a clean shutdown with a traceback.
++        print(f"  (metrics unavailable: {exc})")
++        return
+     print(_table(rows, headers))
+-    rows, headers = _query(f"""
+-        SELECT m.model_name AS model,
+-               printf('%.1f', COALESCE(SUM(m.nano_aiu),0) / {_NANO}.0) AS credits,
+-               COUNT(*) AS uses
+-        FROM model_usage m JOIN sessions s ON m.session_id = s.id
+-        WHERE s.no_op = 0 AND s.ended_at >= ?
+-        GROUP BY m.model_name ORDER BY SUM(m.nano_aiu) DESC
+-    """, (run_started,))
++    try:
++        rows, headers = _query(f"""
++            SELECT m.model_name AS model,
++                   printf('%.1f', COALESCE(SUM(m.nano_aiu),0) / {_NANO}.0) AS credits,
++                   COUNT(*) AS uses
++            FROM model_usage m JOIN sessions s ON m.session_id = s.id
++            WHERE s.no_op = 0 AND s.ended_at >= ?
++            GROUP BY m.model_name ORDER BY SUM(m.nano_aiu) DESC
++        """, (run_started,))
++    except sqlite3.Error:
++        return
+     if rows:
+         print()
+         print(_table(rows, headers))
+@@ -1007,7 +1260,7 @@ def project_handoff_file(cwd: Path) -> Path | None:
+     finds the project's real entry instead of reporting it unregistered.
+     """
+     catalog = project_catalog_path()
+-    if not catalog.is_file():
++    if not file_present(catalog):
+         return None
+     target = str(primary_repo_root(cwd).resolve())
+     if IS_WINDOWS:
+@@ -1130,9 +1383,9 @@ def start_session(instance: Instance, copilot_args: list[str], session_num: int,
+         argv += ["-i", preamble]
+     argv = _ensure_usage_logging(argv)
+ 
+-    instance.restart_marker.unlink(missing_ok=True)
+-    instance.exit_file.unlink(missing_ok=True)
+-    instance.session_file.unlink(missing_ok=True)
++    remove_file(instance.restart_marker)
++    remove_file(instance.exit_file)
++    remove_file(instance.session_file)
+ 
+     spec = write_launch_spec(instance, argv, cwd, session_num)
+ 
+@@ -1152,7 +1405,7 @@ def start_session(instance: Instance, copilot_args: list[str], session_num: int,
+     for _ in range(30):
+         if instance.copilot_pid() is not None:
+             break
+-        if instance.exit_file.exists():
++        if path_present(instance.exit_file) is True:
+             break
+         time.sleep(0.2)
+ 
+@@ -1235,7 +1488,7 @@ def _running_loop_pid(instance: Instance) -> int | None:
+         return None
+     if _pid_alive(pid):
+         return pid
+-    instance.loop_pid_file.unlink(missing_ok=True)
++    remove_file(instance.loop_pid_file)
+     return None
+ 
+ 
+@@ -1252,8 +1505,12 @@ def is_copilot_running(instance: Instance) -> bool:
+ 
+     Omitting ``pane_dead`` lets loop mode poll forever when the runner dies
+     without writing its marker.
++
++    Only a marker we can actually see ends the session. A probe that fails
++    says nothing about whether Copilot is alive, and answering "exited" would
++    make the supervisor tear down and relaunch a perfectly healthy session.
+     """
+-    if instance.exit_file.exists():
++    if path_present(instance.exit_file) is True:
+         return False
+     if not MUX.has_session(instance.session):
+         return False
+@@ -1294,7 +1551,7 @@ def stop_session_gracefully(instance: Instance) -> None:
+     MUX.kill_session(instance.session)
+     # Give the runner a moment to finish writing metrics.
+     for _ in range(10):
+-        if instance.exit_file.exists():
++        if path_present(instance.exit_file) is True:
+             break
+         time.sleep(0.5)
+ 
+@@ -1400,7 +1657,7 @@ def stop_operator(target: str | None = None) -> int:
+                 print(f"Failed to stop session '{instance.session}'.", file=sys.stderr)
+                 return 1
+         instance.cleanup_files()
+-        instance.state_file.unlink(missing_ok=True)
++        remove_file(instance.state_file)
+         remove_tab(instance.id)
+         log(f"Stopped: {target}")
+         return 0
+@@ -1420,7 +1677,7 @@ def stop_operator(target: str | None = None) -> int:
+             log(f"  Failed to stop {ident}")
+             continue
+         inst.cleanup_files()
+-        inst.state_file.unlink(missing_ok=True)
++        remove_file(inst.state_file)
+         remove_tab(inst.id)
+         log(f"Stopped: {ident}")
+         count += 1
+@@ -1461,36 +1718,10 @@ def _restart_handoff_lock(instance: Instance):
+     """Serialise supervisor handoffs for one instance.
+ 
+     Yields True when the lock was taken, False when another handoff is
+-    already in progress. Uses O_CREAT|O_EXCL because it is the one primitive
+-    that is atomic on both POSIX and Windows; a lock whose recorded pid is
+-    gone is stale (the holder crashed) and is reclaimed.
++    already in progress.
+     """
+-    path = instance.restart_lock_file
+-    acquired = False
+-    try:
+-        for _ in range(2):
+-            try:
+-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+-            except FileExistsError:
+-                holder = None
+-                try:
+-                    holder = int(path.read_text(encoding="utf-8").strip())
+-                except (OSError, ValueError):
+-                    pass
+-                if holder is not None and _pid_alive(holder):
+-                    break
+-                # Stale: the holder died mid-handoff. Reclaim and retry once.
+-                path.unlink(missing_ok=True)
+-                continue
+-            else:
+-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+-                    fh.write(str(os.getpid()))
+-                acquired = True
+-                break
++    with _exclusive_lock(instance.restart_lock_file) as acquired:
+         yield acquired
+-    finally:
+-        if acquired:
+-            path.unlink(missing_ok=True)
+ 
+ 
+ def restart_loop(target: str | None) -> int:
+@@ -1538,9 +1769,10 @@ def restart_loop(target: str | None) -> int:
+         print("  That records the arguments, so future restarts can just use: "
+               f"operator restart-loop {instance.display_name}", file=sys.stderr)
+         return 1
+-    if not Path(recorded_cwd).is_dir():
++    if dir_present(Path(recorded_cwd)) is False:
+         # Spawning from the caller's cwd instead would silently point the
+-        # instance at a different project.
++        # instance at a different project. A directory that merely cannot be
++        # examined is not known to be gone, so it does not earn this refusal.
+         print(f"The directory '{target}' was started in no longer exists:",
+               file=sys.stderr)
+         print(f"  {recorded_cwd}", file=sys.stderr)
+@@ -1574,7 +1806,7 @@ def _do_restart_loop(instance: Instance, user_args: list[str],
+                 break
+             time.sleep(0.5)
+         else:
+-            instance.detach_marker.unlink(missing_ok=True)
++            remove_file(instance.detach_marker)
+             print(f"Loop supervisor for '{target}' did not stop within "
+                   f"{budget}s. Session left untouched; no new supervisor "
+                   f"started.", file=sys.stderr)
+@@ -1585,8 +1817,11 @@ def _do_restart_loop(instance: Instance, user_args: list[str],
+         # exited for its own reasons — most likely a concurrent `operator
+         # stop`, which also takes the session down. Spawning an adopting
+         # supervisor now would resurrect a session the user just stopped.
+-        if instance.detach_marker.exists():
+-            instance.detach_marker.unlink(missing_ok=True)
++        # A marker we cannot examine is not proof it was consumed, and the
++        # cost of guessing wrong here is a session coming back from the dead,
++        # so anything but a definite absence refuses.
++        if path_present(instance.detach_marker) is not False:
++            remove_file(instance.detach_marker)
+             print(f"The supervisor for '{target}' exited without taking the "
+                   f"restart request — something else stopped it.",
+                   file=sys.stderr)
+@@ -1679,7 +1914,7 @@ def forget_instance(target: str | None) -> int:
+         print(f"No operator state for '{target}'.", file=sys.stderr)
+         return 1
+     instance.cleanup_files()
+-    instance.state_file.unlink(missing_ok=True)
++    remove_file(instance.state_file)
+     remove_tab(instance.id)
+     print(f"Removed operator state for '{instance.display_name}'.")
+     print("Any running session with that name was left untouched.")
+@@ -1708,9 +1943,17 @@ def reload_instance(target: str | None) -> int:
+               file=sys.stderr)
+         return 1
+     instance = Instance(target)
+-    if not instance.spec_file.exists():
++    if path_present(instance.spec_file) is False:
+         die(f"No launch spec found for '{target}' at {instance.spec_file}")
+-    spec = json.loads(instance.spec_file.read_text(encoding="utf-8"))
++    try:
++        spec = json.loads(instance.spec_file.read_text(encoding="utf-8"))
++    except (OSError, ValueError) as exc:
++        # The spec is about to be rewritten from what was read. Reading it as
++        # "empty" would replace a working launch spec with one that launches
++        # nothing, so a failed read has to stop the command instead.
++        die(f"Could not read the launch spec at {instance.spec_file}: {exc}")
++    if not isinstance(spec, dict):
++        die(f"The launch spec at {instance.spec_file} is not a JSON object.")
+     argv = list(spec.get("argv", []))
+     agent = extract_agent_from_args(argv)
+     preamble = build_preamble(agent, instance)
+@@ -1742,9 +1985,12 @@ def ingest_all_logs(force: bool = False) -> int:
+ 
+ 
+ def _log_files() -> list[Path]:
+-    if not COPILOT_LOG_DIR.is_dir():
++    if not dir_present(COPILOT_LOG_DIR):
++        return []
++    try:
++        return sorted(COPILOT_LOG_DIR.glob("process-*.log"))
++    except OSError:
+         return []
+-    return sorted(COPILOT_LOG_DIR.glob("process-*.log"))
+ 
+ 
+ def manage_logs(args: list[str]) -> int:
+@@ -2025,6 +2271,9 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
+     and "I could not look" must not read the same as "nobody is here".
+     Note that an *unavailable* multiplexer is not uncertainty: with no
+     backend there are no sessions to miss, so that answers the empty list.
++    The same rule applies one record down: an unreadable launch spec, tab
++    registry or state directory refuses the census rather than quietly
++    dropping the instance it could not place.
+     """
+     try:
+         if not MUX.available():
+@@ -2033,7 +2282,17 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
+     except (MuxError, OSError):
+         return None
+ 
+-    known = set(managed_instances()) | set(load_tabs())
++    # The population itself has to be readable. An unexaminable state
++    # directory or an unreadable tab registry would otherwise shrink `known`
++    # silently, and `known` is what decides whether an unplaceable instance
++    # is one of ours.
++    if dir_present(RESTART_DIR) is None:
++        return None
++    tabs = read_tabs()
++    if tabs is None:
++        return None
++
++    known = set(managed_instances()) | set(tabs)
+     found: list[str] = []
+     for ident in live:
+         try:
+@@ -2044,7 +2303,17 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
+         else:
+             pane_failed = False
+         recorded = _tracked_cwd_for_id(ident)
+-        if _dir_matches(pane, cwd) or _dir_matches(recorded, cwd):
++        if _dir_matches(pane, cwd):
++            found.append(ident)
++            continue
++        if recorded is UNPLACEABLE:
++            # The launch spec or the tab registry is there and would not be
++            # read. The pane did not place this instance here either, so the
++            # only honest answer is that we do not know who is in this
++            # directory — the same refusal as a failed pane lookup, one
++            # record further down.
++            return None
++        if _dir_matches(recorded, cwd):
+             found.append(ident)
+         elif pane_failed and ident in known:
+             # The backend refused to say where this instance is and the
+@@ -2241,7 +2510,7 @@ def run_single_session(instance: Instance, copilot_args: list[str],
+     set_tab_progress(TAB_STEADY)
+     MUX.attach(instance.session)
+ 
+-    if MUX.has_session(instance.session) and not instance.exit_file.exists():
++    if MUX.has_session(instance.session) and path_present(instance.exit_file) is not True:
+         print()
+         print("Detached from copilot session.")
+         print(f"  Re-attach: operator join {instance.display_name}")
+@@ -2306,10 +2575,15 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
+         if handoff_file is None:
+             log("  Project is not registered in the catalog — no handoff file "
+                 "is expected here")
+-        elif not handoff_file.exists():
++        elif path_present(handoff_file) is False:
+             crash_recovery = True
+             log("  No handoff file found for this project — treating this as "
+                 "crash recovery")
++        elif path_present(handoff_file) is None:
++            # Telling the agent a handoff is missing is a claim about the last
++            # session. A probe that failed has not established anything.
++            log(f"  Could not examine {handoff_file} — not reporting this as "
++                f"crash recovery")
+ 
+     preamble = build_preamble(agent, instance, crash_recovery=crash_recovery)
+ 
+@@ -2371,6 +2645,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
+     last_launched = 0
+     launch_failures = 0
+     crash_failures = 0
++    unknown_markers = 0
+     resume_id_used = ""
+     adopting = adopt
+     instance.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+@@ -2448,7 +2723,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
+                         break
+                     if not is_copilot_running(instance):
+                         break
+-                    if instance.detach_marker.exists() or instance.stop_marker.exists():
++                    if marker_set(instance.detach_marker) or marker_set(instance.stop_marker):
+                         # A stop/detach request must not wait out session-id
+                         # discovery: `operator restart-loop` blocks on this
+                         # supervisor exiting, and a session that never reports
+@@ -2467,11 +2742,11 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
+                     # `operator restart-loop` both block waiting for this
+                     # supervisor to act, so a whole poll interval of latency
+                     # is paid by a human (or an agent) every time.
+-                    if instance.stop_marker.exists():
++                    if marker_set(instance.stop_marker):
+                         # `operator stop NAME` asked us to shut down and take the
+                         # session with us — same as Ctrl+C, just triggered
+                         # remotely since this loop now runs in the background.
+-                        instance.stop_marker.unlink(missing_ok=True)
++                        remove_file(instance.stop_marker)
+                         log(f"Session #{session_num}: stop requested — shutting down")
+                         stop_session_gracefully(instance)
+                         show_run_summary(run_started)
+@@ -2479,11 +2754,11 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
+                             MUX.kill_session(instance.session)
+                         instance.cleanup_files()
+                         return 0
+-                    if instance.detach_marker.exists():
++                    if marker_set(instance.detach_marker):
+                         # `operator stop-loop NAME` asked us to stop supervising
+                         # but leave the session running untouched. Also how
+                         # `operator restart-loop` retires the old supervisor.
+-                        instance.detach_marker.unlink(missing_ok=True)
++                        remove_file(instance.detach_marker)
+                         sid = instance.read_session_id()
+                         instance.save_state(session_num, run_started, sid)
+                         log(f"Session #{session_num}: detach requested — leaving "
+@@ -2493,7 +2768,27 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
+                     if shutdown["requested"]:
+                         raise KeyboardInterrupt
+                     if not is_copilot_running(instance):
+-                        if instance.restart_marker.exists():
++                        stop_state = marker_state(instance.stop_marker)
++                        detach_state = marker_state(instance.detach_marker)
++                        if stop_state is None or detach_state is None:
++                            # The session is gone and we cannot tell whether a
++                            # human asked for that. Relaunching would resurrect
++                            # a session someone stopped; assuming a stop would
++                            # abandon one that crashed. Re-poll instead and let
++                            # a readable marker settle it.
++                            unknown_markers += 1
++                            log(f"Session #{session_num}: copilot is not running but "
++                                f"the stop/detach markers cannot be examined "
++                                f"({unknown_markers}/{MAX_LAUNCH_FAILURES}) — "
++                                f"waiting rather than relaunching")
++                            if unknown_markers >= MAX_LAUNCH_FAILURES:
++                                log(f"  Giving up after {unknown_markers} consecutive "
++                                    f"unreadable checks — leaving the session alone")
++                                show_run_summary(run_started)
++                                return 1
++                            continue
++                        unknown_markers = 0
++                        if marker_set(instance.restart_marker):
+                             log(f"Session #{session_num}: restart signal detected!")
+                             crash_failures = 0
+                         else:
+@@ -2508,7 +2803,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
+                                 return 1
+                         restart_requested = True
+                         break
+-                    if instance.restart_marker.exists():
++                    if marker_set(instance.restart_marker):
+                         log(f"Session #{session_num}: restart signal detected!")
+                         crash_failures = 0
+                         restart_requested = True
+@@ -2516,7 +2811,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
+ 
+                 if restart_requested:
+                     log("Restarting copilot...")
+-                    instance.restart_marker.unlink(missing_ok=True)
++                    remove_file(instance.restart_marker)
+                     stop_session_gracefully(instance)
+                     instance.save_state(session_num, run_started)
+                     session_num += 1
+@@ -2550,7 +2845,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
+         log("Operator shut down")
+         return 0
+     finally:
+-        instance.loop_pid_file.unlink(missing_ok=True)
++        remove_file(instance.loop_pid_file)
+ 
+ 
+ # ── help ────────────────────────────────────────────────────────
+@@ -2754,7 +3049,7 @@ def show_help() -> int:
+ 
+ 
+ # ── entry point ─────────────────────────────────────────────────
+-def _tracked_cwd_for_id(ident: str) -> str | None:
++def _tracked_cwd_for_id(ident: str) -> str | None | _Unplaceable:
+     """The directory a tracked/managed *instance id* is bound to, if known.
+ 
+     Keyed on the id rather than the display name because the two are not
+@@ -2762,20 +3057,35 @@ def _tracked_cwd_for_id(ident: str) -> str | None:
+     id from something that is already an id produces a different, non-existent
+     instance whose files are always missing — a lookup that fails silently and
+     reports "location unknown" for an instance whose location is on disk.
++
++    Three answers, not two: a directory, ``None`` for "nothing on disk binds
++    this id anywhere", and ``UNPLACEABLE`` for "the records exist and would
++    not be read". Collapsing the third into the second is what lets a census
++    return a curated population as though it were complete.
+     """
+     spec = RESTART_DIR / f"{ident}.launch.json"
+-    if spec.exists():
++    state = file_present(spec)
++    if state is None:
++        return UNPLACEABLE
++    if state:
+         try:
+-            return json.loads(spec.read_text(encoding="utf-8")).get("cwd")
+-        except (OSError, ValueError):
+-            pass
+-    entry = load_tabs().get(ident)
++            cwd = json.loads(spec.read_text(encoding="utf-8")).get("cwd")
++        except ValueError:
++            cwd = None
++        except OSError:
++            return UNPLACEABLE
++        if cwd:
++            return cwd
++    tabs = read_tabs()
++    if tabs is None:
++        return UNPLACEABLE
++    entry = tabs.get(ident)
+     if entry:
+         return entry.get("cwd")
+     return None
+ 
+ 
+-def _tracked_cwd_for(name: str) -> str | None:
++def _tracked_cwd_for(name: str) -> str | None | _Unplaceable:
+     """Best-effort lookup of the directory a tracked/managed instance name is
+     already bound to, so a same-named directory elsewhere doesn't collide."""
+     return _tracked_cwd_for_id(Instance(name).id)
+@@ -2792,6 +3102,11 @@ def _name_conflicts(name: str, cwd: Path) -> bool:
+     if not (MUX.available() and MUX.has_session(inst.session)):
+         return False
+     bound_to = _tracked_cwd_for(name)
++    if bound_to is UNPLACEABLE:
++        # Something is running under this name and we cannot show it is this
++        # directory. Sharing a name with an instance we cannot place is the
++        # expensive mistake here; suffixing the name is the cheap one.
++        return True
+     return bound_to is not None and bound_to != str(cwd)
+ 
+ 
+@@ -2998,11 +3313,12 @@ def instance_snapshot(instance: Instance) -> dict:
+     except ValueError:
+         session_num = 0
+     spec: dict = {}
+-    if instance.spec_file.exists():
+-        try:
+-            spec = json.loads(instance.spec_file.read_text(encoding="utf-8"))
+-        except (OSError, ValueError):
+-            spec = {}
++    try:
++        loaded = json.loads(instance.spec_file.read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        loaded = None
++    if isinstance(loaded, dict):
++        spec = loaded
+     cwd = spec.get("cwd") or (load_tabs().get(instance.id) or {}).get("cwd") or ""
+     session_live = MUX.available() and MUX.has_session(instance.session)
+     return {
+@@ -3067,7 +3383,7 @@ def _recorded_usage(cwd: str) -> str:
+     Metrics are keyed by working directory rather than by instance name, so
+     this is the project's total across every run — not just this one.
+     """
+-    if not cwd or not METRICS_DB.exists():
++    if not cwd or file_present(METRICS_DB) is not True:
+         return ""
+     try:
+         rows, _ = _query(f"""
+diff --git a/operator_mail.py b/operator_mail.py
+index 7d3f96f..6ca1f7e 100644
+--- a/operator_mail.py
++++ b/operator_mail.py
+@@ -147,64 +147,17 @@ def record_delivered(root: Path, msg: dict) -> Path:
+     return _write(archive_dir(root, msg["to_id"]), delivered)
+ 
+ 
+-class _Unreadable:
+-    """The result of a read that failed, as distinct from what it found.
+-
+-    ``json.loads`` raising ``ValueError`` is knowledge about the file: these
+-    bytes are not a message and never will be. ``read_text`` raising
+-    ``OSError`` is knowledge about the *read* -- a sharing violation, a
+-    scanner holding the file open, a permission that will be there again next
+-    time -- and says nothing whatsoever about the contents. Spelling both
+-    "corrupt" lets a file that was never seen be treated as one that was seen
+-    and found wanting, and for mail the second of those authorises moving it
+-    out of the inbox. `_write_json` already goes to the trouble of atomic
+-    writes so a reader cannot mistake a half-written file for a corrupt one;
+-    this is the same hazard arriving through the other door.
+-    """
+-
+-    __slots__ = ()
+-
+-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+-        return "<unreadable>"
+-
+-
+-UNREADABLE = _Unreadable()
+-
+-
+-def _read_message(path: Path) -> dict | None | _Unreadable:
+-    """One message file, tri-state.
+-
+-    Returns the message, ``None`` if the file is genuinely not a message, or
+-    :data:`UNREADABLE` if it could not be read at all. Callers that destroy
+-    or move files must branch on all three: only ``None`` is evidence.
+-    """
+-    try:
+-        raw = path.read_text(encoding="utf-8")
+-    except OSError:
+-        return UNREADABLE
+-    except ValueError:
+-        # Bytes that are not UTF-8 at all. Like malformed JSON this is
+-        # knowledge about the file and will not change on a retry, so it is
+-        # corruption rather than an unreadable state. It has to be caught
+-        # here and not only around `json.loads`: `read_text` decodes, so
+-        # `UnicodeDecodeError` -- a `ValueError` -- is raised by the read.
+-        return None
+-    try:
+-        data = json.loads(raw)
+-    except ValueError:
+-        return None
+-    return data if isinstance(data, dict) else None
+-
+-
+ def _load_dir(directory: Path) -> list[tuple[Path, dict]]:
+     if not directory.is_dir():
+         return []
+     found: list[tuple[Path, dict]] = []
+     for path in sorted(directory.glob("*.json")):
+-        data = _read_message(path)
+-        # Neither a corrupt file nor an unreadable one can be listed, but
+-        # nothing is destroyed here, so skipping is safe for both: a message
+-        # that could not be read this time is simply still there next time.
++        try:
++            data = json.loads(path.read_text(encoding="utf-8"))
++        except (OSError, ValueError):
++            # A corrupt file must not jam the mailbox forever. Skip it here;
++            # consume() moves it aside so it stops being reconsidered.
++            continue
+         if isinstance(data, dict):
+             found.append((path, data))
+     return found
+@@ -236,16 +189,13 @@ def consume(root: Path, instance_id: str) -> list[dict]:
+     taken: list[dict] = []
+     archive.mkdir(parents=True, exist_ok=True)
+     for path in sorted(inbox.glob("*.json")):
+-        data = _read_message(path)
+-        if data is UNREADABLE:
+-            # The read failed, so this message has not been seen by anybody.
+-            # Leaving it pending means it is offered again; moving it aside
+-            # would archive it unread and leave a mailbox that looks empty
+-            # rather than blocked. A jam is visible. A loss is not.
+-            continue
+-        if data is None:
+-            # Genuinely not a message. Move it out of the way rather than
+-            # leaving it to be reconsidered on every single session start.
++        try:
++            data = json.loads(path.read_text(encoding="utf-8"))
++            if not isinstance(data, dict):
++                raise ValueError("not an object")
++        except (OSError, ValueError):
++            # Move unreadable files out of the way rather than leaving them to
++            # be re-read on every single session start.
+             try:
+                 os.replace(path, archive / path.name)
+             except OSError:
+@@ -315,11 +265,6 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
+         if path.stem not in wanted:
+             continue
+         ident = _message_id(path)
+-        if ident is UNREADABLE:
+-            # A file that could not be opened has not agreed with its name.
+-            # Leave it pending rather than archiving on the strength of a
+-            # filename nothing has corroborated.
+-            continue
+         # A name is a claim, not proof. Accept it only when the file agrees
+         # with it, or when the file claims no id at all and so contradicts
+         # nothing. A file named for one message while holding another is a
+@@ -336,10 +281,6 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
+         found = set()
+         for path in files:
+             ident = _message_id(path)
+-            if ident is UNREADABLE:
+-                # Same as above: unopened is not unnamed. Falling through
+-                # would reach the `elif` and choose it on its filename.
+-                continue
+             if ident is not None:
+                 if ident in wanted:
+                     chosen.add(path)
+@@ -355,17 +296,12 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
+                for path in files if path in chosen)
+ 
+ 
+-def _message_id(path: Path) -> str | None | _Unreadable:
+-    """The id a message file claims.
+-
+-    ``None`` when the file claims no usable id, :data:`UNREADABLE` when it
+-    could not be read -- which is not the same claim, and callers that treat
+-    "claims nothing" as "contradicts nothing" must not extend that courtesy
+-    to a file they never opened.
+-    """
+-    data = _read_message(path)
+-    if data is UNREADABLE:
+-        return UNREADABLE
++def _message_id(path: Path) -> str | None:
++    """The id a message file claims, or None if it does not claim a usable one."""
++    try:
++        data = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return None
+     if not isinstance(data, dict):
+         return None
+     ident = data.get("id")
+@@ -375,12 +311,10 @@ def _message_id(path: Path) -> str | None | _Unreadable:
+ def _archive_one(path: Path, destination: Path, read_at: str) -> int:
+     """Move one inbox file into `destination`, stamping it read if it parses."""
+     target = destination / path.name
+-    data = _read_message(path)
+-    if data is UNREADABLE:
+-        # Archiving a file whose contents were never read would file away a
+-        # message nobody has seen. Report nothing archived and leave it
+-        # pending: the caller offers it again, which costs a re-delivery.
+-        return 0
++    try:
++        data = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        data = None
+     if isinstance(data, dict):
+         data["read_at"] = read_at
+         try:
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 5667e23..7ee7a2e 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -3,8 +3,10 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import pathlib
+ import sys
+ import warnings
++from contextlib import contextmanager
+ from pathlib import Path
+ 
+ import pytest
+@@ -129,6 +131,57 @@ def state_dir(tmp_path: Path) -> Path:
+     return d
+ 
+ 
++@contextmanager
++def denied(monkeypatch, *paths, limit: int | None = None, counter=None):
++    """Make every stat of ``paths`` raise EACCES, as a revoked directory does.
++
++    Three call sites are patched, not one. ``Path.exists()`` reaches the
++    filesystem through ``os.stat`` -- and on 3.10 through a private pathlib
++    accessor that copies ``os.stat`` at import time -- while the tri-state
++    probes in ``copilot_operator`` call ``os.lstat`` directly. Deny only
++    ``os.lstat`` and code that still uses ``exists()`` sails through, so the
++    test grades nothing; deny only ``os.stat`` and the probes never see the
++    failure they exist to handle; miss the accessor and the whole thing is
++    vacuous on 3.10.
++
++    ``limit`` denies only the first N probes, which is how a transient failure
++    (a scanner holding a file open on Windows) actually behaves: the next poll
++    succeeds.
++    """
++    targets = {str(Path(p)) for p in paths}
++    seen = counter if counter is not None else {"n": 0}
++    real_stat, real_lstat = os.stat, os.lstat
++
++    def guard(real):
++        def probe(path, *args, **kwargs):
++            try:
++                key = str(Path(path))
++            except TypeError:
++                key = None
++            if key in targets and (limit is None or seen["n"] < limit):
++                seen["n"] += 1
++                raise PermissionError(13, "Permission denied")
++            return real(path, *args, **kwargs)
++        return probe
++
++    monkeypatch.setattr(os, "stat", guard(real_stat))
++    monkeypatch.setattr(os, "lstat", guard(real_lstat))
++    accessor = getattr(pathlib, "_NormalAccessor", None)
++    saved = {}
++    if accessor is not None:
++        for name, real in (("stat", real_stat), ("lstat", real_lstat)):
++            if hasattr(accessor, name):
++                saved[name] = getattr(accessor, name)
++                setattr(accessor, name, staticmethod(guard(real)))
++    try:
++        yield seen
++    finally:
++        for name, original in saved.items():
++            setattr(accessor, name, original)
++        monkeypatch.setattr(os, "stat", real_stat)
++        monkeypatch.setattr(os, "lstat", real_lstat)
++
++
+ @pytest.fixture
+ def db_path(tmp_path: Path) -> Path:
+     return tmp_path / "metrics.db"
+diff --git a/tests/test_agent_mail_cli.py b/tests/test_agent_mail_cli.py
+index 2fd2d4c..997f51b 100644
+--- a/tests/test_agent_mail_cli.py
++++ b/tests/test_agent_mail_cli.py
+@@ -12,6 +12,7 @@ import shlex
+ from pathlib import Path
+ 
+ import pytest
++from conftest import denied
+ 
+ import copilot_operator as op
+ import operator_mail
+@@ -813,6 +814,106 @@ def test_no_multiplexer_means_no_live_sessions_rather_than_no_answer(
+     assert op.live_instance_ids_under(tmp_path) == []
+ 
+ 
++def test_a_launch_spec_that_will_not_open_fails_the_census(tmp_path,
++                                                           monkeypatch):
++    """The record exists and cannot be read: that is not "unrecorded".
++
++    A peer whose pane sits elsewhere is placed by its launch spec. If reading
++    that spec fails and the failure is typed as "no recorded directory", the
++    peer drops out of the census and the list that comes back looks complete
++    -- the same hole as a swallowed pane lookup, one record further down.
++    """
++    project = tmp_path / "proj"
++    project.mkdir()
++    peer = _register("agent-x", launch=project)
++    spec = op.RESTART_DIR / f"{peer.id}.launch.json"
++    mux = RecordingMux(sessions=[peer.id],
++                       paths={peer.id: str(tmp_path / "elsewhere")})
++    monkeypatch.setattr(op, "MUX", mux)
++
++    with denied(monkeypatch, spec) as seen:
++        assert op.live_instance_ids_under(project) is None
++    assert seen["n"] > 0, "the denial never fired; the test proves nothing"
++
++
++def test_a_pane_that_places_a_peer_here_does_not_need_the_spec(tmp_path,
++                                                               monkeypatch):
++    """The counterpart: an unreadable spec is only uncertainty when it is the
++    thing that would have answered. A pane already in this directory settles
++    it, so the census must not refuse."""
++    project = tmp_path / "proj"
++    project.mkdir()
++    peer = _register("agent-x", launch=project)
++    spec = op.RESTART_DIR / f"{peer.id}.launch.json"
++    mux = RecordingMux(sessions=[peer.id], paths={peer.id: str(project)})
++    monkeypatch.setattr(op, "MUX", mux)
++
++    with denied(monkeypatch, spec):
++        assert op.live_instance_ids_under(project) == [peer.id]
++
++
++def test_an_unreadable_tab_registry_fails_the_census(tmp_path, monkeypatch):
++    """``load_tabs`` reports an unreadable registry as an empty one. The
++    census asks a different question -- who is here -- and an empty answer to
++    that is a claim, so it has to consult the tri-state read instead."""
++    project = tmp_path / "proj"
++    project.mkdir()
++    peer = _register("agent-x", launch=None)
++    op.TABS_FILE.write_text(json.dumps({peer.id: {"cwd": str(project)}}),
++                            encoding="utf-8")
++    mux = RecordingMux(sessions=[peer.id],
++                       paths={peer.id: str(tmp_path / "elsewhere")})
++    monkeypatch.setattr(op, "MUX", mux)
++
++    real_read_text = Path.read_text
++    seen = {"n": 0}
++
++    def unreadable(self, *args, **kwargs):
++        if str(self) == str(op.TABS_FILE):
++            seen["n"] += 1
++            raise PermissionError(13, "Permission denied")
++        return real_read_text(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "read_text", unreadable)
++    try:
++        assert op.live_instance_ids_under(project) is None
++    finally:
++        monkeypatch.setattr(Path, "read_text", real_read_text)
++    assert seen["n"] > 0, "the denial never fired; the test proves nothing"
++
++
++def test_an_unexaminable_state_directory_fails_the_census(tmp_path,
++                                                          monkeypatch):
++    """`known` decides whether an unplaceable session is one of ours. If the
++    state directory cannot be listed, `known` shrinks silently and the answer
++    is drawn from a population that is missing members."""
++    project = tmp_path / "proj"
++    project.mkdir()
++    peer = _register("agent-x", launch=None)
++    mux = RecordingMux(sessions=[peer.id], paths={peer.id: None})
++    monkeypatch.setattr(op, "MUX", mux)
++
++    with denied(monkeypatch, op.RESTART_DIR) as seen:
++        assert op.live_instance_ids_under(project) is None
++    assert seen["n"] > 0, "the denial never fired; the test proves nothing"
++
++
++def test_a_name_bound_somewhere_we_cannot_read_is_treated_as_taken(
++        tmp_path, monkeypatch):
++    """`_name_conflicts` guards against two agents sharing a name. An
++    unreadable binding is not proof the name is free."""
++    project = tmp_path / "proj"
++    project.mkdir()
++    peer = _register("agent-x", launch=project)
++    spec = op.RESTART_DIR / f"{peer.id}.launch.json"
++    monkeypatch.setattr(op, "MUX", RecordingMux(sessions=[peer.id]))
++
++    assert op._name_conflicts("agent-x", project) is False
++    with denied(monkeypatch, spec, op.TABS_FILE):
++        assert op._name_conflicts("agent-x", project) is True
++
++
++
+ def test_a_machine_with_no_multiplexer_can_still_read_its_own_mail(
+         tmp_path, monkeypatch, capsys):
+     """The no-backend carve-out has to survive the whole guard, not just the
+diff --git a/tests/test_mail.py b/tests/test_mail.py
+index cb51580..a749745 100644
+--- a/tests/test_mail.py
++++ b/tests/test_mail.py
+@@ -146,200 +146,6 @@ def test_corrupt_message_does_not_jam_the_mailbox(tmp_path):
+     assert operator_mail.consume(tmp_path, "beta") == []
+ 
+ 
+-# ── unreadable input, which is not corrupt input ────────────────
+-def _deny_reads(monkeypatch, *paths):
+-    """Make `read_text` fail for exactly these files, and prove that it did.
+-
+-    A denial that never fires produces a test asserting against an ordinary
+-    read, which passes for the wrong reason. The returned list is the record
+-    of what was actually denied; every test below asserts on it before it
+-    asserts on anything else.
+-    """
+-    wanted = {Path(p).resolve() for p in paths}
+-    fired: list[str] = []
+-    real = Path.read_text
+-
+-    def denied(self, *args, **kwargs):
+-        if self.resolve() in wanted:
+-            fired.append(str(self))
+-            raise PermissionError(13, "The process cannot access the file")
+-        return real(self, *args, **kwargs)
+-
+-    monkeypatch.setattr(Path, "read_text", denied)
+-    return fired
+-
+-
+-def test_an_unreadable_message_is_not_mistaken_for_a_corrupt_one(tmp_path,
+-                                                                 monkeypatch):
+-    """A failed read says nothing about the file, so nothing may be concluded.
+-
+-    Moving it aside archives a message nobody has seen and leaves a mailbox
+-    that looks empty rather than blocked -- the same signature as mail that
+-    was never sent.
+-    """
+-    msg = _msg(tmp_path, text="important")
+-    path = operator_mail.inbox_dir(tmp_path, "beta") / f"{msg['id']}.json"
+-    fired = _deny_reads(monkeypatch, path)
+-
+-    assert operator_mail.consume(tmp_path, "beta") == []
+-    assert fired, "the denial never fired; this test proved nothing"
+-    assert path.exists(), "an unread message was moved out of the inbox"
+-    assert not (operator_mail.archive_dir(tmp_path, "beta") / path.name).exists()
+-    assert operator_mail.pending_count(tmp_path, "beta") == 1
+-
+-
+-def test_a_message_that_could_not_be_read_is_delivered_once_it_can_be(
+-        tmp_path, monkeypatch):
+-    msg = _msg(tmp_path, text="important")
+-    path = operator_mail.inbox_dir(tmp_path, "beta") / f"{msg['id']}.json"
+-    fired = _deny_reads(monkeypatch, path)
+-    assert operator_mail.consume(tmp_path, "beta") == []
+-    assert fired
+-
+-    monkeypatch.undo()
+-    assert [m["text"] for m in operator_mail.consume(tmp_path, "beta")] == \
+-        ["important"]
+-
+-
+-def test_one_unreadable_message_does_not_hold_up_its_neighbours(tmp_path,
+-                                                                monkeypatch):
+-    first = operator_mail.new_message("alpha", "beta", "beta", "blocked")
+-    first["id"] = "20260731200000-aaaaaaa0"
+-    operator_mail.queue(tmp_path, first)
+-    second = operator_mail.new_message("alpha", "beta", "beta", "fine")
+-    second["id"] = "20260731200001-aaaaaaa1"
+-    operator_mail.queue(tmp_path, second)
+-    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+-    fired = _deny_reads(monkeypatch, inbox / f"{first['id']}.json")
+-
+-    assert [m["text"] for m in operator_mail.consume(tmp_path, "beta")] == \
+-        ["fine"]
+-    assert fired
+-    assert (inbox / f"{first['id']}.json").exists()
+-
+-
+-def test_archive_does_not_file_away_a_message_it_could_not_read(tmp_path,
+-                                                                monkeypatch):
+-    """`archive` is told which ids were shown to the recipient. A file it
+-    cannot open has not been shown to anybody and has not corroborated its
+-    own name, so archiving it on the strength of the filename files away
+-    something unread -- and counts it as delivered."""
+-    msg = _msg(tmp_path, text="important")
+-    path = operator_mail.inbox_dir(tmp_path, "beta") / f"{msg['id']}.json"
+-    fired = _deny_reads(monkeypatch, path)
+-
+-    assert operator_mail.archive(tmp_path, "beta", [msg["id"]]) == 0
+-    assert fired
+-    assert path.exists()
+-    assert operator_mail.pending_count(tmp_path, "beta") == 1
+-
+-
+-def test_an_unreadable_file_is_not_listed_as_pending(tmp_path, monkeypatch):
+-    """Skipping is right here -- nothing is destroyed by omitting it from a
+-    listing -- but the file must survive to be listed later."""
+-    msg = _msg(tmp_path, text="important")
+-    path = operator_mail.inbox_dir(tmp_path, "beta") / f"{msg['id']}.json"
+-    fired = _deny_reads(monkeypatch, path)
+-
+-    assert operator_mail.pending(tmp_path, "beta") == []
+-    assert fired
+-    assert path.exists()
+-
+-
+-_POSIX_PERMS = (os.name != "nt" and hasattr(os, "geteuid")
+-                and os.geteuid() != 0)
+-
+-
+-@pytest.mark.skipif(not _POSIX_PERMS,
+-                    reason="needs POSIX permissions enforced against a non-root user")
+-def test_a_really_unreadable_file_really_survives_consume(tmp_path):
+-    """The incident on a real filesystem, with no mock in the way.
+-
+-    `chmod 000` in a writable directory is an ordinary state, and it is the
+-    exact shape that matters: the read is denied while the rename is still
+-    permitted, so nothing stops the move-aside from succeeding. A reviewer
+-    argued the loss existed only in the monkeypatch because a Windows lock
+-    would deny both operations -- true of a Windows lock, and this is why the
+-    claim needed a real OS to settle rather than another fixture.
+-    """
+-    msg = _msg(tmp_path, text="important")
+-    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+-    path = inbox / f"{msg['id']}.json"
+-    os.chmod(path, 0o000)
+-    try:
+-        # Prove the premise. Without this the test passes whenever the
+-        # permission silently fails to bite.
+-        with pytest.raises(OSError):
+-            path.read_text(encoding="utf-8")
+-        probe = inbox / "probe.tmp"
+-        os.replace(path, probe)
+-        os.replace(probe, path)
+-
+-        assert operator_mail.consume(tmp_path, "beta") == []
+-        assert path.exists(), "an unread message was moved out of the inbox"
+-        assert operator_mail.pending_count(tmp_path, "beta") == 1
+-    finally:
+-        # Restore permissions wherever the file ended up. Chmod'ing a path
+-        # that a failing run has already moved would raise from the `finally`
+-        # and mask the assertion that actually failed, so a test that caught
+-        # the bug would report the wrong reason for catching it.
+-        for candidate in (path,
+-                          operator_mail.archive_dir(tmp_path, "beta") / path.name):
+-            if candidate.exists():
+-                os.chmod(candidate, 0o600)
+-
+-
+-def test_a_file_that_can_neither_be_read_nor_moved_is_left_alone(tmp_path,
+-                                                                 monkeypatch):
+-    """The Windows sharing-violation shape, where both operations fail.
+-
+-    This case was already safe: the move-aside raised and was passed over,
+-    leaving the file pending. It is recorded so the guarantee is pinned
+-    rather than incidental, and it is the counterpart to the test above --
+-    together they say the outcome no longer depends on whether the operating
+-    system happened to also deny the rename.
+-    """
+-    msg = _msg(tmp_path, text="important")
+-    path = operator_mail.inbox_dir(tmp_path, "beta") / f"{msg['id']}.json"
+-    fired = _deny_reads(monkeypatch, path)
+-
+-    real_replace = os.replace
+-
+-    def denied_replace(src, dst, *args, **kwargs):
+-        if Path(src).resolve() == path.resolve():
+-            raise PermissionError(32, "The process cannot access the file")
+-        return real_replace(src, dst, *args, **kwargs)
+-
+-    monkeypatch.setattr(operator_mail.os, "replace", denied_replace)
+-
+-    assert operator_mail.consume(tmp_path, "beta") == []
+-    assert fired
+-    assert path.exists()
+-    assert operator_mail.pending_count(tmp_path, "beta") == 1
+-
+-
+-def test_bytes_that_are_not_utf8_are_corruption_not_an_unreadable_state(
+-        tmp_path):
+-    """`read_text` decodes, so it raises `UnicodeDecodeError` -- a
+-    `ValueError` -- from the READ rather than the parse. Undecodable bytes
+-    are still permanent knowledge about the file, so they must be moved aside
+-    like any other corruption and must never escape as an exception: one bad
+-    file in a mailbox would otherwise take down the supervisor loop, which
+-    calls `pending()` on every poll.
+-    """
+-    _msg(tmp_path, text="good")
+-    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+-    bad = inbox / "20260731-notutf8.json"
+-    bad.write_bytes(b"\xff\xfe not utf-8 at all")
+-
+-    assert [m["text"] for m in operator_mail.pending(tmp_path, "beta")] == \
+-        ["good"]
+-    assert [m["text"] for m in operator_mail.consume(tmp_path, "beta")] == \
+-        ["good"]
+-    assert not bad.exists()
+-    assert (operator_mail.archive_dir(tmp_path, "beta") / bad.name).exists()
+-
+-
+ def test_non_object_json_is_ignored(tmp_path):
+     directory = operator_mail.inbox_dir(tmp_path, "beta")
+     directory.mkdir(parents=True, exist_ok=True)
+diff --git a/tests/test_presence_probes.py b/tests/test_presence_probes.py
+new file mode 100644
+index 0000000..779d2dc
+--- /dev/null
++++ b/tests/test_presence_probes.py
+@@ -0,0 +1,516 @@
++"""A path that cannot be examined is not a path that is absent.
++
++`Path.exists` answers a three-state question with two values and raises on the
++third. In this program that mattered three ways:
++
++* the supervisor's poll loop catches only ``KeyboardInterrupt``, so one denied
++  stat on a marker file ended the unattended restarts it exists to provide;
++* ``migrate_legacy_state`` moves onto a destination it believes is absent;
++* the tab registry is rewritten whole from what was read, so reading it as
++  empty erases every other tab.
++
++The mock lives in ``conftest.denied`` and is shared with the mail-CLI census
++tests. It denies ``os.stat``, ``os.lstat`` and -- on 3.10 -- the private
++``pathlib`` accessor that binds ``os.stat`` at import time. All three, because
++the old code and the new code reach the filesystem by different routes:
++``Path.exists()`` goes through ``os.stat`` (via that accessor on 3.10), while
++``path_present`` calls ``os.lstat`` directly. Deny only ``os.lstat`` and the
++unfixed code sails through, so the test grades nothing; deny only ``os.stat``
++and the fixed code never sees the failure it exists to handle.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sys
++from pathlib import Path
++
++import pytest
++from conftest import denied
++
++import copilot_operator as op
++
++
++@pytest.fixture(autouse=True)
++def isolated_state(tmp_path, monkeypatch):
++    restart = tmp_path / "restart"
++    restart.mkdir(parents=True)
++    monkeypatch.setattr(op, "OPERATOR_HOME", tmp_path)
++    monkeypatch.setattr(op, "RESTART_DIR", restart)
++    monkeypatch.setattr(op, "LOG_FILE", tmp_path / "operator.log")
++    monkeypatch.setattr(op, "METRICS_DB", tmp_path / "metrics.db")
++    monkeypatch.setattr(op, "COPILOT_LOG_DIR", tmp_path / "logs")
++    monkeypatch.setattr(op, "TABS_FILE", tmp_path / "tabs.json")
++    monkeypatch.setattr(op, "POLL_INTERVAL", 0)
++    monkeypatch.setattr(op, "LAUNCH_BACKOFF_BASE", 0)
++    monkeypatch.setattr(op, "RESTART_PAUSE_SECONDS", 0)
++    op._PROBE_WARNED.clear()
++    yield tmp_path
++    op._PROBE_WARNED.clear()
++
++
++def _can_symlink(tmp_path: Path) -> bool:
++    try:
++        (tmp_path / "_lnk").symlink_to(tmp_path / "_nothing")
++    except (OSError, NotImplementedError):
++        return False
++    (tmp_path / "_lnk").unlink()
++    return True
++
++
++# ── the probes themselves ───────────────────────────────────────
++def test_probes_answer_cannot_tell_rather_than_absent(tmp_path, monkeypatch):
++    target = tmp_path / "thing"
++    target.write_text("x", encoding="utf-8")
++    with denied(monkeypatch, target):
++        assert op.path_present(target) is None
++        assert op.dir_present(target) is None
++        assert op.file_present(target) is None
++
++
++def test_probes_still_report_a_genuinely_absent_path(tmp_path):
++    missing = tmp_path / "nope"
++    assert op.path_present(missing) is False
++    assert op.dir_present(missing) is False
++    assert op.file_present(missing) is False
++
++
++def test_the_denial_reaches_the_call_the_old_code_made(tmp_path, monkeypatch):
++    """Grade the mock, not just the fix.
++
++    Every test below asserts the new probes cope. That is only evidence if the
++    denial would really have reached ``Path.exists``, which is what the code
++    used to call -- including on 3.10, where reaching it takes an extra patch.
++    """
++    target = tmp_path / "thing"
++    target.write_text("x", encoding="utf-8")
++    with denied(monkeypatch, target):
++        with pytest.raises(PermissionError):
++            target.exists()
++
++
++def test_marker_set_reports_unset_and_warns_only_once(tmp_path, monkeypatch):
++    marker = tmp_path / "restart" / "inst.restart"
++    with denied(monkeypatch, marker):
++        assert op.marker_set(marker) is False
++        assert op.marker_set(marker) is False
++        assert op.marker_set(marker) is False
++    logged = op.LOG_FILE.read_text(encoding="utf-8")
++    assert logged.count("Could not examine") == 1, \
++        "a permanently unreadable marker must not log once per poll"
++
++
++def test_marker_set_warns_again_after_recovering(tmp_path, monkeypatch):
++    marker = tmp_path / "restart" / "inst.restart"
++    with denied(monkeypatch, marker, limit=1):
++        assert op.marker_set(marker) is False
++        marker.touch()
++        assert op.marker_set(marker) is True
++    with denied(monkeypatch, marker):
++        assert op.marker_set(marker) is False
++    assert op.LOG_FILE.read_text(encoding="utf-8").count("Could not examine") == 2
++
++
++# ── the supervisor must survive a blinded probe ─────────────────
++def test_poll_loop_survives_a_marker_it_cannot_examine(monkeypatch):
++    """The whole point of loop mode is that it keeps going.
++
++    A denied stat used to propagate out of ``run_loop_mode`` — past the only
++    handler, which catches ``KeyboardInterrupt`` — and the agent stayed dead
++    until a human noticed.
++    """
++    inst = op.Instance("blinded")
++    attempts = {"n": 0}
++
++    def capture(instance, args, session_num, remain_on_exit=False, preamble=""):
++        attempts["n"] += 1
++        instance.exit_file.write_text("0", encoding="utf-8")
++        instance.stop_marker.touch()
++
++    monkeypatch.setattr(op, "start_session", capture)
++    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
++
++    with denied(monkeypatch, inst.stop_marker, inst.restart_marker,
++                inst.detach_marker, limit=3) as seen:
++        rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
++
++    assert seen["n"] == 3, "the denial never fired; the test proves nothing"
++    assert rc == 0
++    assert attempts["n"] == 1, \
++        "a blinded pass must wait, not relaunch; the next pass sees the stop"
++
++
++def test_a_stopped_session_is_not_resurrected_by_an_unreadable_marker(monkeypatch):
++    """The marker is set. The supervisor just cannot read it.
++
++    ``operator stop`` writes the marker and takes the session down. If the
++    supervisor reads "cannot examine" as "nobody asked me to stop", it finds a
++    dead session, calls it a crash, and starts the agent the human just
++    stopped -- an unattended process resurrecting itself. It must run out of
++    patience and leave the session alone instead.
++    """
++    inst = op.Instance("stopped")
++    attempts = {"n": 0}
++
++    def capture(instance, args, session_num, remain_on_exit=False, preamble=""):
++        attempts["n"] += 1
++        instance.exit_file.write_text("0", encoding="utf-8")
++        instance.stop_marker.touch()
++
++    monkeypatch.setattr(op, "start_session", capture)
++    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
++
++    with denied(monkeypatch, inst.stop_marker, inst.detach_marker) as seen:
++        rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
++
++    assert seen["n"] > 0, "the denial never fired; the test proves nothing"
++    assert attempts["n"] == 1, "the stopped session was relaunched"
++    assert rc == 1
++    assert inst.stop_marker.exists(), \
++        "a marker it could not read must not be consumed"
++
++
++def test_is_copilot_running_does_not_end_a_session_on_a_denied_probe(monkeypatch):
++    """An unreadable exit marker says nothing about whether Copilot is alive.
++
++    Reading it as "exited" would tear down and relaunch a healthy session.
++    """
++    inst = op.Instance("alive")
++
++    class FakeMux:
++        def has_session(self, name):
++            return True
++
++        def pane_dead(self, name):
++            return False
++
++    monkeypatch.setattr(op, "MUX", FakeMux())
++    with denied(monkeypatch, inst.exit_file):
++        assert op.is_copilot_running(inst) is True
++
++
++def test_exit_marker_still_ends_the_session_when_it_is_readable(monkeypatch):
++    inst = op.Instance("done")
++    inst.exit_file.write_text("0", encoding="utf-8")
++
++    class FakeMux:
++        def has_session(self, name):
++            return True
++
++        def pane_dead(self, name):
++            return False
++
++    monkeypatch.setattr(op, "MUX", FakeMux())
++    assert op.is_copilot_running(inst) is False
++
++
++# ── destructive gate: the legacy migration ──────────────────────
++def _point_at_legacy(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
++    legacy = tmp_path / "legacy"
++    legacy.mkdir()
++    monkeypatch.setattr(op, "LEGACY_RESTART_DIR", legacy / "restart")
++    monkeypatch.setattr(op, "LEGACY_LOG_FILE", legacy / "operator.log")
++    monkeypatch.setattr(op, "LEGACY_METRICS_DB", legacy / "metrics.db")
++    monkeypatch.setattr(op, "LEGACY_BACKUPS_DIR", legacy / "backups")
++    monkeypatch.setattr(op, "BACKUPS_DIR", tmp_path / "backups")
++    return legacy, tmp_path
++
++
++def test_migration_will_not_move_onto_a_destination_it_cannot_examine(
++        tmp_path, monkeypatch):
++    """``shutil.move`` replaces a file. The destination has to be *known* absent."""
++    legacy, _ = _point_at_legacy(monkeypatch, tmp_path)
++    op.LEGACY_METRICS_DB.write_text("legacy metrics", encoding="utf-8")
++    op.METRICS_DB.write_text("the real metrics", encoding="utf-8")
++
++    with denied(monkeypatch, op.METRICS_DB):
++        op.migrate_legacy_state()
++
++    assert op.METRICS_DB.read_text(encoding="utf-8") == "the real metrics"
++    assert op.LEGACY_METRICS_DB.exists(), "the legacy copy must survive too"
++
++
++def test_migration_still_moves_when_the_destination_is_really_absent(
++        tmp_path, monkeypatch):
++    _point_at_legacy(monkeypatch, tmp_path)
++    op.LEGACY_METRICS_DB.write_text("legacy metrics", encoding="utf-8")
++
++    op.migrate_legacy_state()
++
++    assert op.METRICS_DB.read_text(encoding="utf-8") == "legacy metrics"
++
++
++def test_migration_will_not_move_onto_a_dangling_symlink(tmp_path, monkeypatch):
++    """``exists`` follows the link, finds nothing, and calls it absent.
++
++    The move then lands wherever the link pointed, or destroys the link.
++    """
++    if not _can_symlink(tmp_path):
++        pytest.skip("this platform/user cannot create symlinks")
++    _point_at_legacy(monkeypatch, tmp_path)
++    op.LEGACY_METRICS_DB.write_text("legacy metrics", encoding="utf-8")
++    op.METRICS_DB.symlink_to(tmp_path / "somewhere-else.db")
++
++    op.migrate_legacy_state()
++
++    assert op.METRICS_DB.is_symlink(), "the link should have been left alone"
++    assert not (tmp_path / "somewhere-else.db").exists()
++    assert op.LEGACY_METRICS_DB.exists()
++
++
++def test_a_second_operator_does_not_migrate_at_the_same_time(tmp_path,
++                                                            monkeypatch):
++    """Probing a destination and moving onto it are two syscalls.
++
++    A tri-state probe fixes the first one; it does nothing about the answer
++    going stale before the move. On a box running a loop per project the
++    operators start together, so the migration takes an exclusive lock and
++    the loser finds the work already done -- which is the right outcome for a
++    one-time move.
++    """
++    _point_at_legacy(monkeypatch, tmp_path)
++    op.LEGACY_METRICS_DB.write_text("legacy metrics", encoding="utf-8")
++    lock = op.OPERATOR_HOME / "migrate.lock"
++    lock.write_text(str(os.getpid()), encoding="utf-8")
++
++    op.migrate_legacy_state()
++
++    assert not op.METRICS_DB.exists(), "migrated while another holder had the lock"
++    assert op.LEGACY_METRICS_DB.exists()
++    lock.unlink()
++
++    op.migrate_legacy_state()
++    assert op.METRICS_DB.read_text(encoding="utf-8") == "legacy metrics"
++    assert not lock.exists(), "the lock must not outlive the migration"
++
++
++def test_a_migration_that_fails_says_so(tmp_path, monkeypatch, capsys):
++    """A silent failure here loses the user's metrics database with no line
++    in the log to say it happened."""
++    _point_at_legacy(monkeypatch, tmp_path)
++    op.LEGACY_METRICS_DB.write_text("legacy metrics", encoding="utf-8")
++
++    def refuse(src, dest):
++        raise OSError(13, "Permission denied")
++
++    monkeypatch.setattr(op.shutil, "move", refuse)
++    op.migrate_legacy_state()
++
++    assert "Could not migrate" in capsys.readouterr().err
++
++
++def test_migration_survives_an_unreadable_legacy_directory(tmp_path, monkeypatch):
++    _point_at_legacy(monkeypatch, tmp_path)
++    op.LEGACY_RESTART_DIR.mkdir()
++    with denied(monkeypatch, op.LEGACY_RESTART_DIR, op.LEGACY_BACKUPS_DIR,
++                op.LEGACY_LOG_FILE, op.LEGACY_METRICS_DB):
++        op.migrate_legacy_state()  # must not raise
++
++
++# ── destructive gate: the tab registry ──────────────────────────
++def test_register_tab_refuses_to_rewrite_a_registry_it_could_not_read(
++        tmp_path, monkeypatch):
++    """The registry is written whole. Reading it as empty erases every tab."""
++    registry = {"other": {"display_name": "other", "cwd": "/somewhere",
++                          "argv": ["--loop"], "wsl_distro": "",
++                          "updated_at": "2026-07-27T10:00:00Z"}}
++    op.TABS_FILE.write_text(json.dumps(registry), encoding="utf-8")
++    monkeypatch.setenv("WT_SESSION", "test-tab")
++
++    real_read_text = Path.read_text
++
++    def unreadable(self, *args, **kwargs):
++        if str(self) == str(op.TABS_FILE):
++            raise PermissionError(13, "Permission denied")
++        return real_read_text(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "read_text", unreadable)
++    op.register_tab(op.Instance("newcomer"), True, ["--agent", "a"], tmp_path)
++    monkeypatch.setattr(Path, "read_text", real_read_text)
++
++    assert json.loads(op.TABS_FILE.read_text(encoding="utf-8")) == registry
++
++
++def test_register_tab_still_records_when_the_registry_reads_fine(
++        tmp_path, monkeypatch):
++    op.TABS_FILE.write_text(json.dumps({"other": {"cwd": "/somewhere"}}),
++                            encoding="utf-8")
++    monkeypatch.setenv("WT_SESSION", "test-tab")
++
++    op.register_tab(op.Instance("newcomer"), True, ["--agent", "a"], tmp_path)
++
++    entries = json.loads(op.TABS_FILE.read_text(encoding="utf-8"))
++    assert set(entries) == {"other", "newcomer"}
++
++
++def test_read_tabs_separates_absent_from_unreadable(tmp_path, monkeypatch):
++    assert op.read_tabs() == {}
++    op.TABS_FILE.write_text("{ not json", encoding="utf-8")
++    assert op.read_tabs() is None
++    assert op.load_tabs() == {}
++
++
++# ── ownership and state ─────────────────────────────────────────
++def test_ownership_refuses_when_the_claim_cannot_be_examined(monkeypatch):
++    """Ownership authorizes killing a session. Anything unproven must refuse."""
++    inst = op.Instance("claimed")
++    inst.claim("tok")
++    with denied(monkeypatch, inst.managed_file):
++        assert inst.ownership() is None
++        assert inst.owns_live_session() is False
++
++
++def test_ownership_refuses_a_claim_that_is_there_but_unreadable(tmp_path, monkeypatch):
++    """Present is not the same as proven.
++
++    A dangling symlink answers ``lstat`` happily and then fails the read. The
++    old handler turned that failed read into a tokenless ownership dict, which
++    ``owns_live_session`` treats as this operator's claim -- authority to kill
++    a session, granted by a claim nobody managed to read.
++    """
++    inst = op.Instance("ghostclaim")
++    if not _can_symlink(tmp_path):
++        pytest.skip("symlink creation is not permitted here")
++    inst.managed_file.symlink_to(tmp_path / "nothing-here")
++    assert op.path_present(inst.managed_file) is True, \
++        "the premise: the marker reads as present"
++    assert inst.ownership() is None
++    assert inst.owns_live_session() is False
++
++
++def test_ownership_still_honours_a_legacy_marker_with_no_token():
++    """The counterpart: a readable marker that simply predates tokens is a
++    real claim and must keep working."""
++    inst = op.Instance("legacyclaim")
++    inst.managed_file.write_text("not json", encoding="utf-8")
++    assert inst.ownership() == {"token": None, "display_name": inst.display_name}
++
++
++def test_is_managed_counts_state_it_cannot_examine_as_present(monkeypatch):
++    """Continuity, not authority: reporting "no such instance" for state that
++    is really there is the misleading answer, and nothing destructive trusts
++    this."""
++    inst = op.Instance("shy")
++    inst.claim("tok")
++    with denied(monkeypatch, inst.managed_file, inst.state_file):
++        assert inst.is_managed() is True
++
++
++def test_is_managed_is_still_false_for_an_instance_with_no_state():
++    assert op.Instance("ghost").is_managed() is False
++
++
++def test_load_state_survives_an_unreadable_state_file(monkeypatch):
++    inst = op.Instance("stateful")
++    inst.save_state(3, "2026-07-27T10:00:00Z")
++    with denied(monkeypatch, inst.state_file):
++        assert inst.load_state() == {"SESSION_NUM": "3",
++                                     "RUN_STARTED": "2026-07-27T10:00:00Z"}
++
++
++def test_managed_instances_survives_an_unreadable_state_directory(monkeypatch):
++    with denied(monkeypatch, op.RESTART_DIR):
++        assert op.managed_instances() == {}
++
++
++# ── catalog and launch spec ─────────────────────────────────────
++def test_handoff_lookup_survives_an_unexaminable_catalog(tmp_path, monkeypatch):
++    catalog = tmp_path / "catalog.csv"
++    catalog.write_text('"/somewhere",abc\n', encoding="utf-8")
++    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
++    with denied(monkeypatch, catalog):
++        assert op.project_handoff_file(tmp_path) is None
++
++
++def test_reload_refuses_to_rewrite_a_spec_it_could_not_read(tmp_path, monkeypatch):
++    """``reload`` writes the spec back from what it read. A failed read that
++    became ``{}`` would leave an instance that launches nothing."""
++    inst = op.Instance("reloadable")
++    original = json.dumps({"argv": ["--agent", "a"], "cwd": str(tmp_path)})
++    inst.spec_file.write_text(original, encoding="utf-8")
++
++    real_read_text = Path.read_text
++
++    def unreadable(self, *args, **kwargs):
++        if str(self) == str(inst.spec_file):
++            raise PermissionError(13, "Permission denied")
++        return real_read_text(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "read_text", unreadable)
++    with pytest.raises(SystemExit):
++        op.reload_instance("reloadable")
++    monkeypatch.setattr(Path, "read_text", real_read_text)
++
++    assert inst.spec_file.read_text(encoding="utf-8") == original
++
++
++def test_reload_rejects_a_spec_that_is_not_an_object(tmp_path):
++    inst = op.Instance("listy")
++    inst.spec_file.write_text("[1, 2, 3]", encoding="utf-8")
++    with pytest.raises(SystemExit):
++        op.reload_instance("listy")
++
++
++# ── metrics: sqlite creates what it cannot find ─────────────────
++def test_report_refuses_a_metrics_database_it_cannot_examine(capsys, monkeypatch):
++    """``sqlite3.connect`` creates the file when it is missing.
++
++    So "cannot tell" must not fall through to a connect: through a dangling
++    symlink that writes a fresh empty database at the link target, and every
++    query then fails against it.
++    """
++    with denied(monkeypatch, op.METRICS_DB):
++        assert op.report_metrics("summary") == 1
++    assert not op.METRICS_DB.exists()
++    assert "Could not examine" in capsys.readouterr().err
++
++
++def test_report_treats_a_dangling_metrics_symlink_as_no_database(
++        tmp_path, capsys):
++    if not _can_symlink(tmp_path):
++        pytest.skip("symlink creation is not permitted here")
++    target = tmp_path / "elsewhere.db"
++    op.METRICS_DB.symlink_to(target)
++    assert op.report_metrics("summary") == 1
++    assert not target.exists(), "sqlite created a database at the link target"
++
++
++def test_report_reports_a_corrupt_database_instead_of_crashing(capsys):
++    op.METRICS_DB.write_text("this is not a database", encoding="utf-8")
++    assert op.report_metrics("summary") == 1
++    assert "Could not read" in capsys.readouterr().err
++
++
++# ── deleting is a probe too ─────────────────────────────────────
++def test_cleanup_survives_a_file_it_cannot_delete(monkeypatch):
++    """``missing_ok=True`` forgives absence, not EACCES.
++
++    Refusing an action gracefully and then crashing in the cleanup that
++    follows is the same failure wearing a different hat -- and it lands on
++    the supervisor's shutdown path, which only runs when something already
++    went wrong.
++    """
++    inst = op.Instance("sticky")
++    inst.claim("tok")
++    inst.stop_marker.touch()
++    real_unlink = Path.unlink
++
++    def denied_unlink(self, *args, **kwargs):
++        if str(self) == str(inst.stop_marker):
++            raise PermissionError(13, "Permission denied")
++        return real_unlink(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "unlink", denied_unlink)
++    assert op.remove_file(inst.stop_marker) is False
++    inst.cleanup_files()
++    monkeypatch.setattr(Path, "unlink", real_unlink)
++
++    assert not inst.managed_file.exists(), \
++        "one undeletable file must not stop the rest of the cleanup"
++
++
++def test_remove_file_reports_success_for_an_absent_path():
++    inst = op.Instance("clean")
++    assert op.remove_file(inst.stop_marker) is True
++
++

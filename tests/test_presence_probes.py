@@ -258,6 +258,91 @@ def test_migration_will_not_move_onto_a_dangling_symlink(tmp_path, monkeypatch):
     assert op.LEGACY_METRICS_DB.exists()
 
 
+def test_a_second_operator_does_not_migrate_at_the_same_time(tmp_path,
+                                                            monkeypatch):
+    """Probing a destination and moving onto it are two syscalls.
+
+    A tri-state probe fixes the first one; it does nothing about the answer
+    going stale before the move. On a box running a loop per project the
+    operators start together, so the migration takes an exclusive lock and
+    the loser finds the work already done -- which is the right outcome for a
+    one-time move.
+    """
+    _point_at_legacy(monkeypatch, tmp_path)
+    op.LEGACY_METRICS_DB.write_text("legacy metrics", encoding="utf-8")
+    lock = op.OPERATOR_HOME / "migrate.lock"
+    lock.write_text(str(os.getpid()), encoding="utf-8")
+
+    op.migrate_legacy_state()
+
+    assert not op.METRICS_DB.exists(), "migrated while another holder had the lock"
+    assert op.LEGACY_METRICS_DB.exists()
+    lock.unlink()
+
+    op.migrate_legacy_state()
+    assert op.METRICS_DB.read_text(encoding="utf-8") == "legacy metrics"
+    assert not lock.exists(), "the lock must not outlive the migration"
+
+
+def test_a_migration_that_fails_says_so(tmp_path, monkeypatch, capsys):
+    """A silent failure here loses the user's metrics database with no line
+    in the log to say it happened."""
+    _point_at_legacy(monkeypatch, tmp_path)
+    op.LEGACY_METRICS_DB.write_text("legacy metrics", encoding="utf-8")
+
+    def refuse(src, dest):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(op.shutil, "move", refuse)
+    op.migrate_legacy_state()
+
+    assert "Could not migrate" in capsys.readouterr().err
+
+
+def test_a_lock_being_taken_is_not_mistaken_for_a_stale_one(tmp_path):
+    """``os.open`` creates the lock file empty and the pid lands a moment
+    later. Reading that empty file as "no owner, therefore stale" hands the
+    same lock to two processes -- which is the one thing a lock exists to
+    stop."""
+    lock = tmp_path / "some.lock"
+    lock.write_text("", encoding="utf-8")
+
+    with op._exclusive_lock(lock) as acquired:
+        assert acquired is False
+    assert lock.exists(), "another process's half-written lock was deleted"
+
+
+def test_a_lock_whose_owner_is_gone_is_still_reclaimed(tmp_path):
+    """The counterpart: refusing everything unparseable must not cost us the
+    stale-holder recovery that made the lock usable after a crash."""
+    lock = tmp_path / "some.lock"
+    lock.write_text("999999999", encoding="utf-8")
+
+    with op._exclusive_lock(lock) as acquired:
+        assert acquired is True
+        assert lock.read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert not lock.exists()
+
+
+def test_a_lock_that_cannot_be_read_is_treated_as_held(tmp_path, monkeypatch):
+    lock = tmp_path / "some.lock"
+    lock.write_text("999999999", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def unreadable(self, *args, **kwargs):
+        if str(self) == str(lock):
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    try:
+        with op._exclusive_lock(lock) as acquired:
+            assert acquired is False
+    finally:
+        monkeypatch.setattr(Path, "read_text", real_read_text)
+    assert lock.exists()
+
+
 def test_migration_survives_an_unreadable_legacy_directory(tmp_path, monkeypatch):
     _point_at_legacy(monkeypatch, tmp_path)
     op.LEGACY_RESTART_DIR.mkdir()
