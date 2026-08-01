@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -228,6 +231,112 @@ def test_loop_mode_keeps_an_explicit_no_experimental(monkeypatch):
     assert seen, "the loop never launched, so nothing about its args was tested"
     assert "--experimental" not in seen[0]
     assert "--no-experimental" in seen[0]
+
+
+# ── operator.sh must default the same way ───────────────────────
+#
+# Everything above tests the Python operator. `operator.sh` is what actually
+# runs on Linux and macOS, it received the same change, and CI checks it with
+# `bash -n` only -- which proves it parses and says nothing about what it
+# launches. So the flag could be dropped from the shell path while every job
+# stayed green: an extension outage on two platforms, reported by nothing, in
+# exactly the shape this change exists to abolish.
+OPERATOR_SH = Path(__file__).resolve().parent.parent / "operator.sh"
+
+def _bash_executable() -> str | None:
+    """A bash that can actually run a script out of a native temp directory.
+
+    On Windows, `bash` on PATH is `System32\\bash.exe` -- the WSL launcher.
+    On this class of machine it cannot reach `/mnt/c` at all, and it has been
+    observed exiting 0 for a script whose transfer had failed: a false OK,
+    which is the one failure mode these tests exist to refuse. Git for Windows
+    ships a real msys bash that takes native paths, so prefer it, and fall
+    back to PATH only where PATH bash is the genuine article.
+    """
+    if os.name == "nt":
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        git_bash = program_files / "Git" / "bin" / "bash.exe"
+        return str(git_bash) if git_bash.is_file() else None
+    return shutil.which("bash")
+
+
+bash = pytest.mark.skipif(_bash_executable() is None,
+                          reason="no bash that can run a native-path script")
+
+
+def _shell_function(name: str) -> str:
+    """The body of a top-level ``name() {`` ... ``}`` function in operator.sh.
+
+    Reads the real shipped source rather than a copy of it, so these tests
+    cannot go on passing against a function the script no longer contains.
+    """
+    text = OPERATOR_SH.read_text(encoding="utf-8")
+    match = re.search(rf"^{re.escape(name)}\(\) \{{\n(.*?)^\}}$",
+                      text, re.MULTILINE | re.DOTALL)
+    assert match, f"{name}() not found in operator.sh"
+    return match.group(1)
+
+
+@pytest.mark.parametrize("function", ["run_single_session", "run_loop_mode"])
+def test_operator_sh_launches_copilot_in_experimental_mode(function):
+    """Both shell launch paths, not just one.
+
+    Parametrised because they are separate code paths that were changed
+    separately. Covering only the loop would leave a plain `operator` on macOS
+    starting sessions with no extensions at all.
+    """
+    body = _shell_function(function)
+    appends = [line.strip() for line in body.splitlines()
+               if 'copilot_args+=("--experimental")' in line]
+    assert len(appends) == 1, (
+        f"{function}() should add --experimental exactly once, found {appends}")
+    # Guarded, never unconditional -- the shell counterpart of
+    # test_loop_mode_keeps_an_explicit_no_experimental. Without this line,
+    # hard-coding the flag would satisfy the assertion above while making
+    # --no-experimental impossible to express through the operator.
+    assert appends[0].startswith("has_experimental_flag "), (
+        f"{function}() adds --experimental unconditionally: {appends[0]}")
+
+
+@bash
+@pytest.mark.parametrize("args", [
+    ["--experimental"], ["--no-experimental"], ["--experimental=true"],
+    ["--yolo"], [], ["--experimentalish"],
+    # Value positions. A blind token scan cannot tell an option from the value
+    # of one, so these are the cases where the two implementations are most
+    # likely to be fixed apart -- and the ones a bare-token table misses.
+    ["-i", "--no-experimental"], ["-p", "--no-experimental"],
+    ["--", "--no-experimental"],
+])
+def test_operator_sh_has_experimental_flag_agrees_with_python(tmp_path, args):
+    """Run the real shell function and require the same answer as Python's.
+
+    This asserts AGREEMENT, deliberately, not correctness: the expected value
+    is `op.has_experimental_flag` itself rather than a hand-written table, so
+    the two implementations cannot drift apart without this failing. Whether a
+    given answer is the *right* one is the job of the tests that name the
+    behaviour; the job of this one is that Linux and macOS never quietly get a
+    different launch decision from Windows.
+
+    That is why the value-position cases belong here even while both sides
+    still answer them the same way. The moment one implementation learns to
+    skip option values and the other does not, this goes red -- which is the
+    realistic failure, since the shell half is the half that gets forgotten.
+
+    A harness that fails to run the script at all exits with some other code
+    and fails loudly, rather than passing vacuously.
+    """
+    script = tmp_path / "probe.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        f"has_experimental_flag() {{\n{_shell_function('has_experimental_flag')}}}\n"
+        'has_experimental_flag "$@"\n',
+        encoding="utf-8", newline="\n")
+    proc = subprocess.run([_bash_executable(), "probe.sh", *args], cwd=tmp_path,
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode in (0, 1), (
+        f"the probe did not run (exit {proc.returncode}): {proc.stderr}")
+    assert (proc.returncode == 0) is op.has_experimental_flag(args)
 
 
 # ── preamble ────────────────────────────────────────────────────
