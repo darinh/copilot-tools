@@ -7,6 +7,7 @@ actually measured. Every test here pins one side of that decision.
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -370,43 +371,212 @@ def test_a_log_that_gains_its_event_during_the_scan_read_is_not_erased(
     assert "Cleared 0 row(s)" in capsys.readouterr().out
 
 
-def test_no_file_io_happens_while_the_write_lock_is_held(db_path, logs,
-                                                         monkeypatch):
-    """A repair must not become an outage.
+class _Traced:
+    """A connection that records the transaction verbs it is asked to run.
 
-    The operator waits BUSY_TIMEOUT (15s) for the database. Statting
-    thousands of logs inside one BEGIN IMMEDIATE can outlast that on a
-    network mount or a loaded disk, so the live loop dies of a lock this
-    script was holding. Each row gets its own short transaction instead, and
-    the stat happens outside it.
+    Lets a test assert the *shape* of the locking -- where transactions open
+    and close relative to the file probes -- rather than a proxy for it.
     """
-    add_session(db_path, "process-1.log")
-    (logs / "process-1.log").write_text("no shutdown here", encoding="utf-8")
 
-    stats_under_lock = []
+    def __init__(self, conn, trace):
+        self._conn = conn
+        self.trace = trace
+
+    def execute(self, sql, *args):
+        verb = sql.strip().split()[0].upper()
+        if verb in ("BEGIN", "COMMIT", "ROLLBACK"):
+            self.trace.append(verb)
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _trace_run(db_path, logs, monkeypatch, argv, on_begin=None):
+    """Run the repair, recording probes and transaction verbs in one order.
+
+    ``on_begin`` fires as each row's transaction opens -- the moment a live
+    operator that held the lock has just let go of it.
+    """
+    trace = []
     real_fingerprint = backfill_unknown_metrics.log_fingerprint
-
-    def watched(path):
-        stats_under_lock.append(conn_holder["conn"].in_transaction)
-        return real_fingerprint(path)
-
-    conn_holder = {}
+    real_read = backfill_unknown_metrics.log_has_shutdown_event
     real_connect = backfill_unknown_metrics.connect
 
-    def remember(db):
-        conn_holder["conn"] = real_connect(db)
-        return conn_holder["conn"]
+    class Hooked(_Traced):
+        def execute(self, sql, *args):
+            if on_begin is not None and sql.strip().upper().startswith("BEGIN"):
+                on_begin()
+            return super().execute(sql, *args)
 
-    monkeypatch.setattr(backfill_unknown_metrics, "connect", remember)
-    monkeypatch.setattr(backfill_unknown_metrics, "log_fingerprint", watched)
+    def stat(path):
+        trace.append("STAT")
+        return real_fingerprint(path)
 
-    backfill_unknown_metrics.main(
+    def read(path):
+        trace.append("READ")
+        return real_read(path)
+
+    monkeypatch.setattr(backfill_unknown_metrics, "log_fingerprint", stat)
+    monkeypatch.setattr(
+        backfill_unknown_metrics, "log_has_shutdown_event", read)
+    monkeypatch.setattr(backfill_unknown_metrics, "connect",
+                        lambda db: Hooked(real_connect(db), trace))
+
+    rc = backfill_unknown_metrics.main(argv)
+    return rc, trace
+
+
+def _segments(trace):
+    """The probes inside each transaction, one list per transaction."""
+    out = []
+    current = None
+    for event in trace:
+        if event == "BEGIN":
+            assert current is None, "a transaction opened inside another one"
+            current = []
+        elif event in ("COMMIT", "ROLLBACK"):
+            assert current is not None, f"{event} with no transaction open"
+            out.append(current)
+            current = None
+        elif current is not None:
+            current.append(event)
+    assert current is None, "a transaction was left open"
+    return out
+
+
+def test_the_write_lock_holds_one_stat_and_never_a_log_read(db_path, logs,
+                                                            monkeypatch):
+    """A repair must not become an outage, and must not check stale evidence.
+
+    Two constraints pull against each other and both are real. Reading every
+    log inside one transaction blocks the live operator for the length of the
+    whole scan, which on a loaded disk outlasts the 15s it waits. But checking
+    the log *before* opening the transaction is worse than useless: acquiring
+    the lock can itself block for that same 15s, so the verdict is stale by
+    the time it is acted on.
+
+    The shape that satisfies both: read logs with no transaction open, then
+    per row take the lock and re-stat that one log inside it. Microseconds
+    held, nothing trusted across the wait.
+    """
+    add_session(db_path, "process-1.log")
+    add_session(db_path, "process-2.log")
+    for name in ("process-1.log", "process-2.log"):
+        (logs / name).write_text("no shutdown here", encoding="utf-8")
+
+    rc, trace = _trace_run(
+        db_path, logs, monkeypatch,
         ["--db", str(db_path), "--logs", str(logs), "--apply"])
 
-    assert stats_under_lock, "test precondition: no stat was observed at all"
-    assert not any(stats_under_lock), (
-        "a log was statted while holding the write lock")
-    assert read_row(db_path, "process-1.log")["lines_added"] is None
+    assert rc == 0
+    assert "READ" in trace, "test precondition: no log was ever read"
+    assert "BEGIN" in trace, "test precondition: no transaction was opened"
+
+    segments = _segments(trace)
+    assert len(segments) == 2, (
+        f"expected one transaction per row, got {len(segments)}: {trace}")
+    for probes in segments:
+        assert probes == ["STAT"], (
+            f"a transaction did more than stat its own log: {probes}")
+
+    assert "READ" not in trace[trace.index("BEGIN"):], (
+        "a log was read while the write lock was held")
+
+
+def test_a_log_that_gains_its_event_while_the_lock_is_awaited_is_not_erased(
+        db_path, logs, capsys, monkeypatch):
+    """``BEGIN IMMEDIATE`` can wait 15 seconds. Evidence cannot be older.
+
+    The process this repair contends with for the write lock is the operator,
+    and the operator is precisely the thing that appends a shutdown event and
+    re-ingests the row. So the interleaving is not exotic, it is the expected
+    one: check the log, block on the lock, and by the time the lock is granted
+    the log has grown the event and the row has been measured -- legitimately
+    to all zeros, because short sessions do that -- so the zero guard still
+    matches and a genuinely measured row is erased.
+
+    Simulated here by growing the log exactly as each transaction opens: the
+    write lock has just been released by whoever appended it.
+    """
+    add_session(db_path, "process-1.log")
+    log = logs / "process-1.log"
+    log.write_text("no shutdown here", encoding="utf-8")
+
+    fired = []
+
+    def operator_finishes_the_session():
+        fired.append(True)
+        log.write_text(
+            'no shutdown here\n{"kind": "session_shutdown"}', encoding="utf-8")
+
+    rc, trace = _trace_run(
+        db_path, logs, monkeypatch,
+        ["--db", str(db_path), "--logs", str(logs), "--apply"],
+        on_begin=operator_finishes_the_session)
+
+    assert rc == 0
+    assert fired, "test precondition: no transaction ever opened"
+    row = read_row(db_path, "process-1.log")
+    assert row["api_time_seconds"] == 0, (
+        "erased a row whose log grew its shutdown event during the lock wait")
+    assert row["raw_metrics"] == ZEROED_RAW
+    assert "Cleared 0 row(s)" in capsys.readouterr().out
+
+
+def test_an_unreadable_log_is_not_mistaken_for_a_deleted_one(
+        db_path, logs, capsys, monkeypatch):
+    """``--missing-logs`` clears on the strength of "the log is gone".
+
+    A locked file, a dropped network mount or a permission error is not gone.
+    Folding every ``OSError`` into the same "absent" answer lets a momentary
+    I/O failure erase a session whose log is sitting on disk with a shutdown
+    event in it -- and unlike a missing log, that one is provably measured.
+    ``log_has_shutdown_event`` already treats an unreadable log as a reason to
+    change nothing; the fingerprint has to agree with it.
+    """
+    add_session(db_path, "process-1.log")
+    log = logs / "process-1.log"
+    log.write_text('{"kind": "session_shutdown"}', encoding="utf-8")
+
+    real_stat = Path.stat
+
+    def denied(self, *args, **kwargs):
+        if self.name == "process-1.log":
+            raise PermissionError(13, "the file is locked by another process")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied)
+
+    assert backfill_unknown_metrics.log_fingerprint(log) == \
+        backfill_unknown_metrics.UNREADABLE, (
+        "test precondition: the stat was not actually denied")
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--missing-logs",
+         "--apply"])
+
+    assert rc == 0
+    row = read_row(db_path, "process-1.log")
+    assert row["api_time_seconds"] == 0, (
+        "erased a measured row because its log could not be statted")
+    assert row["raw_metrics"] == ZEROED_RAW
+    assert "No fabricated zeros found" in capsys.readouterr().out
+
+
+def test_a_genuinely_missing_log_is_still_cleared_with_the_flag(
+        db_path, logs, capsys):
+    """The other side of the same decision, so the fix above cannot pass by
+    refusing to clear anything at all."""
+    add_session(db_path, "process-gone.log")
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--missing-logs",
+         "--apply"])
+
+    assert rc == 0
+    assert read_row(db_path, "process-gone.log")["api_time_seconds"] is None
+    assert "Cleared 1 row(s)" in capsys.readouterr().out
 
 
 def test_clears_more_rows_than_sqlite_takes_parameters(db_path, logs, capsys):
