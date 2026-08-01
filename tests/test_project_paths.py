@@ -72,6 +72,25 @@ def test_primary_root_of_a_missing_path_is_unchanged(tmp_path):
     assert primary_repo_root(gone) == gone
 
 
+def test_primary_root_of_a_worktree_it_cannot_examine_is_still_the_root(
+        repo_with_worktree, monkeypatch):
+    """A path that cannot be stat-ed is not a path outside a repository.
+
+    ``is_dir()`` raises on EACCES, and the enclosing handler returned ``start``
+    unchanged -- the documented answer for "not in a repo", handed back for a
+    checkout that is very much in one. In a worktree that answer is the
+    worktree, which looks like an unregistered project and mints the duplicate
+    catalog entry this module exists to prevent. Git needs no stat of ours to
+    answer, so it is asked anyway.
+    """
+    root, wt = repo_with_worktree
+    with denied(monkeypatch, wt) as seen:
+        found = primary_repo_root(wt)
+    assert seen["n"], "the denial never fired; the test proves nothing"
+    assert found.resolve() == root.resolve(), \
+        "an unexaminable worktree was mistaken for a project of its own"
+
+
 # ── catalog lookups ─────────────────────────────────────────────
 def test_handoff_resolves_the_catalog_from_a_worktree(
         repo_with_worktree, tmp_path, monkeypatch):
