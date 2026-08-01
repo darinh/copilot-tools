@@ -1,0 +1,17 @@
+# Line endings, where they are a correctness property rather than a style one.
+#
+# `core.autocrlf=true` is the norm on Windows, and this repository had no
+# attributes file, so every `*.sh` here was stored LF in the index and written
+# CRLF into a Windows working tree. Real bash then refuses the file at its
+# second line -- `set: pipefail\r: invalid option name` -- before a single
+# assertion runs. Nobody on Windows could execute the shell suites at all,
+# which is how `tests/test-todo-claims.sh` went its whole life unrun.
+#
+# `eol=lf` is checkout behaviour, so it fixes the working tree that `text`
+# alone would not: `text` normalises on the way in, and the index was already
+# clean. The rule is scoped to shell scripts on purpose -- `*.ps1` and the rest
+# stay on the platform default, because CRLF costs them nothing.
+#
+# `tests/test_line_ending_conformance.py` fails if a tracked shell script ever
+# falls outside these patterns, including one named without a `.sh` suffix.
+*.sh text eol=lf
