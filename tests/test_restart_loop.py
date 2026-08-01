@@ -428,10 +428,11 @@ def test_restart_loop_requires_a_name():
 
 # ── handoff hazards found in adversarial review ─────────────────
 
-def test_concurrent_restarts_do_not_spawn_two_supervisors(monkeypatch):
+def test_concurrent_restarts_do_not_spawn_two_supervisors(monkeypatch, capsys):
     """Two supervisors watching one session relaunch over each other's work
     forever. Only one handoff may be in flight at a time."""
     spawned = {"n": 0}
+    refusal: dict = {}
     monkeypatch.setattr(op.MUX, "has_session", lambda session: True)
     monkeypatch.setattr(op, "_running_loop_pid", lambda instance: None)
 
@@ -443,7 +444,8 @@ def test_concurrent_restarts_do_not_spawn_two_supervisors(monkeypatch):
         spawned["n"] += 1
         if spawned["n"] == 1:
             # A second restart arriving mid-handoff must be turned away.
-            assert op.restart_loop("concurrent") == 1
+            refusal["rc"] = op.restart_loop("concurrent")
+            refusal["err"] = capsys.readouterr().err
         return 1
 
     monkeypatch.setattr(op, "_spawn_background_loop", reentrant_spawn)
@@ -451,6 +453,13 @@ def test_concurrent_restarts_do_not_spawn_two_supervisors(monkeypatch):
                         lambda instance: 55 if spawned["n"] else None)
 
     assert op.restart_loop("concurrent") == 0
+    assert refusal["rc"] == 1
+    # 1 is every refusal this function has, and the inner call is standing in
+    # front of several. Delete the handoff lock and it walks past this one
+    # into the handoff itself, waits out its budget on a supervisor that never
+    # dies, and returns the same 1 from a timeout -- which is what the suite
+    # used to accept. So the reason has to be read, not just the code.
+    assert "already in progress" in refusal["err"]
     assert spawned["n"] == 1, "the second restart must not have spawned anything"
 
 
