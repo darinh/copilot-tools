@@ -169,9 +169,14 @@ Each project can have a persistent configuration stored outside the repo at `~/.
 form of the platform that created the entry**:
 
 ```csv
-"C:\Users\dev\repos\my-app",a1b2c3d4-e5f6-7890-abcd-ef1234567890
-"/home/dev/projects/other-project",f9e8d7c6-b5a4-3210-fedc-ba0987654321
+"C:\Users\dev\repos\my-app",EXAMPLE1-1111-1111-1111-111111111111
+"/home/dev/projects/other-project",EXAMPLE2-2222-2222-2222-222222222222
 ```
+
+Those two GUIDs are invalid on purpose. **Do not copy them, and do not write this block anywhere.**
+Generate a fresh GUID, and **append** your one line to `catalog.csv` — never rewrite the file.
+It holds the registration of every project on the machine, no tool here writes it, and nothing
+here can rebuild it.
 
 When matching, normalize the current project root before comparing. On Windows compare
 case-insensitively; on Linux and macOS compare case-sensitively.
@@ -194,7 +199,8 @@ case-insensitively; on Linux and macOS compare case-sensitively.
    - "This project isn't in the catalog yet. Would you like to set it up?"
    - Choices: "Enable all features" / "Select features" / "Skip for now"
    - If enabling: generate a GUID, create the directory, write `copilot-instructions.md` (see
-     **What to write in a per-project file** below), add entry to `catalog.csv`.
+     **What to write in a per-project file** below), and **append** one line to `catalog.csv`.
+     Never rewrite that file.
    - **If spec-driven is selected and `.specify/` is missing**, initialize spec-kit using the script
      variant matching your platform — `ps` on Windows, `sh` on Linux/macOS/WSL:
 

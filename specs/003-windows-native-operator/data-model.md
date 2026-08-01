@@ -175,9 +175,13 @@ Rows are deleted and reinserted per session on reprocessing.
 `~/.copilot/projects/catalog.csv` — two columns, optionally quoted:
 
 ```csv
-"C:\Users\dev\repos\my-app",a1b2c3d4-e5f6-7890-abcd-ef1234567890
-"/home/dev/repos/my-app",f9e8d7c6-b5a4-3210-fedc-ba0987654321
+"C:\Users\dev\repos\my-app",EXAMPLE1-1111-1111-1111-111111111111
+"/home/dev/repos/my-app",EXAMPLE2-2222-2222-2222-222222222222
 ```
+
+The GUIDs shown are deliberately invalid, matching `templates/copilot-instructions.md`: an agent
+reads both files as instructions, and a realistic value beside a write instruction is one that gets
+copied into the user's real catalog.
 
 Lookup normalizes the project root and compares. On Windows the comparison is **case-insensitive** and
 separator-normalized; on POSIX it is case-sensitive. A catalog written on one platform stores that
