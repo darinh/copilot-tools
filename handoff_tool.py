@@ -93,8 +93,31 @@ def die(msg: str) -> "NoReturn":  # type: ignore[valid-type]
     sys.exit(1)
 
 
+def resolved_str(path) -> str:
+    """``str`` of ``path`` resolved, falling back to a lexical absolute path.
+
+    ``Path.resolve`` is not total. A symlink loop raises ``RuntimeError`` on
+    every interpreter this project supports, and a component that cannot be
+    traversed raises ``OSError``. Both used to be unreachable from here
+    because ``main`` refused an unexaminable root before either could be
+    called. Now that it proceeds -- deliberately, so a transient denial does
+    not cost the session its handoff -- they are reachable, and a traceback on
+    this path throws away the very text the tool exists to bank.
+
+    The fallback does not follow links, so it can only be *less* resolved than
+    the real answer, never differently resolved. Both sides of the catalog
+    comparison go through this same function, so a path that will not resolve
+    is matched literally or not at all; it cannot come to name a different
+    project.
+    """
+    try:
+        return str(Path(path).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return os.path.abspath(str(path))
+
+
 def normalize(path) -> str:
-    resolved = str(Path(path).resolve())
+    resolved = resolved_str(path)
     return resolved.lower() if IS_WINDOWS else resolved
 
 
@@ -525,12 +548,12 @@ def resolve_guid(project_root) -> str:
                             f"project id: {guid!r}\n"
                             f"The second column must be one plain directory "
                             f"name, such as a GUID. Fix the line to read:\n"
-                            f"  \"{Path(project_root).resolve()}\",<guid>")
+                            f"  \"{resolved_str(project_root)}\",<guid>")
                     return guid
     except OSError as exc:
         die(f"Cannot read catalog {CATALOG}: {exc}")
     die(f"No catalog entry for: {target}\n"
-        f"Add it with a line such as:\n  \"{Path(project_root).resolve()}\",<guid>")
+        f"Add it with a line such as:\n  \"{resolved_str(project_root)}\",<guid>")
 
 
 class StateUnreadable(Exception):
@@ -571,7 +594,7 @@ def managed_ids() -> set[str]:
 
 
 def infer_instance(project_root, mux: Mux) -> str | None:
-    target = str(Path(project_root).resolve())
+    target = resolved_str(project_root)
     try:
         managed = managed_ids()
     except StateUnreadable as exc:
