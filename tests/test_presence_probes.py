@@ -1162,10 +1162,71 @@ def test_an_unlistable_skills_directory_says_so_instead_of_shipping_nothing(
     found = st._skill_sources()
 
     out = capsys.readouterr().out
-    assert found == [], "premise: nothing can be enumerated through that link"
+    assert found is None, (
+        f"an unlistable skills/ answered the same as a repository that ships "
+        f"none, and the caller cannot tell them apart from the return: {found!r}"
+    )
     assert "could not be listed" in out, (
         f"a skills/ that could not be read was reported as a repository that "
         f"ships no skills, with nothing said about it: {out!r}"
+    )
+
+
+def test_an_unreadable_extensions_directory_is_not_reported_as_absent(
+        tmp_path, monkeypatch, capsys):
+    """The skip message is the only trace either state leaves behind.
+
+    ``_extension_sources`` returned ``[]`` for a directory it could not read,
+    so ``install_extensions`` printed "No extensions/ directory found" — a
+    cause nobody measured, for a directory that was found and was unreadable.
+    A wrong sentence here is worse than none, because it closes the question.
+    """
+    if not _can_symlink(tmp_path):
+        pytest.skip("no symlink privilege on this machine")
+    import setup_tools as st
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "extensions").symlink_to(tmp_path / "gone", target_is_directory=True)
+    monkeypatch.setattr(st, "REPO_ROOT", root)
+
+    st.install_extensions(assume_yes=True)
+
+    out = capsys.readouterr().out
+    assert "could not be read" in out, (
+        f"the run said nothing about an extensions/ it could not examine: "
+        f"{out!r}"
+    )
+    assert "absent" not in out, (
+        f"an unreadable extensions/ was reported as an absent one: {out!r}"
+    )
+    assert "No extensions/ directory found" not in out, (
+        f"the original false sentence came back: {out!r}"
+    )
+
+
+def test_an_absent_extensions_directory_is_still_reported_as_absent(
+        tmp_path, monkeypatch, capsys):
+    """Negative control for the test above.
+
+    Without this, wording the unreadable branch so that it never says "absent"
+    would pass by making *both* branches say "could not be read", which is the
+    same defect with the polarity reversed.
+    """
+    import setup_tools as st
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setattr(st, "REPO_ROOT", root)
+
+    st.install_extensions(assume_yes=True)
+
+    out = capsys.readouterr().out
+    assert "absent" in out, (
+        f"a genuinely missing extensions/ did not say so: {out!r}"
+    )
+    assert "could not be read" not in out, (
+        f"a missing extensions/ was reported as an unreadable one: {out!r}"
     )
 
 
