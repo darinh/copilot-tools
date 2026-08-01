@@ -460,10 +460,46 @@ def test_preserve_refuses_a_file_that_grows_past_the_limit_while_read(
 
 
 def test_preserve_treats_a_vanished_file_as_nothing_to_save(tmp_path, monkeypatch):
-    """The reader can consume the handoff between the probe and the stat."""
+    """The reader can consume the handoff between the probe and the stat.
+
+    `None` is also what the ordinary absent path returns, so the return value
+    alone cannot say which branch ran -- and if this `path_present` patch ever
+    stopped reaching the name `preserve_prior_handoff` actually calls, the real
+    probe would answer False for this missing file and the assertion would pass
+    on the wrong branch, testing nothing. The `lstat` spy is what separates
+    them: it is only reached *past* the absent check, so it fires exactly when
+    the probe was overridden and not at all when the patch is dead.
+    """
     target = tmp_path / "next-session.md"
+    seen = []
+    real_lstat = ho.os.lstat
     monkeypatch.setattr(ho, "path_present", lambda p: True)
+    monkeypatch.setattr(ho.os, "lstat",
+                        lambda p, *a, **kw: (seen.append(Path(p)),
+                                             real_lstat(p, *a, **kw))[1])
+
     assert ho.preserve_prior_handoff(target) is None
+    assert target in seen, \
+        "returned None without reaching the stat: the absent check answered, " \
+        "so the vanished-between-probe-and-stat race was never exercised"
+
+
+def test_a_probe_that_says_absent_is_the_one_preserve_consults(tmp_path, monkeypatch):
+    """Control for the test above, through the same call.
+
+    Both tests patch `ho.path_present`; this one drives it the other way with a
+    handoff that really is sitting there. A live patch means no archive. A
+    patch that misses the name preserve consults means the real probe sees the
+    file, the copy happens, and this fails -- which is what makes the sibling's
+    `is None` mean something.
+    """
+    target = tmp_path / "next-session.md"
+    target.write_text("UNREAD", encoding="utf-8")
+    monkeypatch.setattr(ho, "path_present", lambda p: False)
+
+    assert ho.preserve_prior_handoff(target) is None
+    assert not (tmp_path / ho.SUPERSEDED_DIRNAME).exists(), \
+        "the patched probe was not the one preserve_prior_handoff calls"
 
 
 def test_preserve_refuses_a_directory(tmp_path):
@@ -915,21 +951,42 @@ def test_a_second_writer_cannot_enter_the_section_while_one_is_open(
     assert holding.wait(timeout=10), "first handoff never reached the write"
 
     second_got_in = threading.Event()
+    contender_failed = []
 
     def run_second():
-        with ho.handoff_lock(handoff) as acquired:
-            if acquired:
-                second_got_in.set()
+        try:
+            with ho.handoff_lock(handoff) as acquired:
+                if acquired:
+                    second_got_in.set()
+        except BaseException as exc:              # pragma: no cover - reported
+            contender_failed.append(exc)
 
     monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.3)
     contender = threading.Thread(target=run_second, daemon=True)
     contender.start()
     contender.join(timeout=10)
+    assert not contender_failed, \
+        f"the contender never reached the lock: {contender_failed!r}"
     assert not second_got_in.is_set(), \
         "a second handoff entered the critical section while one was open"
 
     let_go.set()
     worker.join(timeout=10)
+
+    # The control, through the same call: an unset event is also what a
+    # contender that crashed on the way to the lock leaves behind, and what a
+    # thread that never ran leaves behind. Re-running the identical body with
+    # the section now free must set it. If this fails, the exclusion asserted
+    # above was never demonstrated -- only the silence was.
+    rerun = threading.Thread(target=run_second, daemon=True)
+    rerun.start()
+    rerun.join(timeout=10)
+    assert not contender_failed, \
+        f"the contender never reached the lock: {contender_failed!r}"
+    assert second_got_in.is_set(), \
+        "the contender cannot take the lock even when it is free, so its " \
+        "earlier failure to take it proves nothing"
+
     assert "FIRST" in handoff.read_text(encoding="utf-8")
     archived = [p.read_text(encoding="utf-8")
                 for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]

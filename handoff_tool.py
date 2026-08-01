@@ -55,6 +55,14 @@ from project_paths import (                                   # noqa: E402
 )
 
 IS_WINDOWS = platform.system() == "Windows"
+# `projects_root()` resolves `Path.home()` on every call, but this line runs
+# once, at IMPORT time -- so the home directory this path was built from is
+# whichever one was in effect when the module was first imported, not the one
+# in effect when the catalog is read. A test that relocates home afterwards
+# (monkeypatching `Path.home`, or `HOME`/`USERPROFILE`) moves the *functions*
+# and leaves this constant pointing at the real one. Patch `handoff_tool.CATALOG`
+# itself, which is what the tests here do and what conftest's guard tells you
+# to do when it catches a write to the live catalog.
 CATALOG = projects_root() / "catalog.csv"
 # Where a handoff that was never read goes instead of into the bit bucket.
 SUPERSEDED_DIRNAME = "superseded"
