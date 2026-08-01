@@ -49,3 +49,10 @@ version = { attr = "copilot_tools_version.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `tests/` is on the path deliberately, not by accident of the default
+# import mode. The conformance scans share their AST helpers by importing
+# one another, and under `--import-mode=importlib` pytest stops prepending
+# the rootdir of a test file to `sys.path` -- so that sharing would become a
+# collection-time `ModuleNotFoundError` the day someone passes that flag.
+# One line here says the arrangement is intended and makes it survive.
+pythonpath = ["tests"]

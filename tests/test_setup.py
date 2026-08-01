@@ -222,6 +222,50 @@ def test_link_directory_does_not_prompt_when_the_link_is_already_ours(tmp_path, 
     assert setup_tools._link_directory(src, dest) == "already linked"
 
 
+@pytest.mark.parametrize("exc", [
+    RuntimeError("Symlink loop"),
+    ValueError("stat: embedded null character in path"),
+], ids=["symlink-loop", "embedded-nul"])
+def test_link_directory_survives_a_source_that_will_not_resolve(
+        tmp_path, monkeypatch, exc):
+    """The "is this link already ours?" question must not abort the install.
+
+    ``resolve`` raises ``RuntimeError`` on a symlink loop and ``ValueError``
+    on an embedded NUL as well as ``OSError`` on a denial, and only the last
+    was caught. A link is the one input on this branch that can *be* a loop,
+    so the narrow handler turned "no, it points somewhere else" -- which costs
+    one prompt -- into a traceback out of the middle of setup, with every
+    later artifact left uninstalled for a reason the traceback does not name.
+
+    The refusal is asserted, not just the absence of a raise: falling through
+    must reach the user's consent prompt and keep their link, not quietly
+    replace it.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f.mjs").write_text("x", encoding="utf-8")
+
+    mine = tmp_path / "my-working-copy"
+    mine.mkdir()
+    dest = tmp_path / "dest"
+    _make_dir_link(mine, dest)
+
+    real = Path.resolve
+    wanted = str(Path(src))
+
+    def boom(self, *args, **kwargs):
+        if str(self) == wanted:
+            raise exc
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", boom)
+    monkeypatch.setattr(setup_tools, "ask", lambda *a, **k: False)
+    result = setup_tools._link_directory(src, dest)
+
+    assert "skipped" in result, result
+    assert _link_destination(dest) is not None, "the user's link was destroyed"
+
+
 def test_link_directory_keeps_a_broken_user_link_without_consent(tmp_path, monkeypatch):
     """A link whose target is gone is still the user's link. Treating it as
     absent would silently overwrite the one thing it records."""

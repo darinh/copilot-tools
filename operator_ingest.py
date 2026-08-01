@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import install_manifest
+from project_paths import resolved_str
 
 BUSY_TIMEOUT = 15.0
 
@@ -448,7 +449,17 @@ def ingest_file(
     force: bool = False,
 ) -> str:
     """Parse one log file into the database. Returns a short status string."""
-    logfile = Path(logfile).resolve()
+    # `resolved_str` rather than a bare `Path(...).resolve()`, and the
+    # difference is which of the three failures reaches a sentence. `resolve`
+    # raises `ValueError` on an embedded NUL and `RuntimeError` on a symlink
+    # loop as well as `OSError` on a denial; `main` below catches
+    # `FileNotFoundError` and `OSError`, so the other two left the
+    # `operator-ingest` CLI as a traceback -- past the two handlers written
+    # precisely so an unusable log gets a named refusal. A path that will not
+    # resolve is now made lexically absolute instead, and the tri-state
+    # `file_present` below decides what it is, which is the question that
+    # actually matters here.
+    logfile = Path(resolved_str(logfile))
     # `file_present` rather than `is_file`, and the difference is which
     # caller you look at. `ingest_all` wraps this in `except Exception` and
     # turns anything raised into one `ERROR <name>` line, so a bare probe

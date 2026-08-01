@@ -994,7 +994,12 @@ def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
         try:
             if Path(os.path.realpath(dest)) == src.resolve():
                 return "already linked"
-        except OSError:
+        except (OSError, RuntimeError, ValueError):
+            # All three, not just OSError. `resolve` raises `RuntimeError` on a
+            # symlink loop and `ValueError` on an embedded NUL, and a link is
+            # the one input here that can *be* a loop. The narrow handler made
+            # the answer to "is this link already ours?" a traceback out of the
+            # middle of setup, rather than the "no" that costs one prompt.
             pass
         if not may_replace and not ask(
                 f"{dest} is a link to {_link_target(dest) or 'somewhere else'} "
