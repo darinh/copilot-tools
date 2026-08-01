@@ -289,6 +289,48 @@ def test_a_really_unreadable_file_really_survives_consume(tmp_path):
                 os.chmod(candidate, 0o600)
 
 
+@pytest.mark.skipif(not _POSIX_PERMS,
+                    reason="needs POSIX permissions enforced against a non-root user")
+def test_an_unsearchable_inbox_does_not_crash_the_poll_loop(tmp_path):
+    """The `except OSError` around the `is_file()` probe is load-bearing.
+
+    It reads like belt-and-braces, and the next person to see it will be
+    tempted to delete it as unreachable. It is not. `pathlib.is_file()` is not
+    total: it swallows `OSError` only for an allowlist -- `_IGNORED_ERRNOS` is
+    `ENOENT, ENOTDIR, EBADF, ELOOP`, plus three WinErrors -- and *re-raises*
+    everything else, `EACCES` included. That is nowhere in its signature or
+    its docstring.
+
+    So the errno decides whether `is_file()` answers a question or raises a
+    new one, which is the same confusion this function exists to remove:
+    returning False is a claim about the object, raising is a claim about the
+    attempt, and pathlib merges them.
+
+    An inbox that is readable but not searchable (mode 0o400) is the reachable
+    shape: `glob` still lists the names while every `stat` on them fails
+    EACCES. Without the guard the exception escapes `_read_message` and out
+    through `pending()` -- which the supervisor loop calls on every poll.
+    """
+    _msg(tmp_path, text="important")
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    os.chmod(inbox, 0o400)
+    try:
+        # Prove the premise, or this test passes against an ordinary inbox.
+        names = sorted(inbox.glob("*.json"))
+        assert names, "premise: the names must still be listable"
+        with pytest.raises(OSError):
+            names[0].read_text(encoding="utf-8")
+        with pytest.raises(OSError):
+            # The point of the whole test: this is the call that raises.
+            names[0].is_file()
+
+        assert operator_mail.pending(tmp_path, "beta") == []
+        assert operator_mail.consume(tmp_path, "beta") == []
+        assert operator_mail.pending_count(tmp_path, "beta") == 1
+    finally:
+        os.chmod(inbox, 0o700)
+
+
 def test_a_file_that_can_neither_be_read_nor_moved_is_left_alone(tmp_path,
                                                                  monkeypatch):
     """The Windows sharing-violation shape, where both operations fail.
