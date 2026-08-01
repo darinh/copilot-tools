@@ -461,6 +461,40 @@ test("UNSCANNED is a headline marker of its own, and a mixed session gets both r
   assert.ok(!headline(forged).startsWith(forgery), headline(forged));
 });
 
+test("the unscanned notice pluralises at one and many, in number and in case", () => {
+  // Symmetric to the inherited pluralisation test, and added because the
+  // inherited one caught a real pronoun-case defect while this function --
+  // which has three independent singular/plural ternaries -- had no plural
+  // coverage at all. Every existing UNSCANNED assertion passes exactly one
+  // root, so a swapped ternary arm survives the whole suite. The count is
+  // almost always 1 in practice (a single primary that failed to scan),
+  // which is precisely why nothing would ever surface the other branch.
+  const one = unscannedRootsNotice(["/a"]);
+  const many = unscannedRootsNotice(["/a", "/b"]);
+
+  assert.match(one, /1 checkout could not be examined/, one);
+  assert.match(many, /2 checkouts could not be examined/, many);
+
+  // The load-bearing sentence: it must not read as a clean bill of health at
+  // either arity.
+  assert.match(one, /not a report that it is clean/, one);
+  assert.match(many, /not a report that they are clean/, many);
+
+  assert.match(one, /sitting in it will go unmentioned/, one);
+  assert.match(many, /sitting in them will go unmentioned/, many);
+
+  assert.match(one, /when it was taken/, one);
+  assert.match(many, /when they were taken/, many);
+
+  // Controls against a swapped arm: each arity must NOT carry the other's
+  // wording. Without these, a ternary with both arms set to the same string
+  // would satisfy every assertion above at one of the two counts.
+  assert.ok(!/they are clean/.test(one), one);
+  assert.ok(!/it is clean/.test(many), many);
+  assert.ok(!/when they were taken/.test(one), one);
+  assert.ok(!/when it was taken/.test(many), many);
+});
+
 test("sessionContext emits the briefing byte-identically when nothing was inherited", () => {
   // The change is additive or it is a rewrite. A clean checkout must see the
   // exact text it saw before this function existed -- and an empty array and
