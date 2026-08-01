@@ -27,7 +27,14 @@ import {
   newEntries,
   parseStatusPaths,
   parseUntracked,
+  nestedWorktreePrefixes,
+  primaryCheckoutRoot,
+  rootToWatch,
+  UNKNOWN_ROOT,
+  primaryStrayReport,
   scanCheckout,
+  scanCheckoutTree,
+  withoutNestedWorktrees,
   sessionBriefing,
   stashTakesUntracked,
   strayReport,
@@ -222,6 +229,26 @@ test("message pluralisation is correct at one and many", () => {
   assert.match(blockReason({ verb: "git add", strays: ["a", "b"] }), /2 stray artifacts /);
   assert.match(strayReport(["a"], "/tmp/s"), /1 new untracked path /);
   assert.match(strayReport(["a", "b"], "/tmp/s"), /2 new untracked paths /);
+  assert.match(primaryStrayReport(["a"], "/tmp/s", "/repo"), /1 new untracked path /);
+  assert.match(primaryStrayReport(["a", "b"], "/tmp/s", "/repo"), /2 new untracked paths /);
+});
+
+test("the primary-checkout report names the other tree and does not order a deletion", () => {
+  const report = primaryStrayReport(["test_order.py"], "/tmp/scratch", "/repo/primary");
+  assert.match(report, /test_order\.py/);
+  assert.match(report, /\/repo\/primary/, "the agent cannot act on a report that does not say where");
+  assert.match(report, /PRIMARY/, "the whole finding is that this is not the tree in use");
+  assert.match(report, /\/tmp\/scratch/, "somewhere to put the work instead");
+  // A subagent's leftovers and a peer's live experiment are indistinguishable
+  // from here. Telling the agent to delete on that evidence is the exact
+  // destroy-on-a-guess move this toolkit exists to remove from code.
+  assert.match(report, /ask the other agents before/i);
+  // Control: the working-checkout report is a different message, so a wiring
+  // mistake that returned the wrong one cannot pass the assertions above.
+  assert.ok(
+    !strayReport(["test_order.py"], "/tmp/scratch").includes("PRIMARY"),
+    "the two reports must not be the same text",
+  );
 });
 
 // --- integration: a real git binary against a real repository ------------
@@ -676,6 +703,250 @@ test("recursion into -c strings is depth-bounded and terminates", () => {
   const nested = 'sh -c "sh -c \'sh -c "git add -A"\'"';
   assert.doesNotThrow(() => gitInvocations(nested));
   assert.ok(Array.isArray(gitInvocations(nested)));
+});
+
+
+
+// --- integration: linked worktrees ---------------------------------------
+//
+// The defect these cover was found in the field, not in a fixture. Three
+// artifacts appeared in a repository's PRIMARY checkout while the agent whose
+// subagents wrote them was working in `.worktrees/<branch>`. The guard was
+// installed, it handles the `task` tool deliberately, and it said nothing --
+// because `checkoutRoot` resolves `--show-toplevel`, which inside a linked
+// worktree is the worktree. The population was one root; the phenomenon spans
+// two; and "clean" was reported in the same words used when nothing happened.
+
+/** A repository with one commit and a linked worktree at `.worktrees/feat`. */
+async function withWorktree(body) {
+  const base = await mkdtemp(join(tmpdir(), "checkout-guard-wt-"));
+  try {
+    const primary = await realpath(base);
+    await git(["init", "-q", "-b", "main"], primary);
+    await writeFile(join(primary, "README.md"), "# repo\n");
+    await git(["add", "README.md"], primary);
+    await git(
+      ["-c", "user.email=test@example.invalid", "-c", "user.name=test",
+       "commit", "-q", "-m", "initial"],
+      primary,
+    );
+    const worktree = join(primary, ".worktrees", "feat");
+    const { ok } = await git(["worktree", "add", "-q", worktree, "-b", "feat"], primary);
+    assert.ok(ok, "premise: git could create the linked worktree");
+    await body({ primary, worktree: await realpath(worktree) });
+  } finally {
+    await rm(base, { recursive: true, force: true, maxRetries: 3 });
+  }
+}
+
+test("primaryCheckoutRoot answers the primary from inside a linked worktree", async () => {
+  await withWorktree(async ({ primary, worktree }) => {
+    // Premise first: --show-toplevel really does answer the worktree here. If
+    // it answered the primary there would be no bug and this whole file of
+    // assertions would be measuring nothing.
+    assert.equal(await checkoutRoot(worktree), worktree,
+      "premise: --show-toplevel resolves to the worktree, which is the bug");
+    assert.equal(await primaryCheckoutRoot(worktree), primary);
+    // And from the primary itself both resolvers agree, so a session that is
+    // not in a worktree never watches the same tree twice.
+    assert.equal(await primaryCheckoutRoot(primary), primary);
+    assert.equal(await checkoutRoot(primary), primary);
+  });
+});
+
+test("a stray in the primary is invisible to a worktree scan and visible to the primary scan", async () => {
+  await withWorktree(async ({ primary, worktree }) => {
+    // Control: the scan is working and finds a stray in the tree it is aimed
+    // at. Without this, the `false` below is satisfied by a scan that is
+    // simply broken.
+    await writeFile(join(worktree, "in_worktree.py"), "scratch\n");
+    const wtScan = await scanCheckoutTree(await checkoutRoot(worktree));
+    assert.ok(wtScan.includes("in_worktree.py"),
+      `control: the worktree scan finds its own stray: ${JSON.stringify(wtScan)}`);
+
+    // The incident: a subagent writes into the primary while the agent is here.
+    await writeFile(join(primary, "test_order.py"), "scratch\n");
+    const blind = await scanCheckoutTree(await checkoutRoot(worktree));
+    assert.ok(!blind.includes("test_order.py"),
+      "the old single-root scan cannot see the primary -- this is the defect");
+    // Deliberately the shipped call: root resolution AND the scan that the
+    // extension actually invokes. Reaching for `scanCheckout` here would leave
+    // this test green with the new scan function deleted, testing git's
+    // behaviour rather than any code in this change.
+    const watched = await scanCheckoutTree(await primaryCheckoutRoot(worktree));
+    assert.ok(watched.includes("test_order.py"),
+      `the primary scan sees it: ${JSON.stringify(watched)}`);
+  });
+});
+
+test("watching the primary does not report the worktrees directory itself", async () => {
+  // Without this the fix is unusable: every session that creates a worktree
+  // would be told its own worktree is a stray artifact in the primary, on
+  // every command, for ever. A guard that cries wolf gets switched off.
+  //
+  // This was caught by the test failing, not by review. INTRINSIC_EXCLUSIONS
+  // looks like it already covers `.worktrees`, and it does not cover git's
+  // untracked records at all -- which is invisible in this repository because
+  // its .gitignore lists `/.worktrees/`, so git never mentions it here.
+  await withWorktree(async ({ primary }) => {
+    // Premise: the plain scan really does report the nested worktree, so the
+    // filtered result below is an exclusion working and not a scan seeing
+    // nothing. If this ever stops being true the test still holds, but it is
+    // no longer testing what it was written for.
+    const raw = await scanCheckout(primary);
+    assert.ok(raw.some((p) => p.startsWith(".worktrees")),
+      `premise: git reports a nested worktree as untracked: ${JSON.stringify(raw)}`);
+
+    const found = await scanCheckoutTree(primary);
+    assert.ok(!found.some((p) => p.startsWith(".worktrees")),
+      `.worktrees is a checkout, not repository content: ${JSON.stringify(found)}`);
+    // Control: this scan does find real strays in the same tree, so the clean
+    // result above is an exclusion working rather than a scan seeing nothing.
+    await writeFile(join(primary, "probe.py"), "scratch\n");
+    assert.ok((await scanCheckoutTree(primary)).includes("probe.py"),
+      "control: the primary scan is not simply blind");
+  });
+});
+
+test("the worktree exclusion is derived from git, not from the .worktrees name", async () => {
+  // A worktree placed somewhere else is still a checkout. Keying the exclusion
+  // off the directory name would work in this repository and quietly fail in
+  // any project that puts its worktrees elsewhere -- a selector that admits
+  // only the cases already known about.
+  await withWorktree(async ({ primary }) => {
+    const odd = join(primary, "scratch-checkout");
+    const { ok } = await git(["worktree", "add", "-q", odd, "-b", "other"], primary);
+    assert.ok(ok, "premise: git could create a worktree outside .worktrees/");
+
+    const prefixes = await nestedWorktreePrefixes(primary);
+    assert.ok(prefixes.includes("scratch-checkout/"), JSON.stringify(prefixes));
+    assert.ok(prefixes.includes(".worktrees/feat/"), JSON.stringify(prefixes));
+    assert.ok(!prefixes.some((p) => p === "/" || p === ""), "the primary is not its own nested worktree");
+
+    const found = await scanCheckoutTree(primary);
+    assert.ok(!found.some((p) => p.startsWith("scratch-checkout")),
+      `a worktree is a checkout wherever it lives: ${JSON.stringify(found)}`);
+  });
+});
+
+test("primaryCheckoutRoot returns null for a bare main worktree", async () => {
+  // There is no working tree to leave anything in, and reporting on one would
+  // mean reporting on the contents of .git.
+  //
+  // The env override is load-bearing, and this test did not have it at first:
+  // a machine configured with `safe.bareRepository = explicit` makes git refuse
+  // the command outright, so the function returned null down the "git failed"
+  // path and the assertion below passed without ever reaching the `bare`
+  // branch. Deleting that branch left the suite green. The premise assertions
+  // exist so that can never silently happen again.
+  const base = await mkdtemp(join(tmpdir(), "checkout-guard-bare-"));
+  const saved = {
+    count: process.env.GIT_CONFIG_COUNT,
+    key: process.env.GIT_CONFIG_KEY_0,
+    value: process.env.GIT_CONFIG_VALUE_0,
+  };
+  try {
+    const root = await realpath(base);
+    await git(["init", "-q", "--bare", "-b", "main"], root);
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "safe.bareRepository";
+    process.env.GIT_CONFIG_VALUE_0 = "all";
+
+    const probe = await git(["worktree", "list", "--porcelain"], root);
+    assert.ok(probe.ok, "premise: git must ANSWER, or null proves nothing");
+    assert.match(probe.stdout, /^bare$/m, "premise: git reports the main worktree as bare");
+    assert.match(probe.stdout, /^worktree /m, "premise: there is a path to be tempted by");
+
+    assert.equal(await primaryCheckoutRoot(root), null);
+  } finally {
+    for (const [name, key] of [["GIT_CONFIG_COUNT", "count"], ["GIT_CONFIG_KEY_0", "key"], ["GIT_CONFIG_VALUE_0", "value"]]) {
+      if (saved[key] === undefined) delete process.env[name];
+      else process.env[name] = saved[key];
+    }
+    await rm(base, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test("an unanswered worktree list is not an answer of 'no worktrees'", () => {
+  // The propagation, which the two halves being individually correct does not
+  // establish: a null from either question has to arrive at the caller as
+  // null. `found` returned here would name the agent's own worktree as a stray
+  // in the primary, on every command after one transient git failure.
+  assert.equal(withoutNestedWorktrees(["a.py", ".worktrees/x/"], null), null,
+    "no list of worktrees: the honest result is 'I do not know'");
+  assert.equal(withoutNestedWorktrees(null, [".worktrees/x/"]), null,
+    "no scan: nothing to filter and nothing to claim");
+  // Controls, so the assertions above are about null and not about the filter
+  // being broken in general.
+  assert.deepEqual(withoutNestedWorktrees(["a.py", ".worktrees/x/"], [".worktrees/x/"]),
+    ["a.py"], "a real list really does filter");
+  assert.deepEqual(withoutNestedWorktrees(["a.py"], []), ["a.py"],
+    "a real answer of 'no nested worktrees' passes everything through");
+});
+
+test("primaryCheckoutRoot reports a failed lookup as UNKNOWN_ROOT, not as null", async () => {
+  const base = await mkdtemp(join(tmpdir(), "checkout-guard-norepo-"));
+  try {
+    const root = await realpath(base);
+    // Premise: git must actually FAIL here, or this is testing the parser
+    // rather than the failure path it claims to cover.
+    const probe = await git(["worktree", "list", "--porcelain"], root);
+    assert.equal(probe.ok, false, "premise: git refuses outside a repository");
+    assert.equal(await primaryCheckoutRoot(root), UNKNOWN_ROOT);
+  } finally {
+    await rm(base, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test("a failed lookup is never cached, a real answer always is", () => {
+  // The distinction this encodes: `null` is a claim about the repository and
+  // UNKNOWN_ROOT is a claim about the attempt. The session caches this once,
+  // so remembering an answer derived from one timed-out `git worktree list`
+  // would disable primary-root watching for the rest of the session -- and the
+  // result would be indistinguishable from a session with nothing to watch.
+  assert.deepEqual(rootToWatch("/repo/.worktrees/x", UNKNOWN_ROOT),
+    { watch: null, cache: false }, "a failure must be retried, not remembered");
+  // Controls: every answer that is a real answer IS remembered, so the
+  // assertion above is about failure and not about caching being broken.
+  assert.deepEqual(rootToWatch("/repo/.worktrees/x", "/repo"),
+    { watch: "/repo", cache: true });
+  assert.deepEqual(rootToWatch("/repo", "/repo"),
+    { watch: null, cache: true }, "already in the primary: nothing else to watch");
+  assert.deepEqual(rootToWatch("/repo", null),
+    { watch: null, cache: true }, "bare: a real answer that there is no working tree");
+});
+
+test("a failed worktree lookup does not become an empty list of worktrees", async () => {
+  // The census bug: `[]` from a failed lookup reads as "there are no nested
+  // worktrees", and every worktree in the tree is then reported as a stray.
+  const base = await mkdtemp(join(tmpdir(), "checkout-guard-norepo2-"));
+  try {
+    const root = await realpath(base);
+    const probe = await git(["worktree", "list", "--porcelain"], root);
+    assert.equal(probe.ok, false, "premise: the lookup really does fail here");
+    assert.equal(await nestedWorktreePrefixes(root), null,
+      "null means 'could not find out', which is not the same as 'none'");
+  } finally {
+    await rm(base, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test("the worktree exclusion applies to the tree the agent is working in too", async () => {
+  // Not just to the primary. An agent working in the primary would otherwise
+  // have its own `git add -A` denied because a peer created a worktree beside
+  // it -- the same false positive, with a blocking consequence instead of an
+  // advisory one.
+  await withWorktree(async ({ primary }) => {
+    const odd = join(primary, "peer-checkout");
+    const { ok } = await git(["worktree", "add", "-q", odd, "-b", "peer"], primary);
+    assert.ok(ok, "premise: the peer worktree was created");
+    const raw = await scanCheckout(primary);
+    assert.ok(raw.some((p) => p.startsWith("peer-checkout")),
+      `premise: the raw scan does report it: ${JSON.stringify(raw)}`);
+    const found = await scanCheckoutTree(primary);
+    assert.ok(!found.some((p) => p.startsWith("peer-checkout")),
+      `the scan the extension uses excludes it: ${JSON.stringify(found)}`);
+  });
 });
 
 
