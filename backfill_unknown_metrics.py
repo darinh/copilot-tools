@@ -73,6 +73,12 @@ def log_has_shutdown_event(path: Path) -> bool:
         return True  # Unreadable log: assume measured, change nothing.
 
 
+UNREADABLE = (-1, -1)
+"""The log is there but could not be statted. Never a real fingerprint --
+``st_size`` is never negative -- so it compares equal to nothing, including
+itself as far as any decision here is concerned."""
+
+
 def log_fingerprint(path: Path) -> tuple[int, int] | None:
     """What the log looked like when the scan trusted it, or None if absent.
 
@@ -88,11 +94,22 @@ def log_fingerprint(path: Path) -> tuple[int, int] | None:
     *skip* a row, so the failure it must avoid is a missed change, and a
     change that preserves both size and timestamp is not one a growing log
     makes.
+
+    Absent and unreadable are different answers and must not share one.
+    ``--missing-logs`` clears a row on the strength of "the log is gone", so
+    folding a permission error, a dropped network mount or a locked file into
+    the same ``None`` lets a transient I/O failure erase a session whose log
+    is sitting right there with a shutdown event in it. Only
+    ``FileNotFoundError`` means gone; every other ``OSError`` means we could
+    not look, which is what ``log_has_shutdown_event`` already treats as a
+    reason to change nothing.
     """
     try:
         st = path.stat()
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError:
+        return UNREADABLE
     return (st.st_mtime_ns, st.st_size)
 
 
@@ -124,6 +141,8 @@ def find_fabricated(conn: sqlite3.Connection, log_dir: Path,
         # check that exists to catch exactly this waved it through. Stat
         # first and any change from here on shows up as a mismatch.
         fingerprint = log_fingerprint(path)
+        if fingerprint == UNREADABLE:
+            continue  # Cannot look: "cannot check" is not "know it is wrong".
         if fingerprint is None:
             if missing_logs:
                 fabricated.append((row["id"], None))
@@ -185,15 +204,23 @@ def clear_rows(conn: sqlite3.Connection,
     * the four columns are still all zero (in SQL, inside the transaction);
     * the log still looks the way it did when the scan read it -- a log that
       grew a shutdown event, or came back from the dead, changes its
-      fingerprint.
+      fingerprint. Statted inside the transaction too, for the reason below.
 
     All-zero on its own would be the wrong test. A short session really can
     measure 0s of API time, a 0-second duration and no line changes, which is
     exactly the case ``find_fabricated`` uses the log to rule out.
 
-    Rows are cleared one at a time, each in its own short transaction, and the
-    stat happens *outside* it. Holding one ``BEGIN IMMEDIATE`` across the
-    whole list would block the live operator for as long as the loop takes --
+    Rows are cleared one at a time, each in its own short transaction, and
+    both halves are re-checked *inside* it. The stat has to be under the lock:
+    ``BEGIN IMMEDIATE`` can wait up to ``BUSY_TIMEOUT`` for a busy database,
+    so a fingerprint checked before it is up to 15 seconds stale by the time
+    the UPDATE runs -- and the operator that held the lock is exactly the
+    process that appends the shutdown event and re-ingests the row. Checking
+    outside the lock reproduces the very bug the check exists to prevent,
+    with a window wide enough to drive through.
+
+    One stat per row under that row's own lock is microseconds. What must
+    never happen is one ``BEGIN IMMEDIATE`` held across the whole list --
     thousands of statements plus a stat per row, which on a network mount or
     a loaded disk can outlast the 15s the operator is willing to wait, turning
     a repair into an outage. Nothing here needs cross-row atomicity: the only
@@ -209,15 +236,17 @@ def clear_rows(conn: sqlite3.Connection,
     sets = ", ".join(f"{c} = NULL" for c in COLUMNS)
     cleared = 0
     for row_id, fingerprint in found:
-        row = conn.execute(
-            "SELECT log_file FROM sessions WHERE id = ?", (row_id,)
-        ).fetchone()
-        if row is None or not row["log_file"]:
-            continue
-        if log_fingerprint(log_dir / row["log_file"]) != fingerprint:
-            continue
         conn.execute("BEGIN IMMEDIATE")
         try:
+            row = conn.execute(
+                "SELECT log_file FROM sessions WHERE id = ?", (row_id,)
+            ).fetchone()
+            if row is None or not row["log_file"]:
+                conn.execute("ROLLBACK")
+                continue
+            if log_fingerprint(log_dir / row["log_file"]) != fingerprint:
+                conn.execute("ROLLBACK")
+                continue
             # The text edit runs first: its guard stops matching the moment
             # the columns become NULL. Both land in one transaction, so the
             # summary can never describe a different session than the columns.
