@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -427,6 +428,72 @@ def test_an_unlistable_inbox_is_not_reported_as_empty_on_any_platform(
     assert operator_mail.pending_count(tmp_path, "never-existed") == 0
 
     denying["on"] = False
+    assert operator_mail.pending_count(tmp_path, "beta") == 1
+
+
+def test_a_parent_component_that_is_a_plain_file_is_a_fault_not_an_empty_inbox(
+        tmp_path):
+    """The same lie one level up the path, and it is platform-specific.
+
+    A reviewer found this after the leaf case was already fixed. On Windows,
+    `os.scandir` on a path whose *parent* component is a plain file raises
+    FileNotFoundError -- errno 2, winerror 3 -- which is indistinguishable by
+    type and errno from a mailbox nobody has ever written to. Measured, both
+    on the raw syscall and through this module. So `except FileNotFoundError:
+    return []` restored the exact defect this change exists to remove, one
+    directory higher, on the platform the toolkit is developed on.
+
+    Parametrised over depth because the shape recurs: any component of the
+    path can be the plain file, and only the leaf raises NotADirectoryError.
+    """
+    for depth, blocker in ((1, "messages"), (2, "messages/beta")):
+        root = tmp_path / f"root{depth}"
+        target = root / blocker
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("not a directory", encoding="utf-8")
+
+        for call in (lambda: operator_mail.pending(root, "beta"),
+                     lambda: operator_mail.pending_count(root, "beta"),
+                     lambda: operator_mail.consume(root, "beta")):
+            with pytest.raises(operator_mail.MailError):
+                call()
+
+    # The matched control, and the reason this cannot just always raise: a
+    # tree where the parents are real directories and the mailbox has simply
+    # never been written to is genuinely empty, and must stay silent. That is
+    # the state of every instance on its first run.
+    fresh = tmp_path / "fresh"
+    (fresh / "messages" / "beta").mkdir(parents=True)
+    assert operator_mail.pending(fresh, "beta") == []
+    assert operator_mail.pending_count(fresh, "beta") == 0
+    assert operator_mail.pending(tmp_path / "never-made-at-all", "beta") == []
+
+
+def test_a_plain_file_at_the_archive_path_is_reported_not_a_raw_traceback(
+        tmp_path):
+    """`consume` and `archive` create the archive dir, and had the same hole.
+
+    Found by a reviewer immediately after the send-side `mkdir` was wrapped:
+    the identical bare `mkdir(exist_ok=True)` was still sitting in both
+    readers. It matters more here than on the send side, because `consume`
+    runs from the supervisor loop, which catches `MailError` and continues --
+    a raw `FileExistsError` instead takes the whole loop down and orphans its
+    pid file.
+    """
+    msg = _msg(tmp_path, text="hello")
+    archive = operator_mail.archive_dir(tmp_path, "beta")
+    if archive.exists():
+        shutil.rmtree(archive)
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    archive.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.consume(tmp_path, "beta")
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.archive(tmp_path, "beta", [msg["id"]])
+
+    # Refusing must not have eaten the message: it is still pending, so the
+    # next read after somebody clears the blockage still delivers it.
     assert operator_mail.pending_count(tmp_path, "beta") == 1
 
 

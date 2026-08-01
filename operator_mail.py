@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -121,16 +122,22 @@ def _write_json(path: Path, msg: dict) -> None:
         raise
 
 
-def _write(directory: Path, msg: dict) -> Path:
+def _ensure_dir(directory: Path) -> None:
+    """Create ``directory``, reporting a refusal as :class:`MailError`.
+
+    ``exist_ok=True`` forgives an existing *directory*, not a plain file
+    sitting where one belongs -- that raises ``FileExistsError``. Uncaught,
+    those escaped as raw tracebacks from `operator send` and from the
+    supervisor loop, both of which only know how to handle a ``MailError``.
+    """
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        # `exist_ok` forgives a directory, not a plain file sitting where the
-        # mailbox belongs -- that raises FileExistsError, and uncaught it left
-        # the *sender* with a raw traceback for a fault at the other end. The
-        # reader half of this module refuses that same mailbox with a
-        # MailError, so the writer half says it the same way.
         raise MailError(f"could not open mailbox {directory}: {exc}") from exc
+
+
+def _write(directory: Path, msg: dict) -> Path:
+    _ensure_dir(directory)
     path = directory / f"{msg['id']}.json"
     try:
         _write_json(path, msg)
@@ -234,6 +241,30 @@ def _read_message(path: Path) -> dict | None | _Unreadable:
     return data if isinstance(data, dict) else None
 
 
+def _blocking_ancestor(directory: Path) -> Path | None:
+    """The nearest existing component of ``directory`` that is not a directory.
+
+    ``None`` means the path is merely absent, with nothing in the way -- the
+    normal state of a mailbox that has never been written to.
+
+    ``os.stat`` is used rather than ``Path.exists``/``Path.is_dir`` on
+    purpose: those swallow a documented set of errnos, which is precisely the
+    kind of quiet substitution of "no" for "could not tell" this module is
+    being cleaned of. A component that cannot be stat'ed at all is returned as
+    a blocker, because an unreadable ancestor is not evidence of an empty
+    mailbox either.
+    """
+    for candidate in (directory, *directory.parents):
+        try:
+            st = os.stat(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return candidate
+        return None if stat.S_ISDIR(st.st_mode) else candidate
+    return None
+
+
 def _message_files(directory: Path) -> list[Path]:
     """Message files in ``directory``, oldest name first.
 
@@ -284,9 +315,22 @@ def _message_files(directory: Path) -> list[Path]:
         with os.scandir(directory) as entries:
             for _ in entries:
                 pass
-    except FileNotFoundError:
-        # Never written to. An empty answer is the true one, and it is the
-        # ordinary state of every mailbox nobody has messaged yet.
+    except FileNotFoundError as exc:
+        # Not as obvious as it looks, and a reviewer caught it here. On
+        # Windows a *parent* component that is a plain file also arrives as
+        # FileNotFoundError -- winerror 3, errno 2 -- identical in type and
+        # errno to a mailbox nobody has ever written to. Measured: scandir on
+        # `<file>/child` and on a simply-absent path are indistinguishable
+        # from the exception alone, so returning [] here would have restored
+        # the very defect this function exists to remove, one level up the
+        # path. The ancestor walk is what separates them.
+        blocker = _blocking_ancestor(directory)
+        if blocker is not None:
+            raise MailError(
+                f"could not read mailbox {directory}: {blocker} is not a "
+                f"directory") from exc
+        # Genuinely absent: nobody has messaged this instance yet, which is
+        # the ordinary state of every mailbox on its first run.
         return []
     except OSError as exc:
         raise MailError(f"could not read mailbox {directory}: {exc}") from exc
@@ -332,7 +376,7 @@ def consume(root: Path, instance_id: str) -> list[dict]:
         return []
     read_at = _utcnow()
     taken: list[dict] = []
-    archive.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(archive)
     for path in messages:
         data = _read_message(path)
         if data is UNREADABLE:
@@ -448,7 +492,7 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
     if not chosen:
         return 0
     read_at = _utcnow()
-    destination.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(destination)
     return sum(_archive_one(path, destination, read_at)
                for path in files if path in chosen)
 
