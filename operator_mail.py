@@ -147,17 +147,64 @@ def record_delivered(root: Path, msg: dict) -> Path:
     return _write(archive_dir(root, msg["to_id"]), delivered)
 
 
+class _Unreadable:
+    """The result of a read that failed, as distinct from what it found.
+
+    ``json.loads`` raising ``ValueError`` is knowledge about the file: these
+    bytes are not a message and never will be. ``read_text`` raising
+    ``OSError`` is knowledge about the *read* -- a sharing violation, a
+    scanner holding the file open, a permission that will be there again next
+    time -- and says nothing whatsoever about the contents. Spelling both
+    "corrupt" lets a file that was never seen be treated as one that was seen
+    and found wanting, and for mail the second of those authorises moving it
+    out of the inbox. `_write_json` already goes to the trouble of atomic
+    writes so a reader cannot mistake a half-written file for a corrupt one;
+    this is the same hazard arriving through the other door.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<unreadable>"
+
+
+UNREADABLE = _Unreadable()
+
+
+def _read_message(path: Path) -> dict | None | _Unreadable:
+    """One message file, tri-state.
+
+    Returns the message, ``None`` if the file is genuinely not a message, or
+    :data:`UNREADABLE` if it could not be read at all. Callers that destroy
+    or move files must branch on all three: only ``None`` is evidence.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return UNREADABLE
+    except ValueError:
+        # Bytes that are not UTF-8 at all. Like malformed JSON this is
+        # knowledge about the file and will not change on a retry, so it is
+        # corruption rather than an unreadable state. It has to be caught
+        # here and not only around `json.loads`: `read_text` decodes, so
+        # `UnicodeDecodeError` -- a `ValueError` -- is raised by the read.
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _load_dir(directory: Path) -> list[tuple[Path, dict]]:
     if not directory.is_dir():
         return []
     found: list[tuple[Path, dict]] = []
     for path in sorted(directory.glob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            # A corrupt file must not jam the mailbox forever. Skip it here;
-            # consume() moves it aside so it stops being reconsidered.
-            continue
+        data = _read_message(path)
+        # Neither a corrupt file nor an unreadable one can be listed, but
+        # nothing is destroyed here, so skipping is safe for both: a message
+        # that could not be read this time is simply still there next time.
         if isinstance(data, dict):
             found.append((path, data))
     return found
@@ -189,13 +236,16 @@ def consume(root: Path, instance_id: str) -> list[dict]:
     taken: list[dict] = []
     archive.mkdir(parents=True, exist_ok=True)
     for path in sorted(inbox.glob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("not an object")
-        except (OSError, ValueError):
-            # Move unreadable files out of the way rather than leaving them to
-            # be re-read on every single session start.
+        data = _read_message(path)
+        if data is UNREADABLE:
+            # The read failed, so this message has not been seen by anybody.
+            # Leaving it pending means it is offered again; moving it aside
+            # would archive it unread and leave a mailbox that looks empty
+            # rather than blocked. A jam is visible. A loss is not.
+            continue
+        if data is None:
+            # Genuinely not a message. Move it out of the way rather than
+            # leaving it to be reconsidered on every single session start.
             try:
                 os.replace(path, archive / path.name)
             except OSError:
@@ -265,6 +315,11 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
         if path.stem not in wanted:
             continue
         ident = _message_id(path)
+        if ident is UNREADABLE:
+            # A file that could not be opened has not agreed with its name.
+            # Leave it pending rather than archiving on the strength of a
+            # filename nothing has corroborated.
+            continue
         # A name is a claim, not proof. Accept it only when the file agrees
         # with it, or when the file claims no id at all and so contradicts
         # nothing. A file named for one message while holding another is a
@@ -281,6 +336,10 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
         found = set()
         for path in files:
             ident = _message_id(path)
+            if ident is UNREADABLE:
+                # Same as above: unopened is not unnamed. Falling through
+                # would reach the `elif` and choose it on its filename.
+                continue
             if ident is not None:
                 if ident in wanted:
                     chosen.add(path)
@@ -296,12 +355,17 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
                for path in files if path in chosen)
 
 
-def _message_id(path: Path) -> str | None:
-    """The id a message file claims, or None if it does not claim a usable one."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+def _message_id(path: Path) -> str | None | _Unreadable:
+    """The id a message file claims.
+
+    ``None`` when the file claims no usable id, :data:`UNREADABLE` when it
+    could not be read -- which is not the same claim, and callers that treat
+    "claims nothing" as "contradicts nothing" must not extend that courtesy
+    to a file they never opened.
+    """
+    data = _read_message(path)
+    if data is UNREADABLE:
+        return UNREADABLE
     if not isinstance(data, dict):
         return None
     ident = data.get("id")
@@ -311,10 +375,12 @@ def _message_id(path: Path) -> str | None:
 def _archive_one(path: Path, destination: Path, read_at: str) -> int:
     """Move one inbox file into `destination`, stamping it read if it parses."""
     target = destination / path.name
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = None
+    data = _read_message(path)
+    if data is UNREADABLE:
+        # Archiving a file whose contents were never read would file away a
+        # message nobody has seen. Report nothing archived and leave it
+        # pending: the caller offers it again, which costs a re-delivery.
+        return 0
     if isinstance(data, dict):
         data["read_at"] = read_at
         try:

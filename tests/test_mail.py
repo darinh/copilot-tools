@@ -146,6 +146,200 @@ def test_corrupt_message_does_not_jam_the_mailbox(tmp_path):
     assert operator_mail.consume(tmp_path, "beta") == []
 
 
+# ── unreadable input, which is not corrupt input ────────────────
+def _deny_reads(monkeypatch, *paths):
+    """Make `read_text` fail for exactly these files, and prove that it did.
+
+    A denial that never fires produces a test asserting against an ordinary
+    read, which passes for the wrong reason. The returned list is the record
+    of what was actually denied; every test below asserts on it before it
+    asserts on anything else.
+    """
+    wanted = {Path(p).resolve() for p in paths}
+    fired: list[str] = []
+    real = Path.read_text
+
+    def denied(self, *args, **kwargs):
+        if self.resolve() in wanted:
+            fired.append(str(self))
+            raise PermissionError(13, "The process cannot access the file")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    return fired
+
+
+def test_an_unreadable_message_is_not_mistaken_for_a_corrupt_one(tmp_path,
+                                                                 monkeypatch):
+    """A failed read says nothing about the file, so nothing may be concluded.
+
+    Moving it aside archives a message nobody has seen and leaves a mailbox
+    that looks empty rather than blocked -- the same signature as mail that
+    was never sent.
+    """
+    msg = _msg(tmp_path, text="important")
+    path = operator_mail.inbox_dir(tmp_path, "beta") / f"{msg['id']}.json"
+    fired = _deny_reads(monkeypatch, path)
+
+    assert operator_mail.consume(tmp_path, "beta") == []
+    assert fired, "the denial never fired; this test proved nothing"
+    assert path.exists(), "an unread message was moved out of the inbox"
+    assert not (operator_mail.archive_dir(tmp_path, "beta") / path.name).exists()
+    assert operator_mail.pending_count(tmp_path, "beta") == 1
+
+
+def test_a_message_that_could_not_be_read_is_delivered_once_it_can_be(
+        tmp_path, monkeypatch):
+    msg = _msg(tmp_path, text="important")
+    path = operator_mail.inbox_dir(tmp_path, "beta") / f"{msg['id']}.json"
+    fired = _deny_reads(monkeypatch, path)
+    assert operator_mail.consume(tmp_path, "beta") == []
+    assert fired
+
+    monkeypatch.undo()
+    assert [m["text"] for m in operator_mail.consume(tmp_path, "beta")] == \
+        ["important"]
+
+
+def test_one_unreadable_message_does_not_hold_up_its_neighbours(tmp_path,
+                                                                monkeypatch):
+    first = operator_mail.new_message("alpha", "beta", "beta", "blocked")
+    first["id"] = "20260731200000-aaaaaaa0"
+    operator_mail.queue(tmp_path, first)
+    second = operator_mail.new_message("alpha", "beta", "beta", "fine")
+    second["id"] = "20260731200001-aaaaaaa1"
+    operator_mail.queue(tmp_path, second)
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    fired = _deny_reads(monkeypatch, inbox / f"{first['id']}.json")
+
+    assert [m["text"] for m in operator_mail.consume(tmp_path, "beta")] == \
+        ["fine"]
+    assert fired
+    assert (inbox / f"{first['id']}.json").exists()
+
+
+def test_archive_does_not_file_away_a_message_it_could_not_read(tmp_path,
+                                                                monkeypatch):
+    """`archive` is told which ids were shown to the recipient. A file it
+    cannot open has not been shown to anybody and has not corroborated its
+    own name, so archiving it on the strength of the filename files away
+    something unread -- and counts it as delivered."""
+    msg = _msg(tmp_path, text="important")
+    path = operator_mail.inbox_dir(tmp_path, "beta") / f"{msg['id']}.json"
+    fired = _deny_reads(monkeypatch, path)
+
+    assert operator_mail.archive(tmp_path, "beta", [msg["id"]]) == 0
+    assert fired
+    assert path.exists()
+    assert operator_mail.pending_count(tmp_path, "beta") == 1
+
+
+def test_an_unreadable_file_is_not_listed_as_pending(tmp_path, monkeypatch):
+    """Skipping is right here -- nothing is destroyed by omitting it from a
+    listing -- but the file must survive to be listed later."""
+    msg = _msg(tmp_path, text="important")
+    path = operator_mail.inbox_dir(tmp_path, "beta") / f"{msg['id']}.json"
+    fired = _deny_reads(monkeypatch, path)
+
+    assert operator_mail.pending(tmp_path, "beta") == []
+    assert fired
+    assert path.exists()
+
+
+_POSIX_PERMS = (os.name != "nt" and hasattr(os, "geteuid")
+                and os.geteuid() != 0)
+
+
+@pytest.mark.skipif(not _POSIX_PERMS,
+                    reason="needs POSIX permissions enforced against a non-root user")
+def test_a_really_unreadable_file_really_survives_consume(tmp_path):
+    """The incident on a real filesystem, with no mock in the way.
+
+    `chmod 000` in a writable directory is an ordinary state, and it is the
+    exact shape that matters: the read is denied while the rename is still
+    permitted, so nothing stops the move-aside from succeeding. A reviewer
+    argued the loss existed only in the monkeypatch because a Windows lock
+    would deny both operations -- true of a Windows lock, and this is why the
+    claim needed a real OS to settle rather than another fixture.
+    """
+    msg = _msg(tmp_path, text="important")
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    path = inbox / f"{msg['id']}.json"
+    os.chmod(path, 0o000)
+    try:
+        # Prove the premise. Without this the test passes whenever the
+        # permission silently fails to bite.
+        with pytest.raises(OSError):
+            path.read_text(encoding="utf-8")
+        probe = inbox / "probe.tmp"
+        os.replace(path, probe)
+        os.replace(probe, path)
+
+        assert operator_mail.consume(tmp_path, "beta") == []
+        assert path.exists(), "an unread message was moved out of the inbox"
+        assert operator_mail.pending_count(tmp_path, "beta") == 1
+    finally:
+        # Restore permissions wherever the file ended up. Chmod'ing a path
+        # that a failing run has already moved would raise from the `finally`
+        # and mask the assertion that actually failed, so a test that caught
+        # the bug would report the wrong reason for catching it.
+        for candidate in (path,
+                          operator_mail.archive_dir(tmp_path, "beta") / path.name):
+            if candidate.exists():
+                os.chmod(candidate, 0o600)
+
+
+def test_a_file_that_can_neither_be_read_nor_moved_is_left_alone(tmp_path,
+                                                                 monkeypatch):
+    """The Windows sharing-violation shape, where both operations fail.
+
+    This case was already safe: the move-aside raised and was passed over,
+    leaving the file pending. It is recorded so the guarantee is pinned
+    rather than incidental, and it is the counterpart to the test above --
+    together they say the outcome no longer depends on whether the operating
+    system happened to also deny the rename.
+    """
+    msg = _msg(tmp_path, text="important")
+    path = operator_mail.inbox_dir(tmp_path, "beta") / f"{msg['id']}.json"
+    fired = _deny_reads(monkeypatch, path)
+
+    real_replace = os.replace
+
+    def denied_replace(src, dst, *args, **kwargs):
+        if Path(src).resolve() == path.resolve():
+            raise PermissionError(32, "The process cannot access the file")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(operator_mail.os, "replace", denied_replace)
+
+    assert operator_mail.consume(tmp_path, "beta") == []
+    assert fired
+    assert path.exists()
+    assert operator_mail.pending_count(tmp_path, "beta") == 1
+
+
+def test_bytes_that_are_not_utf8_are_corruption_not_an_unreadable_state(
+        tmp_path):
+    """`read_text` decodes, so it raises `UnicodeDecodeError` -- a
+    `ValueError` -- from the READ rather than the parse. Undecodable bytes
+    are still permanent knowledge about the file, so they must be moved aside
+    like any other corruption and must never escape as an exception: one bad
+    file in a mailbox would otherwise take down the supervisor loop, which
+    calls `pending()` on every poll.
+    """
+    _msg(tmp_path, text="good")
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    bad = inbox / "20260731-notutf8.json"
+    bad.write_bytes(b"\xff\xfe not utf-8 at all")
+
+    assert [m["text"] for m in operator_mail.pending(tmp_path, "beta")] == \
+        ["good"]
+    assert [m["text"] for m in operator_mail.consume(tmp_path, "beta")] == \
+        ["good"]
+    assert not bad.exists()
+    assert (operator_mail.archive_dir(tmp_path, "beta") / bad.name).exists()
+
+
 def test_non_object_json_is_ignored(tmp_path):
     directory = operator_mail.inbox_dir(tmp_path, "beta")
     directory.mkdir(parents=True, exist_ok=True)
