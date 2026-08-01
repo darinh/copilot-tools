@@ -219,6 +219,15 @@ def test_a_catalogued_worktree_does_not_shadow_its_own_project(
     resolver that stopped at the worktree would be caught there only by
     returning ``None``, never by returning the *wrong* project's state
     directory, which is the outcome that actually loses a handoff.
+
+    The stub at the end is the control, and it is not decoration: the project
+    winning is also exactly what you would see if the worktree row had been
+    skipped as malformed and never competed at all -- a bad GUID, a row the
+    reader drops, a quoting mistake in this test's own fixture. Driving the
+    same call over the same catalog with resolution stubbed to the identity --
+    the duplicate-identity bug itself -- makes the trap row win, which is
+    evidence only that call can produce, and it says the assertion above is
+    resolution beating a live competitor.
     """
     root, wt = repo_with_worktree
     catalog = _catalog(tmp_path, monkeypatch, wt, "guid-worktree")
@@ -231,6 +240,11 @@ def test_a_catalogued_worktree_does_not_shadow_its_own_project(
     assert found is not None, "neither row matched; the lookup found nothing"
     assert found.parent.name == "guid-project", \
         f"the worktree's own row shadowed the project's: {found.parent.name}"
+
+    monkeypatch.setattr(op, "primary_repo_root", lambda p: Path(p))
+    shadowed = op.project_handoff_file(wt)
+    assert shadowed is not None and shadowed.parent.name == "guid-worktree", \
+        f"the worktree row never competed; the assertion above is vacuous: {shadowed!r}"
 
 
 # -- one definition of a valid project id ------------------------
