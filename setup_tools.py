@@ -1258,13 +1258,18 @@ TEMPLATE_ARTIFACTS = (
 def _dir_entries(root: Path, label: str) -> list[Path] | None:
     """Everything directly inside ``root``, or None when it cannot be listed.
 
-    None and ``[]`` are different answers, and the difference is discharged by
-    a warning rather than by the return value — both callers below go on to
-    install nothing, because there is nothing else they *can* do. What must
-    not happen is doing that quietly. ``[]`` means the repository genuinely
-    ships none of this kind and deserves no comment; None means the question
-    went unanswered, and a run that installs nothing for that reason has to
-    say so or it reads as a success.
+    None and ``[]`` are different answers, and both survive the return. ``[]``
+    means the repository genuinely ships none of this kind and deserves no
+    comment; None means the question went unanswered, and a run that installs
+    nothing for that reason has to say so or it reads as a success.
+
+    The warning below is not the whole discharge of that difference. It is the
+    part ``deployed_artifacts`` has to rely on, because that function returns
+    artifacts and there is no artifact for an unanswered question — but the two
+    installers each say a different sentence for the two answers, and until
+    they did, a directory that could not be *read* was reported as a directory
+    that was not *found*. That sentence was the only trace either state left
+    once setup finished, and it named a cause nobody had measured.
 
     ``Path.is_dir`` cannot make that distinction. It answers False for a root
     that is occupied but unexaminable -- a symlink whose target is gone, a
@@ -1330,9 +1335,17 @@ def _dir_or_unknown(path: Path) -> bool:
     return False
 
 
-def _skill_sources() -> list[Path]:
+def _skill_sources() -> list[Path] | None:
+    """Every skill directory in the repository, or None if that is unknown.
+
+    The None is propagated rather than collapsed because the installer says a
+    different sentence for each answer, and the sentence is the only place the
+    difference can still be seen by the time setup finishes.
+    """
     root = REPO_ROOT / "skills"
     entries = _dir_entries(root, "skills")
+    if entries is None:
+        return None
     if not entries:
         return []
     # A skill is a directory holding a SKILL.md. `is_file` answers False for a
@@ -1348,9 +1361,16 @@ def _skill_sources() -> list[Path]:
     return sorted(p for p in entries if _dir_or_unknown(p) and _has_manifest(p))
 
 
-def _extension_sources() -> list[Path]:
+def _extension_sources() -> list[Path] | None:
+    """Every extension directory in the repository, or None if that is unknown.
+
+    See :func:`_skill_sources` for why None survives the return rather than
+    being folded into the empty list here.
+    """
     root = REPO_ROOT / "extensions"
     entries = _dir_entries(root, "extensions")
+    if entries is None:
+        return None
     if not entries:
         return []
     return sorted(p for p in entries if _dir_or_unknown(p))
@@ -1361,15 +1381,22 @@ def deployed_artifacts() -> list[tuple[str, str, Path, Path]]:
 
     One definition shared by the installers and ``--status`` so a report can
     never describe a different set of files than the one setup writes.
+
+    This is the one caller that cannot act on "the sources are unknown": it
+    returns artifacts, and there is no artifact to return for a question that
+    went unanswered. The collapse is written out rather than left to fall out
+    of a falsy test, so that it reads as the decision it is. ``_dir_entries``
+    has already warned by the time control arrives here, so the unknown is not
+    lost — it is reported somewhere this return type cannot carry it.
     """
     items: list[tuple[str, str, Path, Path]] = []
     for src_name, dest_name, _label in TEMPLATE_ARTIFACTS:
         items.append((f"templates/{src_name}", "template",
                       REPO_ROOT / "templates" / src_name, COPILOT_DIR / dest_name))
-    for src in _skill_sources():
+    for src in _skill_sources() or []:
         items.append((f"skills/{src.name}", "skill",
                       src, COPILOT_DIR / "skills" / src.name))
-    for src in _extension_sources():
+    for src in _extension_sources() or []:
         items.append((f"extensions/{src.name}", "extension",
                       src, COPILOT_DIR / "extensions" / src.name))
     return items
@@ -1719,8 +1746,14 @@ def extension_report(
 def install_extensions(assume_yes: bool = False, manifest: dict | None = None) -> None:
     print("\nInstalling runtime extensions...")
     sources = _extension_sources()
+    if sources is None:
+        # `_dir_entries` has already said why. What must not be added to it is
+        # a second sentence naming a cause nobody measured: the directory was
+        # not "not found", it was found and could not be read.
+        warn("Skipping extensions — the source directory could not be read")
+        return
     if not sources:
-        warn("No extensions/ directory found — skipping")
+        warn("No extensions to install — extensions/ is absent or holds none")
         return
     manifest = install_manifest.empty_manifest() if manifest is None else manifest
     dest_root = COPILOT_DIR / "extensions"
@@ -1855,6 +1888,9 @@ def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> No
     part-way through can leave the user with no skill at all.
     """
     skills = _skill_sources()
+    if skills is None:
+        warn("Skipping skills — the source directory could not be read")
+        return
     if not skills:
         return
 
