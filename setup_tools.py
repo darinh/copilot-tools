@@ -1265,11 +1265,14 @@ def _dir_entries(root: Path, label: str) -> list[Path] | None:
 
     The warning below is not the whole discharge of that difference. It is the
     part ``deployed_artifacts`` has to rely on, because that function returns
-    artifacts and there is no artifact for an unanswered question — but the two
-    installers each say a different sentence for the two answers, and until
-    they did, a directory that could not be *read* was reported as a directory
-    that was not *found*. That sentence was the only trace either state left
-    once setup finished, and it named a cause nobody had measured.
+    artifacts and there is no artifact for an unanswered question. The two
+    installers do better: each warns for None specifically, and until they did,
+    a directory that could not be *read* was reported by ``install_extensions``
+    as a directory that was not *found*. That sentence was the only trace
+    either state left once setup finished, and it named a cause nobody had
+    measured. (``install_skills`` stays silent for ``[]`` on purpose — a
+    repository that ships no skills is not an event — so for skills the two
+    answers differ as warning-versus-silence rather than as two sentences.)
 
     ``Path.is_dir`` cannot make that distinction. It answers False for a root
     that is occupied but unexaminable -- a symlink whose target is gone, a
@@ -1338,9 +1341,9 @@ def _dir_or_unknown(path: Path) -> bool:
 def _skill_sources() -> list[Path] | None:
     """Every skill directory in the repository, or None if that is unknown.
 
-    The None is propagated rather than collapsed because the installer says a
-    different sentence for each answer, and the sentence is the only place the
-    difference can still be seen by the time setup finishes.
+    The None is propagated rather than collapsed because ``install_skills``
+    warns for it and stays silent for ``[]``, and that difference is the only
+    trace an unreadable ``skills/`` leaves once setup has finished.
     """
     root = REPO_ROOT / "skills"
     entries = _dir_entries(root, "skills")

@@ -1197,8 +1197,11 @@ def test_an_unreadable_extensions_directory_is_not_reported_as_absent(
         f"the run said nothing about an extensions/ it could not examine: "
         f"{out!r}"
     )
-    assert "not found" not in out and "No extensions/ directory found" not in out, (
+    assert "absent" not in out, (
         f"an unreadable extensions/ was reported as an absent one: {out!r}"
+    )
+    assert "No extensions/ directory found" not in out, (
+        f"the original false sentence came back: {out!r}"
     )
 
 
