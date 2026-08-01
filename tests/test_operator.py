@@ -175,12 +175,12 @@ def _capture_launch_args(monkeypatch):
     return seen
 
 
-def _run_single(monkeypatch, args):
+def _run_single(monkeypatch, args, headless: bool = False):
     seen = _capture_launch_args(monkeypatch)
     monkeypatch.setattr(op.MUX, "attach", lambda session: None)
     monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
     monkeypatch.setattr(op, "wait_for_exit", lambda instance, timeout=10: True)
-    op.run_single_session(op.Instance("exp-single"), args)
+    op.run_single_session(op.Instance("exp-single"), args, headless=headless)
     assert seen, "the session never launched, so nothing about its args was tested"
     return seen[0]
 
@@ -423,13 +423,13 @@ def test_both_operators_inject_identical_single_session_defaults(tmp_path,
 
     The shape test below is deliberately loose because it also covers loop
     mode, where the two legitimately differ (`operator.sh` resolves the agent
-    name itself). Single session has no such licence: every injected argument
-    is a decision about how the CLI behaves for the user, and there is no
-    reason any of them should depend on which platform they happen to be on.
+    name itself). Attached single session has no such licence: every injected
+    argument is a decision about how the CLI behaves for the user, and there
+    is no reason any of them should depend on which platform they are on.
     `--yolo` is why this test exists -- the Python operator injected it here
     and the shell operator did not, so the same command granted an agent
-    blanket approval on Windows and not on Linux, for two months, with nothing
-    in either program that would ever have said so.
+    blanket approval on Windows and not on Linux, for months, with nothing in
+    either program that would ever have said so.
 
     Loose where the general case demands it, exact where exactness is
     available.
@@ -441,6 +441,23 @@ def test_both_operators_inject_identical_single_session_defaults(tmp_path,
         "the two operators disagree about what a single session grants:\n"
         f"  operator.sh:          {shell_argv}\n"
         f"  copilot_operator.py:  {python_argv}")
+
+
+def test_operator_sh_has_no_headless_mode():
+    """The premise under `run_single_session`'s headless `--yolo` branch.
+
+    That branch is defensible as a Python-only difference *only* because there
+    is no shell counterpart to diverge from. If `operator.sh` ever grows a
+    headless single session, the identity test above will not notice -- it
+    drives the attached path -- and the platforms would quietly disagree about
+    blanket approval again, which is the exact bug this whole change exists to
+    close. Fail here instead, while it is still cheap.
+    """
+    assert "headless" not in OPERATOR_SH.read_text(encoding="utf-8").lower(), (
+        "operator.sh now mentions headless. If it has gained a headless "
+        "single session, decide deliberately whether it grants --yolo and "
+        "assert that against copilot_operator.py -- do not just delete this "
+        "test.")
 
 
 @bash
@@ -612,20 +629,45 @@ def test_project_handoff_file_still_accepts_a_real_guid(tmp_path, monkeypatch):
     assert found.parent.name == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 
 
-# ── --yolo is loop-only ──────────────────────────────────────────
-def test_single_session_does_not_grant_yolo(monkeypatch):
-    """A single session attaches your terminal, so you are there to answer.
+# ── --yolo is granted only where nobody can be asked ─────────────
+def test_attached_single_session_does_not_grant_yolo(monkeypatch):
+    """Your terminal is attached, so you are there to answer.
 
-    `--yolo` waives every approval prompt for the life of the session. In loop
-    mode that is the only workable setting -- nobody is watching, so a prompt
-    would hang until the session times out. A single session hands the
-    terminal straight back to the human who typed the command, so granting it
-    there buys nothing and spends the one control that mode still has.
+    `--yolo` waives every approval prompt for the life of the session. Here
+    the terminal goes straight back to the human who typed the command, so
+    granting it buys nothing and spends the one control this mode still has.
     """
     assert "--yolo" not in _run_single(monkeypatch, [])
 
 
-def test_a_single_session_still_honours_a_user_asking_for_yolo(monkeypatch):
+def test_headless_single_session_does_grant_yolo(monkeypatch):
+    """Nothing attaches, so there is nobody to answer a prompt.
+
+    `operator join` is an invitation the user may never accept. Without
+    `--yolo` a headless session does not degrade to "more prompts" -- it
+    blocks on the first approval indefinitely, while looking exactly like a
+    session doing long work: live process, live pane, no error anywhere. The
+    lower-authority option is the one that fails silently here, which is why
+    the ruling goes the other way from the attached case.
+    """
+    assert "--yolo" in _run_single(monkeypatch, [], headless=True)
+
+
+def test_headless_and_attached_single_sessions_do_not_agree_about_yolo(monkeypatch):
+    """Asserted together so the two cannot quietly drift into one answer.
+
+    Separately, either test can be "fixed" by editing it to match whichever
+    behaviour someone changed first, and the pair would still be green. The
+    distinction is the whole ruling: it is not that prompts are good or bad,
+    it is that a prompt with nobody to answer it is a silent hang.
+    """
+    attached = _run_single(monkeypatch, [])
+    headless = _run_single(monkeypatch, [], headless=True)
+    assert ("--yolo" in headless) and ("--yolo" not in attached), (
+        f"attached={attached}\nheadless={headless}")
+
+
+def test_an_attached_single_session_still_honours_a_user_asking_for_yolo(monkeypatch):
     """Not granting it by default is not the same as refusing it.
 
     It lands after the injected defaults, which is what makes it expressible

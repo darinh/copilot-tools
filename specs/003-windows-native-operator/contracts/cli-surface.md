@@ -42,7 +42,7 @@ and non-ASCII characters (FR-007).
 
 | Mode | Injected |
 |---|---|
-| Single session | `--autopilot --effort high --experimental` |
+| Single session | `--autopilot --effort high --experimental`, plus `--yolo` when `--headless` |
 | Loop mode | `--yolo --autopilot --no-ask-user --effort high --experimental`, plus `--agent <name>` when absent, plus the autonomous preamble via `-i` |
 | Both | `--log-level debug`, unless the user set `--log-level` or `COPILOT_OPERATOR_NO_DEBUG_LOG=1`. Required because Copilot only writes usage data at debug level. |
 
@@ -55,14 +55,22 @@ cannot tell a flag from a value: `-p --no-experimental` is a prompt, not a rulin
 In loop mode with saved state, `--resume=<session-id>` is appended **exactly once**, and is suppressed
 when the user already specified a session argument (FR-012).
 
-`--yolo` is injected in **loop mode only**, and both implementations must agree on that. A loop
-runs unattended, so a permission prompt has nobody to answer it and would hang the session
-indefinitely; a single session attaches the invoking terminal, so the human who typed the command
-is present. Where the two operators disagreed about how much authority to grant — `copilot_operator.py`
-injected `--yolo` into single sessions and `operator.sh` did not — the disparity was resolved by
-converging on the **lower** authority, because the same command on two platforms granting an agent
-different powers is a difference nobody reads the source to discover. A user who wants it passes
-`--yolo` themselves; it lands after the injected defaults and is honoured.
+`--yolo` is granted only where nobody can be asked. It waives every approval prompt for the life of
+the session, so the question is whether a human is watching, and both implementations must answer it
+the same way. **Loop mode**: granted — unattended, so a prompt would hang forever. **Attached single
+session**: not granted — the invoking terminal is attached and the human who typed the command is
+sitting at it. **Headless single session**: granted, because nothing attaches; `operator join` is an
+invitation the user may never accept, and a blocked session is indistinguishable from a working one
+(live process, live pane, no error). `operator.sh` has no headless mode, so that branch exists only
+in `copilot_operator.py`.
+
+Where the two operators disagreed — `copilot_operator.py` injected `--yolo` into attached single
+sessions and `operator.sh` did not — the disparity was resolved by converging on the **lower**
+authority, because the same command on two platforms granting an agent different powers is a
+difference nobody reads the source to discover. Note the asymmetry is not "prompts versus no
+prompts": the headless branch goes the other way precisely because there the lower-authority option
+is the one that fails silently and unrecoverably. A user who wants it in any mode passes `--yolo`
+themselves; it lands after the injected defaults and is honoured.
 
 ### Report types
 
