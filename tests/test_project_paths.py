@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from conftest import denied
 
 import copilot_operator as op
 import handoff_tool as ho
@@ -69,6 +70,43 @@ def test_primary_root_outside_a_repository_is_unchanged(tmp_path):
 def test_primary_root_of_a_missing_path_is_unchanged(tmp_path):
     gone = tmp_path / "nope"
     assert primary_repo_root(gone) == gone
+
+
+def test_primary_root_of_a_worktree_it_cannot_examine_is_still_the_root(
+        repo_with_worktree, monkeypatch):
+    """A stat that fails is not a path outside a repository.
+
+    ``is_dir()`` raises on EACCES, and the enclosing handler returned ``start``
+    unchanged -- the documented answer for "not in a repo", handed back for a
+    checkout that is very much in one. In a worktree that answer is the
+    worktree, which looks like an unregistered project and mints the duplicate
+    catalog entry this module exists to prevent.
+
+    Scope, stated honestly: a directory the process genuinely cannot search
+    will fail git's ``chdir`` too, and that failure is caught below and still
+    returns ``base``. This fix does not rescue that case and does not claim
+    to. What it rescues is the larger class where the *stat* fails and the
+    directory is still usable -- a Windows sharing violation from a scanner
+    holding a handle, EIO on a network home, a transient denial between two
+    polls. So the assertion that matters is not only the answer but that git
+    was consulted at all, which is the behaviour that changed.
+    """
+    root, wt = repo_with_worktree
+    calls: list[str | None] = []
+    real_run = subprocess.run
+
+    def spy(cmd, **kwargs):
+        calls.append(kwargs.get("cwd"))
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(project_paths.subprocess, "run", spy)
+    with denied(monkeypatch, wt) as seen:
+        found = primary_repo_root(wt)
+    assert seen["n"], "the denial never fired; the test proves nothing"
+    assert calls == [str(wt)], \
+        f"the failed probe short-circuited the git call: {calls!r}"
+    assert found.resolve() == root.resolve(), \
+        "an unexaminable worktree was mistaken for a project of its own"
 
 
 # ── catalog lookups ─────────────────────────────────────────────

@@ -29,6 +29,7 @@ import pytest
 from conftest import denied
 
 import copilot_operator as op
+import handoff_tool as ho
 
 
 @pytest.fixture(autouse=True)
@@ -570,3 +571,281 @@ def test_remove_file_reports_success_for_an_absent_path():
     assert op.remove_file(inst.stop_marker) is True
 
 
+
+
+# ── the handoff tool asks the same questions ────────────────────
+# `handoff_tool` runs once, by hand, at the end of a session, so its probes
+# do not have a poll loop to survive. They have something narrower to protect:
+# the words the agent just wrote. A wrong "absent" here either refuses a
+# handoff that could have been written or writes it under the wrong name, and
+# the session's context is gone either way.
+
+
+@pytest.fixture
+def handoff_env(tmp_path, monkeypatch):
+    home = tmp_path / "ho_home"
+    (home / ".copilot" / "projects").mkdir(parents=True)
+    restart = tmp_path / "ho_operator" / "restart"
+    restart.mkdir(parents=True)
+    catalog = home / ".copilot" / "projects" / "catalog.csv"
+    monkeypatch.setattr(ho, "CATALOG", catalog)
+    monkeypatch.setattr(ho, "state_dir", lambda: restart)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    project = tmp_path / "ho_proj"
+    project.mkdir()
+    return {"home": home, "catalog": catalog,
+            "restart": restart, "project": project}
+
+
+def _refusal_name(call) -> str:
+    """Run ``call`` and name how it refused, or what it returned instead.
+
+    Written to survive being run against a revision where the refusal does not
+    exist yet: a test that hard-references a new symbol fails on the reference
+    rather than on the behaviour, and a file of those is a control that never
+    reaches an assertion.
+
+    ``Exception`` and not ``BaseException``: pytest steers the run with
+    ``BaseException`` subclasses -- ``KeyboardInterrupt``, ``SystemExit``,
+    ``Skipped`` -- and catching those turns a Ctrl-C into a string this
+    function then compares for equality. The refusals being graded here are
+    all ordinary exceptions.
+    """
+    try:
+        return f"returned {call()!r}"
+    except Exception as exc:  # noqa: BLE001 - the type is the finding
+        return type(exc).__name__
+
+
+def test_a_catalog_it_cannot_examine_is_not_a_missing_catalog(
+        handoff_env, monkeypatch):
+    """The stat is denied; the read is not.
+
+    A denied parent directory makes ``is_file()`` raise, and the tool used to
+    end there -- on a catalog that ``open`` would have handed over without
+    complaint. "Catalog not found" would have been the wrong instruction as
+    well as the wrong diagnosis: it sends the operator off to create a file
+    that is already sitting there.
+    """
+    handoff_env["catalog"].write_text(
+        f'"{handoff_env["project"].resolve()}",guid-probe\n', encoding="utf-8")
+    with denied(monkeypatch, handoff_env["catalog"]) as seen:
+        assert ho.resolve_guid(handoff_env["project"]) == "guid-probe"
+    assert seen["n"], "the denial never fired; the test proves nothing"
+
+
+def test_a_genuinely_absent_catalog_still_says_so(handoff_env, capsys):
+    with pytest.raises(SystemExit):
+        ho.resolve_guid(handoff_env["project"])
+    assert "Catalog not found" in capsys.readouterr().err
+
+
+def test_the_census_refuses_when_it_cannot_examine_the_restart_dir(
+        handoff_env, monkeypatch):
+    """An unreadable registry is not an empty one.
+
+    ``managed_ids`` decides which sessions this tool is allowed to name. Read
+    as empty it reports that nothing is running, which is indistinguishable
+    from the truth and arrives with no warning at all.
+    """
+    (handoff_env["restart"] / "alpha.managed").write_text("{}", encoding="utf-8")
+    with denied(monkeypatch, handoff_env["restart"]) as seen:
+        outcome = _refusal_name(ho.managed_ids)
+    assert seen["n"], "the denial never fired; the test proves nothing"
+    assert outcome == "StateUnreadable", \
+        f"a census that could not be taken came back as: {outcome}"
+
+
+def test_the_census_reports_nothing_managed_when_nothing_is_there(
+        handoff_env):
+    """The other half of the same claim: absent really does mean empty."""
+    for entry in handoff_env["restart"].iterdir():
+        entry.unlink()
+    handoff_env["restart"].rmdir()
+    assert ho.managed_ids() == set()
+
+
+def test_a_dangling_restart_symlink_is_not_an_empty_registry(
+        handoff_env, tmp_path):
+    """``dir_present`` follows links, and a broken one raises FileNotFoundError.
+
+    An exception type is a claim about what the call did, not about what is on
+    disk. The link's own directory entry is right there; something replaced or
+    moved the registry it points at. Reading that as "no instances are
+    managed" is the empty-population bug arriving through the probe that was
+    supposed to prevent it.
+
+    This is the real-filesystem version and it skips where symlinks are not
+    permitted, which on Windows is most machines. The differential below
+    covers the same branch everywhere; keep both, because this one is the only
+    evidence that a real dangling link produces the errno the other one
+    simulates.
+    """
+    if not _can_symlink(tmp_path):
+        pytest.skip("symlink creation is not permitted here")
+    for entry in handoff_env["restart"].iterdir():
+        entry.unlink()
+    handoff_env["restart"].rmdir()
+    handoff_env["restart"].symlink_to(tmp_path / "moved_away")
+    outcome = _refusal_name(ho.managed_ids)
+    assert outcome == "StateUnreadable", \
+        f"a registry that is present but unusable came back as: {outcome}"
+
+
+def test_a_registry_that_stats_absent_but_lstats_present_is_not_empty(
+        handoff_env, monkeypatch):
+    """The dangling-symlink branch, on every platform.
+
+    The whole decision rests on one differential: ``stat`` follows the link
+    and reports ENOENT, ``lstat`` does not follow it and reports the entry.
+    Simulating exactly that -- rather than a symlink -- runs the branch on
+    Windows CI without developer mode, which is where the skip above would
+    otherwise leave it ungraded on the platform whose path handling is the
+    most brittle.
+    """
+    target = str(handoff_env["restart"])
+    real_stat = os.stat
+
+    def stat_says_gone(path, *args, **kwargs):
+        try:
+            key = str(Path(path))
+        except TypeError:
+            key = None
+        if key == target:
+            raise FileNotFoundError(2, "No such file or directory")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat_says_gone)
+    accessor = getattr(sys.modules["pathlib"], "_NormalAccessor", None)
+    if accessor is not None and hasattr(accessor, "stat"):
+        monkeypatch.setattr(accessor, "stat", staticmethod(stat_says_gone))
+
+    assert op.dir_present(handoff_env["restart"]) is False, \
+        "the simulation did not reach dir_present; the test proves nothing"
+    assert op.path_present(handoff_env["restart"]) is True, \
+        "lstat was patched too; the differential the branch needs is gone"
+    outcome = _refusal_name(ho.managed_ids)
+    assert outcome == "StateUnreadable", \
+        f"present-but-unusable came back as: {outcome}"
+
+
+def test_a_listing_that_fails_midway_is_not_a_short_registry(
+        handoff_env, monkeypatch):
+    """The probe said "directory"; the listing still failed.
+
+    Returning the names gathered so far would report a partial census as a
+    complete one, which is the same lie with better manners.
+    """
+    real_iterdir = Path.iterdir
+
+    def denied_iterdir(self, *args, **kwargs):
+        if str(self) == str(handoff_env["restart"]):
+            raise PermissionError(13, "Permission denied")
+        return real_iterdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "iterdir", denied_iterdir)
+    outcome = _refusal_name(ho.managed_ids)
+    assert outcome == "StateUnreadable", \
+        f"a listing that failed came back as: {outcome}"
+
+
+def test_inference_names_the_real_problem_instead_of_blaming_the_user(
+        handoff_env, monkeypatch, capsys):
+    """"Cannot infer instance" is true but useless when the cause is EACCES.
+
+    The operator is told to supply a name, does, and hits the same denial
+    somewhere else. The message has to say which thing could not be read.
+    """
+    (handoff_env["restart"] / "alpha.managed").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "list_sessions", lambda self: ["alpha"])
+    monkeypatch.setattr(ho.Mux, "pane_current_path",
+                        lambda self, s: str(handoff_env["project"]))
+    with denied(monkeypatch, handoff_env["restart"]) as seen:
+        with pytest.raises(SystemExit):
+            ho.infer_instance(handoff_env["project"], ho.Mux())
+    assert seen["n"], "the denial never fired; the test proves nothing"
+    err = capsys.readouterr().err
+    assert "which operator instances are managed" in err, \
+        f"refused, but without naming what could not be read: {err!r}"
+
+
+def test_a_project_root_it_cannot_examine_still_gets_its_handoff_written(
+        handoff_env, monkeypatch):
+    """Refusing here throws the session away for certain.
+
+    Everything downstream of this probe fails safe: the destination comes from
+    an exact catalog match, so an unusable root misses the lookup rather than
+    matching the wrong row. There is no wrong file to write, and one lost
+    handoff is worse than one confusing warning.
+    """
+    handoff_env["catalog"].write_text(
+        f'"{handoff_env["project"].resolve()}",guid-root\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    with denied(monkeypatch, handoff_env["project"]) as seen:
+        rc = ho.main(["--instance", "proj", "--status", "s", "--next", "n",
+                      "--project-root", str(handoff_env["project"])])
+    assert seen["n"], "the denial never fired; the test proves nothing"
+    assert rc == 0
+    written = (handoff_env["home"] / ".copilot" / "projects" / "guid-root"
+               / "next-session.md")
+    assert "## Status" in written.read_text(encoding="utf-8")
+
+
+def test_a_genuinely_missing_project_root_is_still_refused(handoff_env, capsys):
+    with pytest.raises(SystemExit):
+        ho.main(["--instance", "proj", "--status", "s", "--next", "n",
+                 "--project-root", str(handoff_env["project"] / "nope")])
+    assert "Directory not found" in capsys.readouterr().err
+
+
+def test_resolved_str_survives_a_path_that_will_not_resolve(tmp_path,
+                                                            monkeypatch):
+    """``Path.resolve`` is not total, and the new code reaches it.
+
+    A symlink loop raises ``RuntimeError`` -- not ``OSError``, so nothing that
+    guards for filesystem trouble catches it. It was unreachable while an
+    unexaminable root was refused up front; letting that root through made it
+    reachable, which is the fix for one bug opening the door to another.
+    """
+    real_resolve = Path.resolve
+
+    def loops(self, *args, **kwargs):
+        if str(self) == str(tmp_path):
+            raise RuntimeError(f"Symlink loop from {self}")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", loops)
+    with pytest.raises(RuntimeError):
+        Path(tmp_path).resolve()
+    answer = ho.resolved_str(tmp_path)
+    assert os.path.isabs(answer), \
+        f"the fallback must still yield an absolute path, got {answer!r}"
+
+
+def test_a_project_root_that_will_not_resolve_reaches_a_named_refusal(
+        handoff_env, monkeypatch, capsys):
+    """The refusal must survive being unable to resolve the thing it names.
+
+    Both branches that give up on the catalog interpolate the resolved root
+    into the message that tells the operator how to fix it. Raising there
+    replaces an actionable refusal with a traceback, at the exact moment the
+    session's words are still unwritten.
+    """
+    handoff_env["catalog"].write_text('"/somewhere/else",other\n',
+                                      encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    real_resolve = Path.resolve
+    doomed = str(handoff_env["project"])
+
+    def loops(self, *args, **kwargs):
+        if str(self) == doomed:
+            raise RuntimeError(f"Symlink loop from {self}")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", loops)
+    with pytest.raises(SystemExit):
+        ho.main(["--instance", "proj", "--status", "s", "--next", "n",
+                 "--project-root", doomed])
+    err = capsys.readouterr().err
+    assert "No catalog entry" in err, \
+        f"expected an actionable refusal, got: {err!r}"

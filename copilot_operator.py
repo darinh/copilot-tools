@@ -29,7 +29,6 @@ import shlex
 import shutil
 import signal
 import sqlite3
-import stat as stat_module
 import subprocess
 import sys
 import time
@@ -50,7 +49,11 @@ if _HERE not in sys.path:
 
 import operator_ingest                                       # noqa: E402
 import operator_mail                                         # noqa: E402
-from install_manifest import path_present                     # noqa: E402
+from install_manifest import (                                # noqa: E402
+    dir_present,
+    file_present,
+    path_present,
+)
 from operator_console import enable_utf8_output               # noqa: E402
 from operator_mux import (                                    # noqa: E402
     Mux, MuxError, MuxNotFoundError, safe_instance_id,
@@ -175,33 +178,15 @@ def utcnow() -> str:
 # The tri-state answer is deliberate. "Cannot tell" must not share a return
 # value with "absent", because absent is what licenses overwriting a file or
 # concluding a session has ended.
+#
+# `dir_present`, `file_present` and `path_present` live in
+# :mod:`install_manifest` so that this module, `handoff_tool` and the setup
+# path all decide presence by the same rules. A second copy of a probe is a
+# second place for the polarity to drift.
 
 #: Paths already reported as unexaminable, so a permanent failure is logged
 #: once per process rather than once per poll.
 _PROBE_WARNED: set[str] = set()
-
-
-def dir_present(path: Path) -> bool | None:
-    """Whether ``path`` is a directory: True, False, or None for "cannot tell".
-
-    Follows symlinks, since a link to a directory is usable as one.
-    """
-    try:
-        return stat_module.S_ISDIR(os.stat(path).st_mode)
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    except (OSError, ValueError):
-        return None
-
-
-def file_present(path: Path) -> bool | None:
-    """Whether ``path`` is a regular file: True, False, or None."""
-    try:
-        return stat_module.S_ISREG(os.stat(path).st_mode)
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    except (OSError, ValueError):
-        return None
 
 
 class _Unplaceable:
