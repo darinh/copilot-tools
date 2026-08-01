@@ -337,6 +337,78 @@ def test_a_shutdown_event_added_within_one_clock_tick_is_still_caught(
     assert "Cleared 0 row(s)" in capsys.readouterr().out
 
 
+def test_a_log_that_gains_its_event_during_the_scan_read_is_not_erased(
+        db_path, logs, capsys, monkeypatch):
+    """The fingerprint has to be taken before the evidence is read, not after.
+
+    Reading the log is the slow part of the scan, so it is the likeliest
+    moment for a live operator to append the shutdown event. Fingerprinting
+    after the read records the file in its NEW state while the verdict
+    reflects the OLD one -- the two agree at write time, and the check that
+    exists to catch precisely this waves it through.
+    """
+    add_session(db_path, "process-1.log")
+    log = logs / "process-1.log"
+    log.write_text("no shutdown here", encoding="utf-8")
+
+    def read_and_grow(path):
+        path.read_text(encoding="utf-8", errors="replace")
+        path.write_text('{"kind": "session_shutdown"}', encoding="utf-8")
+        return False  # what the read saw: no event, a moment too early
+
+    monkeypatch.setattr(
+        backfill_unknown_metrics, "log_has_shutdown_event", read_and_grow)
+
+    rc = backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert rc == 0
+    row = read_row(db_path, "process-1.log")
+    assert row["api_time_seconds"] == 0, (
+        "erased a row whose log grew its shutdown event mid-read")
+    assert row["raw_metrics"] == ZEROED_RAW
+    assert "Cleared 0 row(s)" in capsys.readouterr().out
+
+
+def test_no_file_io_happens_while_the_write_lock_is_held(db_path, logs,
+                                                         monkeypatch):
+    """A repair must not become an outage.
+
+    The operator waits BUSY_TIMEOUT (15s) for the database. Statting
+    thousands of logs inside one BEGIN IMMEDIATE can outlast that on a
+    network mount or a loaded disk, so the live loop dies of a lock this
+    script was holding. Each row gets its own short transaction instead, and
+    the stat happens outside it.
+    """
+    add_session(db_path, "process-1.log")
+    (logs / "process-1.log").write_text("no shutdown here", encoding="utf-8")
+
+    stats_under_lock = []
+    real_fingerprint = backfill_unknown_metrics.log_fingerprint
+
+    def watched(path):
+        stats_under_lock.append(conn_holder["conn"].in_transaction)
+        return real_fingerprint(path)
+
+    conn_holder = {}
+    real_connect = backfill_unknown_metrics.connect
+
+    def remember(db):
+        conn_holder["conn"] = real_connect(db)
+        return conn_holder["conn"]
+
+    monkeypatch.setattr(backfill_unknown_metrics, "connect", remember)
+    monkeypatch.setattr(backfill_unknown_metrics, "log_fingerprint", watched)
+
+    backfill_unknown_metrics.main(
+        ["--db", str(db_path), "--logs", str(logs), "--apply"])
+
+    assert stats_under_lock, "test precondition: no stat was observed at all"
+    assert not any(stats_under_lock), (
+        "a log was statted while holding the write lock")
+    assert read_row(db_path, "process-1.log")["lines_added"] is None
+
+
 def test_clears_more_rows_than_sqlite_takes_parameters(db_path, logs, capsys):
     """A user with a long history has more damaged rows than SQLite has
     parameter slots -- the limit is 999 before 3.32. Binding every id into one

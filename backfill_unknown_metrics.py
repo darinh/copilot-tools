@@ -117,12 +117,19 @@ def find_fabricated(conn: sqlite3.Connection, log_dir: Path,
         if not row["log_file"]:
             continue
         path = log_dir / row["log_file"]
-        if not path.exists():
+        # Fingerprint BEFORE reading, never after. The read is the slow part,
+        # and a log that gains its shutdown event while being read would
+        # otherwise be fingerprinted in its new state and then match perfectly
+        # at write time -- the verdict stale, the evidence fresh, and the
+        # check that exists to catch exactly this waved it through. Stat
+        # first and any change from here on shows up as a mismatch.
+        fingerprint = log_fingerprint(path)
+        if fingerprint is None:
             if missing_logs:
                 fabricated.append((row["id"], None))
             continue
         if not log_has_shutdown_event(path):
-            fabricated.append((row["id"], log_fingerprint(path)))
+            fabricated.append((row["id"], fingerprint))
     return fabricated
 
 
@@ -184,8 +191,16 @@ def clear_rows(conn: sqlite3.Connection,
     measure 0s of API time, a 0-second duration and no line changes, which is
     exactly the case ``find_fabricated`` uses the log to rule out.
 
-    Rows are updated one at a time rather than through a single
-    ``WHERE id IN (...)``: it keeps the parameter count flat instead of
+    Rows are cleared one at a time, each in its own short transaction, and the
+    stat happens *outside* it. Holding one ``BEGIN IMMEDIATE`` across the
+    whole list would block the live operator for as long as the loop takes --
+    thousands of statements plus a stat per row, which on a network mount or
+    a loaded disk can outlast the 15s the operator is willing to wait, turning
+    a repair into an outage. Nothing here needs cross-row atomicity: the only
+    invariant is that one row's summary and columns agree, and that holds
+    inside each per-row transaction.
+
+    Updating one row at a time also keeps the parameter count flat instead of
     scaling with the number of damaged rows -- SQLite's limit is 999 before
     3.32 -- and it is what makes a per-row re-check possible at all.
 
@@ -193,16 +208,16 @@ def clear_rows(conn: sqlite3.Connection,
     """
     sets = ", ".join(f"{c} = NULL" for c in COLUMNS)
     cleared = 0
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        for row_id, fingerprint in found:
-            row = conn.execute(
-                "SELECT log_file FROM sessions WHERE id = ?", (row_id,)
-            ).fetchone()
-            if row is None:
-                continue
-            if log_fingerprint(log_dir / row["log_file"]) != fingerprint:
-                continue
+    for row_id, fingerprint in found:
+        row = conn.execute(
+            "SELECT log_file FROM sessions WHERE id = ?", (row_id,)
+        ).fetchone()
+        if row is None or not row["log_file"]:
+            continue
+        if log_fingerprint(log_dir / row["log_file"]) != fingerprint:
+            continue
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             # The text edit runs first: its guard stops matching the moment
             # the columns become NULL. Both land in one transaction, so the
             # summary can never describe a different session than the columns.
@@ -214,16 +229,16 @@ def clear_rows(conn: sqlite3.Connection,
                 f"UPDATE sessions SET {sets} WHERE id = ? AND {ZERO_GUARD}",
                 (row_id,))
             cleared += cur.rowcount
-        conn.execute("COMMIT")
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except sqlite3.Error:
-            # SQLite rolls back on its own for some errors, and then there is
-            # no transaction left to end. Never let that displace the real
-            # exception -- it is the one that says what went wrong.
-            pass
-        raise
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                # SQLite rolls back on its own for some errors, and then there
+                # is no transaction left to end. Never let that displace the
+                # real exception -- it is the one that says what went wrong.
+                pass
+            raise
     return cleared, len(found) - cleared
 
 
