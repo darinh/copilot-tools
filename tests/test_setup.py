@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -1446,3 +1447,147 @@ def test_replace_still_swaps_when_the_destination_was_expected(tmp_path):
 
     assert (dest / "SKILL.md").read_text(encoding="utf-8") == "new"
     assert not (tmp_path / ".demo.previous").exists()
+
+
+def _locking_replace(monkeypatch, *, fail_times, winerror=5, only_staged=True):
+    """Stand in for ``os.replace`` while a scanner holds the source open.
+
+    Selective on the source by default: the real lock this models is on the
+    tree ``shutil.copytree`` has just written, and a double that failed every
+    rename could not tell a retried swap apart from a retried rollback.
+
+    ``time.sleep`` is patched on the ``time`` module rather than on
+    ``setup_tools`` so that this file still runs against a revision that never
+    imported it. Reaching through the module under test would raise
+    ``AttributeError`` during setup there, and six identical errors thrown
+    before a single assertion runs is a control that cannot fail for the
+    reason it claims to test.
+    """
+    real = os.replace
+    calls = []
+
+    def fake(src, dst):
+        calls.append((str(src), str(dst)))
+        staged_src = ".installing" in os.path.basename(str(src))
+        if (staged_src or not only_staged) and len(calls) <= fail_times:
+            exc = OSError(13, "Access is denied")
+            exc.winerror = winerror
+            raise exc
+        return real(src, dst)
+
+    slept = []
+    monkeypatch.setattr(setup_tools.os, "replace", fake)
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(setup_tools, "IS_WINDOWS", True)
+    return calls, slept
+
+
+def test_a_transient_lock_on_the_swap_is_waited_out(tmp_path, monkeypatch):
+    """An antivirus scanner opening the tree setup just copied makes the very
+    next rename fail with ERROR_ACCESS_DENIED. Nothing is wrong and nothing is
+    the user's -- the destination name is free -- so refusing here loses a
+    skill to a lock that was over before the warning was printed."""
+    dest = tmp_path / "demo"
+    staged = tmp_path / ".demo.installing"
+    staged.mkdir()
+    (staged / "SKILL.md").write_text("the new copy", encoding="utf-8")
+    calls, slept = _locking_replace(monkeypatch, fail_times=4)
+
+    setup_tools._replace_tree(staged, dest, expect_absent=True)
+
+    assert (dest / "SKILL.md").read_text(encoding="utf-8") == "the new copy"
+    assert len(calls) == 5, "it should have kept trying until the lock lifted"
+    assert len(slept) == 4, "one wait between each attempt"
+    assert all(s > 0 for s in slept), "a retry with no wait is just a louder failure"
+
+
+def test_a_lock_that_outlasts_the_retries_still_stops(tmp_path, monkeypatch):
+    """The negative control for the test above, and the property the retry must
+    not cost: waiting is bounded, so a handle that is genuinely still open ends
+    as it did before -- raising, with the user's copy put back."""
+    dest = tmp_path / "demo"
+    dest.mkdir()
+    (dest / "SKILL.md").write_text("the user's copy", encoding="utf-8")
+    staged = tmp_path / ".demo.installing"
+    staged.mkdir()
+    (staged / "SKILL.md").write_text("the new copy", encoding="utf-8")
+    calls, _ = _locking_replace(monkeypatch, fail_times=99)
+
+    with pytest.raises(OSError):
+        setup_tools._replace_tree(staged, dest, expect_absent=False)
+
+    assert (dest / "SKILL.md").read_text(encoding="utf-8") == "the user's copy"
+    swaps = [c for c in calls if ".installing" in os.path.basename(c[0])]
+    assert len(swaps) > 1, "a lock worth waiting out must have been waited out"
+    assert len(swaps) < 20, "and the waiting must be bounded, not a spin"
+
+
+def test_moving_the_users_copy_aside_is_never_retried(tmp_path, monkeypatch):
+    """A handle on the *user's* tree is the one case where the original rule
+    stands unchanged: it is their file being held open, and waiting for it to
+    close so we can move it is the opposite of what the lock is telling us."""
+    dest = tmp_path / "demo"
+    dest.mkdir()
+    (dest / "SKILL.md").write_text("the user's copy", encoding="utf-8")
+    staged = tmp_path / ".demo.installing"
+    staged.mkdir()
+    (staged / "SKILL.md").write_text("the new copy", encoding="utf-8")
+    calls, slept = _locking_replace(monkeypatch, fail_times=99, only_staged=False)
+
+    with pytest.raises(OSError):
+        setup_tools._replace_tree(staged, dest, expect_absent=False)
+
+    assert len(calls) == 1, "the aside rename must fail on its first refusal"
+    assert slept == []
+
+
+def test_a_refusal_that_is_not_a_lock_is_not_waited_out(tmp_path, monkeypatch):
+    """Only the two errors that mean "open right now" are worth waiting on. Any
+    other is a real refusal, and retrying it would turn a clear error into a
+    slow one while telling the user nothing new."""
+    dest = tmp_path / "demo"
+    staged = tmp_path / ".demo.installing"
+    staged.mkdir()
+    (staged / "SKILL.md").write_text("the new copy", encoding="utf-8")
+    calls, slept = _locking_replace(monkeypatch, fail_times=99, winerror=87)
+
+    with pytest.raises(OSError):
+        setup_tools._replace_tree(staged, dest, expect_absent=True)
+
+    assert len(calls) == 1
+    assert slept == []
+
+
+def test_posix_does_not_wait_out_a_permission_error(tmp_path, monkeypatch):
+    """The same errno on POSIX means the permissions forbid it, which waiting
+    does not change. Retrying there would be a slow refusal, so the platform
+    check is asserted rather than assumed."""
+    dest = tmp_path / "demo"
+    staged = tmp_path / ".demo.installing"
+    staged.mkdir()
+    (staged / "SKILL.md").write_text("the new copy", encoding="utf-8")
+    calls, slept = _locking_replace(monkeypatch, fail_times=99)
+    monkeypatch.setattr(setup_tools, "IS_WINDOWS", False)
+
+    with pytest.raises(OSError):
+        setup_tools._replace_tree(staged, dest, expect_absent=True)
+
+    assert len(calls) == 1
+    assert slept == []
+
+
+def test_reconcile_waits_out_a_lock_restoring_the_only_copy(tmp_path, monkeypatch):
+    """The aside copy is the user's only one here, so this rename is the most
+    expensive one in the module to give up on: losing it to a transient lock
+    leaves the skill under a dotted name until somebody notices."""
+    dest = tmp_path / "demo"
+    previous = tmp_path / ".demo.previous"
+    previous.mkdir()
+    (previous / "SKILL.md").write_text("the only copy", encoding="utf-8")
+    calls, _ = _locking_replace(monkeypatch, fail_times=4, only_staged=False)
+
+    setup_tools._reconcile_scratch(dest)
+
+    assert (dest / "SKILL.md").read_text(encoding="utf-8") == "the only copy"
+    assert len(calls) == 5
+
