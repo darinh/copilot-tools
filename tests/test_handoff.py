@@ -954,20 +954,24 @@ def test_a_second_writer_cannot_enter_the_section_while_one_is_open(
     assert holding.wait(timeout=10), "first handoff never reached the write"
 
     second_got_in = threading.Event()
+    rerun_got_in = threading.Event()
     contender_failed = []
 
-    def run_second():
+    def run_second(got_in):
         try:
             with ho.handoff_lock(handoff) as acquired:
                 if acquired:
-                    second_got_in.set()
+                    got_in.set()
         except BaseException as exc:              # pragma: no cover - reported
             contender_failed.append(exc)
 
     monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.3)
-    contender = threading.Thread(target=run_second, daemon=True)
+    contender = threading.Thread(target=run_second, args=(second_got_in,),
+                                 daemon=True)
     contender.start()
     contender.join(timeout=10)
+    assert not contender.is_alive(), \
+        "the contender is still running, so its verdict is not in yet"
     assert not contender_failed, \
         f"the contender never reached the lock: {contender_failed!r}"
     assert not second_got_in.is_set(), \
@@ -975,18 +979,22 @@ def test_a_second_writer_cannot_enter_the_section_while_one_is_open(
 
     let_go.set()
     worker.join(timeout=10)
+    assert not worker.is_alive(), "the first handoff never finished"
 
     # The control, through the same call: an unset event is also what a
     # contender that crashed on the way to the lock leaves behind, and what a
     # thread that never ran leaves behind. Re-running the identical body with
-    # the section now free must set it. If this fails, the exclusion asserted
-    # above was never demonstrated -- only the silence was.
-    rerun = threading.Thread(target=run_second, daemon=True)
+    # the section now free must set it. Its own event, because the one above
+    # could be set late by the first contender, and a positive the subject's
+    # own failure can author is not a control.
+    rerun = threading.Thread(target=run_second, args=(rerun_got_in,),
+                             daemon=True)
     rerun.start()
     rerun.join(timeout=10)
+    assert not rerun.is_alive(), "the re-run contender is still running"
     assert not contender_failed, \
         f"the contender never reached the lock: {contender_failed!r}"
-    assert second_got_in.is_set(), \
+    assert rerun_got_in.is_set(), \
         "the contender cannot take the lock even when it is free, so its " \
         "earlier failure to take it proves nothing"
 
