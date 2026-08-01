@@ -520,12 +520,23 @@ def _push_trigger(ci: str) -> tuple[bool, bool]:
     skipping its own assertions on block-style yaml, and a parser that can
     only be checked against the one file it currently reads is a parser whose
     failure mode is silence.
+
+    ``parsed`` exists so the caller can tell "looked, and the trigger is
+    unrestricted" from "could not look". Those are the two outcomes a check
+    most easily confuses, and only one of them is good news -- so anything
+    this function does not genuinely understand must come back
+    ``parsed=False`` and be raised loudly, never guessed at. ``branches-ignore``
+    is the case that taught us: it restricts pushes, but not by naming the
+    branches that run, so returning "unrestricted" for it would be a
+    confidently wrong answer rather than an admission.
     """
     triggers = ci.split("\njobs:")[0]
     push = re.search(r"\n  push:\n((?:    .*\n)*)", triggers)
     if not push:
         return (False, False)
     body = push.group(1)
+    if re.search(r"^\s*branches-ignore:", body, re.M):
+        return (False, False)
     if "branches:" not in body:
         return (False, True)
     parsed = bool(re.search(r"branches:\s*\[([^\]]*)\]", body)
@@ -583,6 +594,39 @@ def test_both_yaml_list_spellings_are_parsed(style):
 
 def test_an_unrestricted_push_trigger_is_recognised_as_such():
     assert _push_trigger("on:\n  push:\n\njobs:\n") == (False, True)
+
+
+def test_a_trigger_shape_we_do_not_understand_is_reported_as_unparsed():
+    """The parser must admit ignorance rather than guess "unrestricted".
+
+    ``branches-ignore`` restricts which pushes run, but not by naming the
+    branches that do, so the honest answer is "could not look" -- which the
+    caller turns into a loud failure. Answering ``(False, True)`` here would
+    be the exact defect this session spent its time on: a value that is wrong
+    rather than absent, so every downstream fallback for absence sails past it.
+    """
+    ignore = "on:\n  push:\n    branches-ignore: [gh-pages]\n\njobs:\n"
+    assert _push_trigger(ignore) == (False, False), (
+        "branches-ignore read as an unrestricted trigger; the check would "
+        "then assert the README's *narrower* claim is wrong, confidently")
+
+
+def test_the_ci_claim_check_is_actually_live_against_the_real_workflow():
+    """A control for the environment, not the input.
+
+    The spelling controls above prove the parser copes with the shapes we
+    hand it. They cannot notice that the real `ci.yml` has drifted to a shape
+    that makes the check upstream skip its assertions, because they never
+    read it. This one does: if the trigger stops being parseable, or stops
+    being restricted, the test above changes which branch it runs and this
+    one says so out loud instead.
+    """
+    ci = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert _push_trigger(ci) == (True, True), (
+        "ci.yml's push trigger is no longer a parsed, branch-restricted one, "
+        "so test_the_readme_ci_claim_matches_the_workflow is no longer "
+        "checking what it was written to check -- re-read it before assuming "
+        "the README is still accurate")
 
 
 def test_a_fenced_command_is_reported_even_beside_an_unrelated_denial():
