@@ -20,6 +20,7 @@ import csv
 import os
 import platform
 import sys
+import uuid
 from pathlib import Path
 
 # An editable install freezes the module list into its import finder, so a
@@ -71,6 +72,88 @@ def same_or_within(child: str, parent: str) -> bool:
         return False
 
 
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{n}" for n in range(1, 10)),
+    *(f"LPT{n}" for n in range(1, 10)),
+}
+# `<>:"|?*` and the control characters cannot appear in a Windows filename.
+# Letting one through does not create a directory, it raises deep inside
+# `mkdir` as an uncaught OSError.
+_UNSAFE_GUID_CHARS = frozenset('<>:"|?*') | frozenset(chr(c) for c in range(32))
+
+
+def guid_is_usable(guid: str) -> bool:
+    """True when `guid` names exactly one directory under the projects root.
+
+    A catalog row is hand-edited often enough that its second column cannot be
+    trusted to hold a GUID. A blank one is the dangerous case: ``projects /
+    ""`` collapses back to the projects root itself, so the handoff lands in a
+    single shared ``next-session.md`` that every project overwrites in turn --
+    and the next session reads it, deletes it, and never learns it belonged to
+    someone else. A separator or a `..` escapes the projects root the same way,
+    just further.
+
+    The trailing-dot rule is the subtle one, and it is the same bug wearing a
+    disguise: Windows strips trailing dots and spaces from a path component, so
+    ``projects/victim.`` and ``projects/victim`` are one directory. Accepting
+    ``victim.`` would let a malformed row silently overwrite a *different*
+    project's handoff -- exactly the clobbering this function exists to stop.
+
+    One collision is deliberately *not* rejected: ``abc`` and ``ABC`` are one
+    directory on a case-insensitive filesystem. That is a different kind of
+    fault. ``victim.`` is malformed in isolation -- it does not name what it
+    appears to name -- whereas ``ABC`` names exactly ``ABC``, and the problem
+    only exists if some *other* row also claims ``abc``. Catching it means
+    comparing rows against each other, which belongs in a catalog check rather
+    than in a predicate over one value, and rejecting case variants outright
+    would break catalogs that are correct today.
+    """
+    if not guid or guid != guid.strip():
+        return False
+    # Rejects ".", ".." and any run of dots, plus anything Windows would trim
+    # down to a different name.
+    if guid.strip(".") == "" or guid != guid.rstrip("."):
+        return False
+    if "/" in guid or "\\" in guid:
+        return False
+    if _UNSAFE_GUID_CHARS & frozenset(guid):
+        return False
+    if guid.split(".")[0].upper() in _WINDOWS_RESERVED:
+        return False
+    # Catches the platform-specific leftovers, notably a Windows drive-relative
+    # token like `C:x`, whose final component is not the whole string.
+    return guid == Path(guid).name
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """Replace `path` with `text` in one indivisible step.
+
+    The reader of this file deletes it once it has been read, so a torn write
+    is not cosmetic: it is context the next agent can never recover. Writing a
+    sibling temp file and renaming over the target means a reader sees the
+    whole old file or the whole new one, never half of either.
+
+    The temp file is a sibling because ``os.replace`` is only atomic within one
+    filesystem, and its name is random because two agents working the same
+    project can hand off at the same moment -- a shared temp name would let
+    them interleave into one corrupt file, which is the very failure this
+    function exists to prevent. A pid would be *nearly* unique; it repeats
+    across containers sharing a mounted home, which is precisely where two
+    agents are most likely to collide.
+    """
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        die(f"Cannot write handoff {path}: {exc}")
+
+
 def resolve_guid(project_root) -> str:
     if not CATALOG.is_file():
         die(f"Catalog not found: {CATALOG}")
@@ -84,10 +167,17 @@ def resolve_guid(project_root) -> str:
                 if not path:
                     continue
                 try:
-                    if normalize(path) == target:
-                        return guid
+                    matched = normalize(path) == target
                 except OSError:
                     continue
+                if matched:
+                    if not guid_is_usable(guid):
+                        die(f"Catalog entry for {target} has an unusable "
+                            f"project id: {guid!r}\n"
+                            f"The second column must be one plain directory "
+                            f"name, such as a GUID. Fix the line to read:\n"
+                            f"  \"{Path(project_root).resolve()}\",<guid>")
+                    return guid
     except OSError as exc:
         die(f"Cannot read catalog {CATALOG}: {exc}")
     die(f"No catalog entry for: {target}\n"
@@ -201,15 +291,24 @@ def main(argv: list[str] | None = None) -> int:
     handoff_file = project_dir / "next-session.md"
     marker = state_dir() / instance_id
 
-    project_dir.mkdir(parents=True, exist_ok=True)
-    state_dir().mkdir(parents=True, exist_ok=True)
+    # Even a validated guid can fail here -- a read-only home, a full disk, a
+    # revoked permission. Report it the way the rest of the tool reports
+    # trouble rather than with a bare traceback.
+    try:
+        project_dir.mkdir(parents=True, exist_ok=True)
+        state_dir().mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        die(f"Cannot create {project_dir} or {state_dir()}: {exc}")
 
-    handoff_file.write_text(
+    write_atomic(
+        handoff_file,
         render(args.status, args.in_progress, args.next_steps,
                args.context, args.prompt),
-        encoding="utf-8",
     )
-    marker.touch()
+    try:
+        marker.touch()
+    except OSError as exc:
+        die(f"Handoff written, but cannot raise restart marker {marker}: {exc}")
 
     print(f"✅ Handoff written: {handoff_file}")
     print(f"✅ Restart signal: {marker}")
