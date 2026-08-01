@@ -8,7 +8,7 @@
 
 import { execFile } from "node:child_process";
 import { readdirSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { resolve, join, relative, isAbsolute } from "node:path";
 
 // The only directories excluded on this extension's own authority. Everything
 // else that should be ignored is decided by asking git (`check-ignore`), so
@@ -499,6 +499,37 @@ export function strayReport(strays, scratchDir) {
   );
 }
 
+/**
+ * Report for artifacts that appeared in the primary checkout while the agent
+ * is working somewhere else.
+ *
+ * Worded separately from `strayReport` on purpose. "A file appeared" and "a
+ * file appeared in the tree you are not looking at" are different findings,
+ * and the second is the one that costs a peer their evening: the primary
+ * checkout is the tree every other agent resolves as the project.
+ *
+ * It does not tell the agent to delete anything. From here a subagent's
+ * leftover and a peer's live experiment are indistinguishable, and deleting
+ * the second on the strength of the first is the mistake this toolkit spends
+ * most of its effort removing from code.
+ */
+export function primaryStrayReport(strays, scratchDir, primaryRoot) {
+  const plural = strays.length === 1 ? "" : "s";
+  return (
+    `[checkout-guard] ${strays.length} new untracked path${plural} appeared in ` +
+    `the PRIMARY checkout (${primaryRoot}) during your last command, which is ` +
+    `not the checkout you are working in:\n` +
+    formatPathList(strays) +
+    `\n\nMost likely a subagent: subagents run their own shell and a relative ` +
+    `path resolves against whatever directory they happened to start in. If ` +
+    `these are yours, delete them now and rerun that work under ${scratchDir}. ` +
+    `If you cannot tell whether they are yours, ask the other agents before ` +
+    `deleting anything -- a peer's live experiment looks exactly like ` +
+    `leftovers from here, and the primary checkout is the one tree where a ` +
+    `mystery file costs someone else the most.`
+  );
+}
+
 /** Text injected at session start so the scratch directory is discoverable. */
 export function sessionBriefing(scratchDir) {
   return (
@@ -507,7 +538,9 @@ export function sessionBriefing(scratchDir) {
     `experiment output there, never in a git checkout -- the checkout may be ` +
     `shared with peer agents, and an unexplained file in it costs someone hours. ` +
     `This applies to subagents you launch: tell them the same path, because ` +
-    `their shell commands land in your checkout. A blanket \`git add -A\` is ` +
+    `a subagent starts its own shell in a directory you did not choose, and a ` +
+    `relative path resolves against that -- which may be this checkout or the ` +
+    `repository's primary one. A blanket \`git add -A\` is ` +
     `blocked while stray artifacts are present; staging a path by name is not.`
   );
 }
@@ -553,6 +586,79 @@ export async function checkoutRoot(cwd) {
   if (!ok) return null;
   const root = stdout.trim();
   return root ? resolve(root) : null;
+}
+
+/**
+ * The repository's primary checkout, or null if it cannot be determined.
+ *
+ * `--show-toplevel` cannot answer this: inside a linked worktree it returns the
+ * worktree. The first record of `git worktree list --porcelain` is always the
+ * main working tree, from anywhere in the repository, which is why the rest of
+ * this toolkit resolves the project that way too.
+ *
+ * Returns null for a bare main worktree. There is no working tree there for
+ * anything to be left in, and reporting on one would be reporting on `.git`.
+ */
+export async function primaryCheckoutRoot(cwd) {
+  const { ok, stdout } = await git(["worktree", "list", "--porcelain"], cwd);
+  if (!ok) return null;
+  // Records are newline-separated and separated from each other by a blank
+  // line; only the first is read, so a `bare` line later in the output belongs
+  // to some other worktree and says nothing about this one.
+  const first = stdout.split(/\r?\n\r?\n/)[0] ?? "";
+  const lines = first.split(/\r?\n/);
+  const worktree = lines.find((line) => line.startsWith("worktree "));
+  if (!worktree) return null;
+  if (lines.some((line) => line.trim() === "bare")) return null;
+  const root = worktree.slice("worktree ".length).trim();
+  return root ? resolve(root) : null;
+}
+
+/**
+ * Checkout-relative prefixes of every linked worktree nested inside `root`.
+ *
+ * A linked worktree is a checkout, never content of the checkout containing
+ * it, but git has no opinion about that: `git status` in the primary reports a
+ * nested worktree as an ordinary untracked directory. `INTRINSIC_EXCLUSIONS`
+ * does not cover this, because it is consulted for empty-directory candidates
+ * and ignore lookups rather than for git's own `??` records -- which is
+ * invisible in a repository whose `.gitignore` lists `/.worktrees/`, as this
+ * one's does.
+ *
+ * The paths come from git rather than from the `.worktrees/` naming
+ * convention, so a worktree placed anywhere else is still recognised.
+ */
+export async function nestedWorktreePrefixes(root) {
+  const { ok, stdout } = await git(["worktree", "list", "--porcelain"], root);
+  if (!ok) return [];
+  const prefixes = [];
+  for (const record of stdout.split(/\r?\n\r?\n/)) {
+    const line = record.split(/\r?\n/).find((l) => l.startsWith("worktree "));
+    if (!line) continue;
+    const path = resolve(line.slice("worktree ".length).trim());
+    if (path === resolve(root)) continue;
+    const rel = relative(root, path).replace(/\\/g, "/");
+    if (!rel || rel.startsWith("../") || isAbsolute(rel)) continue;
+    prefixes.push(`${rel}/`);
+  }
+  return prefixes;
+}
+
+/**
+ * `scanCheckout` for a checkout the agent is not working in.
+ *
+ * Identical except that linked worktrees nested inside it are not reported.
+ * Without this, every session that works in `.worktrees/<branch>` would be
+ * told its own worktree is a stray artifact in the primary, on every command,
+ * for ever -- and a guard that cries wolf gets switched off, which costs more
+ * than the artifacts it was watching for.
+ */
+export async function scanPrimaryCheckout(root) {
+  const found = await scanCheckout(root);
+  if (found === null) return null;
+  const nested = await nestedWorktreePrefixes(root);
+  if (nested.length === 0) return found;
+  return found.filter((p) => !nested.some((n) => p === n || p.startsWith(n)));
 }
 
 /** Top-level directory names, or [] when the checkout cannot be read. */
