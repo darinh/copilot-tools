@@ -1436,10 +1436,14 @@ def restart_loop(target: str | None) -> int:
               f"started by an operator that predates restart-loop.",
               file=sys.stderr)
         print("  Its next session would lose its original arguments, so it is "
-              "safer to restart it yourself:", file=sys.stderr)
+              "safer to restart it yourself. Run this from "
+              f"{instance.display_name}'s working directory — --adopt is what "
+              "keeps the running session alive:", file=sys.stderr)
         print(f"    operator stop-loop {instance.display_name}", file=sys.stderr)
-        print(f"    operator --loop --headless --name {instance.display_name} "
-              f"[original args]", file=sys.stderr)
+        print(f"    operator --loop --headless --adopt "
+              f"--name {instance.display_name} [original args]", file=sys.stderr)
+        print("  That records the arguments, so future restarts can just use: "
+              f"operator restart-loop {instance.display_name}", file=sys.stderr)
         return 1
     if not Path(recorded_cwd).is_dir():
         # Spawning from the caller's cwd instead would silently point the

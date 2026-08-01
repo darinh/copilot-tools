@@ -375,6 +375,22 @@ def test_restart_loop_refuses_when_args_were_never_recorded(monkeypatch):
     assert op.restart_loop("legacy") == 1
 
 
+def test_legacy_refusal_tells_the_user_to_adopt(monkeypatch, capsys):
+    """The manual fallback is only safe with --adopt. Without it the relaunch
+    hits the existing-session prompt, which in headless mode aborts and in
+    interactive mode offers to kill the very session we are preserving."""
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: True)
+    monkeypatch.setattr(op, "_running_loop_pid", lambda instance: 1234)
+
+    inst = op.Instance("legacyadvice")
+    _claim(inst)
+    assert op.restart_loop("legacyadvice") == 1
+
+    err = capsys.readouterr().err
+    assert "--adopt" in err
+    assert "stop-loop legacyadvice" in err
+
+
 def test_restart_loop_starts_one_when_none_is_running(monkeypatch):
     """`stop-loop` then `restart-loop` must work: a session with no
     supervisor is exactly what this should be able to fix."""

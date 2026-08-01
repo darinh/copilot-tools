@@ -215,7 +215,7 @@ running, it keeps its session number too.
 |---|---|
 | No session running | Refuses — there is nothing to keep alive |
 | Session not owned by this operator | Refuses — it belongs to someone else |
-| No recorded loop arguments | Refuses — the replacement would differ from the original; it tells you the manual commands instead |
+| No recorded loop arguments | Refuses — the replacement would differ from the original; it tells you the manual `stop-loop` + `--adopt` commands instead |
 | Supervisor does not stop in time | Aborts without spawning, leaving the session and its old supervisor alone |
 | No supervisor running (e.g. after `stop-loop`) | Starts one that adopts the session |
 
