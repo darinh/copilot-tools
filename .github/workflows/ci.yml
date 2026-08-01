@@ -113,3 +113,31 @@ jobs:
         timeout-minutes: 5
         run: node --test extensions/checkout-guard/guard.test.mjs
 
+  git-identity:
+    # Purging one accidentally-committed corporate address from this
+    # repository cost a full history rewrite AND the deletion and recreation
+    # of the GitHub remote, because refs/pull/* kept the address alive through
+    # the rewrite. The repository is public, so the gap between a push and a
+    # discovery is publication, and an identity mistake is one of the few
+    # defects here that cannot be fixed forward. Until this job existed the
+    # rule "every commit uses darinh@gmail.com" was enforced by whoever
+    # remembered it -- and the address originally came from a different
+    # machine's global config, which is exactly when nobody does.
+    name: Commit identity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Load-bearing, and the reason this is a separate job rather than a
+          # step in one of the others: every job above checks out at the
+          # default depth of 1. A history scan run there would examine the tip
+          # commit, certify the hundreds behind it, and report that in green
+          # forever. git_identity.py refuses a shallow clone with exit 2
+          # rather than passing, so removing this line turns the job red
+          # instead of silent -- but it is still the line that makes the job
+          # mean anything.
+          fetch-depth: 0
+
+      - name: Every commit uses an allowed identity
+        run: python3 git_identity.py
+
