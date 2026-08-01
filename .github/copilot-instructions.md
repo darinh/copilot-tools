@@ -1,5 +1,27 @@
 # Repository Agent Instructions
 
+## Never `pip install -e` from a worktree
+
+Every agent here works in `<repo>/.worktrees/<branch>/`, and `pip install -e`
+records its source directory in the interpreter's import path and points the
+`operator` and `handoff` console scripts at it — machine-wide, for every user
+of that interpreter. A worktree is created in order to be deleted, so the
+install is a breakage armed to fire when *somebody else* correctly finishes
+that branch and removes it. Twice now that has killed `operator` and `handoff`
+for every agent on the box, and both times the person holding the traceback
+had no path back to the cause.
+
+Pass the primary checkout explicitly rather than trusting the working
+directory:
+
+    python -m pip install -e C:\Users\darin\repos\copilot-tools --no-deps
+
+`worktree_guard_backend.py` — this project's PEP 517 backend — now refuses to
+build an editable install from a linked worktree and names the checkout to use
+instead. Submodules, wheels and sdists are unaffected, and
+`COPILOT_TOOLS_ALLOW_WORKTREE_INSTALL=1` overrides it. Do not weaken the guard
+to make a one-off convenient; the override exists for that.
+
 ## Shell scripts must run on bash 3.2
 
 `/bin/bash` on macOS is 3.2 — Apple froze it at the last GPLv2 release and is
