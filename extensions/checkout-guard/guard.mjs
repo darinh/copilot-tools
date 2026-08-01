@@ -619,6 +619,7 @@ export function inheritedStrayReport(strays, root, { primary = false } = {}) {
   const plural = strays.length === 1 ? "" : "s";
   const were = strays.length === 1 ? "was" : "were";
   const it = strays.length === 1 ? "it" : "them";
+  const they = strays.length === 1 ? "it" : "they";
   const where = primary
     ? `the PRIMARY checkout (${root}), which is not the checkout you are ` +
       `working in,`
@@ -629,7 +630,7 @@ export function inheritedStrayReport(strays, root, { primary = false } = {}) {
     formatPathList(strays) +
     `\n\nNothing will mention ${it} again. The guard reports what appears ` +
     `DURING a session, and anything present at the start is folded into the ` +
-    `baseline, so this is the only point at which ${it} can be raised.\n\n` +
+    `baseline, so this is the only point at which ${they} can be raised.\n\n` +
     `Empty directories are included, and \`git status\` does not list those -- ` +
     `git tracks no empty directory, so a checkout can report perfectly clean ` +
     `with artifacts sitting in its root.\n\n` +

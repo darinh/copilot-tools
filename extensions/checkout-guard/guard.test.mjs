@@ -409,6 +409,23 @@ test("the primary variant says which tree, and the working variant does not clai
 test("inherited pluralisation is correct at one and many", () => {
   assert.match(inheritedStrayReport(["a"], "/r"), /1 untracked path was/);
   assert.match(inheritedStrayReport(["a", "b"], "/r"), /2 untracked paths were/);
+
+  // Pronoun CASE, not just number. Every other pronoun in the report is in
+  // object position ("mention them", "leave them alone"), so a single
+  // object-case variable reads correctly nearly everywhere -- and then reads
+  // as "the only point at which them can be raised" at the one place the
+  // pronoun is a subject. A plural-number-only assertion passes straight
+  // through that, which is how it shipped: the singular branch is grammatical
+  // either way, so nothing that tests one stray can see it.
+  const one = inheritedStrayReport(["a"], "/r");
+  const many = inheritedStrayReport(["a", "b"], "/r");
+  assert.match(one, /point at which it can be raised/, one);
+  assert.match(many, /point at which they can be raised/, many);
+  assert.ok(!/which them can/.test(many), many);
+
+  // The control: object position stays object-case in the same report, so
+  // this is not just "every pronoun was renamed to they".
+  assert.match(many, /Nothing will mention them again/, many);
 });
 
 test("UNSCANNED is a headline marker of its own, and a mixed session gets both reports", () => {
