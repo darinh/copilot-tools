@@ -205,6 +205,24 @@ class _Unplaceable:
 UNPLACEABLE = _Unplaceable()
 
 
+class _CatalogUnreadable:
+    """Sentinel: the catalog could not be read, which is not "no entry".
+
+    Handed back by ``project_handoff_file`` so a caller cannot mistake "the
+    catalog would not open" for "this project was never registered". The two
+    licence opposite statements to the agent: the first establishes nothing,
+    while the second is used to explain why no handoff is expected here.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<catalog-unreadable>"
+
+
+CATALOG_UNREADABLE = _CatalogUnreadable()
+
+
 def remove_file(path: Path) -> bool:
     """Delete ``path`` if we can; report whether it is gone.
 
@@ -393,7 +411,15 @@ def migrate_legacy_state() -> None:
         if not acquired:
             return
         moved = 0
-        if dir_present(LEGACY_RESTART_DIR) and LEGACY_RESTART_DIR != RESTART_DIR:
+        # Each probe is spent on three states, not two. ~/.copilot is deleted
+        # by the CLI, so anything left behind here is lost for good -- and a
+        # skip caused by an unexaminable source is indistinguishable, in the
+        # log and in the outcome, from there having been nothing to move.
+        legacy_restart = dir_present(LEGACY_RESTART_DIR)
+        if legacy_restart is None:
+            log(f"  Could not examine {LEGACY_RESTART_DIR} — any legacy state "
+                f"there has been left in place, not migrated")
+        elif legacy_restart and LEGACY_RESTART_DIR != RESTART_DIR:
             try:
                 legacy_items = list(LEGACY_RESTART_DIR.iterdir())
             except OSError as exc:
@@ -403,9 +429,16 @@ def migrate_legacy_state() -> None:
                 moved += _move_legacy(src, RESTART_DIR / src.name)
         for src, dest in ((LEGACY_LOG_FILE, LOG_FILE),
                           (LEGACY_METRICS_DB, METRICS_DB)):
-            if file_present(src):
+            state = file_present(src)
+            if state is None:
+                log(f"  Could not examine {src} — left in place, not migrated")
+            elif state:
                 moved += _move_legacy(src, dest)
-        if dir_present(LEGACY_BACKUPS_DIR):
+        backups = dir_present(LEGACY_BACKUPS_DIR)
+        if backups is None:
+            log(f"  Could not examine {LEGACY_BACKUPS_DIR} — left in place, "
+                f"not migrated")
+        elif backups:
             moved += _move_legacy(LEGACY_BACKUPS_DIR, BACKUPS_DIR)
         if moved:
             log(f"Migrated {moved} legacy state item(s) into {OPERATOR_HOME}")
@@ -1271,23 +1304,34 @@ def project_catalog_path() -> Path:
     return projects_root() / "catalog.csv"
 
 
-def project_handoff_file(cwd: Path) -> Path | None:
+def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
     """Resolve the handoff (``next-session.md``) path for a project directory.
 
     Looks the directory up in ``~/.copilot/projects/catalog.csv`` (the same
     catalog ``handoff``/``handoff_tool.py`` use) and returns the path the
     handoff file *would* live at, regardless of whether it currently exists.
-    Returns None if the directory has no catalog entry at all.
+    Returns None if the directory has no catalog entry at all, and
+    :data:`CATALOG_UNREADABLE` if the catalog could not be read, which is a
+    different answer and must not share a return value with the first.
 
     The lookup is keyed on the primary checkout, so running from a worktree
     finds the project's real entry instead of reporting it unregistered.
+
+    The presence probe is spent on ``is False`` and only ``is False``, for the
+    reason :func:`handoff_tool.resolve_guid` spells out against this same file:
+    a denied *stat* does not imply a denied *read*, so a catalog sitting behind
+    an unsearchable parent still gets opened. Gating the read on the stat could
+    only ever subtract a lookup that would have succeeded -- measured: the stat
+    raises EACCES while ``open`` hands the bytes over.
     """
     catalog = project_catalog_path()
-    if not file_present(catalog):
+    if file_present(catalog) is False:
         return None
     target = str(primary_repo_root(cwd).resolve())
     if IS_WINDOWS:
         target = target.lower()
+    # "No row matched" is only an answer if every row was actually compared.
+    undecided = False
     try:
         with open(catalog, "r", encoding="utf-8", errors="replace", newline="") as fh:
             for row in csv.reader(fh):
@@ -1306,14 +1350,18 @@ def project_handoff_file(cwd: Path) -> Path | None:
                 try:
                     resolved = str(Path(path).resolve())
                 except OSError:
+                    # This row could not be compared. Skipping it is right, but
+                    # it means the "not registered" verdict below is no longer
+                    # established for this catalog.
+                    undecided = True
                     continue
                 if IS_WINDOWS:
                     resolved = resolved.lower()
                 if resolved == target:
                     return project_dir(guid) / "next-session.md"
     except OSError:
-        return None
-    return None
+        return CATALOG_UNREADABLE
+    return CATALOG_UNREADABLE if undecided else None
 
 
 def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = False) -> str:
@@ -2007,13 +2055,24 @@ def ingest_all_logs(force: bool = False) -> int:
     return 0
 
 
-def _log_files() -> list[Path]:
-    if not dir_present(COPILOT_LOG_DIR):
+def _log_files() -> "list[Path] | None":
+    """The process logs, or None when the directory could not be examined.
+
+    An empty list is a census: it says the directory was read and found to
+    hold nothing. A denied stat or a failed glob establishes no such thing,
+    and the caller spends the empty list as "No Copilot logs found" -- a
+    failed read arriving as a confident statement about the filesystem, which
+    is the empty-population bug this module keeps having to unlearn.
+    """
+    present = dir_present(COPILOT_LOG_DIR)
+    if present is None:
+        return None
+    if present is False:
         return []
     try:
         return sorted(COPILOT_LOG_DIR.glob("process-*.log"))
     except OSError:
-        return []
+        return None
 
 
 def manage_logs(args: list[str]) -> int:
@@ -2041,6 +2100,10 @@ def manage_logs(args: list[str]) -> int:
                 die("--days requires a whole number")
 
     files = _log_files()
+    if files is None:
+        print(f"Could not examine {COPILOT_LOG_DIR} — not reporting whether "
+              f"logs are present there.")
+        return 1
     if not files:
         print(f"No Copilot logs found in {COPILOT_LOG_DIR}")
         return 0
@@ -2596,7 +2659,13 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     crash_recovery = False
     if resume_id:
         handoff_file = project_handoff_file(Path.cwd())
-        if handoff_file is None:
+        if handoff_file is CATALOG_UNREADABLE:
+            # The catalog would not open. That establishes nothing about
+            # whether this project is registered, so it must not be reported
+            # as either a missing handoff or an unregistered project.
+            log("  Could not read the project catalog — not reporting this as "
+                "crash recovery")
+        elif handoff_file is None:
             log("  Project is not registered in the catalog — no handoff file "
                 "is expected here")
         elif path_present(handoff_file) is False:
