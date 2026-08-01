@@ -45,7 +45,6 @@ import git_identity
 from git_identity import CLEAN, UNDETERMINED, VIOLATIONS, Result, is_allowed, scan
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 ALLOWED = "darinh@gmail.com"
 CORPORATE = "dahoove@microsoft.com"
@@ -103,12 +102,38 @@ def test_permitted_identities_are_allowed(email):
     "someone@microsoft.com",
     "someone@example.corp",          # the NEXT employer, not the last one
     "",
-    "darinh@gmail.com.attacker.net",  # suffix rules must anchor at the end
+    "darinh@gmail.com.attacker.net",  # exact rules must not match a prefix
     "users.noreply.github.com",       # the suffix without the @
-    "evil@notusers.noreply.github.com.evil.net",
+    "evil@notusers.noreply.github.com",
+    # The suffix embedded mid-string, under a domain somebody else controls.
+    # This is the case that anchoring exists for: `endswith` refuses it and a
+    # substring test accepts it, and a mutation of exactly that shape survived
+    # this suite until these three were added.
+    "attacker@users.noreply.github.com.evil.net",
+    "attacker@users.noreply.github.com.co",
+    "@users.noreply.github.com.example.org",
 ])
 def test_disallowed_identities_are_rejected(email):
     assert not is_allowed(email), f"{email!r} must not be treated as allowed"
+
+
+def test_the_allowed_suffix_must_be_anchored_at_the_end():
+    """A named test for the mutation that survived, so it cannot come back.
+
+    Substring-matching the suffix is the single most plausible wrong
+    implementation of this rule, and it hands every address under
+    ``users.noreply.github.com.<anything-they-registered>`` a pass. Registering
+    that domain is not exotic; it is the standard shape of a suffix-matching
+    bypass.
+    """
+    allowed_suffix = "@users.noreply.github.com"
+    hostile = f"attacker{allowed_suffix}.evil.example"
+    assert allowed_suffix in hostile, "premise: a substring test would accept it"
+    assert not is_allowed(hostile), (
+        "the suffix rule is matching anywhere in the address rather than at "
+        "the end")
+    assert is_allowed(f"someone{allowed_suffix}"), (
+        "negative control: the genuine suffix still passes")
 
 
 def test_the_allowlist_names_what_is_permitted_rather_than_what_is_banned():
@@ -165,6 +190,51 @@ def test_a_corporate_co_author_trailer_is_found(tmp_path):
     result = scan(str(repo))
     assert result.state == VIOLATIONS
     assert ("co-author", CORPORATE) in {(o.field, o.email) for o in result.offenders}
+
+
+@pytest.mark.parametrize("trailer", [
+    # Two addresses on one line. The first regex here captured only the LAST
+    # one, so putting an allowed address after a corporate one made the commit
+    # read as clean. Found independently by two reviewers; it is a false
+    # negative, which is the direction that publishes.
+    f"Co-authored-by: Evil <{CORPORATE}> and Good <{ALLOWED}>",
+    # Trailing text after the bracket. The old `\\s*$` anchor made the line
+    # fail to match at all, so the address was never examined.
+    f"Co-authored-by: Evil <{CORPORATE}>  # a note",
+    # No brackets. Git's tooling writes them; a human typing the trailer by
+    # hand does not, and the address is published either way.
+    f"Co-authored-by: {CORPORATE}",
+    # Indented, and in a different case than the canonical spelling.
+    f"    co-authored-BY: Evil <{CORPORATE}>",
+])
+def test_a_corporate_address_cannot_hide_in_a_trailer_line(tmp_path, trailer):
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "init", body=trailer)
+    result = scan(str(repo))
+    assert result.state == VIOLATIONS, (
+        f"the corporate address hid in {trailer!r}")
+    assert CORPORATE in {o.email for o in result.offenders}
+
+
+def test_an_allowed_address_beside_a_corporate_one_is_not_a_pass(tmp_path):
+    """Negative control for the case above: both addresses are reported.
+
+    The bug was not "misses trailers"; it was "stops at the first address it
+    can approve of". So the allowed address must still be seen as allowed
+    while the corporate one is reported.
+    """
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "init", body=f"Co-authored-by: A <{ALLOWED}> and B <{CORPORATE}>")
+    result = scan(str(repo))
+    assert {o.email for o in result.offenders} == {CORPORATE}
+
+
+def test_the_ordinary_single_address_trailer_is_still_read(tmp_path):
+    """Negative control: the spelling every commit here uses is not flagged."""
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "init", body=(
+        "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"))
+    assert scan(str(repo)).state == CLEAN
 
 
 def test_one_bad_commit_among_many_good_ones_is_found(tmp_path):
@@ -311,21 +381,51 @@ def test_git_timing_out_is_undetermined_not_clean(clean_repo, monkeypatch):
 def test_an_unparseable_log_record_is_undetermined_not_clean(clean_repo, monkeypatch):
     """A format change must not quietly become a clean bill of health.
 
-    If `git log` ever answers in a shape this module does not recognise, the
-    honest reading is "I do not know", not "I found no bad addresses".
+    The malformed record is served *beside a valid one*, and that detail is
+    the test. An earlier version returned only the malformed record, so an
+    implementation that silently dropped bad records would have produced an
+    empty population and been caught by the empty-history refusal instead --
+    the test would have stayed green while the behaviour it names was gone.
+    With a valid record present, dropping the bad one yields CLEAN over one
+    commit, which is exactly the wrong answer this asserts against.
     """
     real_run = git_identity.subprocess.run
+    good = _git("log", "--format=%H", cwd=clean_repo).strip()
 
     def mangle(cmd, **kwargs):
         proc = real_run(cmd, **kwargs)
         if "log" in cmd:
-            proc.stdout = "not\x1fthe\x1eshape\x1fasked\x1efor\x1e"
+            valid = f"{good}\x1f{ALLOWED}\x1f{ALLOWED}\x1fsubject\x1e"
+            proc.stdout = valid + "not\x1fthe\x1eshape\x1e"
         return proc
 
     monkeypatch.setattr(git_identity.subprocess, "run", mangle)
     result = scan(str(clean_repo))
-    assert result.state == UNDETERMINED
+    assert result.state == UNDETERMINED, (
+        "a malformed record was dropped rather than refused, so a log this "
+        "module cannot fully read was reported as a clean history")
     assert "unparseable" in result.reason
+
+
+def test_the_valid_half_of_that_log_really_would_have_parsed(clean_repo, monkeypatch):
+    """Premise control for the test above.
+
+    If the hand-built 'valid' record did not actually parse, the previous test
+    would pass for the wrong reason -- refusing the record it was supposed to
+    accept. This asserts the good half alone is read as one clean commit.
+    """
+    real_run = git_identity.subprocess.run
+    good = _git("log", "--format=%H", cwd=clean_repo).strip()
+
+    def only_valid(cmd, **kwargs):
+        proc = real_run(cmd, **kwargs)
+        if "log" in cmd:
+            proc.stdout = f"{good}\x1f{ALLOWED}\x1f{ALLOWED}\x1fsubject\x1e"
+        return proc
+
+    monkeypatch.setattr(git_identity.subprocess, "run", only_valid)
+    result = scan(str(clean_repo))
+    assert result.state == CLEAN and result.examined == 1
 
 
 def test_an_unrecognised_shallow_answer_is_undetermined(clean_repo, monkeypatch):
@@ -361,6 +461,66 @@ def test_clean_is_unreachable_without_examining_a_commit(tmp_path):
         result = scan(str(repo))
         assert not (result.state == CLEAN and result.examined == 0), repo
         assert result.state == UNDETERMINED, repo
+
+
+def test_the_default_scope_reaches_refs_outside_branches_and_tags(tmp_path):
+    """`--all` is load-bearing, and nothing else in this file pinned it.
+
+    A reviewer narrowed the default from `--all` to `--branches --tags` and
+    the whole suite still passed. That mutation is not theoretical: it is
+    exactly the blind spot that made the previous incident unfixable, because
+    `refs/pull/*` retained the purged address after every branch had been
+    rewritten. A commit reachable only from such a ref is published, and the
+    scan must reach it.
+    """
+    repo = _repo(tmp_path / "r")
+    _commit(repo, "clean")
+    _git("checkout", "-q", "-b", "tmp", cwd=repo)
+    _commit(repo, "leak", email=CORPORATE, filename="bad.txt")
+    hidden = _git("rev-parse", "HEAD", cwd=repo).strip()
+    _git("update-ref", "refs/pull/1/head", hidden, cwd=repo)
+    _git("checkout", "-q", "main", cwd=repo)
+    _git("branch", "-q", "-D", "tmp", cwd=repo)
+
+    # Premise: the commit really is outside branches and tags now, so this
+    # measures the scope rather than a lucky reachability.
+    assert hidden not in _git("log", "--branches", "--tags", "--format=%H",
+                              cwd=repo)
+    assert hidden in _git("log", "--all", "--format=%H", cwd=repo)
+
+    result = scan(str(repo))
+    assert result.state == VIOLATIONS, (
+        "a commit reachable only from refs/pull/* was not examined; the "
+        "default scope no longer covers every published ref")
+
+
+def test_a_commit_git_cannot_decode_is_undetermined_not_a_violation(tmp_path):
+    """Measured, not imagined: this crashed before the encoding was named.
+
+    `text=True` decodes with the locale's preferred encoding, which is cp1252
+    on Windows. A commit message byte that no codepage covers raised
+    UnicodeDecodeError inside subprocess's reader thread, left stdout as None
+    and surfaced as an uncaught AttributeError -- so Python exited 1, which
+    this program defines as VIOLATIONS. An unreadable log reported a bad
+    identity.
+    """
+    repo = _repo(tmp_path / "r")
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    message = tmp_path / "msg.bin"
+    message.write_bytes(b"subject \x81 \xc3\xa9\n")
+    # Not via `_git`: that helper decodes with the locale too, so it would
+    # raise here and the test would fail before reaching the thing it tests.
+    subprocess.run(
+        ["git", "-c", f"user.email={ALLOWED}", "-c", "user.name=T",
+         "commit", "-q", "-F", str(message)],
+        cwd=str(repo), check=True, capture_output=True)
+
+    result = scan(str(repo))  # must not raise
+    assert result.state != VIOLATIONS, (
+        "an undecodable byte was reported as a disallowed identity")
+    assert result.state == CLEAN
+    assert result.examined == 1
 
 
 # ---------------------------------------------------------------------------
@@ -440,13 +600,22 @@ def test_this_repository_has_no_disallowed_identities():
 # against one commit is worse -- it is documentation that reports success.
 # ---------------------------------------------------------------------------
 
+WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
+
+
+def _workflows() -> dict:
+    """Every workflow file, parsed. Keyed by filename."""
+    return {p.name: yaml.safe_load(p.read_text(encoding="utf-8"))
+            for p in sorted(WORKFLOW_DIR.glob("*.yml"))}
+
+
 def _jobs_running(workflow: dict, needle: str) -> list[str]:
     """Names of jobs having a step whose ``run:`` mentions `needle`.
 
     Parsed, not grepped. A substring search over the raw file is satisfied by
-    the string appearing in a comment -- including the explanatory comments
-    this very change adds to ci.yml -- so it would keep passing after the step
-    itself was deleted.
+    the string appearing in a comment -- and this change deliberately writes
+    the script's name into workflow comments -- so a grep would keep passing
+    after the step itself was deleted.
     """
     jobs = (workflow or {}).get("jobs") or {}
     return [name for name, job in jobs.items()
@@ -470,46 +639,87 @@ def _checkout_fetch_depth(job: dict) -> tuple[bool, object]:
     return False, None
 
 
-def test_ci_runs_the_commit_identity_scan():
-    """Without this job the module is a script nobody executes."""
-    workflow = yaml.safe_load(CI_YML.read_text(encoding="utf-8"))
-    assert _jobs_running(workflow, "git_identity.py"), (
-        "no ci.yml job runs git_identity.py; the check is not enforced")
+def _scanning_jobs() -> list[tuple[str, str, dict]]:
+    """``(workflow_file, job_name, job)`` for every job running the scan."""
+    out = []
+    for filename, workflow in _workflows().items():
+        for name in _jobs_running(workflow, "git_identity.py"):
+            out.append((filename, name, workflow["jobs"][name]))
+    return out
 
 
-def test_the_identity_job_checks_out_the_whole_history():
+def test_some_workflow_runs_the_commit_identity_scan():
+    """Without this the module is a script nobody executes."""
+    assert _scanning_jobs(), (
+        "no workflow job runs git_identity.py; the check is not enforced")
+
+
+def test_every_job_running_the_scan_checks_out_the_whole_history():
     """The line that makes the job mean anything.
 
     At the default depth the scan would see one commit. It refuses rather than
-    certifying, so the job would go red rather than silent -- but red-on-every-
-    push is its own pressure to weaken the check, so the depth is pinned here
-    where the reason can be written down next to it.
+    certifying, so the job would go red rather than silent -- but the depth is
+    pinned here where the reason can be written down beside it.
     """
-    workflow = yaml.safe_load(CI_YML.read_text(encoding="utf-8"))
-    for name in _jobs_running(workflow, "git_identity.py"):
-        checks_out, depth = _checkout_fetch_depth(workflow["jobs"][name])
-        assert checks_out, f"job {name!r} scans history without checking it out"
+    for filename, name, job in _scanning_jobs():
+        checks_out, depth = _checkout_fetch_depth(job)
+        assert checks_out, f"{filename}:{name} scans history without checking it out"
         assert depth == 0, (
-            f"job {name!r} checks out at fetch-depth {depth!r}; the identity "
-            "scan needs 0 (full history) or it can only see the tip")
+            f"{filename}:{name} checks out at fetch-depth {depth!r}; the "
+            "identity scan needs 0 (full history) or it can only see the tip")
 
 
-def test_the_matrix_jobs_are_the_reason_this_job_is_separate():
+def test_the_identity_scan_is_not_restricted_to_the_main_branch():
+    """A commit is published the moment it is pushed to any branch.
+
+    ci.yml restricts its push trigger to `main` -- deliberately, and another
+    test asserts it. Inheriting that restriction here would leave every other
+    branch unwatched, so the scan lives in a workflow whose push trigger names
+    no branches at all.
+    """
+    for filename, name, _job in _scanning_jobs():
+        triggers = _workflows()[filename].get(True) or _workflows()[filename].get("on")
+        assert triggers is not None, f"{filename}: no trigger block found"
+        assert "push" in triggers, f"{filename}: the scan does not run on push"
+        push = triggers["push"] or {}
+        assert not (push or {}).get("branches"), (
+            f"{filename}:{name} only runs for branches {push.get('branches')!r}; "
+            "a push to any other branch publishes without being checked")
+
+
+def test_the_ci_matrix_jobs_are_the_reason_the_scan_is_separate():
     """A premise assertion, so the rationale cannot quietly stop being true.
 
-    The comment in ci.yml claims the other jobs are shallow. If that ever
-    stops being so, the argument for a separate job is worth revisiting --
-    deliberately, rather than discovering the comment has been wrong for
-    months.
+    The workflow comments claim the ci.yml jobs are shallow. If that ever
+    stops being so, the argument for a separate full-depth workflow is worth
+    revisiting deliberately, rather than discovering the comment has been
+    wrong for months.
     """
-    workflow = yaml.safe_load(CI_YML.read_text(encoding="utf-8"))
-    scanning = set(_jobs_running(workflow, "git_identity.py"))
-    others = [n for n in workflow["jobs"] if n not in scanning]
-    assert others, "premise: ci.yml has jobs besides the identity scan"
-    depths = {n: _checkout_fetch_depth(workflow["jobs"][n])[1] for n in others}
+    ci = _workflows()["ci.yml"]
+    depths = {n: _checkout_fetch_depth(j)[1] for n, j in ci["jobs"].items()}
+    assert depths, "premise: ci.yml defines jobs"
     assert all(d is None for d in depths.values()), (
-        f"a non-identity job now sets fetch-depth: {depths}. Not a failure of "
-        "the scan -- revisit whether it still needs its own job.")
+        f"a ci.yml job now sets fetch-depth: {depths}. Not a failure of the "
+        "scan -- revisit whether it still needs its own workflow.")
+
+
+def test_the_scan_workflow_fetches_the_pull_request_refs():
+    """refs/pull/* is what made the previous incident unfixable.
+
+    actions/checkout fetches refs/heads/* and refs/tags/* even at depth 0, so
+    an address living only in a pull request is published while `git log
+    --all` walks straight past it. This asserts the fetch that closes that gap
+    is still there, and that it is not neutered with `|| true`.
+    """
+    for filename, _name, job in _scanning_jobs():
+        runs = " ".join(str((s or {}).get("run") or "")
+                        for s in job.get("steps") or [])
+        assert "refs/pull/" in runs, (
+            f"{filename}: the scan job does not fetch refs/pull/*, so a "
+            "commit living only in a pull request is invisible to it")
+        assert "|| true" not in runs, (
+            f"{filename}: a step is allowed to fail silently, which lets the "
+            "scan examine a narrower population than it reports")
 
 
 def test_the_workflow_parser_notices_a_job_that_stopped_running_the_scan():
@@ -554,18 +764,34 @@ def test_the_workflow_parser_accepts_a_full_checkout():
     assert _checkout_fetch_depth(full["jobs"]["x"]) == (True, 0)
 
 
-def test_the_workflow_parser_is_not_satisfied_by_a_comment():
-    """The defect this repository found in its own ci.yml check the same week.
+def test_a_grep_would_pass_on_the_real_workflows_where_the_parse_does_not():
+    """The reason these checks parse rather than search, measured on the tree.
 
-    A raw substring search passes on a workflow that only *mentions* the
-    script -- and this change deliberately writes the script's name into a
-    ci.yml comment, so the grep spelling of this test would pass with the step
-    deleted.
+    An earlier version of this test fed a commented YAML string to
+    ``_jobs_running`` and asserted it found nothing -- which was vacuous,
+    because ``yaml.safe_load`` strips comments before the helper ever sees
+    them. It proved a property of PyYAML, not of the check.
+
+    This one is not vacuous: it asserts against the actual workflow files that
+    the naive spelling of this check would pass on a file where the *step* had
+    been deleted, because the script's name also appears in prose there.
     """
-    mentioned_only = yaml.safe_load(
-        "jobs:\n"
-        "  x:\n"
-        "    # runs git_identity.py, honestly\n"
-        "    steps:\n"
-        "      - uses: actions/checkout@v4\n")
-    assert _jobs_running(mentioned_only, "git_identity.py") == []
+    mentions = {p.name for p in WORKFLOW_DIR.glob("*.yml")
+                if "git_identity.py" in p.read_text(encoding="utf-8")}
+    running = {filename for filename, _n, _j in _scanning_jobs()}
+    assert running, "premise: some workflow really does run the scan"
+    assert mentions >= running
+
+    # The load-bearing half: strip every `run:` line from the real workflow
+    # and the grep still passes, because the comments survive.
+    for filename in running:
+        text = (WORKFLOW_DIR / filename).read_text(encoding="utf-8")
+        stripped = "\n".join(line for line in text.splitlines()
+                             if "run:" not in line)
+        assert "git_identity.py" in stripped, (
+            f"{filename}: this test's premise expired -- the script name no "
+            "longer appears outside a run: line, so a grep would no longer "
+            "be fooled")
+        assert _jobs_running(yaml.safe_load(stripped), "git_identity.py") == [], (
+            f"{filename}: the parsed check still reports the scan as running "
+            "after every run: line was removed")

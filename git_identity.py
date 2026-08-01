@@ -48,6 +48,24 @@ Exit codes: ``0`` clean, ``1`` violations found, ``2`` could not determine.
 Usage::
 
     python git_identity.py [--repo PATH] [REV ...]      # default: --all
+
+**What this cannot see, and what it therefore costs.** Three limits are worth
+writing down beside the check rather than discovering them in a red build:
+
+* ``actions/checkout`` fetches ``refs/heads/*`` and ``refs/tags/*`` even at
+  ``fetch-depth: 0``. It does **not** fetch ``refs/pull/*`` -- the very refs
+  that made the 2026-07-31 incident unfixable. The workflow therefore fetches
+  them explicitly before scanning. A local run without that fetch is scanning
+  a narrower population than CI is.
+* Merging through the GitHub web UI authors the merge commit with the
+  *clicking user's* primary GitHub address, which is not necessarily the one
+  configured on any machine. Merge locally, or keep that address allowed.
+* The scan is unconditional over all of history, so a single bad commit
+  reddens every subsequent build until the history is rewritten. That is
+  deliberate and it is the same bill the incident already presented: there is
+  no version of "tolerate the published address" that is cheaper than removing
+  it. A fork inherits this, and a fork containing its owner's commits will
+  fail -- correctly, by this repository's rule, which is not theirs.
 """
 from __future__ import annotations
 
@@ -87,8 +105,37 @@ UNDETERMINED = 2
 _FIELD = "\x1f"
 _RECORD = "\x1e"
 
-_TRAILER = re.compile(r"^\s*Co-authored-by:.*?<([^>]*)>\s*$",
-                      re.IGNORECASE | re.MULTILINE)
+# Co-author trailers are read in two stages, and the reason is a bypass that
+# two independent reviewers found in the one-stage version. A single regex
+# ending `<([^>]*)>\s*$` captures only the LAST address on the line, so
+#
+#     Co-authored-by: Evil <corp@example.com> and Good <darinh@gmail.com>
+#
+# reported only the allowed address and the commit passed as clean; and a line
+# with any trailing text after the bracket failed to match at all. Both are
+# false negatives, which is the direction that publishes. So: find the trailer
+# lines, then take *every* address on each one.
+_TRAILER_LINE = re.compile(r"^[ \t]*Co-authored-by:(.*)$",
+                           re.IGNORECASE | re.MULTILINE)
+_ANGLE_ADDRESS = re.compile(r"<([^>]*)>")
+
+
+def _trailer_addresses(body: str) -> list[str]:
+    """Every address on every ``Co-authored-by:`` line of a commit message.
+
+    A trailer with no angle brackets still names somebody -- git's own tooling
+    writes them, but a hand-typed ``Co-authored-by: Someone corp@example.com``
+    is neither rare nor less published -- so the bare remainder is taken when
+    there is no bracketed address to take.
+    """
+    found: list[str] = []
+    for line in _TRAILER_LINE.findall(body):
+        bracketed = _ANGLE_ADDRESS.findall(line)
+        if bracketed:
+            found.extend(bracketed)
+        elif "@" in line:
+            found.append(line.strip())
+    return found
 
 
 class Identity(NamedTuple):
@@ -141,11 +188,24 @@ def _git(args: list[str], repo: str) -> str:
     Every failure mode collapses to one exception on purpose: the caller turns
     it into UNDETERMINED, and the one thing it must never do is turn it into
     an empty list of offenders.
+
+    The encoding is named rather than inherited. `text=True` alone decodes with
+    the locale's preferred encoding, which on Windows is cp1252 -- and git
+    stores commit data as bytes, so a single byte no codepage covers (measured:
+    0x81 in a commit message) raised UnicodeDecodeError inside subprocess's
+    reader thread, left `proc.stdout` as None, and surfaced as an uncaught
+    AttributeError. Python then exits 1, which in this program means
+    VIOLATIONS. An unreadable log would have been reported as a bad identity.
+
+    `errors="replace"` keeps that failure safe in the other direction too: a
+    mangled address becomes replacement characters, matches nothing in the
+    allowlist, and is reported rather than skipped.
     """
     try:
         proc = subprocess.run(
             ["git", "-C", repo, *args],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=120,
         )
     except FileNotFoundError as exc:  # git is not installed
         raise _GitUnavailable("git is not installed or not on PATH") from exc
@@ -157,6 +217,11 @@ def _git(args: list[str], repo: str) -> str:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         first = detail[0] if detail else f"exit {proc.returncode}"
         raise _GitUnavailable(f"`git {' '.join(args)}` failed: {first}")
+    if proc.stdout is None:
+        # Belt and braces for the mode above: a successful exit with no stdout
+        # object at all is git answering nothing, not git answering "none".
+        raise _GitUnavailable(
+            f"`git {' '.join(args)}` produced no readable output")
     return proc.stdout
 
 
@@ -177,7 +242,7 @@ def _parse_log(raw: str) -> list[Identity]:
         commit, author, committer, body = parts
         found.append(Identity(commit, "author", author))
         found.append(Identity(commit, "committer", committer))
-        for address in _TRAILER.findall(body):
+        for address in _trailer_addresses(body):
             found.append(Identity(commit, "co-author", address))
     return found
 
