@@ -25,11 +25,16 @@ associative arrays. That replacement is the part worth testing on every
 platform: an associative array cannot mistake `alpha` for a member when only
 `alpha-one` was added, and a string of names joined by newlines very much can.
 """
+import os
+import shutil
 import subprocess
+import sys
 
 import pytest
 
-from test_operator import OPERATOR_SH, _bash_executable, _shell_function, bash
+import test_operator
+from test_operator import (MACOS_SYSTEM_BASH, OPERATOR_SH, _bash_executable,
+                           _bash_version, _shell_function, bash)
 
 
 def _run(script: str, tmp_path, *argv: str) -> subprocess.CompletedProcess:
@@ -277,3 +282,123 @@ def test_operator_sh_uses_no_bash_4_only_declarations():
     assert OPERATOR_SH.name in scanned, (
         f"operator.sh is no longer in the conformance scan: {scanned}")
     assert not _findings(OPERATOR_SH.read_text(encoding="utf-8"))
+
+
+# ── the canary has to be a chosen bird ──────────────────────────
+#
+# Every claim above about this file being "the bash 3.2 canary on the macOS
+# runners" is a claim about which interpreter `_bash_executable` returns, and
+# until now that was `shutil.which("bash")` -- the first bash on PATH, which
+# is Apple's 3.2 by accident of PATH order rather than by decision. Homebrew's
+# bash is 5.x and installs ahead of `/bin`; a runner image is free to do the
+# same tomorrow. Nothing would go red if it did, because bash 5 runs
+# everything bash 3.2 runs: the suite would stay green while the only
+# execution coverage of 3.2 in this repository quietly stopped existing, and
+# the docstrings would go on asserting it in prose.
+#
+# So: choose the interpreter explicitly, and make the loss of it loud.
+
+
+def test_macos_prefers_the_system_bash_over_whatever_path_offers(monkeypatch,
+                                                                 tmp_path):
+    """The darwin branch, exercised on every platform rather than only macOS.
+
+    A test that can only run on the one leg it protects is worth very little
+    here -- seven of the eight CI jobs, and every local run on this project's
+    Windows and Linux boxes, would never execute it. So the platform is
+    injected and the two candidate interpreters are made distinguishable: PATH
+    offers a Homebrew-shaped path, `/bin/bash` is a file that exists, and the
+    answer says which one was consulted.
+    """
+    system_bash = tmp_path / "system-bash"
+    system_bash.write_text("", encoding="utf-8")
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(test_operator, "MACOS_SYSTEM_BASH", system_bash)
+    monkeypatch.setattr(shutil, "which", lambda name: "/opt/homebrew/bin/bash")
+
+    assert _bash_executable() == str(system_bash)
+
+
+def test_macos_falls_back_to_path_when_there_is_no_system_bash(monkeypatch,
+                                                               tmp_path):
+    """The negative control for the test above, and a fail-open guarantee.
+
+    Without this, the preceding assertion is also satisfied by an
+    implementation that ignores PATH entirely and always returns
+    `MACOS_SYSTEM_BASH` -- including when nothing is there, which would turn
+    every bash test into a mysterious `FileNotFoundError` instead of a skip.
+    The same call with `/bin/bash` absent must reach `shutil.which`.
+    """
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(test_operator, "MACOS_SYSTEM_BASH",
+                        tmp_path / "does-not-exist")
+    monkeypatch.setattr(shutil, "which", lambda name: "/opt/homebrew/bin/bash")
+
+    assert _bash_executable() == "/opt/homebrew/bin/bash"
+
+
+def test_linux_still_uses_path_even_though_bin_bash_exists(monkeypatch,
+                                                           tmp_path):
+    """`/bin/bash` is a real file on Linux too, and there it is the wrong
+    answer: it is 5.x like everything else on that platform, and PATH is what
+    a user's shell scripts actually resolve. Pinning the preference to darwin
+    is what keeps this a statement about Apple's frozen interpreter rather
+    than a global "always /bin/bash" that happens to read the same.
+    """
+    system_bash = tmp_path / "system-bash"
+    system_bash.write_text("", encoding="utf-8")
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(test_operator, "MACOS_SYSTEM_BASH", system_bash)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/bash")
+
+    assert _bash_executable() == "/usr/bin/bash"
+
+
+@bash
+def test_bash_version_reads_a_real_interpreter_and_admits_when_it_cannot():
+    """A failed interrogation must stay distinguishable from an answer.
+
+    `_bash_version` returning `None` is the whole reason the canary below can
+    assert rather than shrug: if an unaskable interpreter came back as some
+    default version, "we could not check" would be recorded as "we checked".
+    Both branches are asserted together because either one alone passes
+    against a function that has been broken into returning a constant.
+    """
+    real = _bash_version(_bash_executable())
+    assert real is not None, "the bash these tests already run under would not report its version"
+    assert real[0] >= 3, real
+
+    assert _bash_version("/definitely/not/an/interpreter/bash") is None
+
+
+@bash
+@pytest.mark.skipif(sys.platform != "darwin",
+                    reason="only macOS ships a bash 3.2, so only macOS can run this")
+def test_macos_runs_these_tests_under_the_bash_apple_ships():
+    """The loud half. On macOS, this file must really be a 3.2 conformance run.
+
+    If this fails, the tests in this file did not stop working -- they stopped
+    *meaning* what their docstrings say. Either something moved ahead of
+    `/bin/bash`, or Apple finally shipped a newer one. Both are fine outcomes
+    to have, and neither is fine to have silently: the repository would be
+    left with a static scan (`tests/test_shell_bash32_conformance.py`) as its
+    only 3.2 evidence, and a static scan cannot object to a construct nobody
+    thought to write a detector for.
+    """
+    chosen = _bash_executable()
+    assert chosen == str(MACOS_SYSTEM_BASH), (
+        f"these tests are running under {chosen}, not {MACOS_SYSTEM_BASH}; "
+        "the macOS leg is no longer exercising the interpreter macOS ships")
+
+    version = _bash_version(chosen)
+    assert version is not None, (
+        f"{chosen} could not be asked its version -- that is not evidence of "
+        "bash 3.2 coverage, it is the absence of evidence")
+    assert version[0] == 3, (
+        f"{chosen} is bash {version[0]}.{version[1]}, not 3.x. This is the "
+        "only leg in CI that executes these scripts under bash 3.2; if that "
+        "is genuinely gone, say so here deliberately rather than letting the "
+        "docstrings in this file go on claiming coverage that ended.")
