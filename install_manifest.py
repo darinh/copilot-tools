@@ -66,6 +66,54 @@ MODIFIED = "modified"
 #: Something is deployed but the manifest has no record of writing it, so its
 #: provenance is unknown and it is treated as precious.
 UNTRACKED = "untracked"
+#: Something is at the destination but it could not be examined at all, so
+#: nothing is known about it — not even whether it is a file. Distinct from
+#: ``ABSENT`` because absent is the one answer that licenses writing.
+UNREADABLE = "unreadable"
+
+
+# ── presence ─────────────────────────────────────────────────────
+def path_present(path: Path) -> bool | None:
+    """Whether anything is at ``path``: True, False, or None for "cannot tell".
+
+    ``Path.exists`` is the obvious way to ask and gets it wrong in both
+    directions on the interpreters this project supports.
+
+    It *raises* on a permission denial — verified on 3.11 and on 3.12, so on
+    the whole CI matrix — because EACCES is not in pathlib's ignore list. One
+    artifact whose parent directory the user cannot traverse therefore aborts
+    the entire setup run, and every other artifact goes uninstalled for a
+    reason the traceback does not name.
+
+    It *returns False* for the codes those two lists do hold: WINERROR 21 (in
+    ``_IGNORED_WINERRORS``), a drive that exists but is not ready, which is
+    what a disconnected network home looks like; and ELOOP and EBADF (in
+    ``_IGNORED_ERRNOS``). Each reports a path that is not absent as
+    absent, and absent is the one state that lets an installer write without
+    asking.
+
+    So only ``FileNotFoundError`` means gone. ``NotADirectoryError`` means gone
+    too: a component of the path is a file, so nothing can exist below it.
+    Every other ``OSError`` means we could not look, which is a different
+    answer and must not share a return value with the first two.
+
+    ``lstat`` rather than ``stat``, so a symlink whose target has been deleted
+    reads as present. ``Path.exists`` follows it, finds nothing and says False;
+    the installer then writes over "nothing", the write follows the link, and
+    the repository's copy lands wherever the link pointed instead of here.
+    """
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return None
+    except ValueError:
+        # A path the OS cannot represent at all (embedded NUL, and on Windows
+        # some reserved names). Nothing can be there, and nothing can be
+        # written there either.
+        return False
+    return True
 
 
 # ── hashing ──────────────────────────────────────────────────────
@@ -95,7 +143,10 @@ def tree_digest(root: Path) -> str | None:
     on directory iteration order — which differs between filesystems and would
     otherwise make a tree look modified after merely being copied.
     """
-    if not root.is_dir():
+    try:
+        if not root.is_dir():
+            return None
+    except OSError:
         return None
     digest = hashlib.new(ALGORITHM)
     try:
@@ -116,12 +167,22 @@ def tree_digest(root: Path) -> str | None:
 
 
 def digest_for(path: Path) -> str | None:
-    """Digest of a file or a directory, whichever ``path`` names."""
-    if path.is_dir():
-        return tree_digest(path)
-    if path.exists():
-        return file_digest(path)
-    return None
+    """Digest of a file or a directory, whichever ``path`` names.
+
+    Both probes are guarded. ``Path.is_dir`` and ``Path.exists`` raise on a
+    permission denial rather than answering it, and a destination that is a
+    link into a directory the user cannot traverse reaches here having already
+    passed :func:`path_present` — ``lstat`` succeeded on the link itself while
+    ``stat`` through it does not. Being unable to take a digest is not a reason
+    to abort a whole setup run: None already means "cannot prove setup wrote
+    this", which every caller treats as a reason to ask rather than to write.
+    """
+    try:
+        if path.is_dir():
+            return tree_digest(path)
+    except OSError:
+        return None
+    return file_digest(path)
 
 
 # ── version ordering ─────────────────────────────────────────────
@@ -243,8 +304,14 @@ def classify(manifest: dict, key: str, dest: Path, source_digest: str | None) ->
 
     ``source_digest`` is the digest of the repository copy. The deployed file is
     hashed here so callers cannot pass a stale value.
+
+    A destination that cannot be examined is ``UNREADABLE``, never ``ABSENT``.
+    See :func:`path_present` for why those are different questions.
     """
-    if not dest.exists():
+    present = path_present(dest)
+    if present is None:
+        return UNREADABLE
+    if not present:
         return ABSENT
     known = entry(manifest, key)
     if known and known.get("linked"):
@@ -277,6 +344,7 @@ def describe(state: str) -> str:
         STALE: "outdated (unmodified — safe to update)",
         MODIFIED: "modified locally",
         UNTRACKED: "present but not tracked",
+        UNREADABLE: "present but could not be read — left alone",
     }.get(state, state)
 
 
@@ -403,4 +471,12 @@ def status(
 
 
 def needs_update(report: Iterable[ArtifactStatus]) -> bool:
-    return any(item.state in (ABSENT, STALE, MODIFIED, UNTRACKED) for item in report)
+    """True when ``setup`` would still have something to do or to report.
+
+    ``UNREADABLE`` counts even though setup cannot fix it: it is the one state
+    a person has to resolve by hand, and reporting "up to date" for a
+    destination nobody could read would be the report lying about the thing it
+    is least able to see.
+    """
+    return any(item.state in (ABSENT, STALE, MODIFIED, UNTRACKED, UNREADABLE)
+               for item in report)

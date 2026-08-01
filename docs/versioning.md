@@ -87,9 +87,26 @@ a file counts as a change.
 | `stale` | differs from the repository, matches what setup wrote | **updates without asking** |
 | `modified` | differs from what setup wrote — you edited it | asks first |
 | `untracked` | present, differs, no record of us writing it | asks first |
+| `unreadable` | something is there but it could not be examined at all | leaves it, reports it |
 
 `stale` is the only state where setup writes without asking, and it is the one
 state that proves the bytes on disk are the bytes setup itself wrote.
+
+`unreadable` exists because `absent` is the state that licenses writing, and
+`Path.exists()` reaches it for the wrong reason. It **raises** on a permission
+denial (verified on 3.11 and 3.12, so across the whole CI matrix), which aborts
+a setup run over one artifact and leaves the rest uninstalled; and it **returns
+False** for a drive that exists but is not ready (WINERROR 21, what a
+disconnected network home looks like), for `ELOOP` and for `EBADF` — reporting
+a path that is not absent as absent. It also follows symlinks, so a link whose
+target was deleted reads as nothing being there and the install writes through
+it into the target's location.
+
+Presence is probed through `install_manifest.path_present()`, which keeps
+"cannot tell" as its own answer: only `FileNotFoundError` and
+`NotADirectoryError` mean gone, and it uses `lstat`. `--yes` does not override
+`unreadable`, because `--yes` answers questions about contents somebody could
+look at.
 
 If the manifest is missing or corrupt it loads as empty, so everything
 classifies as `untracked` and setup falls back to asking about everything —

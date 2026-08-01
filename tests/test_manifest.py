@@ -1,11 +1,42 @@
 """Tests for the install manifest: hashing, classification, and upgrades."""
 from __future__ import annotations
 
+import errno
 import json
+import os
+from pathlib import Path
 
 import pytest
 
 import install_manifest as im
+
+
+def deny_lstat(monkeypatch, target: Path, error: OSError | None = None) -> None:
+    """Make ``target`` look present-but-unexaminable to the presence probe.
+
+    A real denial cannot be staged portably: POSIX ``chmod`` does not restrain
+    root, which is how containers usually run CI, and Windows needs ACL edits
+    a runner will not reliably grant. Patching the single syscall the probe
+    makes reproduces exactly the condition under test and does so identically
+    on every platform in the matrix. Every other path is passed straight
+    through, so nothing else in the process changes behaviour.
+    """
+    real = os.lstat
+    real_stat = os.stat
+    resolved = str(target)
+
+    def fake(path, *args, **kwargs):
+        if str(path) == resolved:
+            raise error or PermissionError(errno.EACCES, "Permission denied")
+        return real(path, *args, **kwargs)
+
+    def fake_stat(path, *args, **kwargs):
+        if str(path) == resolved:
+            raise error or PermissionError(errno.EACCES, "Permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", fake)
+    monkeypatch.setattr(os, "stat", fake_stat)
 
 
 # ── hashing ──────────────────────────────────────────────────────
@@ -220,13 +251,113 @@ def test_a_linked_artifact_is_always_current(tmp_path):
 
 def test_only_stale_may_be_overwritten_silently():
     assert im.may_overwrite(im.STALE) is True
-    for state in (im.MODIFIED, im.UNTRACKED, im.ABSENT, im.CURRENT):
+    for state in (im.MODIFIED, im.UNTRACKED, im.ABSENT, im.CURRENT, im.UNREADABLE):
         assert im.may_overwrite(state) is False
 
 
 def test_every_state_has_a_description():
-    for state in (im.ABSENT, im.CURRENT, im.STALE, im.MODIFIED, im.UNTRACKED):
+    for state in (im.ABSENT, im.CURRENT, im.STALE, im.MODIFIED, im.UNTRACKED,
+                  im.UNREADABLE):
         assert im.describe(state) != state
+
+
+# ── presence: absent and unreadable are different answers ────────
+def test_path_present_reports_a_file_that_is_there(tmp_path):
+    path = tmp_path / "here.md"
+    path.write_text("x", encoding="utf-8")
+    assert im.path_present(path) is True
+
+
+def test_path_present_reports_a_file_that_is_gone(tmp_path):
+    assert im.path_present(tmp_path / "gone.md") is False
+
+
+def test_path_present_reports_a_path_under_a_file_as_gone(tmp_path):
+    """NotADirectoryError means a component of the path is a regular file, so
+    nothing can exist below it — that is genuinely absent, not unknown."""
+    parent = tmp_path / "afile"
+    parent.write_text("x", encoding="utf-8")
+    assert im.path_present(parent / "child.md") is False
+
+
+def test_path_present_says_unknown_when_it_cannot_look(tmp_path, monkeypatch):
+    """The bug this exists to prevent. ``Path.exists`` raises on a permission
+    denial (verified on 3.11 and 3.12), so one unreadable artifact aborts a
+    whole setup run; and it answers False for the errnos pathlib does ignore,
+    which is the answer that licenses writing over the user's file."""
+    path = tmp_path / "denied.md"
+    path.write_text("the user's work", encoding="utf-8")
+    deny_lstat(monkeypatch, path)
+    assert im.path_present(path) is None
+
+
+def test_path_present_treats_every_io_failure_as_unknown(tmp_path, monkeypatch):
+    """A dropped network mount and a stale NFS handle are not deletions."""
+    path = tmp_path / "onamount.md"
+    path.write_text("x", encoding="utf-8")
+    for number in (errno.EIO, errno.ESTALE, errno.EACCES, errno.ENETDOWN):
+        deny_lstat(monkeypatch, path, OSError(number, os.strerror(number)))
+        assert im.path_present(path) is None, f"errno {number} read as an answer"
+
+
+def test_path_present_sees_a_link_whose_target_is_gone(tmp_path):
+    """Not mocked, so it is real evidence that the probe differs from the
+    primitive it replaces: ``Path.exists`` follows the link, finds nothing and
+    says False, but the name is still occupied and writing to it would land in
+    the target's location rather than here."""
+    target = tmp_path / "target.md"
+    target.write_text("x", encoding="utf-8")
+    link = tmp_path / "link.md"
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("this platform will not create symlinks")
+    target.unlink()
+
+    assert link.exists() is False
+    assert im.path_present(link) is True
+
+
+def test_unreadable_destination_is_not_classified_absent(pair, monkeypatch):
+    """ABSENT is the state that lets an installer write without asking, so a
+    destination nobody could examine must never reach it."""
+    source, dest = pair
+    dest.write_text("the user's work", encoding="utf-8")
+    deny_lstat(monkeypatch, dest)
+    assert im.classify(im.empty_manifest(), "k", dest,
+                       im.file_digest(source)) == im.UNREADABLE
+
+
+def test_needs_update_is_true_when_a_destination_is_unreadable(tmp_path,
+                                                               monkeypatch):
+    """Setup cannot fix it, but reporting "up to date" for the one artifact
+    nobody could look at would be the status lying where it sees least."""
+    source = tmp_path / "src.md"
+    source.write_text("v1", encoding="utf-8")
+    dest = tmp_path / "dest.md"
+    dest.write_text("v1", encoding="utf-8")
+    deny_lstat(monkeypatch, dest)
+    report = im.status(im.empty_manifest(), [("k", "template", source, dest)])
+    assert report[0].state == im.UNREADABLE
+    assert im.needs_update(report) is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root is not restrained by permission bits")
+def test_a_really_unreadable_directory_is_not_absent(tmp_path):
+    """The same case without any mocking, where the platform allows staging
+    it: a directory the process may not traverse."""
+    parent = tmp_path / "locked"
+    parent.mkdir()
+    dest = parent / "artifact.md"
+    dest.write_text("the user's work", encoding="utf-8")
+    os.chmod(parent, 0o000)
+    try:
+        assert im.path_present(dest) is None
+        assert im.classify(im.empty_manifest(), "k", dest, "abc") == im.UNREADABLE
+    finally:
+        os.chmod(parent, 0o700)
 
 
 # ── upgrade strategies ───────────────────────────────────────────
@@ -363,3 +494,17 @@ def test_needs_update_is_true_when_something_is_missing(tmp_path):
     report = im.status(im.empty_manifest(),
                        [("k", "template", source, tmp_path / "gone.md")])
     assert im.needs_update(report) is True
+
+
+def test_digest_of_an_unexaminable_path_is_none_rather_than_a_traceback():
+    """``Path.is_dir`` raises on a permission denial rather than answering it,
+    and a destination that is a link into a directory the user cannot traverse
+    reaches here having already passed ``path_present`` -- lstat succeeds on
+    the link, stat through it does not. Being unable to take a digest is not a
+    reason to abort a whole setup run: None already means "cannot prove setup
+    wrote this", which every caller treats as a reason to ask."""
+    class _Denied:
+        def is_dir(self):
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+    assert im.digest_for(_Denied()) is None

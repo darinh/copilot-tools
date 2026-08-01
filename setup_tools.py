@@ -892,6 +892,22 @@ def _dirs_match(a: Path, b: Path) -> bool:
     return True
 
 
+def _present(path: Path) -> bool:
+    """True when anything occupies ``path``, including something unreadable.
+
+    The tri-state answer comes from :func:`install_manifest.path_present`; this
+    folds "cannot tell" into *present* because every caller here is asking
+    whether the way is clear to create or rename something onto that name. The
+    cost of being wrong is asymmetric: treating an occupied path as free
+    overwrites whatever was there, while treating a free path as occupied costs
+    an ``os.replace`` that fails loudly and changes nothing.
+
+    ``lstat``-based, so a link is seen without being followed — a link with a
+    deleted target still occupies the name.
+    """
+    return install_manifest.path_present(path) is not False
+
+
 def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
                     may_replace: bool = False) -> str:
     """Link src -> dest, preferring a link and falling back to a copy.
@@ -917,7 +933,7 @@ def _link_directory(src: Path, dest: Path, assume_yes: bool = False,
                 "rather than the repository copy. Replace it?", assume_yes):
             return "skipped (kept existing)"
         _remove_dest(dest)
-    elif dest.exists():
+    elif _present(dest):
         if dest.is_dir() and _dirs_match(src, dest):
             return "already up to date"
         if not may_replace and not ask(
@@ -968,8 +984,22 @@ def _is_link(path: Path) -> bool:
     resolve, which is deliberate: a link whose target has been deleted is still
     a link, and treating it as absent leaves it to be discovered by whatever
     tries to write over it.
+
+    A path that cannot be examined answers False, and the answer is a guess —
+    ``Path.is_symlink`` re-raises a permission denial on every interpreter this
+    project supports (verified on 3.11 and 3.12), so without the ``except``
+    one unreadable artifact aborts the whole setup run. False is the harmless
+    guess here because every caller uses True only to take *more* care; a
+    caller that must not guess about a path asks
+    :func:`install_manifest.path_present`, which keeps "cannot tell" as its own
+    answer.
     """
-    return path.is_symlink() or (IS_WINDOWS and _is_junction(path))
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        return False
+    return IS_WINDOWS and _is_junction(path)
 
 
 def _remove_dest(path: Path) -> None:
@@ -1015,7 +1045,7 @@ def _discard(path: Path) -> None:
         pass
 
 
-def _replace_tree(staged: Path, dest: Path) -> None:
+def _replace_tree(staged: Path, dest: Path, *, expect_absent: bool = False) -> None:
     """Move ``staged`` onto ``dest``, keeping ``dest`` recoverable throughout.
 
     The old copy is renamed aside rather than deleted, because deletion is the
@@ -1027,6 +1057,15 @@ def _replace_tree(staged: Path, dest: Path) -> None:
     the operation that fails when something inside is still open, which is
     precisely when stopping is the right answer.
 
+    ``expect_absent`` says the caller never asked the user about ``dest``,
+    because at the moment it classified there was nothing there to ask about.
+    Consent is scoped to the state it was given for: if something has appeared
+    since — the CLI has been observed recreating directories under
+    ``~/.copilot`` — replacing it silently spends an authorisation nobody
+    granted, and the aside copy is discarded on success, so the thing that
+    appeared would be gone. Refusing costs a reinstall; the alternative costs
+    whatever was there.
+
     If the swap fails the old copy is renamed back. If *that* fails too, or if
     the process dies between the two renames, the only copy is left under the
     aside name — which :func:`_reconcile_scratch` restores before anything else
@@ -1035,7 +1074,11 @@ def _replace_tree(staged: Path, dest: Path) -> None:
     previous = dest.with_name(f".{dest.name}.previous")
     _discard(previous)
     moved = False
-    if _is_link(dest) or dest.exists():
+    if _present(dest):
+        if expect_absent:
+            raise FileExistsError(
+                f"{dest} appeared after setup found it absent; nothing was "
+                "replaced")
         os.replace(dest, previous)
         moved = True
     try:
@@ -1057,18 +1100,44 @@ def _reconcile_scratch(dest: Path) -> None:
     until somebody notices. And the scratch names are directories holding a
     ``SKILL.md``, so leaving them in the skills directory invites the CLI to
     load a half-written copy as a skill in its own right.
+
+    The staged copy is read before it is discarded, because its mere existence
+    answers a question nothing else can. :func:`_replace_tree` renames it *onto*
+    the destination, so a swap that finished leaves none behind. Finding one
+    means the swap did not finish — and then something at ``dest`` is not the
+    install this scratch belongs to, whoever put it there, which makes the
+    aside copy still the user's only one. Discarding it on the strength of
+    "well, something is at the destination" is how both copies are lost.
     """
-    _discard(dest.with_name(f".{dest.name}.installing"))
+    staged = dest.with_name(f".{dest.name}.installing")
+    swap_unfinished = install_manifest.path_present(staged) is not False
     previous = dest.with_name(f".{dest.name}.previous")
-    if not (previous.exists() or _is_link(previous)):
+    if install_manifest.path_present(previous) is not True:
+        # Absent, or there but unexaminable — either way there is nothing here
+        # that can be safely moved back.
+        _discard(staged)
         return
-    if dest.exists() or _is_link(dest):
-        _discard(previous)
+    dest_present = install_manifest.path_present(dest)
+    if dest_present is None:
+        # Something may or may not be at the destination. Restoring over it
+        # could destroy a finished install, and discarding the aside copy could
+        # destroy the only one. Leave both and let the caller report.
         return
-    try:
-        os.replace(previous, dest)
-    except OSError:
-        pass
+    if not dest_present:
+        try:
+            os.replace(previous, dest)
+        except OSError:
+            # The aside copy is the only one; leaving it named oddly beats
+            # discarding it because it could not be renamed back.
+            return
+        _discard(staged)
+        return
+    if swap_unfinished:
+        # Both copies survive, litter and all. Tidiness is the thing being
+        # traded away here, and it is the cheaper of the two.
+        return
+    _discard(previous)
+    _discard(staged)
 
 
 #: Files copied from ``templates/`` into ``~/.copilot``.
@@ -1136,13 +1205,30 @@ def detect_tool_versions() -> dict[str, str]:
     return versions
 
 
+def _warn_unreadable(label: str, dest: Path) -> None:
+    """Say why an artifact was left alone, in one wording everywhere.
+
+    Silence here would be the worst outcome of the conservative choice: a
+    machine that quietly stops receiving updates and never says so.
+    """
+    warn(f"{label} at {dest} exists but could not be examined "
+         "(permission, a lock, or an unreachable mount) — not touching it")
+
+
 def _resolve_overwrite(state: str, label: str, dest: Path, assume_yes: bool) -> bool:
     """Decide whether to write over an existing artifact.
 
     The manifest is what makes this more than a byte comparison: ``STALE``
     means the bytes on disk are the bytes setup wrote, so the user has nothing
     invested in them and the update is not a question worth asking.
+
+    ``UNREADABLE`` is refused before ``assume_yes`` is consulted. ``--yes``
+    answers questions about known contents; it is not consent to overwrite
+    something nobody could look at.
     """
+    if state == install_manifest.UNREADABLE:
+        _warn_unreadable(label, dest)
+        return False
     if state == install_manifest.STALE:
         info(f"{label}: updating (your copy was unmodified)")
         return True
@@ -1168,6 +1254,13 @@ def install_extensions(assume_yes: bool = False, manifest: dict | None = None) -
         key = f"extensions/{src.name}"
         state = install_manifest.classify(manifest, key, dest,
                                           install_manifest.tree_digest(src))
+        if state == install_manifest.UNREADABLE:
+            # _link_directory reads an unexaminable destination as occupied and
+            # goes on to ask `dest.is_dir()`, which raises rather than answers
+            # on a permission denial — aborting the whole run over one
+            # extension. Nothing here is worth finding out that way.
+            _warn_unreadable(f"extension '{src.name}'", dest)
+            continue
         try:
             result = _link_directory(src, dest, assume_yes,
                                      may_replace=install_manifest.may_overwrite(state))
@@ -1185,6 +1278,17 @@ def install_extensions(assume_yes: bool = False, manifest: dict | None = None) -
 
 
 def install_templates(assume_yes: bool = False, manifest: dict | None = None) -> None:
+    """Copy the template files into ``~/.copilot``.
+
+    The copy never goes *through* a link. ``shutil.copyfile`` opens the
+    destination for writing, which follows a symlink and lands the repository's
+    copy in the link's target — a path outside ``~/.copilot`` that the user
+    chose and setup was never offered. Consent to overwrite ``dest`` is consent
+    about ``dest``, so the link is removed and a real file is written in its
+    place, which is what the other two installers already do by renaming the
+    destination aside. Every other write here is inside the directory setup
+    owns; this was the one that could reach out of it.
+    """
     print("\nInstalling templates...")
     COPILOT_DIR.mkdir(parents=True, exist_ok=True)
     manifest = install_manifest.empty_manifest() if manifest is None else manifest
@@ -1205,6 +1309,12 @@ def install_templates(assume_yes: bool = False, manifest: dict | None = None) ->
         if not _resolve_overwrite(state, label, dest, assume_yes):
             warn(f"Skipped {label} (kept existing)")
             continue
+        if _is_link(dest):
+            try:
+                _remove_dest(dest)
+            except OSError as exc:
+                warn(f"{label}: not installed ({exc})")
+                continue
         shutil.copyfile(src, dest)
         install_manifest.record(manifest, key, dest, kind="template",
                                 digest=source_digest)
@@ -1244,6 +1354,11 @@ def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> No
         label = f"skill '{src.name}'"
         source_digest = install_manifest.tree_digest(src)
         state = install_manifest.classify(manifest, key, dest, source_digest)
+        if state == install_manifest.UNREADABLE:
+            # Asked before the link question below, which cannot be answered
+            # about a path nobody can examine and would only guess at.
+            _warn_unreadable(label, dest)
+            continue
         if _is_link(dest) and not (install_manifest.entry(manifest, key) or {}).get("linked"):
             # Every digest here is taken *through* the link, so it describes
             # whatever the user pointed at, not the destination — it cannot
@@ -1262,7 +1377,8 @@ def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> No
         try:
             _discard(staged)
             shutil.copytree(src, staged)
-            _replace_tree(staged, dest)
+            _replace_tree(staged, dest,
+                          expect_absent=state == install_manifest.ABSENT)
         except OSError as exc:
             warn(f"{label}: not installed ({exc})")
             _reconcile_scratch(dest)
@@ -1329,7 +1445,7 @@ def apply_upgrades(manifest: dict, assume_yes: bool = False) -> None:
     ``~/.copilot`` would be noise at best.
     """
     installed = manifest.get("package_version")
-    fresh = not any(dest.exists() for _key, _kind, _src, dest in deployed_artifacts())
+    fresh = not any(_present(dest) for _key, _kind, _src, dest in deployed_artifacts())
     pending = install_manifest.pending_migrations(installed, TOOLKIT_VERSION)
     if fresh or not pending:
         return
