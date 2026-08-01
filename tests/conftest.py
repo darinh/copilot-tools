@@ -215,10 +215,19 @@ def _appeared_since(path: str, since: float) -> bool | None:
     Three-valued because an mtime that cannot be read is not an old mtime.
     The slack absorbs coarse filesystem timestamps (FAT rounds to two
     seconds) so that a fresh file is not described as old.
+
+    ``ValueError`` is caught alongside ``OSError`` because ``os.lstat``
+    raises it for an embedded NUL (measured, not assumed -- a long path and a
+    surrogate both give OSError, only NUL gives ValueError). No name from
+    ``os.scandir`` can contain one, so this is unreachable from a real
+    filesystem walk and reachable only from a malformed guarded-directory
+    setting. It is caught anyway on cost: an exception escaping teardown
+    fails an unrelated test, which is precisely the misattribution this
+    module was changed to stop doing.
     """
     try:
         return os.lstat(path).st_mtime >= since - _MTIME_SLACK_SECONDS
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 

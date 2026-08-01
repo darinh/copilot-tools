@@ -423,6 +423,16 @@ def test_appeared_since_reports_unknown_rather_than_stale(tmp_path: Path, monkey
     assert conftest._appeared_since(str(absent), time.time()) is None
 
 
+def test_appeared_since_never_lets_an_exception_escape_teardown():
+    """os.lstat raises ValueError, not OSError, for an embedded NUL.
+
+    Unreachable from an os.scandir name, which cannot contain one, but an
+    exception escaping the fixture would fail an unrelated test -- the exact
+    misattribution this module was changed to stop producing.
+    """
+    assert conftest._appeared_since("a\x00b", time.time()) is None
+
+
 def test_appeared_since_uses_lstat_so_a_dangling_symlink_has_an_mtime(
     tmp_path: Path, monkeypatch
 ):
@@ -511,6 +521,46 @@ def test_a_duplicate_guarded_directory_cannot_downgrade_severity(
 def test_merging_duplicates_leaves_a_normal_configuration_alone():
     """The control: the merge must not quietly rewrite the real settings."""
     assert conftest._guarded_dirs() == tuple(conftest._GUARDED_DIRS)
+
+
+def test_a_peer_file_is_reported_once_and_not_by_every_later_test(
+    tmp_path: Path, monkeypatch
+):
+    """Removing the mtime filter must not turn one peer file into a storm.
+
+    Nothing suppresses an advisory hit any more, so the only thing keeping a
+    long suite from warning once per test is that the snapshot is taken per
+    test: a file that appeared during test N is in the BEFORE set of test
+    N+1. That is load-bearing now, so it is asserted rather than assumed.
+    """
+    monkeypatch.setattr(conftest, "_GUARDED_DIRS", _advisory((tmp_path, False)))
+
+    first = _start_guard("tests/t.py::test_one")
+    (tmp_path / "peer_wrote_this.txt").write_text("x", encoding="utf-8")
+    with pytest.warns(UserWarning, match="peer_wrote_this.txt"):
+        _finish_guard(first)
+
+    for nodeid in ("tests/t.py::test_two", "tests/t.py::test_three"):
+        later = _start_guard(nodeid)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _finish_guard(later)
+        assert [w for w in caught if "appeared in a guarded" in str(w.message)] == []
+
+
+def test_a_peer_file_deleted_and_recreated_is_reported_each_time(
+    tmp_path: Path, monkeypatch
+):
+    """The other half: reported once per appearance, not once ever."""
+    monkeypatch.setattr(conftest, "_GUARDED_DIRS", _advisory((tmp_path, False)))
+    victim = tmp_path / "churn.txt"
+
+    for round_number in range(2):
+        generator = _start_guard(f"tests/t.py::test_{round_number}")
+        victim.write_text("x", encoding="utf-8")
+        with pytest.warns(UserWarning, match="churn.txt"):
+            _finish_guard(generator)
+        victim.unlink()
 
 
 # ── the real project catalog ─────────────────────────────────────
