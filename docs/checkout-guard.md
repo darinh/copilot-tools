@@ -227,8 +227,8 @@ hits a genuine false positive can act without hunting.
 
 | File | What it is |
 |---|---|
-| `extension.mjs` | SDK wiring and the three hook bodies |
-| `guard.mjs` | Every decision the guard makes, its per-session state, and all checkout inspection |
+| `extension.mjs` | SDK wiring: one `createGuard()` call handed to `joinSession` |
+| `guard.mjs` | Every decision the guard makes, the three hook bodies, its per-session state, and all checkout inspection |
 | `guard.test.mjs` | `node --test` suite, no live session required |
 
 ```bash
@@ -243,21 +243,41 @@ not incidental.
 
 That makes the line a real budget rather than a style preference: **anything
 moved into `guard.mjs` gains the node suite, and anything that stays gains a
-parse check.** So `extension.mjs` holds SDK wiring and the three hook bodies
-and nothing else — 179 lines against `guard.mjs`'s 1314. The per-session
-tracking state, `observe`, `noteAuthored`, `otherRootToWatch`,
+parse check.** So `extension.mjs` holds the SDK import, one `createGuard()`
+call and the three hooks it returns — 66 lines against `guard.mjs`'s 1457, and
+not one branch among them. The hook *bodies* are in `guard.mjs` too, behind
+`createGuard`, because they are where every other decision in that file is
+sequenced: which scan seeds which baseline, which tool triggers a second
+checkout's scan, whether a report is emitted or a permission denied. Sequencing
+is exactly the kind of logic that reads correctly and runs wrong. The
+per-session tracking state, `observe`, `noteAuthored`, `otherRootToWatch`,
 `relativeToCheckout`, `MAX_TRACKED`, the scratch-directory name, the
-disable-flag reading and the tool-name sets all live in `guard.mjs`, where they
-are tested. Logic accumulating in `extension.mjs` is a debt, not a convenience.
+disable-flag reading and the tool-name sets live there as well.
+
+The budget is spent as one rather than merely written down: `guard.test.mjs`
+parses `extension.mjs`, strips its comments and fails if a single `if`, `else`,
+`for`, `while`, `switch`, `try`, `catch`, `&&`, `||`, `??` or ternary has
+reappeared, or if the file has grown past 25 lines of code. The detector has a
+positive control per token and a negative control proving prose about `if` is
+not code, because a scan that matches nothing reports the file clean in exactly
+the words it uses when the file really is clean.
+
+Every environment touch in the hook bodies — `mkdirSync`, `process.cwd`, the
+root lookup, the scan — is a `createGuard` parameter with the production
+behaviour as its default, so the tests drive all three hooks without a git
+binary, a checkout, or a writable temp directory, and a caller that passes
+nothing gets what the extension always got.
 
 The state is a factory — `createGuardState()` returning fresh `lastSeen` /
-`outstanding` / `authored` / `primaryRoots` maps — rather than four
-module-level bindings, and that is not a style choice either. A module binding
-is shared by every importer for the life of the process, so the moment those
-maps live in the tested file they would be shared across every case in
-`guard.test.mjs`, and the failures that produces are order-dependent and
-intermittent. The extension creates exactly one state, so nothing is lost by
-making the lifetime explicit.
+`outstanding` / `authored` / `primaryRoots` maps, which `createGuard()` calls
+once per guard — rather than four module-level bindings, and that is not a
+style choice either. A module binding is shared by every importer for the life
+of the process, so the moment those maps live in the tested file they would be
+shared across every case in `guard.test.mjs`, and the failures that produces
+are order-dependent and intermittent. The extension creates exactly one guard,
+so nothing is lost by making the lifetime explicit. Mutating `createGuard` to
+share one state object kills four tests, three of them in cases that are not
+about isolation at all — which is the shape the hazard actually has.
 
 Because `guard.mjs` is where the decisions live, `setup_tools.py` parses every
 `.mjs` in a deployed extension rather than just the entrypoint: `node --check`
