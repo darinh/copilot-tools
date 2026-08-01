@@ -18,9 +18,17 @@ to the code that implements it:
 * the ``operator send`` flags, against ``copilot_operator.SEND_FLAGS``
 * the SQL it tells agents to paste, by running it
 * its own feature-flag table, against the gated sections it promises
+* the catalog format and restart-marker path it tells agents to write
 
 The document is allowed to say more than the code does. It is not allowed to
 say something the code will not do.
+
+Known gap, stated rather than faked: the ``operator --loop --headless --name X
+--agent Y`` launch line is not pinned. That parser has an ``else`` branch which
+forwards anything it does not recognise to the Copilot CLI, so a renamed flag
+fails silently rather than loudly -- and there is no seam to check it against
+short of launching a session. A grep for the flag literals would look like
+coverage and prove nothing, so it is not here.
 """
 from __future__ import annotations
 
@@ -255,24 +263,27 @@ def test_documented_operator_send_flags_are_accepted(template):
         if line.strip().startswith("operator send ")
     ]
     assert sends, "no 'operator send' example found in the Operator section"
-    documented = {
-        tok.split("=")[0]
-        for line in sends
-        # The example's message is an unclosed-quote-free placeholder, but a
-        # future one need not be; posix=True would raise on an odd quote.
-        for tok in shlex.split(line, posix=False)
-        if tok.startswith("--")
-    }
-    unknown = sorted(documented - set(copilot_operator.SEND_FLAGS))
-    assert not unknown, (
-        "the documented 'operator send' line passes flags that "
-        f"copilot_operator.SEND_FLAGS does not list:\n  " + "\n  ".join(unknown)
-    )
-    # The document states these two are required; the CLI enforces it.
-    assert {"--from", "--to"} <= documented, (
-        "operator send requires --from and --to, but the documented example "
-        f"passes only {sorted(documented)}"
-    )
+    for line in sends:
+        # Each example is checked on its own. Pooling the flags of every
+        # example would let two individually broken lines cover for each
+        # other -- one passing only --from, the next only --to -- and the
+        # union satisfies a requirement that neither line meets.
+        documented = {
+            tok.split("=")[0]
+            # posix=False so a quoted value that looks like a flag stays a
+            # value rather than becoming one.
+            for tok in shlex.split(line, posix=False)
+            if tok.startswith("--")
+        }
+        unknown = sorted(documented - set(copilot_operator.SEND_FLAGS))
+        assert not unknown, (
+            "this documented line passes flags that copilot_operator."
+            f"SEND_FLAGS does not list: {unknown}\n  {line}"
+        )
+        assert {"--from", "--to"} <= documented, (
+            "operator send requires --from and --to, but this documented "
+            f"line passes only {sorted(documented)}:\n  {line}"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -300,13 +311,13 @@ _SQL_PLACEHOLDERS = {
 }
 
 # Mirrors the shape of the session database's built-in tables, which the
-# template's SQL joins against but does not define. Only the columns its
-# statements actually name are here -- this is a stand for the template's SQL
-# to run against, not a specification of the real schema.
+# template's SQL joins against but does not define. This is a stand for the
+# template's SQL to run against, not a specification of the real schema.
 _SCRATCH_SCHEMA = """
 CREATE TABLE todos (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
+    description TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -325,8 +336,10 @@ def _sql_blocks(text: str, heading: str) -> list[str]:
     return blocks
 
 
-def _substitute(block: str) -> str:
+def _substitute(block: str, outcome: str = "done") -> str:
     for placeholder, value in _SQL_PLACEHOLDERS.items():
+        if placeholder == "{done_or_blocked}":
+            value = outcome
         block = block.replace(placeholder, value)
     assert "{" not in block, (
         "a placeholder in this SQL block has no entry in _SQL_PLACEHOLDERS, "
@@ -335,15 +348,27 @@ def _substitute(block: str) -> str:
     return block
 
 
-def _run(conn: sqlite3.Connection, block: str) -> None:
+def _run(conn: sqlite3.Connection, block: str, outcome: str = "done") -> None:
     """Execute a documented block after substituting its placeholders.
 
     ``executescript`` rather than ``execute`` because several blocks are whole
     transactions -- ``BEGIN IMMEDIATE``, two statements, ``COMMIT`` -- and
     running them any other way would be verifying a rearrangement of the
     document rather than the document.
+
+    The transaction must be closed when the block ends. The connection is in
+    autocommit mode, so a documented transaction that opens with ``BEGIN
+    IMMEDIATE`` and forgets to ``COMMIT`` leaves it open -- and every
+    assertion afterwards runs on the *same* connection, which can see its own
+    uncommitted rows. The test would pass while the documented protocol held
+    a write lock on the shared session database and stalled every other
+    agent.
     """
-    conn.executescript(_substitute(block))
+    conn.executescript(_substitute(block, outcome))
+    assert not conn.in_transaction, (
+        "this documented block left a transaction open -- it opens one and "
+        "never commits:\n" + block
+    )
 
 
 @pytest.fixture
@@ -377,23 +402,50 @@ def test_the_session_log_sql_runs(template, scratch):
         "expected the documented INSERT and UPDATE for session_log, found "
         f"{len(statements)}"
     )
-    for statement in statements:
-        _run(scratch, statement)
+    assert statements[0].upper().startswith("INSERT"), (
+        "expected the INSERT to be documented before the UPDATE")
+    _run(scratch, statements[0])
+
+    # A second row, written after the documented INSERT so it is not the one
+    # the UPDATE targets. Without it the check below cannot tell a targeted
+    # update from one that has lost its WHERE clause and rewrites every
+    # session ever logged -- both leave the single row looking correct.
+    scratch.execute(
+        "INSERT INTO session_log (id, branch, task_summary) "
+        "VALUES (2, 'other', 'a peer session')")
+    _run(scratch, statements[1])
+
     rows = scratch.execute(
-        "SELECT branch, status, tests_after FROM session_log").fetchall()
-    assert rows == [("main", "completed", 0)], (
-        "the documented INSERT and UPDATE ran, but did not leave the row the "
-        f"document describes: {rows}"
+        "SELECT id, branch, status, tests_before, tests_after, commits, "
+        "files_changed, learnings FROM session_log ORDER BY id"
+    ).fetchall()
+    assert rows == [
+        (1, "main", "completed", 0, 0, "deadbeef",
+         "tests/test_instructions_template.py", "none"),
+        (2, "other", "in_progress", None, None, None, None, None),
+    ], (
+        "the documented INSERT and UPDATE ran, but did not leave the rows the "
+        f"document describes: {rows}\n"
+        "Every column the documented UPDATE names is checked: a statement "
+        "that quietly stopped recording one would otherwise pass. If row 2 "
+        "changed, the UPDATE is not scoped to one session."
     )
 
 
-def test_the_todo_claims_sql_runs_and_claims(template, scratch):
+@pytest.mark.parametrize("outcome", ["done", "blocked"])
+def test_the_todo_claims_sql_runs_and_claims(template, scratch, outcome):
     """The parallel-agent protocol, executed as written rather than retyped.
 
     ``tests/test-todo-claims.sh`` covers the protocol's semantics against its
     own copy of these statements. That is the thing this cannot verify and
     vice versa: a correct protocol is no help if the text agents actually
     paste has drifted from it.
+
+    Both outcomes are run because the release block substitutes the same
+    ``{done_or_blocked}`` into its ``UPDATE`` and its ``DELETE``. Testing only
+    ``done`` would miss a document that hardcoded ``'done'`` in the DELETE's
+    guard: an agent releasing a *blocked* todo would then match zero rows,
+    leave the claim in place, and lock the todo against every future agent.
     """
     blocks = _sql_blocks(template, "Parallel Agents")
     # 'foundation' is in_progress and stays that way, so 'blocked-by-dep' is
@@ -410,13 +462,13 @@ def test_the_todo_claims_sql_runs_and_claims(template, scratch):
     )
     ready = [block for block in blocks if block.lstrip().upper().startswith("SELECT")]
     assert len(ready) == 1, f"expected one ready-work SELECT, found {len(ready)}"
-    query = _substitute(ready[0]).rstrip().rstrip(";")
+    query = _substitute(ready[0], outcome).rstrip().rstrip(";")
     # The claims table has to exist before the ready-work query can name it,
     # so the DDL runs first and the rest of the protocol in document order.
     ddl = [block for block in blocks if block.lstrip().upper().startswith("CREATE")]
     assert ddl, "the Parallel Agents section documents no CREATE TABLE"
     for block in ddl:
-        _run(scratch, block)
+        _run(scratch, block, outcome)
 
     # Before anything is claimed the query must *discriminate*: 'foundation'
     # is not pending and 'blocked-by-dep' has an unfinished dependency. A
@@ -429,7 +481,7 @@ def test_the_todo_claims_sql_runs_and_claims(template, scratch):
 
     for block in blocks:
         if block not in ddl:
-            _run(scratch, block)
+            _run(scratch, block, outcome)
 
     assert scratch.execute(query).fetchall() == [], (
         "after the documented claim and release ran, the ready-work query "
@@ -437,14 +489,100 @@ def test_the_todo_claims_sql_runs_and_claims(template, scratch):
         "blocked todo"
     )
     assert scratch.execute(
-        "SELECT status FROM todos WHERE id = 'ready'").fetchone() == ("done",), (
+        "SELECT status FROM todos WHERE id = 'ready'").fetchone() == (outcome,), (
         "the documented claim and release transactions ran without error but "
-        "did not move the todo through in_progress to done"
+        f"did not move the todo through in_progress to {outcome}"
     )
     assert scratch.execute("SELECT COUNT(*) FROM todo_claims").fetchone() == (0,), (
-        "the documented release transaction left the claim behind, which "
-        "would deadlock the todo against every future agent"
+        f"releasing a '{outcome}' todo left the claim behind, which would "
+        "deadlock it against every future agent"
     )
+
+
+def test_the_placeholder_map_matches_the_placeholders_in_the_document():
+    """A stale entry, or a new placeholder, must not go unnoticed.
+
+    ``_substitute`` refuses a brace it cannot fill, so an unknown placeholder
+    already fails loudly. The other direction is the silent one: an entry
+    left behind after the document dropped it makes the map look like it is
+    doing more work than it is, and the next reader trusts it.
+    """
+    text = TEMPLATE.read_text(encoding="utf-8")
+    documented = set()
+    for heading in ("Session History", "Parallel Agents"):
+        section = _section(text, heading)
+        for chunk in _blocks(section, info="sql") + _inline_code(section):
+            documented.update(re.findall(r"\{[^}\n]*\}", chunk))
+    mapped = {key for key in _SQL_PLACEHOLDERS if key.startswith("{")}
+    assert documented == mapped, (
+        "_SQL_PLACEHOLDERS is out of step with the document:\n"
+        f"  in the document, unmapped: {sorted(documented - mapped)}\n"
+        f"  mapped but no longer used: {sorted(mapped - documented)}"
+    )
+
+
+# --------------------------------------------------------------------------
+# The catalog and the restart marker
+# --------------------------------------------------------------------------
+
+def test_the_documented_catalog_format_parses(template, tmp_path, monkeypatch):
+    """The example catalog rows must be readable by the code that reads them.
+
+    An agent registering a new project writes a row in this shape by hand. A
+    format the reader rejects produces "No catalog entry for ..." at the exact
+    moment the next session tries to find its handoff.
+    """
+    blocks = _blocks(_section(template, "Project Configuration System"), info="csv")
+    assert len(blocks) == 1, f"expected one csv example, found {len(blocks)}"
+    rows = [line for line in blocks[0].splitlines() if line.strip()]
+    assert rows, "the documented catalog example has no rows"
+
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_text(blocks[0], encoding="utf-8")
+    monkeypatch.setattr(handoff_tool, "CATALOG", catalog)
+    for row in rows:
+        path, _, guid = row.rpartition(",")
+        # resolve_guid normalizes both sides, so handing it the documented
+        # path string exercises the row exactly as written -- including the
+        # quoting, which is the part a hand-edited catalog gets wrong.
+        assert handoff_tool.resolve_guid(path.strip().strip('"')) == guid.strip(), (
+            f"handoff_tool.resolve_guid could not read this documented row:\n  {row}"
+        )
+
+
+def test_the_documented_restart_marker_path_is_where_the_operator_looks(
+        template, monkeypatch):
+    """The manual fallback runs when ``handoff`` is not on PATH.
+
+    It is the path with no tooling behind it -- an agent types it verbatim --
+    so a marker written to the wrong directory is a restart that never
+    happens, discovered only by a session that quietly ends.
+    """
+    monkeypatch.delenv("COPILOT_OPERATOR_HOME", raising=False)
+    section = _section(template, "Session Handoff Protocol")
+    # Selected by the placeholder, not by the directory. Filtering on
+    # "/restart/" would have picked only the paths that were already right:
+    # a marker documented as ".../restarts/{instance-name}" would fail the
+    # filter, drop out of the sample, and leave the test green about the one
+    # path that had drifted.
+    documented = [
+        token.strip("`\"'")
+        for block in _blocks(section)
+        for line in block.splitlines()
+        for token in line.split()
+        if "{instance-name}" in token
+    ]
+    assert len(documented) >= 2, (
+        "expected the restart marker in both the PowerShell and the bash "
+        f"fallback, found {len(documented)}: {documented}"
+    )
+    expected = copilot_operator.operator_home() / "restart" / "NAME"
+    for path in documented:
+        actual = Path(path.replace("{instance-name}", "NAME")).expanduser()
+        assert actual == expected, (
+            f"the documented restart marker {path!r} resolves to {actual}, "
+            f"but the operator watches {expected.parent}"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -452,7 +590,8 @@ def test_the_todo_claims_sql_runs_and_claims(template, scratch):
 # --------------------------------------------------------------------------
 
 _GATE = re.compile(r"^\*Enabled by feature flag: `(?P<slug>[a-z0-9-]+)`\*\s*$", re.MULTILINE)
-_TABLE_ROW = re.compile(r"^\| \*\*(?P<name>[^*]+)\*\* \|", re.MULTILINE)
+_TABLE_SEPARATOR = re.compile(r"^\|[\s:|-]+\|$")
+_EMPHASIS = re.compile(r"[*`]")
 _ENABLED_LINE = re.compile(r"Enabled features: (?P<slugs>[^.]+)\.", re.DOTALL)
 
 
@@ -463,12 +602,31 @@ def _gated(text: str) -> list[str]:
 def _table_features(text: str) -> list[str]:
     """Feature names from the one table under ``### Feature Selection``.
 
+    The first column is read structurally rather than by matching the bold
+    markup the rows happen to use today. A guard that goes red when the table
+    is restyled without any change of meaning teaches people to delete it,
+    and it would fail in the *loud* direction here -- "no feature rows found"
+    -- only by luck.
+
     Scoped to the subsection, not to the whole configuration section: a
-    ``| **Bold** |`` row elsewhere would be read as a feature nobody offers,
-    and the gate would then be reporting on a table of its own invention.
+    ``| **Bold** |`` row elsewhere would be read as a feature nobody offers.
     """
-    return [m.group("name").strip()
-            for m in _TABLE_ROW.finditer(_section(text, "Feature Selection", level=3))]
+    lines = [line.strip()
+             for line in _section(text, "Feature Selection", level=3).splitlines()]
+    separators = [i for i, line in enumerate(lines) if _TABLE_SEPARATOR.match(line)]
+    assert len(separators) == 1, (
+        "expected exactly one markdown table under '### Feature Selection', "
+        f"found {len(separators)}. With two there is no way to tell which one "
+        "the feature list is."
+    )
+    names = []
+    for line in lines[separators[0] + 1:]:
+        if not line.startswith("|"):
+            break
+        name = _EMPHASIS.sub("", line.strip("|").split("|")[0]).strip()
+        if name:
+            names.append(name)
+    return names
 
 
 def _enabled_features_line(text: str) -> set[str]:
@@ -546,6 +704,54 @@ def test_the_example_project_file_lists_exactly_the_real_flags(template):
 # --------------------------------------------------------------------------
 # Guard the guards
 # --------------------------------------------------------------------------
+
+def test_the_document_stays_within_what_these_parsers_can_read(template):
+    """State the parsers' preconditions instead of hoping they hold.
+
+    ``_section`` and ``_blocks`` are two-state machines over backtick fences.
+    They are wrong about tilde fences, about a fence nested inside a longer
+    one, and about a heading hidden in an HTML comment -- and wrong in the
+    dangerous direction, because each of those ends a section early and
+    leaves the rest of it unexamined while every test still passes.
+
+    Writing a full markdown parser to hold a 600-line document would be the
+    wrong trade. Asserting the document does not contain those constructs
+    costs three lines and converts a silent fail-open into a failure that
+    names the construct and the parser that cannot read it.
+    """
+    assert "~~~" not in template, (
+        "the document now uses tilde fences, which _section and _blocks do "
+        "not recognise; they would read the fenced content as prose"
+    )
+    assert not re.search(r"^[ \t]*````", template, re.MULTILINE), (
+        "the document now nests fences with four or more backticks; _blocks "
+        "closes on the first ``` and would truncate the block"
+    )
+    for comment in re.findall(r"<!--.*?-->", template, re.DOTALL):
+        assert not re.search(r"^#{1,6} ", comment, re.MULTILINE), (
+            "a heading is commented out with HTML; _section does not skip "
+            f"HTML comments and would end a section there:\n{comment}"
+        )
+
+
+def test_the_feature_table_is_read_structurally_not_by_its_styling(template):
+    """Restyling the table must not break the gate, and must not blind it."""
+    plain = template.replace("| **Session Handoff** |", "| Session Handoff |", 1)
+    assert plain != template, "the substitution found nothing to replace"
+    assert "Session Handoff" in _table_features(plain)
+
+
+def test_a_second_feature_table_is_refused(template):
+    doubled = template.replace(
+        "|---------|-------------|---------|",
+        "|---------|-------------|---------|\n\n| Feature | Description | Default |\n"
+        "|---------|-------------|---------|",
+        1,
+    )
+    assert doubled != template, "the substitution found nothing to replace"
+    with pytest.raises(AssertionError, match="exactly one markdown table"):
+        _table_features(doubled)
+
 
 def test_section_scoping_stops_at_the_next_section():
     text = "## A\n\nalpha\n\n## B\n\nbeta\n"
