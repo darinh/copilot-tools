@@ -122,7 +122,15 @@ def _write_json(path: Path, msg: dict) -> None:
 
 
 def _write(directory: Path, msg: dict) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # `exist_ok` forgives a directory, not a plain file sitting where the
+        # mailbox belongs -- that raises FileExistsError, and uncaught it left
+        # the *sender* with a raw traceback for a fault at the other end. The
+        # reader half of this module refuses that same mailbox with a
+        # MailError, so the writer half says it the same way.
+        raise MailError(f"could not open mailbox {directory}: {exc}") from exc
     path = directory / f"{msg['id']}.json"
     try:
         _write_json(path, msg)
@@ -230,8 +238,22 @@ def _message_files(directory: Path) -> list[Path]:
     """Message files in ``directory``, oldest name first.
 
     An absent mailbox is genuinely empty and returns ``[]``: nobody has ever
-    written to it, which is a complete answer. A mailbox that *exists* but
-    cannot be listed is not an answer at all, and raises :class:`MailError`.
+    written to it, which is a complete answer. Anything else that stops the
+    listing -- a permission fault, or a plain file sitting where the mailbox
+    belongs -- is not an answer at all, and raises :class:`MailError`.
+
+    A first draft of this separated those two by whether they would clear on a
+    retry, and reported ENOTDIR as empty on the grounds that raising would jam
+    the supervisor loop for ever. That reasoning was wrong twice over, and the
+    second reviewer to look at it said so. It does not jam anything: the loop
+    catches :class:`MailError`, logs it and launches anyway. And "will not
+    clear on a retry" is an argument for reporting it *harder*, not for
+    reporting it as the one state that reads as healthy -- a mailbox that is a
+    plain file is permanently deaf, so calling it empty is a silence that
+    lasts for ever and that nothing anywhere complains about. Permanence is
+    the axis that matters one level down in ``_read_message``, where a bad
+    file can be moved aside and a jam is real; at the directory level there is
+    nothing to move aside and no jam to avoid.
 
     That distinction is the whole point of this function, and it cannot be
     made with the ``is_dir()``-then-``glob()`` pair it replaces, because both
@@ -263,12 +285,8 @@ def _message_files(directory: Path) -> list[Path]:
             for _ in entries:
                 pass
     except FileNotFoundError:
-        # Never written to. An empty answer is the true one.
-        return []
-    except NotADirectoryError:
-        # A plain file where the mailbox should be. It holds no messages and
-        # never will, and unlike a permission fault this will not clear on a
-        # retry, so reporting it as empty keeps callers moving.
+        # Never written to. An empty answer is the true one, and it is the
+        # ordinary state of every mailbox nobody has messaged yet.
         return []
     except OSError as exc:
         raise MailError(f"could not read mailbox {directory}: {exc}") from exc

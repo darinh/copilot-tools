@@ -2320,12 +2320,27 @@ def send_message(args: list[str]) -> int:
             print(f"Live delivery failed ({exc}) — queueing instead.",
                   file=sys.stderr)
         else:
-            operator_mail.record_delivered(OPERATOR_HOME, msg)
+            try:
+                operator_mail.record_delivered(OPERATOR_HOME, msg)
+            except operator_mail.MailError as exc:
+                # The message is already on the recipient's screen. This
+                # record only feeds `inbox --history`, and failing the send
+                # over it would invite a resend of a message they have read.
+                print(f"Delivered, but not recorded in history ({exc}).",
+                      file=sys.stderr)
             log(f"Message delivered live: {sender} -> {target.display_name}")
             print(f"Delivered to '{target.display_name}' (session is live).")
             return 0
 
-    operator_mail.queue(OPERATOR_HOME, msg)
+    try:
+        operator_mail.queue(OPERATOR_HOME, msg)
+    except operator_mail.MailError as exc:
+        # Nothing was stored, so this has to be a failure the sender can see.
+        # The fault is at the far end -- their mailbox, not ours -- so say
+        # whose it is rather than leaving a traceback to be read as our bug.
+        print(f"Could not queue for '{target.display_name}': {exc}",
+              file=sys.stderr)
+        return 1
     log(f"Message queued: {sender} -> {target.display_name}")
     print(f"Queued for '{target.display_name}' — it will be delivered at the "
           f"start of its next session.")

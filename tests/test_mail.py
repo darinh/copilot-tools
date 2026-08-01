@@ -456,20 +456,47 @@ def test_an_unreadable_archive_does_not_pass_as_no_history(tmp_path,
         operator_mail.history(tmp_path, "beta")
 
 
-def test_a_plain_file_where_the_inbox_should_be_is_empty_not_a_denial(tmp_path):
-    """ENOTDIR is knowledge about the mailbox, and it will not clear.
+def test_a_plain_file_where_the_inbox_should_be_is_a_fault_not_an_empty_inbox(
+        tmp_path):
+    """A mailbox that is a plain file is permanently deaf, so it must say so.
 
-    Distinct from a permission fault on purpose: retrying cannot help, so
-    raising here would jam every poll of the supervisor loop for ever over a
-    mailbox that holds no messages and never will.
+    This is the case a reviewer overturned. The first version of this fix
+    reported ENOTDIR as empty, reasoning that it would never clear and so
+    raising would jam the supervisor loop for ever. Both halves were wrong.
+    The loop catches `MailError`, logs it and launches anyway, so nothing
+    jams; and permanence is a reason to report a fault more loudly, not to
+    give it the one answer that reads as healthy. Reported empty, such a
+    mailbox is silently undeliverable for ever with nothing anywhere
+    complaining -- the exact shape this whole change exists to remove.
+
+    The sender is asserted here too, because the fault is at the far end from
+    whoever trips over it: `_write`'s `mkdir(exist_ok=True)` forgives a
+    directory but not a file, so `operator send` used to end in a raw
+    `FileExistsError` traceback about somebody else's mailbox.
     """
     inbox = operator_mail.inbox_dir(tmp_path, "beta")
     inbox.parent.mkdir(parents=True, exist_ok=True)
     inbox.write_text("not a directory", encoding="utf-8")
 
-    assert operator_mail.pending(tmp_path, "beta") == []
-    assert operator_mail.pending_count(tmp_path, "beta") == 0
-    assert operator_mail.consume(tmp_path, "beta") == []
+    for call in (lambda: operator_mail.pending(tmp_path, "beta"),
+                 lambda: operator_mail.pending_count(tmp_path, "beta"),
+                 lambda: operator_mail.consume(tmp_path, "beta")):
+        with pytest.raises(operator_mail.MailError):
+            call()
+
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.queue(tmp_path,
+                            operator_mail.new_message("alpha", "beta", "beta",
+                                                      "can you hear me"))
+
+    # The matched control: an ordinary mailbox in the same tree still works,
+    # so the refusal is about this path and not about the tree being broken.
+    assert operator_mail.pending(tmp_path, "gamma") == []
+    operator_mail.queue(tmp_path,
+                        operator_mail.new_message("alpha", "gamma", "gamma",
+                                                  "delivered"))
+    assert [m["text"] for m in operator_mail.pending(tmp_path, "gamma")] == \
+        ["delivered"]
 
 
 def test_a_file_that_can_neither_be_read_nor_moved_is_left_alone(tmp_path,

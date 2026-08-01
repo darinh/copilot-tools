@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 from pathlib import Path
 
 import pytest
@@ -399,6 +400,30 @@ def test_send_still_reports_success_when_the_pending_count_cannot_be_read(
     denying["on"] = False
     assert [m["text"] for m in operator_mail.pending(op.OPERATOR_HOME, "beta")] \
         == ["queued anyway"]
+
+
+def test_send_reports_a_failure_when_the_recipients_mailbox_is_not_a_directory(
+        idle_recipient, capsys):
+    """The fault is at the far end, so the sender must be told whose it is.
+
+    `_write`'s `mkdir(exist_ok=True)` forgives a directory but not a plain
+    file, so this used to end in a raw `FileExistsError` traceback naming a
+    path the sender has no reason to recognise -- and which reads like a bug
+    in `operator send` rather than a broken mailbox belonging to somebody
+    else. Nothing is stored, so unlike the pending-count case this has to be
+    a non-zero exit: a success here would lose the message silently.
+    """
+    inbox = operator_mail.inbox_dir(op.OPERATOR_HOME, "beta")
+    if inbox.exists():
+        shutil.rmtree(inbox)
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox.write_text("not a directory", encoding="utf-8")
+
+    assert op.send_message(["--from", "alpha", "--to", "beta", "undeliverable"]) == 1
+    captured = capsys.readouterr()
+    assert "Could not queue for" in captured.err
+    assert "Queued for" not in captured.out
+    assert "Traceback" not in captured.err
 
 
 @pytest.mark.parametrize("bad", ["--peak", "--unraed", "--help-me", "-x"])
