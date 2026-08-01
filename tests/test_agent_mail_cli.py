@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+from pathlib import Path
 
 import pytest
 
@@ -32,19 +33,35 @@ def isolated_state(tmp_path, monkeypatch):
 class RecordingMux:
     """Stands in for the multiplexer and records what was typed."""
 
-    def __init__(self, sessions=(), dead=False):
+    def __init__(self, sessions=(), dead=False, paths=None, installed=True):
         self.sessions = set(sessions)
         self.dead = dead
         self.sent: list[tuple[str, str]] = []
+        # Where each session's pane is currently sitting, as `Mux` reports it.
+        self.paths = dict(paths or {})
+        self.installed = installed
+
+    def _require_backend(self):
+        """The real Mux resolves its binary lazily and raises when there is
+        none, so a double that answers questions an uninstalled multiplexer
+        could not answer would hide exactly the bugs this models."""
+        if not self.installed:
+            raise op.MuxNotFoundError("no multiplexer installed")
 
     def available(self):
-        return True
+        return self.installed
 
     def has_session(self, name):
+        self._require_backend()
         return name in self.sessions
 
     def list_sessions(self):
+        self._require_backend()
         return sorted(self.sessions)
+
+    def pane_current_path(self, name):
+        self._require_backend()
+        return self.paths.get(name)
 
     def pane_dead(self, _name):
         return self.dead
@@ -422,6 +439,431 @@ def test_inbox_defaults_to_the_instance_for_this_directory(idle_recipient,
     op.send_message(["--from", "alpha", "--to", "beta", "implicit"])
     assert op.show_inbox([]) == 0
     assert "implicit" in capsys.readouterr().out
+
+
+# ── a derived mailbox name is nobody's name ─────────────────────
+# `operator inbox` with no NAME asks default_instance_name(), which answers
+# "what would a session started here be called" -- the directory's name. In a
+# checkout shared by several agents that names nobody, and reading consumes.
+def _register(name, launch=None, managed=True):
+    """Register an instance the way a real launch does.
+
+    The launch spec is written by `write_launch_spec`, the same writer the
+    operator uses, so the recorded-directory lookup is exercised for real
+    rather than against a fixture shaped like the code under test.
+    """
+    inst = op.Instance(name)
+    if managed:
+        inst.claim("tok")
+    if launch is not None:
+        op.write_launch_spec(inst, [], Path(launch), 1)
+    return inst
+
+
+def _shared_checkout(tmp_path, monkeypatch, live, cwd_name="proj"):
+    """Stand in a project directory with `live` instances running.
+
+    `live` maps display name -> pane directory, or -> (pane, launch) when the
+    two differ. A pane of None models a session the backend cannot place.
+    """
+    project = tmp_path / cwd_name
+    project.mkdir(parents=True, exist_ok=True)
+    paths = {}
+    for name, where in live.items():
+        pane, launch = where if isinstance(where, tuple) else (where, where)
+        inst = _register(name, launch=launch)
+        paths[inst.id] = None if pane is None else str(pane)
+    mux = RecordingMux(sessions=list(paths), paths=paths)
+    monkeypatch.setattr(op, "MUX", mux)
+    monkeypatch.setattr(op, "is_copilot_running", lambda _i: False)
+    monkeypatch.chdir(project)
+    return project
+
+
+def _mail_for(name, text):
+    operator_mail.queue(
+        op.OPERATOR_HOME,
+        operator_mail.new_message("someone", name, op.Instance(name).id, text))
+
+
+def test_bare_inbox_refuses_when_the_derived_name_names_nobody_live(
+        tmp_path, monkeypatch, capsys):
+    """The case that actually fired: a peer working in a worktree.
+
+    The reader stood in the primary checkout, so the derived name was the
+    folder's -- `proj` -- which is not the peer, not the reader, not anyone.
+    A rule that only refused when two live instances *answered to* the
+    directory would have allowed this read.
+    """
+    project = tmp_path / "proj"
+    (project / ".worktrees" / "feature").mkdir(parents=True)
+    _shared_checkout(tmp_path, monkeypatch,
+                     {"agent-x": project / ".worktrees" / "feature"})
+    _mail_for("proj", "the folder's mail")
+    capsys.readouterr()
+
+    assert op.show_inbox([]) == 2
+    err = capsys.readouterr().err
+    assert "refusing to consume mail for 'proj'" in err
+    assert "agent-x" in err
+    assert "No mail was read." in err
+
+    # Still deliverable, not merely still counted.
+    assert op.show_inbox(["proj"]) == 0
+    assert "the folder's mail" in capsys.readouterr().out
+
+
+def test_bare_inbox_refuses_when_two_instances_are_live_here(tmp_path,
+                                                             monkeypatch,
+                                                             capsys):
+    _shared_checkout(tmp_path, monkeypatch,
+                     {"proj": tmp_path / "proj",
+                      "agent-x": tmp_path / "proj"})
+    _mail_for("proj", "contested mail")
+    capsys.readouterr()
+
+    assert op.show_inbox([]) == 2
+    err = capsys.readouterr().err
+    assert "agent-x" in err
+    # The derived instance is live too, and saying otherwise would read as
+    # the operator having lost track of a session the user can plainly see.
+    assert "proj" in err
+    assert "operator inbox --peek" in err
+
+    assert op.show_inbox(["proj"]) == 0
+    assert "contested mail" in capsys.readouterr().out
+
+
+def test_bare_inbox_json_is_refused_too_and_prints_no_payload(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """consume() runs before the --json branch, so --json archives as well.
+
+    The guard keys off destructiveness rather than output format. A refusal
+    must also print nothing on stdout: a caller parsing the output would
+    otherwise read a stray `[]` as "you have no mail".
+    """
+    _shared_checkout(tmp_path, monkeypatch, {"agent-x": tmp_path / "proj"})
+    _mail_for("proj", "machine readable mail")
+    capsys.readouterr()
+
+    assert op.show_inbox(["--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "refusing to consume" in captured.err
+
+    assert op.show_inbox(["proj", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["text"] == "machine readable mail"
+
+
+def test_bare_inbox_reads_when_only_the_derived_instance_is_live(tmp_path,
+                                                                 monkeypatch,
+                                                                 capsys):
+    """The unambiguous case still works: the one live instance here IS the
+    name the directory derives, so nobody else can be the addressee."""
+    _shared_checkout(tmp_path, monkeypatch, {"proj": tmp_path / "proj"})
+    _mail_for("proj", "mine to read")
+    capsys.readouterr()
+
+    assert op.show_inbox([]) == 0
+    assert "mine to read" in capsys.readouterr().out
+    assert operator_mail.pending_count(op.OPERATOR_HOME,
+                                       op.Instance("proj").id) == 0
+
+
+def test_a_sanitized_directory_name_is_not_mistaken_for_a_stranger(
+        tmp_path, monkeypatch, capsys):
+    """A folder whose name has to be sanitized must still read its own mail.
+
+    `safe_instance_id` appends a digest when sanitizing changes the name, and
+    it is not idempotent. With no `.managed` file the census has only the
+    session id, and comparing a re-derived id against the real one makes an
+    instance fail to recognize itself -- so the only live instance in the
+    directory is refused as if it were somebody else.
+    """
+    project = tmp_path / "my.repo"
+    project.mkdir()
+    mine = _register("my.repo", launch=project, managed=False)
+    assert mine.id != "my.repo", "test needs a name that sanitizing changes"
+    mux = RecordingMux(sessions=[mine.id], paths={mine.id: str(project)})
+    monkeypatch.setattr(op, "MUX", mux)
+    monkeypatch.setattr(op, "is_copilot_running", lambda _i: False)
+    monkeypatch.chdir(project)
+    _mail_for("my.repo", "still mine")
+    capsys.readouterr()
+
+    assert op.show_inbox([]) == 0
+    assert "still mine" in capsys.readouterr().out
+
+
+def test_a_peer_with_no_ownership_metadata_is_still_counted(tmp_path,
+                                                            monkeypatch,
+                                                            capsys):
+    """A live peer whose `.managed` file is missing must not vanish.
+
+    Without ownership metadata the census has only the session id to work
+    with. Treating that id as a display name and re-deriving an id from it
+    produces a third, non-existent instance whose recorded directory is
+    always unknown -- so the peer drops out of the census and its mail is
+    eaten. The peer here is also `cd`'d elsewhere, so only its launch spec
+    places it.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent.x", launch=project, managed=False)
+    assert op.safe_instance_id(peer.id) != peer.id, "test needs a digest id"
+    mux = RecordingMux(sessions=[peer.id],
+                       paths={peer.id: str(tmp_path / "elsewhere")})
+    monkeypatch.setattr(op, "MUX", mux)
+    monkeypatch.setattr(op, "is_copilot_running", lambda _i: False)
+    monkeypatch.chdir(project)
+    _mail_for("proj", "not yours to read")
+    capsys.readouterr()
+
+    assert op.show_inbox([]) == 2
+    assert "refusing to consume" in capsys.readouterr().err
+    assert op.show_inbox(["proj"]) == 0
+    assert "not yours to read" in capsys.readouterr().out
+
+
+def test_the_derived_name_is_refused_when_it_is_live_somewhere_else(
+        tmp_path, monkeypatch, capsys):
+    """Two checkouts can share a folder name, and one global mailbox.
+
+    `proj` here and `proj` in another directory derive the same name and so
+    share one mailbox. When the operator cannot say where the live `proj` is
+    bound, `default_instance_name` sees no conflict and hands back the plain
+    name -- so the reader here would consume the mail of the `proj` running
+    over there.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    other = tmp_path / "elsewhere" / "proj"
+    other.mkdir(parents=True)
+    stranger = _register("proj", launch=None)  # live, but nothing records where
+    mux = RecordingMux(sessions=[stranger.id], paths={stranger.id: str(other)})
+    monkeypatch.setattr(op, "MUX", mux)
+    monkeypatch.setattr(op, "is_copilot_running", lambda _i: False)
+    monkeypatch.chdir(project)
+    _mail_for("proj", "the other proj's mail")
+    capsys.readouterr()
+
+    assert op.show_inbox([]) == 2
+    assert "not working in this directory" in capsys.readouterr().err
+    assert op.show_inbox(["proj"]) == 0
+    assert "the other proj's mail" in capsys.readouterr().out
+
+
+def test_bare_inbox_reads_when_nothing_is_live_here(tmp_path, monkeypatch,
+                                                    capsys):
+    """Nothing live in this directory means nothing to disambiguate against
+    -- the single-user workflow the default was written for."""
+    _shared_checkout(tmp_path, monkeypatch, {})
+    _mail_for("proj", "quiet checkout")
+    capsys.readouterr()
+
+    assert op.show_inbox([]) == 0
+    assert "quiet checkout" in capsys.readouterr().out
+
+
+def test_a_live_instance_in_an_unrelated_directory_does_not_block(
+        tmp_path, monkeypatch, capsys):
+    _shared_checkout(tmp_path, monkeypatch,
+                     {"agent-x": tmp_path / "somewhere-else"})
+    _mail_for("proj", "unblocked")
+    capsys.readouterr()
+
+    assert op.show_inbox([]) == 0
+    assert "unblocked" in capsys.readouterr().out
+
+
+def test_an_explicit_name_is_read_even_with_peers_live_here(tmp_path,
+                                                            monkeypatch,
+                                                            capsys):
+    """The refusal is about a *guessed* name. Saying who you are always
+    works -- otherwise the fix would break the very habit it is teaching."""
+    _shared_checkout(tmp_path, monkeypatch,
+                     {"agent-x": tmp_path / "proj",
+                      "proj": tmp_path / "proj"})
+    _mail_for("agent-x", "addressed to me")
+    capsys.readouterr()
+
+    assert op.show_inbox(["agent-x"]) == 0
+    assert "addressed to me" in capsys.readouterr().out
+    assert operator_mail.pending_count(op.OPERATOR_HOME,
+                                       op.Instance("agent-x").id) == 0
+
+
+@pytest.mark.parametrize("flag", ["--peek", "--history"])
+def test_non_destructive_reads_are_never_refused(flag, tmp_path, monkeypatch,
+                                                 capsys):
+    _shared_checkout(tmp_path, monkeypatch, {"agent-x": tmp_path / "proj"})
+    _mail_for("proj", "looked at, not eaten")
+    capsys.readouterr()
+
+    assert op.show_inbox([flag]) == 0
+    assert "refusing" not in capsys.readouterr().err
+    assert operator_mail.pending_count(op.OPERATOR_HOME,
+                                       op.Instance("proj").id) == 1
+
+
+def test_the_refusal_is_reachable_from_the_command_line(tmp_path, monkeypatch,
+                                                        capsys):
+    """Through main(), because a guard the dispatcher bypasses guards nothing."""
+    _shared_checkout(tmp_path, monkeypatch, {"agent-x": tmp_path / "proj"})
+    _mail_for("proj", "survives the dispatcher")
+    capsys.readouterr()
+
+    assert op.main(["inbox"]) == 2
+    assert "refusing to consume" in capsys.readouterr().err
+    assert op.main(["inbox", "proj"]) == 0
+    assert "survives the dispatcher" in capsys.readouterr().out
+
+
+# ── the census itself ───────────────────────────────────────────
+def test_live_instances_under_counts_a_pane_that_has_wandered(tmp_path,
+                                                              monkeypatch):
+    """An agent that `cd`'d to a temp directory is still that project's agent.
+
+    The launch directory is recorded in the instance's spec file, so it is
+    the second source consulted. Only counting the pane's current path would
+    let a peer disappear from the census mid-`cd`.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent-x", launch=project)
+    mux = RecordingMux(sessions=[peer.id],
+                       paths={peer.id: str(tmp_path / "elsewhere")})
+    monkeypatch.setattr(op, "MUX", mux)
+
+    assert op.live_instance_ids_under(project) == [peer.id]
+
+
+def test_an_operator_session_nobody_can_place_is_counted(tmp_path, monkeypatch):
+    """Unknown location is not the same as "somewhere else"."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent-x", launch=None)
+    mux = RecordingMux(sessions=[peer.id], paths={peer.id: None})
+    monkeypatch.setattr(op, "MUX", mux)
+
+    assert op.live_instance_ids_under(project) == [peer.id]
+
+
+def test_an_unrelated_backend_session_is_not_counted(tmp_path, monkeypatch):
+    """A plain tmux session the user opened is not an operator instance and
+    has no mailbox, so it must not make the operator refuse everything."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    mux = RecordingMux(sessions=["notes"], paths={"notes": None})
+    monkeypatch.setattr(op, "MUX", mux)
+
+    assert op.live_instance_ids_under(project) == []
+
+
+def test_a_census_that_cannot_be_taken_is_not_an_empty_census(tmp_path,
+                                                              monkeypatch):
+    class Broken(RecordingMux):
+        def list_sessions(self):
+            raise op.MuxError("backend gone")
+
+    monkeypatch.setattr(op, "MUX", Broken())
+    assert op.live_instance_ids_under(tmp_path) is None
+
+
+def test_an_instance_the_backend_will_not_place_fails_the_census(tmp_path,
+                                                                 monkeypatch):
+    """A hole in the census is not a clean bill of health.
+
+    Swallowing a failed pane lookup and carrying on returns a list that looks
+    complete and is not: the peer it could not place simply is not in it, and
+    a caller reading that list concludes nobody else is here.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent-x", launch=tmp_path / "elsewhere")
+
+    class Unhelpful(RecordingMux):
+        def pane_current_path(self, name):
+            raise op.MuxError("cannot reach pane")
+
+    monkeypatch.setattr(op, "MUX", Unhelpful(sessions=[peer.id]))
+    assert op.live_instance_ids_under(project) is None
+
+
+def test_a_failed_pane_lookup_still_counts_a_peer_recorded_here(tmp_path,
+                                                                monkeypatch):
+    """When the launch spec already places an instance in this directory,
+    the pane lookup adds nothing -- there is no uncertainty left to report."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    peer = _register("agent-x", launch=project)
+
+    class Unhelpful(RecordingMux):
+        def pane_current_path(self, name):
+            raise op.MuxError("cannot reach pane")
+
+    monkeypatch.setattr(op, "MUX", Unhelpful(sessions=[peer.id]))
+    assert op.live_instance_ids_under(project) == [peer.id]
+
+
+def test_no_multiplexer_means_no_live_sessions_rather_than_no_answer(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(op, "MUX", RecordingMux(installed=False))
+    assert op.live_instance_ids_under(tmp_path) == []
+
+
+def test_a_machine_with_no_multiplexer_can_still_read_its_own_mail(
+        tmp_path, monkeypatch, capsys):
+    """The no-backend carve-out has to survive the whole guard, not just the
+    census. Every probe must agree that "not installed" is knowledge -- one
+    that treats it as uncertainty refuses every nameless read on a machine
+    with no tmux or psmux, which is most single-user machines. The double
+    raises `MuxNotFoundError` exactly where the real `Mux` would, because a
+    double that answers anyway cannot fail this test.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(op, "MUX", RecordingMux(installed=False))
+    monkeypatch.setattr(op, "is_copilot_running", lambda _i: False)
+    monkeypatch.chdir(project)
+    _mail_for("proj", "no mux, still mine")
+    capsys.readouterr()
+
+    assert op.show_inbox([]) == 0
+    assert "no mux, still mine" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("blowup", [
+    lambda: op.MuxError("backend gone"),
+    lambda: FileNotFoundError(2, "No such file or directory: 'tmux'"),
+])
+def test_a_backend_that_cannot_be_asked_refuses_rather_than_consumes(
+        blowup, tmp_path, monkeypatch, capsys):
+    """"I could not look" must not read the same as "nobody is here".
+
+    A missing mux binary raises FileNotFoundError rather than MuxError, and
+    an uncaught one used to take the whole command down; a caught-but-ignored
+    one let the read proceed under exactly the uncertainty the guard exists
+    to handle.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    class Broken(RecordingMux):
+        def list_sessions(self):
+            raise blowup()
+
+    monkeypatch.setattr(op, "MUX", Broken())
+    monkeypatch.setattr(op, "is_copilot_running", lambda _i: False)
+    monkeypatch.chdir(project)
+    _mail_for("proj", "safe under uncertainty")
+    capsys.readouterr()
+
+    assert op.show_inbox([]) == 2
+    assert "could not be asked" in capsys.readouterr().err
+    assert op.show_inbox(["proj"]) == 0
+    assert "safe under uncertainty" in capsys.readouterr().out
 
 
 # ── dispatch ────────────────────────────────────────────────────

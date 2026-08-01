@@ -1976,8 +1976,116 @@ def _inbox_usage(stream=None) -> None:
     print("  --json     machine-readable output", file=stream)
     print("  --         the next argument is a mailbox name, dash or not",
           file=stream)
-    print("  With no NAME, reads the mailbox for this directory's instance.",
-          file=stream)
+    print("  With no NAME, the mailbox is named after this directory — which "
+          "is\n  nobody in particular. A destructive read is refused when any "
+          "other\n  instance is live here; pass your own name.", file=stream)
+
+
+def _dir_matches(child: str | None, parent: Path) -> bool:
+    """True when ``child`` is ``parent`` or lives beneath it.
+
+    Path comparison follows the convention used elsewhere in this file:
+    resolve first, then lowercase on Windows, where ``C:\\Repo`` and
+    ``c:\\repo`` are the same directory.
+    """
+    if not child:
+        return False
+    try:
+        cp = str(Path(child).resolve())
+        pp = str(parent.resolve())
+    except OSError:
+        return False
+    if IS_WINDOWS:
+        cp, pp = cp.lower(), pp.lower()
+    if cp == pp:
+        return True
+    try:
+        Path(cp).relative_to(Path(pp))
+        return True
+    except ValueError:
+        return False
+
+
+def live_instance_ids_under(cwd: Path) -> list[str] | None:
+    """Ids of live sessions whose work is in or under ``cwd``.
+
+    Returns **ids, never display names**. The two are not interchangeable:
+    ``safe_instance_id`` appends a digest when sanitizing changes a name and
+    is therefore not idempotent, so an id passed back through it becomes a
+    third, non-existent instance. Identity is decided in id space and display
+    names are used only for the message a human reads.
+
+    "Under" and not "equal to" because a git worktree lives *inside* the
+    primary checkout: an agent in ``.worktrees/fix-thing`` is working on the
+    same project as one sitting at the repo root, and from the root it is
+    exactly the peer whose mail must not be eaten.
+
+    Returns ``None`` when the census could not be taken at all — a backend
+    that errors or is missing its binary tells us nothing about who is here,
+    and "I could not look" must not read the same as "nobody is here".
+    Note that an *unavailable* multiplexer is not uncertainty: with no
+    backend there are no sessions to miss, so that answers the empty list.
+    """
+    try:
+        if not MUX.available():
+            return []
+        live = sorted(MUX.list_sessions())
+    except (MuxError, OSError):
+        return None
+
+    known = set(managed_instances()) | set(load_tabs())
+    found: list[str] = []
+    for ident in live:
+        try:
+            pane = MUX.pane_current_path(ident)
+        except (MuxError, OSError):
+            pane = None
+            pane_failed = True
+        else:
+            pane_failed = False
+        recorded = _tracked_cwd_for_id(ident)
+        if _dir_matches(pane, cwd) or _dir_matches(recorded, cwd):
+            found.append(ident)
+        elif pane_failed and ident in known:
+            # The backend refused to say where this instance is and the
+            # recorded directory does not place it here either. That is not
+            # evidence of absence, and a census with a hole in it must not be
+            # returned as though it were complete.
+            return None
+        elif pane is None and recorded is None and ident in known:
+            # An operator session nobody can place. Counting it costs the
+            # caller one explicit name; missing it costs somebody their mail,
+            # so an instance of unknown location is treated as present.
+            found.append(ident)
+    return found
+
+
+def _name_has_live_session(instance: Instance) -> bool | None:
+    """Whether a session by this name is running. ``None`` if unanswerable.
+
+    An *absent* multiplexer answers False rather than None: with no backend
+    installed nothing can be running under it, so this is knowledge, not
+    uncertainty. Anything else that goes wrong is uncertainty.
+    """
+    try:
+        if not MUX.available():
+            return False
+        return MUX.has_session(instance.session)
+    except (MuxError, OSError):
+        return None
+
+
+def _display_name_for_id(ident: str) -> str:
+    """A human label for a session id. Never used to decide identity."""
+    meta = managed_instances().get(ident, {})
+    name = meta.get("display_name")
+    if not name:
+        spec = RESTART_DIR / f"{ident}.launch.json"
+        try:
+            name = json.loads(spec.read_text(encoding="utf-8")).get("display_name")
+        except (OSError, ValueError):
+            name = None
+    return name or ident
 
 
 def show_inbox(args: list[str]) -> int:
@@ -1991,6 +2099,14 @@ def show_inbox(args: list[str]) -> int:
 
     Nothing stops an instance being named ``-beta``, so ``--`` ends the
     options and makes what follows a name.
+
+    With no NAME the mailbox is named after the working directory, and that
+    name answers "what would a session started here be called", not "who am
+    I". In a checkout shared by several agents it names *nobody* — it is just
+    the folder — so consuming it takes whichever peer happens to hold that
+    name. A destructive read of a directory-derived name is therefore refused
+    while any other instance is live here. ``--peek`` and ``--history`` change
+    nothing and stay available.
     """
     flags: list[str] = []
     names: list[str] = []
@@ -2039,10 +2155,54 @@ def show_inbox(args: list[str]) -> int:
 
     if names:
         name = names[0]
+        derived = False
     else:
         name = default_instance_name()
+        derived = True
 
     instance = Instance(name)
+
+    # Keyed on destructiveness, not on output format: consume() runs before
+    # the --json branch below, so `operator inbox --json` archives too.
+    destructive = not peek and not want_history
+    if derived and destructive:
+        cwd = Path.cwd()
+        here = live_instance_ids_under(cwd)
+        name_is_live = _name_has_live_session(instance)
+
+        def _refuse(reason: str) -> int:
+            print(f"operator inbox: refusing to consume mail for "
+                  f"'{instance.display_name}'.", file=sys.stderr)
+            print("  You did not name a mailbox, so this one was named after "
+                  "the directory —", file=sys.stderr)
+            print(f"  which is not the same thing as naming you. {reason}",
+                  file=sys.stderr)
+            print("  Reading archives what it shows, so a wrong guess eats a "
+                  "peer's mail and", file=sys.stderr)
+            print("  leaves an emptied mailbox that looks exactly like an "
+                  "empty one.", file=sys.stderr)
+            print("  Read yours:      operator inbox <your-name>",
+                  file=sys.stderr)
+            print("  Look, keep mail: operator inbox --peek", file=sys.stderr)
+            print("  No mail was read.", file=sys.stderr)
+            return 2
+
+        if here is None or name_is_live is None:
+            # Cannot tell who is working here, so cannot tell whose mailbox
+            # this is. Refusing costs a name; guessing costs somebody's mail.
+            return _refuse("The multiplexer could not be asked who is live "
+                           "here, so this cannot be checked.")
+        if any(ident != instance.id for ident in here):
+            # Report every live instance, the derived one included: telling a
+            # caller "live here: beta" while a session named after the folder
+            # is also running reads as the operator having lost track of it.
+            live_here = ", ".join(_display_name_for_id(i) for i in here)
+            return _refuse(f"Live here: {live_here}.")
+        if name_is_live and instance.id not in here:
+            return _refuse(f"'{instance.display_name}' is live, but is not "
+                           "working in this directory — the folder and the "
+                           "mailbox belong to different agents.")
+
     if want_history:
         msgs = operator_mail.history(OPERATOR_HOME, instance.id)
     elif peek:
@@ -2481,9 +2641,16 @@ MESSAGING
     context, so they talk by mail:
 
         operator send --from alpha --to beta "the schema is frozen"
-        operator inbox                 Read this directory's instance mail
+        operator inbox alpha           Read alpha's mail (marks it read)
         operator inbox beta --peek     Read without marking read
         operator inbox beta --history  What was already delivered
+
+    Pass your own name. With no NAME the mailbox is named after the working
+    directory, which is nobody in particular -- in a checkout two agents
+    share it resolves to the same name for both, and reading archives what
+    it shows. A nameless destructive read is refused when another instance
+    is live here (or in a worktree under it), when the derived name is live
+    somewhere else, or when the multiplexer cannot say who is live.
 
     --from and --to are both required: the recipient has to know who wrote
     and where to send an answer, and every delivered message carries the
@@ -2587,20 +2754,31 @@ def show_help() -> int:
 
 
 # ── entry point ─────────────────────────────────────────────────
-def _tracked_cwd_for(name: str) -> str | None:
-    """Best-effort lookup of the directory a tracked/managed instance name is
-    already bound to, so a same-named directory elsewhere doesn't collide."""
-    inst = Instance(name)
-    spec = inst.spec_file
+def _tracked_cwd_for_id(ident: str) -> str | None:
+    """The directory a tracked/managed *instance id* is bound to, if known.
+
+    Keyed on the id rather than the display name because the two are not
+    interchangeable: ``safe_instance_id`` is not idempotent, so re-deriving an
+    id from something that is already an id produces a different, non-existent
+    instance whose files are always missing — a lookup that fails silently and
+    reports "location unknown" for an instance whose location is on disk.
+    """
+    spec = RESTART_DIR / f"{ident}.launch.json"
     if spec.exists():
         try:
             return json.loads(spec.read_text(encoding="utf-8")).get("cwd")
         except (OSError, ValueError):
             pass
-    entry = load_tabs().get(inst.id)
+    entry = load_tabs().get(ident)
     if entry:
         return entry.get("cwd")
     return None
+
+
+def _tracked_cwd_for(name: str) -> str | None:
+    """Best-effort lookup of the directory a tracked/managed instance name is
+    already bound to, so a same-named directory elsewhere doesn't collide."""
+    return _tracked_cwd_for_id(Instance(name).id)
 
 
 def _name_conflicts(name: str, cwd: Path) -> bool:
