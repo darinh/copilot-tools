@@ -28,6 +28,47 @@ import { resolve, join, relative, isAbsolute } from "node:path";
 export const INTRINSIC_EXCLUSIONS = new Set([".git", ".worktrees"]);
 
 /**
+ * A directory name with any trailing slash removed, which is the one form
+ * every comparison in this file is written against.
+ *
+ * Two conventions meet here and neither is wrong. `topLevelDirs` yields bare
+ * names because that is what readdir gives; `emptyDirCandidates` appends a
+ * slash because that is how a directory is reported to the agent; git echoes
+ * back whichever form it was handed. The bug is not either convention, it is
+ * comparing across them.
+ *
+ * BE PRECISE ABOUT THE STATUS OF THIS, because the temptation is to write it
+ * up as a live bug and it is not one. Today the only caller of `withoutIgnored`
+ * passes `topLevelDirs` output, which is bare, so all three comparisons below
+ * currently agree with themselves and the ignore rule works. Measured, on the
+ * pre-change code, with slash-suffixed input:
+ *
+ *   withoutIgnored(root, ["__pycache__/", "build/", "straydir/"])
+ *     -> ["__pycache__/", "build/", "straydir/"]      nothing filtered,
+ *        while check-ignore had just answered rc=0 "__pycache__/\0build/\0"
+ *
+ * That is the shape: not a crash, not an empty result, but a plausible list
+ * with the rule silently switched off. `ignored` was built by stripping the
+ * slash off git's ANSWER and never off the CANDIDATES, so the Set held
+ * "build" and the lookup asked for "build/".
+ *
+ * Two smaller instances of the same mismatch: INTRINSIC_EXCLUSIONS.has(".git/")
+ * is false where .has(".git") is true, and in `emptyDirCandidates` the
+ * `p === name` test compares across the two forms -- though that one is
+ * rescued today by the `p.startsWith(name + "/")` clause beside it, which
+ * matches "build/" against a bare "build". Do not delete that clause thinking
+ * this normalisation replaced it; it also does the different job of spotting a
+ * directory git already reported a file inside.
+ *
+ * Normalising now rather than documenting the hazard, because the refactor
+ * that makes it live is an obvious one -- feeding `emptyDirCandidates` output,
+ * which IS slash-suffixed, back through `withoutIgnored` -- and because every
+ * failure here is silent and in one direction: a Set lookup or an `===` that
+ * misses always reports "not excluded", "not ignored", "not already known".
+ */
+export const bareName = (n) => n.replace(/[\\/]$/, "");
+
+/**
  * Parse `git status --porcelain -uall -z` output into untracked paths.
  *
  * The `-z` form is used rather than the default because it is the only one
@@ -105,8 +146,12 @@ export function newEntries(before, after) {
 export function emptyDirCandidates(dirNames, known) {
   const seen = (known ?? []).map((p) => p.replace(/\\/g, "/"));
   return dirNames
+    // Canonical form FIRST, before anything compares. See `bareName`: every
+    // filter below is an equality or prefix test against a bare name, and
+    // "build/" silently matches none of them.
+    .map(bareName)
     .filter((name) => !INTRINSIC_EXCLUSIONS.has(name))
-    .filter((name) => !seen.some((p) => p === name || p.startsWith(`${name}/`)))
+    .filter((name) => !seen.some((p) => bareName(p) === name || p.startsWith(`${name}/`)))
     .map((name) => `${name}/`)
     .sort();
 }
@@ -558,11 +603,22 @@ export function git(args, cwd, { stdin = null } = {}) {
     const child = execFile(
       "git", args,
       { cwd, timeout: GIT_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 },
-      (err, stdout) => {
+      (err, stdout, stderr) => {
         // A non-zero exit is routine for some of these calls -- check-ignore
         // returns 1 when nothing matched -- so stdout comes back either way
         // and callers that care about failure read `ok`.
-        done({ ok: !err, stdout: String(stdout ?? "") });
+        //
+        // `ok` alone is not enough for every caller, and `code` exists for the
+        // ones it fails. check-ignore answers "nothing is ignored" with exit 1
+        // and "I could not look" with exit 128, and both arrive here as
+        // ok:false with empty stdout -- a real answer and the absence of one,
+        // rendered identical. See `withoutIgnored`.
+        //
+        // null means git never ran or was killed: a spawn failure carries a
+        // string errno rather than an exit status, and a timeout carries none
+        // at all. Neither is an exit code and neither may be compared to one.
+        const code = err ? (typeof err.code === "number" ? err.code : null) : 0;
+        done({ ok: !err, code, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });
       },
     );
     if (stdin !== null) {
@@ -735,9 +791,17 @@ export function topLevelDirs(root) {
   }
 }
 
-/** Drop the names covered by the project's own .gitignore. */
+/**
+ * The names in `names` that the project's own .gitignore does not cover, or
+ * null when git could not answer.
+ *
+ * Null is not pedantry. The only two things this can usefully say are "these
+ * are ignored" and "none of them are", and the second is also what a broken
+ * call looks like -- so without a third answer the failure is indistinguishable
+ * from the most consequential success. See the exit-code note below.
+ */
 export async function withoutIgnored(root, names) {
-  const candidates = names.filter((n) => !INTRINSIC_EXCLUSIONS.has(n));
+  const candidates = names.filter((n) => !INTRINSIC_EXCLUSIONS.has(bareName(n)));
   if (candidates.length === 0) return [];
   // Paths go in over stdin rather than as arguments, and the reason is not
   // ergonomics: `git check-ignore -z` refuses to run at all without `--stdin`
@@ -752,13 +816,50 @@ export async function withoutIgnored(root, names) {
   // ignored subset. Asking git is the point: an ignore list of this
   // extension's own would disagree with the project silently, and always in
   // the direction of missing things.
-  const { stdout } = await git(["check-ignore", "-z", "--stdin"], root, {
+  //
+  // The exit code is load-bearing and the paragraph above used to be the whole
+  // defence, which was wrong: it names the hazard, closes one cause of it --
+  // the `-z` fatal -- and reads as though it closed all of them. Measured:
+  //
+  //     nothing is ignored   exit 1    stdout ""
+  //     could not look       exit 128  stdout ""
+  //
+  // Identical through `ok` and `stdout`. Only 1 is an answer. Anything else,
+  // including a git that never spawned (code null), is an absence of one, and
+  // the caller has to be told which it got -- because here the ambiguity does
+  // not collapse onto "skip it", it collapses onto INVENTING strays, which the
+  // working-tree report then hands to an agent as an order to delete.
+  const { code, stdout, stderr } = await git(["check-ignore", "-z", "--stdin"], root, {
     stdin: candidates.join("\0"),
   });
-  const ignored = new Set(
-    stdout.split("\0").filter(Boolean).map((p) => p.replace(/[\\/]$/, "")),
-  );
-  return candidates.filter((n) => !ignored.has(n));
+  if (code !== 0 && code !== 1) return null;
+  // Exit 1 is not always "nothing matched". An ignore file git cannot READ
+  // also exits 1 with empty output, while `git status` on the same repository
+  // still exits 0 -- so the rules are unknown and the exit code says they are
+  // empty. Measured on Windows with a deny-read ACL on .gitignore:
+  //
+  //     git status    ok=true
+  //     check-ignore  code=1  stdout=""
+  //     stderr        warning: unable to access '.gitignore': Permission denied
+  //
+  // The warning is the only thing separating the two, and it is git reporting
+  // its own failure rather than a second opinion of ours -- which is the whole
+  // reason it is admissible here. Stat-ing the ignore files ourselves would be
+  // forming a weaker independent answer to a question git already answers, and
+  // could only subtract true positives.
+  //
+  // The match is on git's English wording, so a translated git falls back to
+  // trusting exit 1: no worse than before this line existed, never worse than
+  // the old behaviour. It errs toward refusing, which costs empty-directory
+  // findings and never invents them.
+  if (/unable to access|Permission denied/i.test(stderr)) return null;
+  // Both sides of the comparison, not just git's. Stripping the answer alone
+  // was the bug: candidates carrying a trailing slash then matched nothing in
+  // the Set and the ignore rule silently stopped applying. The returned
+  // strings are the caller's originals -- only the COMPARISON is normalised,
+  // because "build/" and "build" mean different things downstream.
+  const ignored = new Set(stdout.split("\0").filter(Boolean).map(bareName));
+  return candidates.filter((n) => !ignored.has(bareName(n)));
 }
 
 /**
@@ -822,18 +923,51 @@ export function holdsNoFiles(dir, budget = 512) {
 }
 
 /**
+ * The empty directories git cannot see, or [] when `dirs` is null because
+ * check-ignore could not answer.
+ *
+ * Split out from `scanCheckout` so the refusal has a name and one obvious
+ * place to be handled. `scanCheckout` reaches it through the `ignoreFilter`
+ * seam; see there for why a seam is needed rather than a fixture.
+ */
+export function invisibleDirStrays(dirs, known, root) {
+  if (dirs === null) return [];
+  return emptyDirCandidates(dirs, known).filter((rel) =>
+    holdsNoFiles(join(root, rel.replace(/\/$/, ""))),
+  );
+}
+
+/**
  * Every untracked path in the checkout, including the empty directories git
  * refuses to report. Returns null when git could not answer, which callers
  * must treat as "no information" rather than "clean".
+ *
+ * `ignoreFilter` is a seam and exists for one reason: without it the branch
+ * that handles a refusing check-ignore cannot be reached from a test. No
+ * fixture reliably makes check-ignore fail while `git status` on the same
+ * repository still succeeds -- an excludesFile pointing at a directory, an
+ * attributesFile pointing at a directory and a .gitignore that IS a directory
+ * were all measured and all exit 0 or 1. The alternative was a test that
+ * asserted on `invisibleDirStrays` directly while its name promised something
+ * about `scanCheckout`, which is a control on a neighbouring function: it
+ * would stay green through any regression in how this function consumes the
+ * refusal.
  */
-export async function scanCheckout(root) {
+export async function scanCheckout(root, { ignoreFilter = withoutIgnored } = {}) {
   const { ok, stdout } = await git(["status", "--porcelain", "-uall", "-z"], root);
   if (!ok) return null;
   const untracked = parseUntracked(stdout);
   const known = [...parseStatusPaths(stdout), ...(await trackedTopLevel(root))];
-  const dirs = await withoutIgnored(root, topLevelDirs(root));
-  const invisible = emptyDirCandidates(dirs, known).filter((rel) =>
-    holdsNoFiles(join(root, rel.replace(/\/$/, ""))),
-  );
-  return [...untracked, ...invisible];
+  // Only the invisible-directory half depends on check-ignore, so only that
+  // half is dropped when check-ignore cannot answer. `git status` applies the
+  // ignore rules itself and has already spoken for every path it can see, so
+  // discarding its answer too would turn one blind spot into total blindness.
+  //
+  // Dropping is the point. Empty directories are the one population reported
+  // here that git never confirms, so an unfiltered candidate list is not a
+  // rougher answer -- it is every ignored build directory in the project,
+  // handed to an agent as litter to delete. Fewer findings, never invented
+  // ones.
+  const dirs = await ignoreFilter(root, topLevelDirs(root));
+  return [...untracked, ...invisibleDirStrays(dirs, known, root)];
 }

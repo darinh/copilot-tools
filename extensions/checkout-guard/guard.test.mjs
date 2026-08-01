@@ -33,6 +33,7 @@ import {
   gitInvocations,
   gitSubcommand,
   holdsNoFiles,
+  invisibleDirStrays,
   newEntries,
   parseStatusPaths,
   parseUntracked,
@@ -44,6 +45,7 @@ import {
   scanCheckout,
   scanCheckoutTree,
   withoutNestedWorktrees,
+  withoutIgnored,
   sessionBriefing,
   stashTakesUntracked,
   strayReport,
@@ -420,6 +422,213 @@ test("scanCheckout defers to the project's .gitignore, not its own opinions", as
     assert.ok(!after.includes("build/"), "the project said build/ is ignored");
     assert.ok(after.includes("target/"),
       "and said nothing about target/, which a hardcoded ignore list would have swallowed");
+  });
+});
+
+test("withoutIgnored refuses rather than calling an unanswerable question 'nothing is ignored'", async () => {
+  await withRepo(async (root) => {
+    await mkdir(join(root, "build"));
+    await mkdir(join(root, "target"));
+    await writeFile(join(root, ".gitignore"), "/build/\n");
+    // Positive, through THE SAME call. Without it the refusal below is
+    // satisfied by a `withoutIgnored` that can no longer answer anything.
+    assert.deepEqual(await withoutIgnored(root, ["build", "target"]), ["target"],
+      "control: it does still classify when git can answer");
+    // And a genuine "none of these are ignored" is an answer, not a refusal.
+    assert.deepEqual(await withoutIgnored(root, ["target"]), ["target"],
+      "control: exit 1 means nothing matched, which is information");
+
+    // A directory that is not a repository at all. check-ignore exits 128
+    // here, and 128 and 1 arrive identically through `ok` and `stdout`: both
+    // are ok:false with empty output. Only the exit code separates "nothing
+    // is ignored" from "I could not look".
+    const outside = dirname(root);
+    assert.equal(await withoutIgnored(outside, ["build", "target"]), null,
+      "an unanswerable check-ignore is not a verdict of 'nothing is ignored'");
+  });
+});
+
+test("withoutIgnored's refusal is what keeps scanCheckout from inventing strays", async () => {
+  // The consequence, at the seam where it would be paid. `null` reaches
+  // `invisibleDirStrays`, which is the only consumer of check-ignore's answer.
+  //
+  // This is the destructive direction and it is the reason the branch exists.
+  // Everywhere else in this toolkit an unreadable answer collapsing onto a
+  // confident one causes something real to be SKIPPED. Here it collapses onto
+  // "nothing is ignored", which fabricates work: every ignored build directory
+  // in the project, reported as litter, on the working-tree path -- the report
+  // that orders a deletion.
+  await withRepo(async (root) => {
+    await mkdir(join(root, "build"));
+    await mkdir(join(root, "target"));
+    const dirs = ["build", "target"];
+    // Positive, through THE SAME call: it reports these when it has an answer.
+    assert.deepEqual(invisibleDirStrays(dirs, [], root), ["build/", "target/"],
+      "control: a real candidate list is still reported");
+    assert.deepEqual(invisibleDirStrays(null, [], root), [],
+      "no ignore information means no invisible-directory findings, not all of them");
+  });
+});
+
+test("scanCheckout keeps reporting what git could see when check-ignore is the only casualty", async () => {
+  // Refusing costs findings, so it has to cost as few as possible. `git
+  // status` applies the ignore rules itself and has already spoken for every
+  // path it can see; only the empty directories -- which git never reports --
+  // depend on check-ignore. Dropping the whole scan would turn one blind spot
+  // into total blindness.
+  //
+  // Both assertions go through `scanCheckout`. An earlier version put the
+  // positive through `scanCheckout` and the negative through
+  // `invisibleDirStrays`, which proves nothing about how `scanCheckout`
+  // consumes the refusal -- it would have stayed green through any regression
+  // in the line under test. Caught on review.
+  await withRepo(async (root) => {
+    await writeFile(join(root, "loose.py"), "x\n");
+    await mkdir(join(root, "empty"));
+
+    const whole = await scanCheckout(root);
+    assert.ok(whole.includes("loose.py"), "control: the file half is reported");
+    assert.ok(whole.includes("empty/"), "control: and so is the invisible half");
+
+    const degraded = await scanCheckout(root, { ignoreFilter: async () => null });
+    assert.ok(degraded.includes("loose.py"),
+      "git status never consulted check-ignore, so its findings survive");
+    assert.ok(!degraded.includes("empty/"),
+      "and the half that did depend on it is dropped rather than fabricated");
+  });
+});
+
+test("a refusing check-ignore costs findings and never invents them", async () => {
+  // The failure mode being bought off. With no ignore information the
+  // candidate list is every top-level directory in the project, and passing it
+  // through unfiltered would report each one as litter for an agent to delete.
+  await withRepo(async (root) => {
+    for (const d of ["build", "target", "node_modules"]) await mkdir(join(root, d));
+    await writeFile(join(root, ".gitignore"), "/build/\n/node_modules/\n");
+
+    const normal = await scanCheckout(root);
+    assert.ok(normal.includes("target/"), "control: a genuine stray is still found");
+    assert.ok(!normal.includes("build/"), "control: and the ignore rule applies");
+
+    const degraded = await scanCheckout(root, { ignoreFilter: async () => null });
+    assert.deepEqual(degraded.filter((p) => p.endsWith("/")), [],
+      "no directory findings at all -- not build/, and not target/ either");
+  });
+});
+
+test("withoutIgnored gives the same verdict whichever way a directory is spelled", async () => {
+  // LATENT, not live: today's only caller passes `topLevelDirs` output, which
+  // is bare, so the rule works. This pins the refactor a peer flagged --
+  // feeding `emptyDirCandidates` output, which IS slash-suffixed, back through
+  // this filter. Measured on the pre-change code, that returned every name
+  // unfiltered while check-ignore had just answered rc=0 naming two of them
+  // ignored, because the slash was stripped from git's ANSWER and not from the
+  // CANDIDATES.
+  //
+  // What makes it worth fixing ahead of a caller is that nothing about the
+  // result looks wrong. The call succeeds, the list is plausible, and the
+  // ignore rule is simply off.
+  await withRepo(async (root) => {
+    for (const d of ["__pycache__", "build", "straydir"]) await mkdir(join(root, d));
+    await writeFile(join(root, ".gitignore"), "__pycache__/\n/build/\n");
+
+    const bare = await withoutIgnored(root, ["__pycache__", "build", "straydir"]);
+    assert.deepEqual(bare, ["straydir"], "control: the filter does filter");
+
+    const slashed = await withoutIgnored(root, ["__pycache__/", "build/", "straydir/"]);
+    assert.deepEqual(slashed, ["straydir/"], "the same question, spelled the other way");
+
+    // The returned strings keep the caller's spelling. Only the comparison is
+    // normalised -- "build/" and "build" mean different things downstream.
+    assert.ok(slashed[0].endsWith("/"), "normalising the comparison must not rewrite the answer");
+  });
+});
+
+test("the intrinsic exclusions hold however the name is spelled", () => {
+  // Also latent, and the reachability matters: `.git` never gets this far
+  // today, because `withoutIgnored` runs first and excludes it while the name
+  // is still bare. So this is not a historical escape, it is the same
+  // slashed-vs-bare mismatch pinned at the second of the two places it lives.
+  //
+  // Worth pinning anyway because the failure is silent and one-directional: a
+  // Set lookup that misses always reports "not excluded", never the reverse.
+  assert.deepEqual(emptyDirCandidates([".git", ".worktrees", "src"], []), ["src/"],
+    "control: bare names are excluded");
+  assert.deepEqual(emptyDirCandidates([".git/", ".worktrees/", "src/"], []), ["src/"],
+    "and a trailing slash does not smuggle git's own storage through");
+});
+
+/**
+ * Make `file` unreadable and return a function that undoes it, or null if this
+ * platform/user cannot deny itself. Returned rather than thrown so the caller
+ * can skip explicitly: a denial that silently did not take would leave the
+ * test asserting against an ordinary readable file and passing for the wrong
+ * reason.
+ *
+ * The undo is not tidiness. On Windows the deny ACE also blocks unlink, so
+ * without it `withRepo`'s cleanup throws EPERM and the test fails after every
+ * assertion in it has already passed -- a red that says nothing about the
+ * behaviour under test.
+ */
+async function denyRead(file) {
+  const { execFile } = await import("node:child_process");
+  const { chmod, readFile } = await import("node:fs/promises");
+  const run = (cmd, args) => new Promise((d) => execFile(cmd, args, () => d()));
+  const win = process.platform === "win32";
+  if (win) {
+    await run("icacls", [file, "/deny", `${process.env.USERNAME}:(R)`]);
+  } else {
+    await chmod(file, 0o000);
+  }
+  const restore = async () => {
+    if (win) await run("icacls", [file, "/remove:d", `${process.env.USERNAME}`]);
+    else await chmod(file, 0o644);
+  };
+  try {
+    await readFile(file);
+    await restore();
+    return null;
+  } catch {
+    return restore;
+  }
+}
+
+test("an ignore file git cannot READ is not a project that ignores nothing", async (t) => {
+  // The hole left by the exit-code fix, one layer down. check-ignore exits 1
+  // both when nothing matched and when it could not read the ignore rules at
+  // all, and `git status` still exits 0, so the repository looks healthy while
+  // the rules are unknown. Trusting exit 1 there rebuilds the original bug:
+  // unknown rules read as empty rules, and every top-level directory becomes
+  // a candidate stray for an agent to delete.
+  //
+  // The only signal separating the two is git's own warning on stderr. That is
+  // admissible precisely because it is git reporting its own failure -- stat-ing
+  // the ignore files ourselves would be a second, weaker opinion on a question
+  // git already answers, and could only subtract true positives.
+  await withRepo(async (root) => {
+    await mkdir(join(root, "build"));
+    await writeFile(join(root, ".gitignore"), "/build/\n");
+
+    // Positive, through THE SAME call, before the denial.
+    assert.deepEqual(await withoutIgnored(root, ["build", "src"]), ["src"],
+      "control: while the file is readable the rule applies");
+
+    const restore = await denyRead(join(root, ".gitignore"));
+    if (restore === null) {
+      t.skip("this platform/user cannot deny itself read access");
+      return;
+    }
+    try {
+      // Premise: git is still healthy apart from the ignore file. Without this
+      // the refusal below could be any failure at all.
+      assert.ok((await git(["status", "--porcelain", "-uall", "-z"], root)).ok,
+        "premise: the repository itself is fine");
+
+      assert.equal(await withoutIgnored(root, ["build", "src"]), null,
+        "unknown rules are not empty rules");
+    } finally {
+      await restore();
+    }
   });
 });
 
