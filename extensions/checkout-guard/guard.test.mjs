@@ -41,12 +41,14 @@ import {
   primaryCheckoutRoot,
   rootToWatch,
   UNKNOWN_ROOT,
+  inheritedStrayReport,
   primaryStrayReport,
   scanCheckout,
   scanCheckoutTree,
   withoutNestedWorktrees,
   withoutIgnored,
   sessionBriefing,
+  sessionContext,
   stashTakesUntracked,
   strayReport,
   sweepDecision,
@@ -306,6 +308,132 @@ test("PRIMARY in the headline is a marker only the primary report can produce", 
   assert.ok(forged.includes(forgery), "premise: the forged name really does reach the report body");
   assert.ok(!headline(forged).includes("PRIMARY checkout"),
     "a path reaches the body, never the headline");
+});
+
+
+// --- inherited strays: what was already there when the session began -----
+
+test("the inherited report names the paths, the tree, and why now is the only chance", () => {
+  const report = inheritedStrayReport(["archivedir3/", "no_read/"], "/repo/primary");
+  assert.match(report, /archivedir3\//);
+  assert.match(report, /no_read\//);
+  assert.match(report, /\/repo\/primary/, "an agent cannot act on a report that does not say where");
+  // The justification for the feature existing at all. Without it the reader
+  // has no reason to act during this session rather than "later", and later
+  // is precisely when the information is gone.
+  assert.match(report, /only point at which/i);
+  assert.match(report, /git status.*does not list/is,
+    "empty directories are the population git structurally cannot report");
+});
+
+test("the inherited report does not order a deletion and does not send anyone hunting", () => {
+  const report = inheritedStrayReport(["probe.py"], "/repo");
+  // Same rule as primaryStrayReport: a peer's live experiment and a dead
+  // subagent's leftovers are indistinguishable from here.
+  assert.match(report, /do not delete on this report\s+alone/i);
+  assert.match(report, /ask the other agents/i);
+  // Unattributable, not merely unattributed -- the distinction the wording is
+  // carrying. "Unknown owner" starts a search; there is no owner to find,
+  // because the session that made the artifact has ended. A reader told the
+  // search is futile does the cheap thing instead.
+  assert.match(report, /cannot find out who made/i);
+  assert.match(report, /neither can anyone\s+else later/i);
+  // And it says what WOULD license a deletion, so "nobody claimed it" cannot
+  // quietly become the standard of evidence.
+  assert.match(report, /inert/i);
+  assert.match(report, /mtimes/i);
+});
+
+test("INHERITED in the headline is a marker only the inherited report can produce", () => {
+  // Same exclusivity rule as the PRIMARY marker above, and needed for the
+  // same reason: all of these reports are joined into one additionalContext
+  // string, so an assertion of the form `context.includes(path)` cannot tell
+  // which report produced the line without a marker no other report emits.
+  const inheritedReport = inheritedStrayReport(["a.py"], "/repo");
+  assert.ok(headline(inheritedReport).startsWith("[checkout-guard] INHERITED:"),
+    headline(inheritedReport));
+  // Controls through the neighbouring calls, positive first: an absence
+  // asserted about a function that produced no text proves nothing.
+  const during = strayReport(["a.py"], "/tmp/s");
+  const elsewhere = primaryStrayReport(["a.py"], "/tmp/s", "/repo/primary");
+  assert.match(during, /a\.py/, "control: the during-session report does report the path");
+  assert.match(elsewhere, /a\.py/, "control: so does the primary report");
+  assert.ok(!headline(during).includes("INHERITED"), headline(during));
+  assert.ok(!headline(elsewhere).includes("INHERITED"), headline(elsewhere));
+
+  // A path cannot forge the marker, because the headline is built before any
+  // name is formatted. The forged input must be the exact substring the
+  // attribution keys off, not a shorter relative of it.
+  const forgery = "[checkout-guard] INHERITED:";
+  const forged = strayReport([forgery], "/tmp/s");
+  assert.ok(forged.includes(forgery), "premise: the forged name really does reach the body");
+  assert.ok(!headline(forged).startsWith(forgery), "a path reaches the body, never the headline");
+});
+
+test("the primary variant says which tree, and the working variant does not claim to be it", () => {
+  // An agent in a worktree is the whole reason this distinction exists: for
+  // them the primary is a different tree, and a report that reads as a note
+  // about the current directory gets skimmed past.
+  const other = inheritedStrayReport(["a.py"], "/repo/primary", { primary: true });
+  const here = inheritedStrayReport(["a.py"], "/repo/wt");
+  assert.ok(headline(other).includes("PRIMARY checkout"), headline(other));
+  assert.match(other, /not the checkout you are working in/);
+  assert.match(here, /a\.py/, "control: the working-tree variant produces a report at all");
+  assert.ok(!headline(here).includes("PRIMARY checkout"), headline(here));
+  // It must not inherit primaryStrayReport's "during your last command",
+  // which is false of everything this function reports.
+  assert.ok(!other.includes("during your last command"), other);
+});
+
+test("inherited pluralisation is correct at one and many", () => {
+  assert.match(inheritedStrayReport(["a"], "/r"), /1 untracked path was/);
+  assert.match(inheritedStrayReport(["a", "b"], "/r"), /2 untracked paths were/);
+});
+
+test("sessionContext emits the briefing byte-identically when nothing was inherited", () => {
+  // The change is additive or it is a rewrite. A clean checkout must see the
+  // exact text it saw before this function existed -- and an empty array and
+  // a checkout that was never scanned must both count as nothing to report.
+  const bare = sessionBriefing("/tmp/s");
+  assert.equal(sessionContext("/tmp/s"), bare);
+  assert.equal(sessionContext("/tmp/s", []), bare);
+  assert.equal(sessionContext("/tmp/s", [{ strays: [], root: "/repo" }]), bare);
+});
+
+test("a scan that failed is not reported as a clean checkout", () => {
+  // null means the scan established nothing. Rendering it as an empty
+  // checkout is the collapse this whole toolkit exists to remove: an
+  // unanswered question spent as the confident answer.
+  const context = sessionContext("/tmp/s", [{ strays: null, root: "/repo" }]);
+  assert.equal(context, sessionBriefing("/tmp/s"));
+  assert.ok(!context.includes("INHERITED"), context);
+  // Control through the same call: a non-null scan at the same position DOES
+  // produce a report, so the assertion above is about null and not about
+  // sessionContext being inert.
+  const answered = sessionContext("/tmp/s", [{ strays: ["a.py"], root: "/repo" }]);
+  assert.ok(answered.includes("INHERITED"), answered);
+});
+
+test("both seeded checkouts reach the session context", () => {
+  // The failure this pins is silent and was predicted before it could
+  // happen: the strays that motivated the feature live in the PRIMARY, and
+  // an agent working in a worktree seeds the primary through a second,
+  // separate scan. Wire only the first and the feature ships with its own
+  // motivating case still unreported, with every unit test around it green.
+  const context = sessionContext("/tmp/s", [
+    { strays: ["wt-probe.py"], root: "/repo/wt" },
+    { strays: ["archivedir3/"], root: "/repo/primary", primary: true },
+  ]);
+  assert.match(context, /wt-probe\.py/);
+  assert.match(context, /archivedir3\//);
+  // Two reports, not one merged list: the primary finding must keep its own
+  // headline or the reader cannot tell which tree either path is in.
+  const headlines = context.split("\n").filter((l) => l.startsWith("[checkout-guard] INHERITED:"));
+  assert.equal(headlines.length, 2, context);
+  assert.equal(headlines.filter((l) => l.includes("PRIMARY checkout")).length, 1, context);
+  // The briefing still leads, because it names the scratch directory that
+  // makes the reports actionable rather than merely alarming.
+  assert.ok(context.startsWith(sessionBriefing("/tmp/s")), context.slice(0, 200));
 });
 
 // --- integration: a real git binary against a real repository ------------
@@ -1040,6 +1168,62 @@ test("a stray in the primary is invisible to a worktree scan and visible to the 
     const watched = await scanCheckoutTree(await primaryCheckoutRoot(worktree));
     assert.ok(watched.includes("test_order.py"),
       `the primary scan sees it: ${JSON.stringify(watched)}`);
+  });
+});
+
+test("the motivating case, end to end: an invisible empty directory in the primary reaches the session briefing", async () => {
+  // Everything above tests a piece. This tests the sentence the feature
+  // exists to produce, against a real git binary, with the exact fixture
+  // that survived three sessions unreported: an agent in a worktree, an
+  // empty directory in the primary, and a name that stats as a directory
+  // while reading as a file.
+  await withWorktree(async ({ primary, worktree }) => {
+    await mkdir(join(primary, "archivedir3", "testfile.txt"), { recursive: true });
+    await mkdir(join(primary, "no_read"), { recursive: true });
+
+    // Premise, through the shipped call: git itself reports NEITHER planted
+    // path, which is why nobody has ever been told about them. Without this
+    // the assertions below are satisfied by a report about paths git would
+    // have surfaced anyway. (Its output is not empty -- the fixture repo has
+    // no `/.worktrees/` ignore rule, so git names the nested worktree, which
+    // `scanCheckoutTree` filters out. That is a different population.)
+    const status = await git(["status", "--porcelain", "-uall"], primary);
+    assert.ok(!status.stdout.includes("archivedir3"),
+      `premise: git cannot see the empty tree -- got ${JSON.stringify(status.stdout)}`);
+    assert.ok(!status.stdout.includes("no_read"),
+      `premise: git cannot see the empty directory -- got ${JSON.stringify(status.stdout)}`);
+
+    // Exactly what onSessionStart does: seed the working root, then the
+    // primary, and hand both arrays to the briefing.
+    const root = await checkoutRoot(worktree);
+    const other = rootToWatch(root, await primaryCheckoutRoot(worktree)).watch;
+    assert.ok(other && other !== root, `premise: the primary is a second tree: ${other}`);
+    const context = sessionContext("/tmp/s", [
+      { strays: await scanCheckoutTree(root), root },
+      { strays: await scanCheckoutTree(other), root: other, primary: true },
+    ]);
+
+    assert.match(context, /archivedir3\//, context);
+    assert.match(context, /no_read\//, context);
+    // Attributed to the primary report specifically, not merely present
+    // somewhere in a string that concatenates several reports.
+    const primaryReport = context
+      .split("\n\n")
+      .find((part) => part.startsWith("[checkout-guard] INHERITED:") &&
+        part.includes("PRIMARY checkout"));
+    assert.ok(primaryReport, context);
+    assert.match(primaryReport, /archivedir3\//, primaryReport);
+
+    // Control through the same call: with the primary clean, the same
+    // pipeline says nothing, so the report above is caused by the artifacts
+    // and not by the pipeline reporting unconditionally.
+    await rm(join(primary, "archivedir3"), { recursive: true, force: true });
+    await rm(join(primary, "no_read"), { recursive: true, force: true });
+    const clean = sessionContext("/tmp/s", [
+      { strays: await scanCheckoutTree(root), root },
+      { strays: await scanCheckoutTree(other), root: other, primary: true },
+    ]);
+    assert.equal(clean, sessionBriefing("/tmp/s"), clean);
   });
 });
 
