@@ -53,7 +53,7 @@ from operator_console import enable_utf8_output               # noqa: E402
 from operator_mux import (                                    # noqa: E402
     Mux, MuxError, MuxNotFoundError, safe_instance_id,
 )
-from project_paths import primary_repo_root                   # noqa: E402
+from project_paths import guid_is_usable, primary_repo_root  # noqa: E402
 
 __version__ = "1.0.0"
 
@@ -1018,7 +1018,14 @@ def project_handoff_file(cwd: Path) -> Path | None:
                 if len(row) < 2:
                     continue
                 path, guid = row[0].strip().strip('"'), row[1].strip().strip('"')
-                if not path or not guid:
+                # The same predicate the writer uses, imported rather than
+                # copied: two definitions of "valid project id" that drift
+                # apart is the very bug this rejects. A row the writer refuses
+                # to create must not be one the reader will happily open --
+                # `../../elsewhere` resolved two levels outside the projects
+                # root, and on Windows `victim.` is `victim`, another
+                # project's handoff.
+                if not path or not guid_is_usable(guid):
                     continue
                 try:
                     resolved = str(Path(path).resolve())

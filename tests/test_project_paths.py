@@ -16,7 +16,8 @@ import pytest
 
 import copilot_operator as op
 import handoff_tool as ho
-from project_paths import primary_repo_root
+import project_paths
+from project_paths import guid_is_usable, primary_repo_root
 
 
 def _git(*args, cwd) -> None:
@@ -114,3 +115,33 @@ def test_an_uncatalogued_project_is_still_reported_as_such(
     monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
 
     assert op.project_handoff_file(wt) is None
+
+
+# -- one definition of a valid project id ------------------------
+def test_the_writer_and_the_reader_share_one_guid_predicate():
+    """Reader and writer must not hold separate ideas of a valid id.
+
+    `handoff_tool` creates ~/.copilot/projects/<guid>/next-session.md and
+    `copilot_operator` resolves it again to report on it. When those two
+    disagreed, an id the writer refused to create was still one the reader
+    would happily resolve -- and `../../elsewhere` resolved outside the
+    projects root entirely. Sharing the object, not the source, is what keeps
+    them from drifting apart again.
+    """
+    assert ho.guid_is_usable is project_paths.guid_is_usable
+    assert op.guid_is_usable is project_paths.guid_is_usable
+
+
+@pytest.mark.parametrize("guid", [
+    "", ".", "..", "../../elsewhere", "a/b", "a\\b", "victim.", "victim ",
+    "bad:stream", "CON", "NUL", "a\x00b", "...",
+])
+def test_an_id_that_is_not_one_plain_directory_name_is_refused(guid):
+    assert not guid_is_usable(guid)
+
+
+@pytest.mark.parametrize("guid", [
+    "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "abc-123", "..dots",
+])
+def test_an_ordinary_project_id_is_accepted(guid):
+    assert guid_is_usable(guid)
