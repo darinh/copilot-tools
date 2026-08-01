@@ -453,6 +453,43 @@ def test_prune_keeps_logs_not_yet_ingested(tmp_path, monkeypatch, capsys):
     assert "not yet ingested" in capsys.readouterr().out
 
 
+def test_prune_removes_a_log_recorded_under_its_full_path(
+        tmp_path, monkeypatch, capsys):
+    """Ingest records a log by full path; prune has to recognise that spelling.
+
+    Reading only the basename would call every freshly ingested log
+    unrecorded and refuse to prune anything -- the command would keep
+    reporting bytes it never frees.
+    """
+    logs = tmp_path / "logs"
+    db = tmp_path / "m.db"
+    monkeypatch.setattr(op, "COPILOT_LOG_DIR", logs)
+    monkeypatch.setattr(op, "METRICS_DB", db)
+    made = _make_logs(logs, ["process-1-1.log"], age_days=60)
+    _seed(db, [(operator_ingest.log_key(made[0]), REAL_NANO_AIU, 0)])
+
+    assert op.manage_logs(["--prune", "--days", "30"]) == 0
+    assert list(logs.glob("*.log")) == []
+    assert "Removed 1 ingested log" in capsys.readouterr().out
+
+
+def test_prune_still_recognises_a_legacy_basename_row(
+        tmp_path, monkeypatch, capsys):
+    """Rows written before logs were keyed by path hold a bare basename, and
+    are re-keyed only when their log is ingested again. Until then they are
+    the only record that the log was captured, so prune must still match
+    them or it will refuse to free anything in an existing database."""
+    logs = tmp_path / "logs"
+    db = tmp_path / "m.db"
+    monkeypatch.setattr(op, "COPILOT_LOG_DIR", logs)
+    monkeypatch.setattr(op, "METRICS_DB", db)
+    _make_logs(logs, ["process-1-1.log"], age_days=60)
+    _seed(db, [("process-1-1.log", REAL_NANO_AIU, 0)])
+
+    assert op.manage_logs(["--prune", "--days", "30"]) == 0
+    assert list(logs.glob("*.log")) == []
+
+
 def test_prune_leaves_recent_logs(tmp_path, monkeypatch, capsys):
     logs = tmp_path / "logs"
     db = tmp_path / "m.db"

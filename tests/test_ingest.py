@@ -1,7 +1,9 @@
 """Tests for the pure-Python log parser and metrics store."""
 from __future__ import annotations
 
+import os
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -359,7 +361,7 @@ def test_a_real_log_behind_an_unresolvable_path_is_still_ingested(
     with operator_ingest.connect(db_path) as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM sessions WHERE log_file = ?",
-            (log.name,),
+            (operator_ingest.log_key(log),),
         ).fetchone()[0] == 1
 
 
@@ -368,3 +370,172 @@ def test_a_real_log_behind_an_unresolvable_path_is_still_ingested(
 ])
 def test_fmt_tokens(value, expected):
     assert operator_ingest.fmt_tokens(value) == expected
+
+
+# ── log identity ────────────────────────────────────────────────
+def _sessions(db_path):
+    with operator_ingest.connect(db_path) as conn:
+        return conn.execute(
+            "SELECT id, log_file, work_dir, premium_requests FROM sessions "
+            "ORDER BY id").fetchall()
+
+
+def _two_named_alike(tmp_path):
+    """Two different sessions whose logs share a basename."""
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    name = "process-1700000000000-1.log"
+    return (
+        make_log(a / name, premium_calls=(("m1", 3.0),), cwd="/home/dev/alpha"),
+        make_log(b / name, premium_calls=(("m2", 5.0),), cwd="/home/dev/beta"),
+    )
+
+
+def test_logs_sharing_a_basename_are_two_sessions(tmp_path, db_path):
+    """A basename is half an identity, and the column is UNIQUE.
+
+    Copilot names a process log after a timestamp and a pid, so the same name
+    recurs in any second log directory -- another machine's logs copied in, a
+    restored backup, a ``COPILOT_LOG_DIR`` that moved. Keyed on the basename
+    the second log hit the mtime check, came back ``SKIP (already processed)``
+    and was never recorded: a whole session's spend dropped, with a message
+    saying it had been saved.
+    """
+    first, second = _two_named_alike(tmp_path)
+    assert operator_ingest.ingest_file(first, db_path).startswith("OK")
+    assert operator_ingest.ingest_file(second, db_path).startswith("OK"), (
+        "the second log was skipped as a duplicate of a different session"
+    )
+    rows = _sessions(db_path)
+    assert [r["work_dir"] for r in rows] == ["/home/dev/alpha", "/home/dev/beta"]
+
+
+def test_a_session_is_keyed_by_the_logs_full_path(tmp_path, db_path):
+    """The spelling the collision tests depend on, pinned on its own.
+
+    ``copilot_operator.manage_logs`` decides from this value whether a log has
+    been recorded and may be deleted, and it is the reader's half of
+    :func:`operator_ingest.log_key`.
+    """
+    log = make_log(tmp_path / "process-1700000000000-3.log")
+    operator_ingest.ingest_file(log, db_path)
+    assert _sessions(db_path)[0]["log_file"] == operator_ingest.log_key(log)
+    assert Path(operator_ingest.log_key(log)).is_absolute()
+
+
+def test_a_log_named_like_another_does_not_overwrite_it(tmp_path, db_path):
+    """The other half of the same defect, reached when the mtimes differ.
+
+    The mtime check then passes the log through to an ``ON CONFLICT`` upsert,
+    which overwrote the earlier session's row and deleted its ``model_usage``
+    rows -- so the credits stayed in the database but were attributed to the
+    wrong session, which is worse than losing them.
+    """
+    first, second = _two_named_alike(tmp_path)
+    os.utime(second, (time.time() + 7200, time.time() + 7200))
+    operator_ingest.ingest_file(first, db_path)
+    operator_ingest.ingest_file(second, db_path)
+
+    rows = _sessions(db_path)
+    assert len(rows) == 2, "one session's row was overwritten by the other"
+    with operator_ingest.connect(db_path) as conn:
+        per_session = conn.execute(
+            "SELECT session_id, COUNT(*) c FROM model_usage GROUP BY session_id"
+        ).fetchall()
+    assert len(per_session) == 2, "a session lost its per-model breakdown"
+
+
+def test_a_pre_existing_basename_row_is_rekeyed_not_duplicated(tmp_path, db_path):
+    """Databases written before this change key on the basename.
+
+    Left alone they would never match again, so the first ingest after the
+    change would insert a second row for the same log and every historical
+    session would be counted twice in every report -- a silent doubling of the
+    user's recorded spend.
+    """
+    log = make_log(tmp_path / "process-1700000000000-4.log")
+    operator_ingest.init_db(db_path)
+    with operator_ingest.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sessions (session_num, log_file, no_op, started_at,"
+            " ended_at, work_dir) VALUES (99, ?, 0, 'x', 'y', 'legacy')",
+            (log.name,),
+        )
+        conn.commit()
+
+    assert operator_ingest.ingest_file(log, db_path).startswith("OK")
+    rows = _sessions(db_path)
+    assert len(rows) == 1, "the legacy row was left behind as a duplicate"
+    assert rows[0]["log_file"] == operator_ingest.log_key(log)
+
+
+def test_rekeying_leaves_a_legacy_row_alone_when_the_path_is_recorded(
+        tmp_path, db_path):
+    """Adoption may not clobber a row that is already this log's own.
+
+    Once the full-path row exists it is the current one, and a basename row
+    beside it belongs to whatever wrote it. Renaming onto an occupied key
+    would raise on the UNIQUE constraint and abort the ingest.
+    """
+    log = make_log(tmp_path / "process-1700000000000-5.log")
+    operator_ingest.ingest_file(log, db_path)
+    with operator_ingest.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sessions (session_num, log_file, no_op, started_at,"
+            " ended_at, work_dir) VALUES (99, ?, 0, 'x', 'y', 'legacy')",
+            (log.name,),
+        )
+        conn.commit()
+
+    assert operator_ingest.ingest_file(log, db_path, force=True).startswith("OK")
+    rows = _sessions(db_path)
+    assert len(rows) == 2
+    assert {r["log_file"] for r in rows} == {
+        log.name, operator_ingest.log_key(log)}
+
+
+def test_status_line_names_the_file_not_the_path(tmp_path, db_path):
+    """The key is the full path; the human-facing line stays the basename,
+    which is what fits on a terminal next to a directory already printed."""
+    log = make_log(tmp_path / "process-1700000000000-6.log")
+    assert operator_ingest.ingest_file(log, db_path).startswith(
+        f"OK {log.name}:")
+    assert operator_ingest.ingest_file(log, db_path) == (
+        f"SKIP {log.name} (already processed)")
+
+
+def test_backfill_reconstructs_a_full_path_row(tmp_path, db_path):
+    """``backfill_unknown_metrics`` joins ``log_dir / row['log_file']``.
+
+    That join is what makes storing the full path safe without touching the
+    repair script: joining a directory onto an absolute path yields the
+    absolute path, so a full-path row resolves to itself and a legacy
+    basename row still resolves under the directory it was recorded from.
+    Pinned here because the script would otherwise fingerprint the wrong file
+    and silently decline every repair.
+    """
+    import backfill_unknown_metrics
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    log = make_log(elsewhere / "process-1700000000000-7.log")
+    key = operator_ingest.log_key(log)
+    assert str(Path(tmp_path / "logs") / key) == key
+
+    operator_ingest.init_db(db_path)
+    with operator_ingest.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sessions (session_num, log_file, started_at, ended_at,"
+            " api_time_seconds, session_time_seconds, lines_added,"
+            " lines_removed, raw_metrics) VALUES (1, ?, 'x', 'y', 0, 0, 0, 0,"
+            " 'Total usage est: 0 Premium requests')",
+            (key,),
+        )
+        conn.commit()
+        found = backfill_unknown_metrics.find_fabricated(conn, tmp_path / "logs")
+    assert found == [], (
+        "a log carrying a shutdown event was read as fabricated -- the path "
+        "the script reconstructed was not the log the row names"
+    )

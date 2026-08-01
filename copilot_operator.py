@@ -2193,7 +2193,16 @@ def manage_logs(args: list[str]) -> int:
     removed = skipped = 0
     freed = 0
     for f in old:
-        if f.name not in known:
+        # Two spellings, because the column holds two. `operator_ingest.log_key`
+        # is what an ingest writes now -- the full path, so that two logs
+        # sharing a name in different directories stay two sessions -- while
+        # rows written before that change hold a bare basename and are only
+        # re-keyed when their log is ingested again. Matching just the new
+        # spelling would call every historical row unrecorded and refuse to
+        # prune anything; matching just the old one would delete a log
+        # recorded under a different directory's identical name. Both are
+        # accepted, and a log is pruned only when one of them names it.
+        if operator_ingest.log_key(f) not in known and f.name not in known:
             skipped += 1
             continue
         freed += f.stat().st_size

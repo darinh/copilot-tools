@@ -112,6 +112,52 @@ _ADDED_COLUMNS = {
 }
 
 
+def log_key(path) -> str:
+    """The identity of a log file in the ``sessions`` table: its full path.
+
+    ``sessions.log_file`` used to hold ``Path.name``, and a basename is half of
+    a file's identity. Copilot names a process log after a timestamp and a pid,
+    both of which repeat across directories -- a second log directory, a
+    restored backup, a second machine's logs copied in for comparison -- and
+    the column is ``UNIQUE``, so the two collapsed onto one row. Neither
+    failure said anything: with equal mtimes the second log returned
+    ``SKIP ... (already processed)`` and was never recorded at all, and with
+    differing mtimes the ``ON CONFLICT`` upsert overwrote the first session's
+    row and deleted its ``model_usage`` rows. Both spend one session's credits
+    against another session's name.
+
+    Writer and reader both call this rather than each spelling the path out,
+    for the reason :func:`project_paths.resolved_str` exists at all: the two
+    sides of a comparison have to be normalised by the same code or they
+    normalise differently. :func:`copilot_operator.manage_logs` decides from
+    this key whether a log has been ingested and may be deleted, so a
+    disagreement here deletes an unrecorded log.
+    """
+    return resolved_str(path)
+
+
+def _adopt_legacy_row(conn, basename: str, key: str) -> None:
+    """Re-key a row written before ``log_file`` held a full path.
+
+    Without this, the first ingest after the change finds no row for the new
+    key and inserts a second one, so every historical session is counted twice
+    in every report -- a silent doubling of a user's recorded spend, which is
+    worse than the collision this change fixes.
+
+    The rename is skipped when the full path is already present, because that
+    row is the current one and the basename row is a genuine duplicate; and it
+    can only ever match a legacy row, since a key produced by :func:`log_key`
+    is absolute and a basename is not.
+    """
+    if key == basename:
+        return
+    conn.execute(
+        "UPDATE sessions SET log_file = ? WHERE log_file = ? "
+        "AND NOT EXISTS (SELECT 1 FROM sessions WHERE log_file = ?)",
+        (key, basename, key),
+    )
+
+
 def credits_from_nano(nano_aiu) -> float:
     return (nano_aiu or 0) / NANO_AIU_PER_CREDIT
 
@@ -476,12 +522,16 @@ def ingest_file(
 
     init_db(db_path)
     basename = logfile.name
+    # The row key is the full path; `basename` survives only for the status
+    # lines, which a human reads next to a directory they already know.
+    row_key = log_key(logfile)
     mtime = _iso(logfile.stat().st_mtime)
 
     with connect(db_path) as conn:
+        _adopt_legacy_row(conn, basename, row_key)
         if not force:
             row = conn.execute(
-                "SELECT log_file_mtime FROM sessions WHERE log_file = ?", (basename,)
+                "SELECT log_file_mtime FROM sessions WHERE log_file = ?", (row_key,)
             ).fetchone()
             if row and row["log_file_mtime"] == mtime:
                 return f"SKIP {basename} (already processed)"
@@ -510,7 +560,7 @@ def ingest_file(
                     started_at = excluded.started_at,
                     ended_at = excluded.ended_at
                 """,
-                (basename, mtime, ts, ts),
+                (row_key, mtime, ts, ts),
             )
             conn.commit()
             return f"SKIP {basename} (no usage data)"
@@ -651,7 +701,7 @@ def ingest_file(
                 raw_metrics = excluded.raw_metrics
             """,
             (
-                session_num, basename, mtime, started_at, ended_at, work_dir, branch,
+                session_num, row_key, mtime, started_at, ended_at, work_dir, branch,
                 total_premium, nano_aiu, tokens["input"], tokens["cache_read"],
                 tokens["cache_write"], tokens["output"],
                 api_time_s, session_time_s, lines_added, lines_removed,
@@ -659,7 +709,7 @@ def ingest_file(
             ),
         )
         row = conn.execute(
-            "SELECT id FROM sessions WHERE log_file = ?", (basename,)
+            "SELECT id FROM sessions WHERE log_file = ?", (row_key,)
         ).fetchone()
         session_id = row["id"]
 

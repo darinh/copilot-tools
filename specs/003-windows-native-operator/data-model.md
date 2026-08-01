@@ -117,7 +117,7 @@ databases work without migration.
 |---|---|---|
 | `id` | INTEGER PK AUTOINCREMENT | |
 | `session_num` | INTEGER NOT NULL | Loop session number; `0` for no-op records |
-| `log_file` | TEXT **UNIQUE** | Log basename. Drives idempotent upsert. |
+| `log_file` | TEXT **UNIQUE** | The log's full path (`operator_ingest.log_key`). Drives idempotent upsert. |
 | `log_file_mtime` | TEXT | Skip-if-unchanged marker for ingest |
 | `no_op` | INTEGER NOT NULL DEFAULT 0 | `1` when the log carried no usage data |
 | `started_at` / `ended_at` | TEXT NOT NULL | ISO-8601 UTC |
@@ -169,6 +169,22 @@ Rows are deleted and reinserted per session on reprocessing.
   statements, so binding is required.
 - Concurrent instances share one database, so connections set a **busy timeout** and the ingest path is
   idempotent via the `log_file` unique constraint (spec Edge Cases).
+
+`log_file` holds a full path rather than a basename, and the constraint above is why. Copilot names a
+process log after a timestamp and a pid, so the same name recurs in any second log directory — logs
+copied from another machine, a restored backup, a moved `COPILOT_LOG_DIR`. Under a basename key the
+`UNIQUE` constraint merged the two sessions: with equal mtimes the second log returned
+`SKIP (already processed)` and was never recorded, and with differing mtimes the upsert overwrote the
+first session's row and deleted its `model_usage` rows. The column is written and read through one
+helper, `operator_ingest.log_key`, because `copilot_operator.manage_logs` decides from this value
+whether a log has been captured and may be deleted.
+
+Rows written before that change hold a basename. `operator_ingest._adopt_legacy_row` re-keys such a
+row onto the full path the next time its log is ingested, rather than inserting a second row — which
+would count every historical session twice. Rows whose log is gone keep their basename; both
+`manage_logs` and `backfill_unknown_metrics` still resolve them, the latter because joining a
+directory onto an absolute path yields the absolute path, so one expression reads both spellings.
+The schema itself is unchanged, so the legacy bash ingester's `ON CONFLICT(log_file)` still applies.
 
 ## Project catalog entry
 
