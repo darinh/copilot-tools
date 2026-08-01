@@ -65,6 +65,22 @@ def _checkout(root: Path, dot_git: str | None) -> Path:
     return root
 
 
+def _worktree_gitdir(repo: Path, name: str) -> Path:
+    """A git directory laid out the way git lays a linked worktree's out.
+
+    The marker files are not decoration: ``commondir`` is what distinguishes a
+    linked worktree from every other checkout with a ``.git`` file, and
+    ``config`` is what corroborates that the path the refusal message points
+    at is really a checkout. A fixture missing them cannot fail the code that
+    reads them.
+    """
+    gitdir = repo / ".git" / "worktrees" / name
+    gitdir.mkdir(parents=True)
+    (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+    (repo / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    return gitdir
+
+
 # ── classify_checkout: the three verdicts ───────────────────────────────
 
 def test_a_primary_checkout_has_a_git_directory(tmp_path):
@@ -120,6 +136,41 @@ def test_an_unrecognised_gitdir_target_is_unknown(tmp_path):
     assert "neither a worktree nor a submodule" in detail
 
 
+def test_a_separate_git_dir_checkout_is_primary(tmp_path):
+    """``git clone --separate-git-dir`` puts the git directory anywhere the
+    user likes, so the checkout has a ``.git`` file pointing at a path in
+    neither well-known location. It is durable, and refusing it would be this
+    guard being wrong about somebody else's ordinary layout."""
+    elsewhere = tmp_path / "var" / "git" / "copilot-tools.git"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    root = _checkout(tmp_path / "work", f"gitdir: {elsewhere}\n")
+    assert guard.classify_checkout(root) == (guard.PRIMARY, "")
+
+
+def test_a_worktree_in_an_unusual_location_is_still_detected(tmp_path):
+    """``commondir`` is git's own marker for a *linked* worktree, and it is
+    what the path shape falls back on. A worktree whose git directory is not
+    where this guard expects is still a worktree."""
+    gitdir = tmp_path / "elsewhere" / "feat-x"
+    gitdir.mkdir(parents=True)
+    (gitdir / "commondir").write_text("../../repo/.git\n", encoding="utf-8")
+    root = _checkout(tmp_path / "wt", f"gitdir: {gitdir}\n")
+    verdict, detail = guard.classify_checkout(root)
+    assert verdict == guard.WORKTREE
+    assert detail == str(gitdir)
+
+
+def test_a_gitdir_that_is_not_there_at_all_is_unknown(tmp_path):
+    """Neither marker can be read, so nothing is known -- and the guard says
+    that rather than picking whichever answer is convenient."""
+    root = _checkout(tmp_path / "odd",
+                     f"gitdir: {tmp_path / 'gone' / 'missing'}\n")
+    verdict, detail = guard.classify_checkout(root)
+    assert verdict == guard.UNKNOWN
+    assert "neither a worktree nor a submodule" in detail
+
+
 def test_an_unreadable_git_file_is_unknown_not_primary(tmp_path, monkeypatch):
     """A read that failed must not be indistinguishable from a read that said
     'primary'. Folding the two is the bug class this repository keeps finding."""
@@ -152,22 +203,29 @@ def test_an_unexaminable_git_path_is_unknown_not_primary(tmp_path, monkeypatch):
 # ── primary_checkout_of ─────────────────────────────────────────────────
 
 def test_the_primary_checkout_is_read_from_commondir(tmp_path):
-    gitdir = tmp_path / "repo" / ".git" / "worktrees" / "feat-x"
-    gitdir.mkdir(parents=True)
-    (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+    gitdir = _worktree_gitdir(tmp_path / "repo", "feat-x")
     assert guard.primary_checkout_of(gitdir) == tmp_path / "repo"
 
 
 def test_the_primary_checkout_falls_back_to_position(tmp_path):
     """No ``commondir`` to read: the standard layout still gives the answer."""
-    gitdir = tmp_path / "repo" / ".git" / "worktrees" / "feat-x"
-    gitdir.mkdir(parents=True)
+    gitdir = _worktree_gitdir(tmp_path / "repo", "feat-x")
+    (gitdir / "commondir").unlink()
     assert guard.primary_checkout_of(gitdir) == tmp_path / "repo"
 
 
 def test_an_unrecognisable_layout_yields_no_guess(tmp_path):
     """A wrong path in a 'run this instead' line is worse than no line."""
     assert guard.primary_checkout_of(tmp_path / "nowhere" / "at" / "all") is None
+
+
+def test_a_candidate_that_is_not_really_a_git_directory_yields_no_guess(tmp_path):
+    """The positional fallback is a guess, and under a bind mount or a
+    relative ``gitdir:`` it produces a path that is shaped right and is not a
+    checkout. Shape alone must not be enough to print a command."""
+    gitdir = tmp_path / "mount" / ".git" / "worktrees" / "feat-x"
+    gitdir.mkdir(parents=True)          # no config, no HEAD: not a git dir
+    assert guard.primary_checkout_of(gitdir) is None
 
 
 # ── check_editable_source: the decision ─────────────────────────────────
@@ -179,8 +237,7 @@ def test_a_primary_checkout_is_allowed(tmp_path):
 
 
 def test_a_worktree_is_refused_with_a_usable_message(tmp_path, capsys):
-    gitdir = tmp_path / "repo" / ".git" / "worktrees" / "feat-x"
-    gitdir.mkdir(parents=True)
+    gitdir = _worktree_gitdir(tmp_path / "repo", "feat-x")
     root = _checkout(tmp_path / "repo" / ".worktrees" / "feat-x",
                      f"gitdir: {gitdir}\n")
 

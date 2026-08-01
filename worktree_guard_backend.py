@@ -98,9 +98,14 @@ def primary_checkout_of(gitdir: Path) -> Path | None:
     positional guess (``<common>/worktrees/<name>`` -> up two) is the fallback
     for a worktree whose commondir cannot be read.
 
-    Returns ``None`` rather than a guess when the result does not look like a
-    ``.git`` directory, because a wrong path in a "run this instead" line is
-    worse than no line at all.
+    Returns ``None`` rather than a guess unless the answer is *corroborated* --
+    the candidate must be a directory named ``.git`` that actually holds a git
+    directory's own files. A relative ``gitdir:`` under a bind mount, or any
+    layout the positional fallback was not written for, otherwise yields a
+    plausible path that is not a checkout, printed in a "run this instead"
+    line where it will be believed. No line at all is better than a wrong one:
+    the caller falls back to telling the reader how to find the checkout
+    themselves.
     """
     common: Path | None = None
     try:
@@ -116,7 +121,47 @@ def primary_checkout_of(gitdir: Path) -> Path | None:
     common = _normalise(common)
     if common.name != ".git":
         return None
+    if _probe(common / "config") is not True and _probe(common / "HEAD") is not True:
+        return None
     return common.parent
+
+
+def _probe(path: Path) -> bool | None:
+    """Tri-state presence: ``True``, ``False``, or ``None`` for "cannot tell".
+
+    A read that failed has to stay distinguishable from a read that answered
+    "absent", because the two lead to opposite decisions here: an absent
+    ``commondir`` is positive evidence that a git directory belongs to a
+    durable checkout, while an unreadable one is no evidence at all.
+    """
+    try:
+        return path.exists()  # probe-ok: the OSError case is the None below
+    except OSError:
+        return None
+
+
+def _kind_of_git_directory(gitdir: Path) -> str:
+    """Classify a git directory that the path shape did not recognise.
+
+    ``git init --separate-git-dir`` and ``git clone --separate-git-dir`` put
+    the real git directory anywhere the user likes and leave a ``.git`` *file*
+    behind, which is the same shape a worktree and a submodule have and lands
+    in none of their well-known locations. Those checkouts are durable, and
+    refusing them would be this guard being wrong about somebody else's
+    perfectly ordinary layout.
+
+    ``commondir`` is git's own marker and the discriminator used here: a
+    *linked* worktree's git directory always has one, naming the shared
+    directory it borrows objects and refs from. A main worktree's ``.git``, a
+    submodule's git directory and a ``--separate-git-dir`` target never do.
+    """
+    common = _probe(gitdir / "commondir")
+    if common is True:
+        return WORKTREE
+    if common is False and _probe(gitdir / "HEAD") is True:
+        # A git directory that is nobody's linked worktree.
+        return PRIMARY
+    return UNKNOWN
 
 
 def classify_checkout(source_dir: str | os.PathLike[str]) -> tuple[str, str]:
@@ -148,10 +193,19 @@ def classify_checkout(source_dir: str | os.PathLike[str]) -> tuple[str, str]:
         gitdir = source / gitdir
     gitdir = _normalise(gitdir)
     parent = gitdir.parent.name
+    # The path shape answers first: it needs no further filesystem access, so
+    # it still answers for a checkout whose git directory has been moved,
+    # unmounted or made unreadable -- the cases where refusing on a guess
+    # would be least defensible.
     if parent == "worktrees":
         return WORKTREE, str(gitdir)
     if parent == "modules":
         # A submodule. Same shape, opposite lifetime.
+        return PRIMARY, ""
+    kind = _kind_of_git_directory(gitdir)
+    if kind == WORKTREE:
+        return WORKTREE, str(gitdir)
+    if kind == PRIMARY:
         return PRIMARY, ""
     return UNKNOWN, f"{dot_git} points at {gitdir}, which is neither a " \
                     f"worktree nor a submodule git directory"
