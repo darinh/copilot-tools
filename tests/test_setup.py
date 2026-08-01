@@ -1600,12 +1600,21 @@ def test_reconcile_waits_out_a_lock_restoring_the_only_copy(tmp_path, monkeypatc
                                   "--skip-package", "--skip-optional",
                                   "--no-install-prereqs"])
 def test_exact_flags_are_still_accepted(flag, capsys):
-    """The spellings setup.sh and setup.ps1 match, and README documents."""
+    """The spellings setup.sh and setup.ps1 match, and README documents.
+
+    A sentinel flag forces argparse to bail before ``main`` acts on anything.
+    Asserting only that the sentinel is named would pass vacuously if ``flag``
+    were rejected too -- argparse reports every unrecognized argument in one
+    message -- so the assertion that carries the weight is that ``flag`` is
+    ABSENT from the complaint.
+    """
     with pytest.raises(SystemExit) as exc:
         setup_tools.main([flag, "--nonexistent-sentinel"])
-    # argparse rejects the sentinel, not `flag` -- proving `flag` parsed.
     assert exc.value.code == 2
-    assert "--nonexistent-sentinel" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    complaint = err.split("error:")[-1]
+    assert "--nonexistent-sentinel" in complaint
+    assert flag not in complaint, f"{flag} was itself rejected: {complaint}"
 
 
 @pytest.mark.parametrize("abbreviation", ["--stat", "--sta", "--statu",
