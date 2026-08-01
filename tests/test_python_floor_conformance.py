@@ -552,20 +552,43 @@ def _has_lazy_annotations(tree: ast.AST) -> bool:
 #: to share the name, and that is the safe direction: the module simply keeps
 #: the behaviour it had before this rule existed.
 #:
-#: The limit this leaves is a library that resolves annotations on your
-#: behalf — pydantic does, ``dataclasses`` does not. Chasing those would mean
-#: knowing what every decorator does with ``__annotations__``, which is the
-#: type checker this file keeps declining to write. Neither name, nor
-#: pydantic, appears in any first-party file today; that was measured.
-ANNOTATION_RESOLVERS = frozenset({"get_type_hints", "get_annotations"})
+#: ``__annotations__`` is here because reading it is the prerequisite for
+#: evaluating it by hand — ``eval(f.__annotations__["return"])`` needs no
+#: resolver function at all, and a rule that watched only the two function
+#: names would be quiet about it. Raised by a reviewer with the source that
+#: demonstrates it, not reasoned about.
+ANNOTATION_RESOLVERS = frozenset({
+    "get_type_hints", "get_annotations", "__annotations__",
+})
 
 
 def _resolves_annotations(tree: ast.AST) -> bool:
-    """Whether the module reads its own annotations back and evaluates them."""
+    """Whether the module reads its own annotations back and evaluates them.
+
+    A string literal counts, because ``getattr(typing, "get_type_hints")``
+    and ``typing.__dict__["get_type_hints"]`` resolve the same function
+    without ever writing it as a name. Matching the literal keeps this a
+    spelling test rather than the beginning of a dataflow analysis, and it
+    errs the way the rest of this function does: a module that merely
+    mentions the word in a string keeps the behaviour it had before the
+    deferred-annotation rule existed.
+
+    What is left is a name assembled at runtime — ``getattr(typing, "get_"
+    + "type_hints")`` — and a library that resolves annotations on your
+    behalf, which pydantic does and ``dataclasses`` does not. Both need to
+    know what a value *is* rather than how it is written, which is the type
+    checker this file keeps declining to write. Measured across all 57
+    first-party files: one matches — this file, which names the resolvers in
+    :data:`ANNOTATION_RESOLVERS` itself — and it does not defer its own
+    annotations, so no file loses the exemption today.
+    """
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr in ANNOTATION_RESOLVERS:
             return True
         if isinstance(node, ast.Name) and node.id in ANNOTATION_RESOLVERS:
+            return True
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and node.value in ANNOTATION_RESOLVERS):
             return True
         if isinstance(node, ast.ImportFrom):
             if any(a.name in ANNOTATION_RESOLVERS for a in node.names):
@@ -1740,6 +1763,25 @@ FIRES = {
         "    pass\n"
         "HINTS = get_type_hints(f)\n"
     ),
+    "a deferred annotation resolved through getattr with a literal name": (
+        # No Name and no Attribute spells the resolver here; only the string
+        # does. Measured on 3.10.20: this raises AttributeError.
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def f() -> typing.Self:\n"
+        "    pass\n"
+        "RESOLVER = getattr(typing, 'get_type_hints')\n"
+        "HINTS = RESOLVER(f)\n"
+    ),
+    "a deferred annotation evaluated straight out of __annotations__": (
+        # No resolver function at all: the string is read from the mapping
+        # and handed to eval. Measured on 3.10.20: this raises.
+        "from __future__ import annotations\n"
+        "import typing\n"
+        "def f() -> typing.Self:\n"
+        "    pass\n"
+        "RETURN = eval(f.__annotations__['return'])\n"
+    ),
     "an except clause under a comment on an enclosing def header": (
         # A licence must not leak outward-in. Before `visit_Try` set a span
         # for its handlers, a `# floor-ok:` on *any* enclosing statement
@@ -1864,6 +1906,10 @@ EXERCISES = {
         "typing.Self",
     "an except clause under a comment on an enclosing def header":
         "ExceptionGroup",
+    "a deferred annotation resolved through getattr with a literal name":
+        "typing.Self",
+    "a deferred annotation evaluated straight out of __annotations__":
+        "typing.Self",
     "a deferred annotation in a module that calls inspect.get_annotations":
         "typing.Self",
 }
