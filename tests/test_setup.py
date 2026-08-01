@@ -1591,3 +1591,41 @@ def test_reconcile_waits_out_a_lock_restoring_the_only_copy(tmp_path, monkeypatc
     assert (dest / "SKILL.md").read_text(encoding="utf-8") == "the only copy"
     assert len(calls) == 5
 
+
+
+# ── The shell entrypoints' query-flag list must mean the same thing here ──
+
+
+@pytest.mark.parametrize("flag", ["--status", "--check-only", "--yes",
+                                  "--skip-package", "--skip-optional",
+                                  "--no-install-prereqs"])
+def test_exact_flags_are_still_accepted(flag, capsys):
+    """The spellings setup.sh and setup.ps1 match, and README documents."""
+    with pytest.raises(SystemExit) as exc:
+        setup_tools.main([flag, "--nonexistent-sentinel"])
+    # argparse rejects the sentinel, not `flag` -- proving `flag` parsed.
+    assert exc.value.code == 2
+    assert "--nonexistent-sentinel" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("abbreviation", ["--stat", "--sta", "--statu",
+                                          "--check", "--check-onl"])
+def test_abbreviations_are_rejected(abbreviation, capsys):
+    """`--stat` must not quietly mean `--status`.
+
+    setup.sh and setup.ps1 decide whether an invocation is a question
+    (``--status``/``--check-only``/``--help``, which install nothing) or an
+    install, and they match exact spellings. While argparse accepted
+    unambiguous prefixes, ``./setup.sh --stat`` read as an install there and
+    as ``--status`` here -- and the install path moves the user's
+    ``~/.local/bin/{operator,handoff}`` aside on the strength of that
+    disagreement. Asserting the exit code alone would not do: `2` is also what
+    a genuinely unknown flag returns, which is the outcome we want, so the
+    message is asserted too.
+    """
+    with pytest.raises(SystemExit) as exc:
+        setup_tools.main([abbreviation])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments" in err or "invalid choice" in err, err
+    assert abbreviation in err
