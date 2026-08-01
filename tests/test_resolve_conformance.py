@@ -151,10 +151,18 @@ def _rooted_at_file(node: ast.expr) -> bool:
 
     Walks back down the receiver chain, through attribute access and through
     a pathlib constructor, so ``Path(__file__).parent.resolve()`` is
-    recognised as the same thing ``Path(__file__).resolve()`` is. A method
-    call in the chain is walked through its receiver rather than its
-    arguments: ``Path(cfg).relative_to(__file__)`` must not be mistaken for
-    the module's own location.
+    recognised as the same thing ``Path(__file__).resolve()`` is.
+
+    A method call in the chain is walked through its receiver, and **only
+    when it took no positional argument**. Both halves matter, and the second
+    was a real hole in the first draft of this file. Walking the receiver
+    rather than the arguments stops ``Path(cfg).relative_to(__file__)`` being
+    mistaken for the module's own location. Refusing to walk a call that took
+    an argument stops the reverse: ``Path(__file__).joinpath(user).resolve()``
+    and ``Path(__file__).with_name(user).resolve()`` are rooted at ``__file__``
+    and then leave it, so the thing being resolved is whatever the argument
+    said. Exempting those would have made the exemption a two-token bypass of
+    the whole scan.
     """
     for _ in range(_CHAIN_LIMIT):
         if isinstance(node, ast.Name):
@@ -164,7 +172,7 @@ def _rooted_at_file(node: ast.expr) -> bool:
             continue
         if isinstance(node, ast.Call):
             func = node.func
-            if isinstance(func, ast.Attribute):
+            if isinstance(func, ast.Attribute) and not node.args:
                 node = func.value
                 continue
             if _is_pathlib_class(func) and node.args:
@@ -220,6 +228,12 @@ class _ResolveFinder(ast.NodeVisitor):
     ``span`` is the line range an annotation may occupy, computed by the
     sibling scan's ``_header_span`` so that a reason written about an ``if``
     cannot silently license a call several lines inside it.
+
+    A ``def`` or ``lambda`` nested in a guarded body clears the stack for its
+    own body, because a function body does not run inside the ``try`` that
+    lexically encloses it -- it runs wherever it is called, which is
+    somewhere this scan cannot see. A comprehension deliberately does not
+    clear it: that one really does execute inline.
     """
 
     def __init__(self) -> None:
@@ -245,6 +259,23 @@ class _ResolveFinder(ast.NodeVisitor):
 
     # `try/except*` is a different node with the same shape.
     visit_TryStar = visit_Try
+
+    def _visit_deferred(self, node: ast.AST) -> None:
+        outer = self.stack
+        self.stack = []
+        super().generic_visit(node)
+        self.stack = outer
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_deferred(node)
+
+    def visit_FunctionDef(self, node) -> None:
+        outer = self.span
+        self.span = _header_span(node)
+        self._visit_deferred(node)
+        self.span = outer
+
+    visit_AsyncFunctionDef = visit_FunctionDef
 
     def generic_visit(self, node: ast.AST) -> None:
         if isinstance(node, ast.stmt) and not isinstance(node, ast.Try):
@@ -440,6 +471,22 @@ FIRES = {
     "__file__ passed as an argument is not the receiver": (
         _IMPORT + "cfg = Path('x')\np = cfg.relative_to(__file__).resolve()\n"
     ),
+    "rooted at __file__ and then left, via joinpath": (
+        _IMPORT + "p = Path(__file__).joinpath(user).resolve()\n"
+    ),
+    "rooted at __file__ and then left, via with_name": (
+        _IMPORT + "p = Path(__file__).with_name(user).resolve()\n"
+    ),
+    "a lambda does not run inside the try that encloses it": (
+        _IMPORT
+        + "try:\n    f = lambda: Path(x).resolve()\n"
+        + "except (OSError, RuntimeError, ValueError):\n    f = None\n"
+    ),
+    "a nested def does not run inside the try that encloses it": (
+        _IMPORT
+        + "try:\n    def later(p):\n        return Path(p).resolve()\n"
+        + "except (OSError, RuntimeError, ValueError):\n    later = None\n"
+    ),
     "an annotation two lines up does not reach": (
         _IMPORT
         + "# resolve-ok: this reason is about something else entirely\n"
@@ -473,6 +520,19 @@ PASSES = {
     "the module's own location": _IMPORT + "here = Path(__file__).resolve()\n",
     "the module's own location, one attribute along": (
         _IMPORT + "here = Path(__file__).parent.resolve().parent\n"
+    ),
+    "the module's own location, resolved twice": (
+        _IMPORT + "here = Path(__file__).resolve().parent.resolve()\n"
+    ),
+    "a comprehension really does run inside the try": (
+        _IMPORT
+        + "try:\n    ps = [Path(p).resolve() for p in xs]\n"
+        + "except (OSError, RuntimeError, ValueError):\n    ps = []\n"
+    ),
+    "a guarded call inside a nested def": (
+        _IMPORT
+        + "def later(p):\n    try:\n        return Path(p).resolve()\n"
+        + "    except (OSError, RuntimeError, ValueError):\n        return None\n"
     ),
     "annotated with a reason": (
         _IMPORT
