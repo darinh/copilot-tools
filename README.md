@@ -130,6 +130,31 @@ directly if you don't need the migration step below.
 `sqlite3` is **not** required — the toolkit uses Python's standard-library
 `sqlite3` module.
 
+### Never install this editably from a git worktree
+
+`pip install -e` copies nothing. It writes the *source directory* into the
+interpreter's import path and points the `operator` and `handoff` console
+scripts at it, machine-wide for that interpreter. A git worktree exists in
+order to be deleted, so an editable install made from one breaks every console
+script the moment somebody else correctly finishes that branch and runs `git
+worktree remove` — and it breaks for *them*, days later, with no path back to
+the cause. That has happened twice here.
+
+So the project's PEP 517 backend (`worktree_guard_backend.py`) refuses to
+build an editable install when the source directory is a linked worktree, and
+tells you which checkout to install from instead. Wheels and sdists are
+unaffected, submodules are allowed, and
+`COPILOT_TOOLS_ALLOW_WORKTREE_INSTALL=1` overrides the refusal if you really
+mean it. `setup_tools.py` run from a worktree redirects to the primary
+checkout on its own and says so.
+
+Repairing a machine that already has one: reinstall from the primary checkout,
+naming it explicitly rather than relying on the working directory.
+
+```bash
+python -m pip install -e /path/to/the/primary/checkout --no-deps
+```
+
 <details>
 <summary>What <code>setup.sh</code> does beyond <code>setup_tools.py</code> (Linux/WSL/macOS)</summary>
 
@@ -262,6 +287,7 @@ copilot-tools/
 ├── setup_tools.py                 # Cross-platform environment setup
 ├── install_manifest.py            # Records what setup deployed; upgrade strategies
 ├── copilot_tools_version.py       # The single source of the version number
+├── worktree_guard_backend.py      # PEP 517 backend; refuses `pip install -e` of a worktree
 ├── backfill_unknown_metrics.py    # One-off repair: fabricated zeros to NULL
 ├── verify_cross_platform.py       # Stdlib-only verification; runs without pytest
 ├── git_identity.py                # Refuses to certify a history it could not read
