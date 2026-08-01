@@ -2082,6 +2082,10 @@ def reload_instance(target: str | None) -> int:
 def ingest_all_logs(force: bool = False) -> int:
     operator_ingest.init_db(METRICS_DB)
     results = operator_ingest.ingest_all(COPILOT_LOG_DIR, METRICS_DB, force=force)
+    if results is None:
+        print(f"Cannot examine {COPILOT_LOG_DIR} — no logs were ingested, and "
+              f"whether any are there is unknown")
+        return 1
     if not results:
         print(f"No Copilot logs found in {COPILOT_LOG_DIR}")
         return 0

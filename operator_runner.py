@@ -131,8 +131,20 @@ def _process_parents_windows() -> dict[int, int]:
 def _process_parents_posix() -> dict[int, int]:
     parents: dict[int, int] = {}
     proc_root = Path("/proc")
-    if proc_root.is_dir():
-        for entry in proc_root.iterdir():
+    # A wrong answer about /proc falls through to the `ps` fallback below,
+    # which answers the same question by another route — but both halves of
+    # the defect have to reach it. `is_dir` *raises* on a permission denial,
+    # and a restricted container is the ordinary way to meet one, so an
+    # unguarded probe crashes the runner instead of taking the other route.
+    # `iterdir` subsumes the probe: it raises NotADirectoryError or
+    # FileNotFoundError for the cases `is_dir` answered False for, and a
+    # denial reaches the same fallback rather than escaping one line later.
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        entries = None
+    if entries is not None:
+        for entry in entries:
             if not entry.name.isdigit():
                 continue
             try:
