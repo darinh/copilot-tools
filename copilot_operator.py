@@ -1906,6 +1906,8 @@ def send_message(args: list[str]) -> int:
                   file=sys.stderr)
             print('    operator send --from a --to b -- '
                   f'"{arg} ..."', file=sys.stderr)
+            print("  Nothing was sent.", file=sys.stderr)
+            _send_usage()
             return 2
         if arg in ("--from", "--to"):
             if i + 1 >= len(args) or not args[i + 1]:

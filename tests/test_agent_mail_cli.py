@@ -119,7 +119,10 @@ def test_send_refuses_an_unknown_option_rather_than_sending_it_as_text(
     """
     assert op.send_message(
         ["--from", "alpha", "--to", "beta", "--dry-run", "hi"]) == 2
-    assert "unknown option '--dry-run'" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "unknown option '--dry-run'" in err
+    assert "Nothing was sent." in err
+    assert "Usage: operator send" in err
     assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 0
 
 
@@ -335,18 +338,24 @@ def test_inbox_refuses_an_unknown_option_and_keeps_the_mail(bad, idle_recipient,
 def test_inbox_refuses_two_mailboxes_rather_than_silently_picking_one(
         idle_recipient, capsys):
     op.send_message(["--from", "alpha", "--to", "beta", "still here"])
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
     capsys.readouterr()
     assert op.show_inbox(["beta", "gamma"]) == 2
     assert "one mailbox at a time" in capsys.readouterr().err
-    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+    assert op.show_inbox(["beta"]) == 0
+    assert "still here" in capsys.readouterr().out
 
 
 def test_inbox_help_prints_usage_and_reads_nothing(idle_recipient, capsys):
     op.send_message(["--from", "alpha", "--to", "beta", "unread still"])
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
     capsys.readouterr()
     assert op.show_inbox(["--help"]) == 0
-    assert "Usage: operator inbox" in capsys.readouterr().out
-    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+    help_out = capsys.readouterr().out
+    assert "Usage: operator inbox" in help_out
+    assert "unread still" not in help_out
+    assert op.show_inbox(["beta"]) == 0
+    assert "unread still" in capsys.readouterr().out
 
 
 def test_inbox_help_from_main_does_not_touch_this_directorys_mailbox(
@@ -357,7 +366,11 @@ def test_inbox_help_from_main_does_not_touch_this_directorys_mailbox(
     assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
     capsys.readouterr()
     assert op.main(["inbox", "--help"]) == 0
-    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+    help_out = capsys.readouterr().out
+    assert "Usage: operator inbox" in help_out
+    assert "survives help" not in help_out
+    assert op.main(["inbox"]) == 0
+    assert "survives help" in capsys.readouterr().out
 
 
 def test_inbox_reads_a_mailbox_whose_name_starts_with_a_dash(monkeypatch,
@@ -382,12 +395,25 @@ def test_inbox_reads_a_mailbox_whose_name_starts_with_a_dash(monkeypatch,
 
 
 def test_inbox_refuses_an_empty_mailbox_name(idle_recipient, capsys):
-    """An empty name would resolve to some other instance's mailbox."""
-    op.send_message(["--from", "alpha", "--to", "beta", "not yours"])
+    """An empty name resolves to a real mailbox, so it must not be read.
+
+    Asserting that some *other* instance's mail survived would prove
+    nothing: an empty name never pointed at beta in the first place. The
+    mailbox at risk is the one `Instance("")` resolves to, so that is the
+    one this fills, refuses, and then reads back.
+    """
+    blank = op.Instance("").id
+    operator_mail.queue(op.OPERATOR_HOME,
+                        operator_mail.new_message("alpha", "", blank,
+                                                  "nobody's mail"))
+    assert operator_mail.pending_count(op.OPERATOR_HOME, blank) == 1
     capsys.readouterr()
+
     assert op.show_inbox(["--", ""]) == 2
     assert "name is empty" in capsys.readouterr().err
-    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+
+    (survivor,) = operator_mail.consume(op.OPERATOR_HOME, blank)
+    assert survivor["text"] == "nobody's mail"
 
 
 def test_inbox_defaults_to_the_instance_for_this_directory(idle_recipient,
