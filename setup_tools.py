@@ -482,10 +482,12 @@ def ensure_copilot() -> bool:
         if ok and out.strip():
             root = Path(out.strip())
             bin_dir = root if IS_WINDOWS else root / "bin"
-            # probe-ok: a wrong False only skips a PATH entry, and the
-            # `which("copilot")` immediately below re-checks the outcome and
-            # prints manual instructions when it did not work.
-            if bin_dir.is_dir():
+            # `_dir_for_certain` rather than a bare `is_dir`: a wrong False
+            # only skips a PATH entry, and `which("copilot")` below re-checks
+            # the outcome and prints manual instructions when it did not
+            # work — but an unguarded probe *raises* on a permission denial
+            # and takes the whole setup run down over one directory.
+            if _dir_for_certain(bin_dir):
                 persist_user_path(bin_dir)
     if which("copilot"):
         info(f"copilot installed: {which('copilot')}")
@@ -647,9 +649,10 @@ def ensure_uv() -> str | None:
         # policy, and no network scripts piped into an interpreter.
         pip_install(["--upgrade", "uv"])
         scripts = _python_scripts_dir()
-        # probe-ok: a wrong False skips a PATH entry and nothing else; the
-        # `which("uv")` guarding the line below is what decides success.
-        if scripts.is_dir():
+        # A wrong False skips a PATH entry and nothing else; `which("uv")`
+        # guarding the line below is what decides success. The guard is for
+        # the other half: a bare probe raises on a permission denial.
+        if _dir_for_certain(scripts):
             _prepend_process_path(scripts)
             if which("uv"):
                 persist_user_path(scripts)
@@ -658,9 +661,10 @@ def ensure_uv() -> str | None:
         _install_uv_from_astral_script()
 
     # uv installs itself into ~/.local/bin on every platform.
-    # probe-ok: a wrong False costs a PATH entry, and `which("uv")` two lines
-    # down reports the failure with the manual command to fix it.
-    if LOCAL_BIN.is_dir():
+    # A wrong False costs a PATH entry, and `which("uv")` two lines down
+    # reports the failure with the manual command to fix it. Guarded because
+    # the other half of the defect aborts setup outright.
+    if _dir_for_certain(LOCAL_BIN):
         persist_user_path(LOCAL_BIN)
     refresh_path()
     if which("uv"):
@@ -727,9 +731,10 @@ def ensure_specify() -> bool:
         return False
     ok = run([uv, "tool", "install", "--force", "specify-cli", "--from",
               f"git+https://github.com/github/spec-kit.git@{SPEC_KIT_VERSION}"])
-    # probe-ok: a wrong False costs a PATH entry; `which("specify")` below
-    # re-checks and falls through to the manual install instructions.
-    if LOCAL_BIN.is_dir():
+    # A wrong False costs a PATH entry; `which("specify")` below re-checks and
+    # falls through to the manual install instructions. Guarded so a denial
+    # cannot abort the run instead.
+    if _dir_for_certain(LOCAL_BIN):
         persist_user_path(LOCAL_BIN)
     refresh_path()
     if which("specify"):
@@ -870,10 +875,12 @@ def install_package(assume_yes: bool = False) -> bool:
 
     if not shutil.which("operator"):
         for candidate in (_python_scripts_dir(), _user_scripts_dir()):
-            # probe-ok: a wrong False just tries the next candidate, and the
+            # A wrong answer just tries the next candidate, and
             # `shutil.which("operator")` below reports the failure with the
-            # directory to add by hand.
-            if (candidate / ("operator.exe" if IS_WINDOWS else "operator")).exists():
+            # directory to add by hand. `path_present` rather than `exists`
+            # because a denial here would otherwise abort setup.
+            binary = candidate / ("operator.exe" if IS_WINDOWS else "operator")
+            if install_manifest.path_present(binary) is True:
                 _prepend_process_path(candidate)
                 persist_user_path(candidate)
                 break
@@ -1282,16 +1289,6 @@ def _dir_entries(root: Path, label: str) -> list[Path] | None:
              "installing none of them this run")
         return None
     return entries
-    present = install_manifest.path_present(root)
-    if present is False:
-        return []
-    try:
-        entries = sorted(root.iterdir())
-    except OSError as exc:
-        warn(f"{label}: {root} could not be listed ({exc}) — "
-             "installing none of them this run")
-        return None
-    return entries
 
 
 def _dir_or_unknown(path: Path) -> bool:
@@ -1305,20 +1302,32 @@ def _dir_or_unknown(path: Path) -> bool:
     that fails loudly and changes nothing, because ``_link_directory`` and
     ``install_skills`` already report an ``OSError`` per artifact.
 
-    Both halves of the defect are handled, and the second is the one that is
-    easy to miss. ``is_dir`` *raises* on a permission denial — that is the
-    ``except``. It also *returns False*, silently and confidently, for a link
-    whose target is gone or cannot be resolved, because it follows the link
-    and finds nothing. So a False is only believed for a path that is not a
-    link; for a link it means nothing was resolved, which is not the same as
-    "not a directory". A plain file still answers False and stays out.
+    ``is_dir`` *raises* on a permission denial — that is the ``except``. It
+    also *returns False*, silently and confidently, for a link whose target
+    is gone or cannot be resolved, because it follows the link and finds
+    nothing. So a False is believed for a path that is not a link, and for a
+    link whose target resolves to something that is simply not a directory.
+    It is *not* believed for a link that resolves to nothing at all, because
+    there "not a directory" and "nothing was resolved" are the same answer.
+    A plain file still answers False and stays out, and so does a link to one.
     """
     try:
         if path.is_dir():
             return True
     except OSError:
         return True
-    return _is_link(path)
+    if not _is_link(path):
+        return False
+    # A link that ``is_dir`` answered False for. Two very different states
+    # share that answer, and only one of them is unknown: a link that
+    # *resolves* is knowably not a directory and stays out, exactly as a
+    # plain file does. A link that resolves to nothing — target deleted, a
+    # loop, a denial part-way down — is the case this polarity exists for.
+    try:
+        os.stat(path)
+    except OSError:
+        return True
+    return False
 
 
 def _skill_sources() -> list[Path]:
@@ -1786,8 +1795,24 @@ def install_templates(assume_yes: bool = False, manifest: dict | None = None) ->
         src = REPO_ROOT / "templates" / src_name
         dest = COPILOT_DIR / dest_name
         key = f"templates/{src_name}"
-        if install_manifest.path_present(src) is False:
-            warn(f"{label}: source missing ({src})")
+        usable = install_manifest.file_present(src)
+        if usable is None:
+            warn(f"{label}: source at {src} could not be examined — "
+                 "not installed")
+            continue
+        if usable is False:
+            # `file_present` follows links, so a link to a real file is True
+            # and arrives below. False here is "not usable as a regular
+            # file", which covers a genuinely absent source *and* one that
+            # is occupied by something else. Those deserve different words:
+            # the second is a repository that is wrong, not one that is
+            # incomplete, and `copyfile` below would raise on it and take
+            # every later artifact down with it.
+            if install_manifest.path_present(src) is False:
+                warn(f"{label}: source missing ({src})")
+            else:
+                warn(f"{label}: source at {src} is not a regular file — "
+                     "not installed")
             continue
         source_digest = install_manifest.file_digest(src)
         state = install_manifest.classify(manifest, key, dest, source_digest)

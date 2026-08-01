@@ -41,10 +41,47 @@ calls are fine. It demands that every call be either
 * annotated ``# probe-ok: <reason>``, which is a claim that a wrong False is
   harmless *here* and a place to say why.
 
+**What counts as a call.** Four spellings, because a rule enforced against
+one spelling is that spelling's history:
+
+* ``p.exists()`` — the ordinary one.
+* ``Path.is_dir(p)`` — the unbound form, which has one argument rather than
+  none and walks straight past a detector keyed on "no arguments".
+* ``getattr(p, "is_dir")()`` — nobody writes this by accident, which is
+  exactly why it is closed. A tripwire with a one-token bypass is a tripwire
+  whose next violation is deliberate too.
+* ``os.path.exists`` / ``isfile`` / ``isdir`` — **this is the bug class in
+  its purest form.** os.path swallows every ``OSError`` and answers False;
+  it does not even offer the raise. A scan that flagged the pathlib
+  spellings and permitted these would be pointed at the half that fails
+  loudly. A ``try`` does not exempt them either — there is nothing to catch,
+  so the handler is a placebo and the wrong False walks out untouched.
+
+``follow_symlinks=False``, ``os.path.islink`` and ``os.path.lexists`` are
+lstat-based. They are the fix, not the defect, and are deliberately not
+flagged.
+
 The annotation is deliberately cheap to write and impossible to write
 silently: it appears in the diff, it carries a reason, and this file's
 ``test_every_annotation_carries_a_reason`` refuses an empty one. The point is
 not to make the probe unreachable, it is to make choosing it deliberate.
+
+An annotation is read from ``tokenize.COMMENT``, not matched against the raw
+line. A regex could be silenced by a *string* containing the marker —
+``if p.exists(): print('# probe-ok: not a comment at all')`` — with no
+comment anywhere in the file. That is the same defect two reviewers found in
+``checkout-guard``'s detector the same week, where ``//`` inside a string
+literal silenced the comment stripper; it was closed there with a character
+scanner. A detector whose whole purpose is to stop a rule being enforced one
+file at a time cannot have a one-token bypass of its own.
+
+**An annotation must account for both failure modes.** These calls fail two
+ways — they *raise* on a denial and they *return False* on a dangling link —
+and a reason that addresses only one of them is the shape this repository
+keeps paying for. Five annotations in the first draft of this very commit
+said "a wrong False only costs a PATH entry"; every one was true, and every
+one omitted that the raise aborts the entire setup run. They are guarded
+now. When you write a reason, say what the raise does too, or guard it.
 
 **Why static.** The same argument as the bash 3.2 scan. These are not proxies
 for the defect; the two-valued return *is* the defect, and there is no way to
@@ -58,7 +95,9 @@ matching nothing reports the whole tree clean, which reads exactly like
 success, and that is the failure this file exists to prevent.
 """
 import ast
+import io
 import re
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -169,14 +208,108 @@ class _ProbeFinder(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
-        if (isinstance(func, ast.Attribute)
-                and func.attr in PROBES
-                and not node.args
-                and not node.keywords
-                and self.depth == 0):
+        attr = _probe_name(func, node)
+        if attr is not None and (self.depth == 0
+                                 or attr.startswith("os.path.")):
+            # A `try/except OSError` does not guard an `os.path.*` probe:
+            # those never raise, so the handler is a placebo and the False
+            # walks out of the try untouched. Only replacing the call, or
+            # annotating why a wrong False is harmless, is an answer there.
             span = self.span or (node.lineno, node.lineno)
-            self.hits.append((node.lineno, func.attr, span))
+            self.hits.append((node.lineno, attr, span))
         self.generic_visit(node)
+
+
+def _probe_name(func: ast.expr, call: ast.Call) -> str | None:
+    """The probe this call makes, or None if it is not one of ours.
+
+    Three spellings reach the same two-valued answer and all three count:
+
+    ``p.is_dir()``
+        The ordinary one, and the only one anybody writes on purpose.
+
+    ``Path.is_dir(p)``
+        The unbound form. It takes one positional argument rather than none,
+        so a detector that keys on "no arguments" walks straight past it.
+
+    ``getattr(p, "is_dir")()``
+        Nobody reaches for this by accident, which is the point — a tripwire
+        with a one-token bypass is a tripwire whose next violation is also a
+        deliberate one. It costs three lines to close.
+
+    ``follow_symlinks=False`` is deliberately *not* a probe. It makes the
+    call ``lstat``-based, which is the fix rather than the defect, so
+    flagging it would demand a guard against a failure mode it does not have.
+    """
+    if _lstat_based(call):
+        return None
+    # `getattr(p, "is_dir")()` — the call being made is the *result* of a
+    # getattr, so the probe name is a constant inside the callee.
+    if isinstance(func, ast.Call):
+        inner = func
+        if (isinstance(inner.func, ast.Name) and inner.func.id == "getattr"
+                and len(inner.args) == 2
+                and isinstance(inner.args[1], ast.Constant)
+                and inner.args[1].value in PROBES):
+            return str(inner.args[1].value)
+        return None
+    if isinstance(func, ast.Attribute) and func.attr in OSPATH_PROBES:
+        # `os.path.exists(p)` / `isfile` / `isdir`. This is the bug class in
+        # its purest form: os.path swallows *every* OSError and answers
+        # False, so unlike the pathlib spellings it never even offers the
+        # raise. A scan that flags the two that fail loudly and permits the
+        # two that fail silently is pointed at the wrong half.
+        if _is_os_path(func.value) and len(call.args) == 1:
+            return f"os.path.{func.attr}"
+    if isinstance(func, ast.Attribute) and func.attr in PROBES:
+        # Bound `p.is_dir()` takes no positional argument.
+        if not call.args:
+            return func.attr
+        # Unbound `Path.is_dir(p)` takes exactly the receiver. The shape
+        # alone is not enough to recognise it: `os.path.exists(p)` is the
+        # same tree, and it is handled above with its own rules.
+        if len(call.args) == 1 and _is_pathlib_class(func.value):
+            return func.attr
+    return None
+
+
+#: The ``os.path`` predicates that collapse every error into False.
+#: ``islink`` and ``lexists`` are lstat-based and are deliberately absent:
+#: they are the correct spellings, not the defect.
+OSPATH_PROBES = frozenset({"exists", "isfile", "isdir"})
+
+
+def _is_os_path(node: ast.expr) -> bool:
+    """True for the ``os.path`` in ``os.path.isfile``, and for a bare ``path``."""
+    if isinstance(node, ast.Attribute):
+        return node.attr == "path"
+    return isinstance(node, ast.Name) and node.id == "path"
+
+
+#: Spellings of the class in `Path.is_dir(p)`. A local alias defeats this,
+#: which is accepted: the unbound form is already the rare one, and a rule
+#: that has to resolve names is a type checker.
+PATHLIB_CLASSES = frozenset({"Path", "PurePath", "PosixPath", "WindowsPath",
+                             "PurePosixPath", "PureWindowsPath"})
+
+
+def _is_pathlib_class(node: ast.expr) -> bool:
+    """True for ``Path`` and for ``pathlib.Path``."""
+    if isinstance(node, ast.Name):
+        return node.id in PATHLIB_CLASSES
+    if isinstance(node, ast.Attribute):
+        return node.attr in PATHLIB_CLASSES
+    return False
+
+
+def _lstat_based(call: ast.Call) -> bool:
+    """True when ``follow_symlinks=False`` makes the call lstat-based."""
+    for keyword in call.keywords:
+        if keyword.arg == "follow_symlinks":
+            value = keyword.value
+            if isinstance(value, ast.Constant) and value.value is False:
+                return True
+    return False
 
 
 def _header_span(node: ast.stmt) -> tuple[int, int]:
@@ -188,7 +321,41 @@ def _header_span(node: ast.stmt) -> tuple[int, int]:
     return node.lineno, max(node.lineno, end)
 
 
-def _annotation_in(lines: list[str], span: tuple[int, int]) -> str | None:
+def _comments(source: str) -> dict[int, str]:
+    """Line number to comment text, from the tokenizer rather than a regex.
+
+    A regex over raw source cannot tell a comment from a string that
+    contains one, so ::
+
+        if Path('x').exists(): print('# probe-ok: not a comment at all')
+
+    silenced this scan with no comment anywhere in the file. The marker only
+    has to appear on the probe's own line, which makes it unlikely by
+    accident and trivial on purpose — and a tripwire with a deliberate
+    one-token bypass is a tripwire whose next violation is deliberate too.
+
+    This is the same defect, in the same week, that two reviewers found in
+    ``checkout-guard``'s detector, where ``//`` inside a string literal could
+    silence the comment stripper; it was closed there with a character
+    scanner (196c56a). ``tokenize`` is this language's version of that fix:
+    the tokenizer already knows what a comment is, so the question stops
+    being a pattern match on text.
+    """
+    out: dict[int, str] = {}
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.COMMENT:
+                out[token.start[0]] = token.string
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        # The AST parse upstream has already succeeded, so this cannot be a
+        # broken file. An unterminated final line can still upset the
+        # tokenizer; the comments found before it are still correct.
+        pass
+    return out
+
+
+def _annotation_in(comments: dict[int, str], standalone: set[int],
+                   span: tuple[int, int]) -> str | None:
     """The ``probe-ok`` reason covering ``span``, if there is one.
 
     Accepted anywhere in the statement's own header, or in the contiguous
@@ -201,49 +368,64 @@ def _annotation_in(lines: list[str], span: tuple[int, int]) -> str | None:
     start, end = span
     candidates = list(range(start, end + 1))
     above = start - 1
-    while above >= 1 and lines[above - 1].lstrip().startswith("#"):
+    while above >= 1 and above in standalone:
         candidates.append(above)
         above -= 1
     for candidate in candidates:
-        if not 1 <= candidate <= len(lines):
+        text = comments.get(candidate)
+        if text is None:
             continue
-        found = ANNOTATION.search(lines[candidate - 1])
+        found = ANNOTATION.search(text)
         if found:
             return found.group("reason").strip()
     return None
 
 
+def _annotation_context(source: str) -> tuple[dict[int, str], set[int]]:
+    """Comments by line, and the lines whose comment is the whole line."""
+    comments = _comments(source)
+    lines = source.splitlines()
+    standalone = {
+        line for line in comments
+        if 1 <= line <= len(lines) and lines[line - 1].lstrip().startswith("#")
+    }
+    return comments, standalone
+
+
 def unguarded_probes(source: str) -> list[tuple[int, str]]:
     """Every probe in ``source`` that is neither guarded nor annotated."""
-    lines = source.splitlines()
+    comments, standalone = _annotation_context(source)
     finder = _ProbeFinder()
     finder.visit(ast.parse(source))
     return [(lineno, attr) for lineno, attr, span in finder.hits
-            if _annotation_in(lines, span) is None]
+            if _annotation_in(comments, standalone, span) is None]
 
 
 def annotated_probes(source: str) -> list[tuple[int, str]]:
     """Every ``(lineno, reason)`` where a probe was annotated rather than fixed."""
-    lines = source.splitlines()
+    comments, standalone = _annotation_context(source)
     finder = _ProbeFinder()
     finder.visit(ast.parse(source))
     out = []
     for lineno, _attr, span in finder.hits:
-        reason = _annotation_in(lines, span)
+        reason = _annotation_in(comments, standalone, span)
         if reason is not None:
             out.append((lineno, reason))
     return out
 
 
 #: Modules with unguarded probes that a *different* live branch is fixing, and
-#: the exact number each still has. Not an exemption — an exemption would let
-#: the count grow. The assertion below is equality, so this register fails
-#: when new debt arrives *and* when the fix lands, and the second failure is
-#: the only thing that ever gets an entry removed. Nothing here is allowed to
-#: age quietly.
+#: the exact probes each still has. Not an exemption — an exemption would let
+#: the count grow. The assertion below is equality on the *multiset of probe
+#: names*, not on a total, because a total only measures the size of the debt
+#: and not its identity: fixing one ``is_dir`` while adding one ``exists``
+#: leaves any count unchanged and would license the new one silently. The
+#: register therefore fails when new debt arrives, when debt changes shape,
+#: *and* when the fix lands — and the last of those is the only thing that
+#: ever gets an entry removed. Nothing here is allowed to age quietly.
 KNOWN_UNFIXED = {
     "operator_mail.py": (
-        4,
+        ("is_dir", "is_dir", "is_dir", "is_dir"),
         "`fix/mail-unreadable-inbox` replaces all four: a mailbox that cannot "
         "be read is being reported as a mailbox with no mail. Annotating them "
         "here would be a false claim about known-broken code, and editing "
@@ -281,12 +463,15 @@ def test_the_known_unfixed_register_is_exact(name: str) -> None:
     expected, reason = KNOWN_UNFIXED[name]
     module = REPO / name
     assert module.is_file(), f"{name} is registered but no longer exists"
-    actual = len(unguarded_probes(module.read_text(encoding="utf-8")))
+    actual = tuple(sorted(attr for _line, attr
+                          in unguarded_probes(module.read_text(encoding="utf-8"))))
     assert actual == expected, (
-        f"{name} has {actual} unguarded presence probes, the register says "
-        f"{expected}.\n  If it went up, the register is being used as a "
-        f"licence: fix or annotate the new one.\n  If it went down, the fix "
-        f"landed — remove this entry so the module rejoins the scan.\n"
+        f"{name} has unguarded presence probes {actual}, the register says "
+        f"{expected}.\n  If any were added, the register is being used as a "
+        f"licence: fix or annotate the new one.\n  If any were removed, the "
+        f"fix landed — remove this entry so the module rejoins the scan.\n"
+        f"  If the count matches but the names changed, one was fixed and "
+        f"another introduced; the new one still needs a decision.\n"
         f"  Registered because: {reason}"
     )
 
@@ -327,6 +512,47 @@ FIRES = {
     "bare exists": "from pathlib import Path\nif Path('x').exists():\n    pass\n",
     "bare is_dir": "from pathlib import Path\nif Path('x').is_dir():\n    pass\n",
     "bare is_file": "from pathlib import Path\nif Path('x').is_file():\n    pass\n",
+    "unbound form": (
+        "from pathlib import Path\n"
+        "if Path.is_dir(Path('x')):\n"
+        "    pass\n"
+    ),
+    "reached through getattr": (
+        "from pathlib import Path\n"
+        "if getattr(Path('x'), 'is_dir')():\n"
+        "    pass\n"
+    ),
+    "follow_symlinks left at its default": (
+        "from pathlib import Path\n"
+        "if Path('x').is_dir(follow_symlinks=True):\n"
+        "    pass\n"
+    ),
+    "os.path.exists": (
+        "import os\n"
+        "if os.path.exists('x'):\n"
+        "    pass\n"
+    ),
+    "os.path.isfile": (
+        "import os\n"
+        "if not os.path.isfile(logfile):\n"
+        "    pass\n"
+    ),
+    "os.path.isdir": (
+        "import os\n"
+        "if os.path.isdir('x'):\n"
+        "    pass\n"
+    ),
+    "os.path inside an OSError guard, which cannot help it": (
+        "import os\n"
+        "try:\n"
+        "    os.path.isfile('x')\n"
+        "except OSError:\n"
+        "    pass\n"
+    ),
+    "a marker hidden in a string rather than a comment": (
+        "from pathlib import Path\n"
+        "if Path('x').exists(): print('# probe-ok: not a comment at all')\n"
+    ),
     "inside a comprehension": (
         "from pathlib import Path\n"
         "xs = [p for p in Path('x').iterdir() if p.is_dir()]\n"
@@ -365,6 +591,25 @@ FIRES = {
 
 #: Source that must NOT trip it. Each is a spelling the repo actually uses.
 PASSES = {
+    "lstat-based by keyword": (
+        "from pathlib import Path\n"
+        "if Path('x').is_dir(follow_symlinks=False):\n"
+        "    pass\n"
+    ),
+    "os.path.islink is lstat-based and is the fix, not the defect": (
+        "import os\n"
+        "if os.path.islink('x'):\n"
+        "    pass\n"
+    ),
+    "os.path.lexists is lstat-based too": (
+        "import os\n"
+        "if os.path.lexists('x'):\n"
+        "    pass\n"
+    ),
+    "an unrelated method with a probe's name on another object": (
+        "if parser.exists('x', 'y', 'z'):\n"
+        "    pass\n"
+    ),
     "guarded by OSError": (
         "from pathlib import Path\n"
         "try:\n"
@@ -418,9 +663,8 @@ PASSES = {
         "if install_manifest.path_present(Path('x')) is False:\n"
         "    pass\n"
     ),
-    "an unrelated exists with arguments": (
-        "import os\n"
-        "if os.path.exists('x'):\n"
+    "an unrelated method that merely shares a name": (
+        "if parser.exists('x', 'y', 'z'):\n"
         "    pass\n"
     ),
 }

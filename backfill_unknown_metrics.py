@@ -298,8 +298,17 @@ def main(argv: list[str] | None = None) -> int:
                              "measured session has)")
     args = parser.parse_args(argv)
 
-    present = install_manifest.path_present(args.db)
-    if present is None:
+    # `file_present`, not `path_present`. The question here is not "is this
+    # name occupied" but "can this be opened as a database", and the two
+    # differ exactly where it costs something: `path_present` is lstat-based,
+    # so a dangling symlink is True, and spending that True on `connect`
+    # below creates a fresh 0-byte database *at the link's target* — a write
+    # outside anything the user pointed this tool at — and then dies on the
+    # first query. `backup_path` wants the lstat answer because there the
+    # cost of treating a name as occupied is one more suffix. Here the cost
+    # is a file written somewhere nobody named.
+    usable = install_manifest.file_present(args.db)
+    if usable is None:
         # Refusing is right either way -- nothing below can run without the
         # database. Which sentence gets printed is the whole difference: "no
         # database" sends the reader to create one, and they will find one
@@ -309,8 +318,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot examine {args.db} (it is there, or something is, but "
               f"it could not be read)")
         return 1
-    if not present:
-        print(f"No metrics database at {args.db}")
+    if usable is False:
+        if install_manifest.path_present(args.db) is False:
+            print(f"No metrics database at {args.db}")
+        else:
+            print(f"Cannot use {args.db} as a metrics database (the name is "
+                  f"occupied, but not by a readable regular file)")
         return 1
 
     conn = connect(args.db)

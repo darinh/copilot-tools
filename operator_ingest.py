@@ -416,10 +416,12 @@ def extract_premium_from_usage(text: str) -> tuple[dict, int]:
 
 
 def git_branch(work_dir: str) -> str:
-    # probe-ok: a wrong False returns "" and the row is recorded without a
-    # branch. The git call below would fail on the same directory anyway, and
-    # this reaches the same "" by the guarded route.
-    if not work_dir or not Path(work_dir).is_dir():
+    # `dir_present` rather than a bare `is_dir`: a wrong False returns "" and
+    # the row is recorded without a branch, which the git call below would
+    # reach anyway. A raise is the half that matters — an unreadable
+    # `work_dir` would abort `ingest_file` and discard the whole log and its
+    # telemetry, rather than costing one blank field.
+    if not work_dir or install_manifest.dir_present(Path(work_dir)) is not True:
         return ""
     try:
         proc = subprocess.run(
@@ -447,11 +449,19 @@ def ingest_file(
 ) -> str:
     """Parse one log file into the database. Returns a short status string."""
     logfile = Path(logfile).resolve()
-    # probe-ok: a wrong answer raises rather than skipping — the only caller
-    # is `ingest_all`, which turns the exception into an `ERROR <name>` line
-    # for that one log and goes on to the rest.
-    if not logfile.is_file():
+    # `file_present` rather than `is_file`, and the difference is which
+    # caller you look at. `ingest_all` wraps this in `except Exception` and
+    # turns anything raised into one `ERROR <name>` line, so a bare probe
+    # looks harmless from there. `main` — the `operator-ingest` CLI — caught
+    # `FileNotFoundError` and nothing else, so an unreadable log left by
+    # traceback rather than by the error path written for it. The two states
+    # keep different exception types here rather than being folded together,
+    # and `main` below has been widened to report both.
+    usable = install_manifest.file_present(logfile)
+    if usable is False:
         raise FileNotFoundError(str(logfile))
+    if usable is None:
+        raise OSError(f"{logfile} could not be examined")
 
     init_db(db_path)
     basename = logfile.name
@@ -700,6 +710,13 @@ def ingest_all(log_dir, db_path, force: bool = False) -> "list[str] | None":
     which is the same wrong answer in a new place. ``iterdir`` raises, and
     the raise is the only thing here that distinguishes "read it, found
     nothing" from "never read it".
+
+    The name test goes through ``os.path.normcase`` because ``glob`` is
+    case-insensitive on Windows and case-sensitive elsewhere, and dropping to
+    a plain ``startswith`` would have quietly stopped matching
+    ``PROCESS-1.LOG`` on the platform where it used to match. ``normcase``
+    lower-cases on Windows and is the identity on POSIX, so the set of names
+    accepted is the same one ``glob`` accepted, on each platform.
     """
     log_dir = Path(log_dir)
     results: list[str] = []
@@ -709,8 +726,11 @@ def ingest_all(log_dir, db_path, force: bool = False) -> "list[str] | None":
         entries = sorted(log_dir.iterdir())
     except OSError:
         return None
+    prefix = os.path.normcase("process-")
+    suffix = os.path.normcase(".log")
     logs = [p for p in entries
-            if p.name.startswith("process-") and p.name.endswith(".log")]
+            if os.path.normcase(p.name).startswith(prefix)
+            and os.path.normcase(p.name).endswith(suffix)]
     for path in logs:
         try:
             results.append(ingest_file(path, db_path, force=force))
@@ -739,6 +759,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     except FileNotFoundError:
         print(f"ERROR: {args.logfile} not found", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        # Everything that is not "gone": a denial, a loop, a drive that is
+        # not ready. This used to leave as a traceback, because the handler
+        # above names the one state the probe could distinguish.
+        print(f"ERROR: {args.logfile} could not be read ({exc})",
+              file=sys.stderr)
         return 1
     return 0
 

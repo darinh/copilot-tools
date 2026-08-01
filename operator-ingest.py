@@ -10,7 +10,7 @@ Usage:
 
 Exit codes: 0=success/skip, 1=error, 2=no shutdown event
 """
-import re, sys, subprocess, os, argparse, json
+import re, sys, subprocess, os, argparse, json, stat
 from datetime import datetime, timezone
 
 
@@ -137,7 +137,22 @@ def main():
     logfile = os.path.abspath(args.logfile)
     log_basename = os.path.basename(logfile)
 
-    if not os.path.isfile(logfile):
+    # `os.stat` rather than `os.path.isfile`. os.path swallows every OSError
+    # and answers False, so a log that is there but cannot be examined -- a
+    # denial, a dangling symlink, a disconnected network home -- was reported
+    # to the user as "not found", which sends them looking for a file that is
+    # sitting right where they left it. This script stays stdlib-only (it is
+    # invoked directly by operator.sh), so it spells out what
+    # `install_manifest.file_present` does for the importable modules.
+    try:
+        usable = stat.S_ISREG(os.stat(logfile).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        usable = False
+    except OSError as exc:
+        print(f"ERROR: {logfile} could not be examined ({exc})",
+              file=sys.stderr)
+        sys.exit(1)
+    if not usable:
         print(f"ERROR: {logfile} not found", file=sys.stderr)
         sys.exit(1)
 
