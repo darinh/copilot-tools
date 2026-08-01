@@ -44,9 +44,21 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(op, "POLL_INTERVAL", 0)
     monkeypatch.setattr(op, "LAUNCH_BACKOFF_BASE", 0)
     monkeypatch.setattr(op, "RESTART_PAUSE_SECONDS", 0)
-    op._PROBE_WARNED.clear()
+    _reset_probe_warnings()
     yield tmp_path
-    op._PROBE_WARNED.clear()
+    _reset_probe_warnings()
+
+
+def _reset_probe_warnings() -> None:
+    """Clear the warn-once memo, tolerating its absence.
+
+    This file doubles as a negative control: it is run unmodified against
+    older revisions to prove the counterpart tests fail there. A fixture that
+    hard-references a symbol the fix introduced turns every test into an
+    identical setup error, which looks like a devastating control from a
+    distance and in fact never reaches a single assertion.
+    """
+    getattr(op, "_PROBE_WARNED", {}).clear()
 
 
 def _can_symlink(tmp_path: Path) -> bool:
