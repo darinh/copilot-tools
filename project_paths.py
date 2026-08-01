@@ -14,7 +14,7 @@ import platform
 import subprocess
 from pathlib import Path
 
-__all__ = ["primary_repo_root"]
+__all__ = ["primary_repo_root", "guid_is_usable"]
 
 # A background supervisor with no console of its own would otherwise flash a
 # real console window for each of these calls on Windows.
@@ -56,3 +56,76 @@ def primary_repo_root(start=None) -> Path:
             candidate = line[len("worktree "):].strip()
             return Path(candidate) if candidate else base
     return base
+
+
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{n}" for n in range(1, 10)),
+    *(f"LPT{n}" for n in range(1, 10)),
+}
+# `<>:"|?*` and the control characters cannot appear in a Windows filename.
+# Letting one through does not create a directory, it raises deep inside
+# `mkdir` -- and an embedded NUL raises ValueError, which is not an OSError and
+# so slips straight through the usual guards.
+_UNSAFE_GUID_CHARS = frozenset('<>:"|?*') | frozenset(chr(c) for c in range(32))
+
+
+def guid_is_usable(guid: str) -> bool:
+    """True when `guid` names exactly one directory under the projects root.
+
+    This lives here, beside the other project-identity logic, because both the
+    writer (``handoff_tool``) and the reader (``copilot_operator``) must agree
+    on it. Two definitions of a valid project id that drift apart is precisely
+    the defect it exists to prevent, so there is one definition and both
+    import it.
+
+    A catalog row is hand-edited often enough that its second column cannot be
+    trusted to hold a GUID. A blank one is the dangerous case: ``projects /
+    ""`` collapses back to the projects root itself, so the handoff lands in a
+    single shared ``next-session.md`` that every project overwrites in turn --
+    and the next session reads it, deletes it, and never learns it belonged to
+    someone else. A separator or a `..` escapes the projects root the same way,
+    just further.
+
+    The trailing-dot rule is the subtle one, and it is the same bug wearing a
+    disguise: Windows strips trailing dots and spaces from a path component, so
+    ``projects/victim.`` and ``projects/victim`` are one directory. Accepting
+    ``victim.`` would let a malformed row silently address a *different*
+    project's handoff -- exactly the clobbering this function exists to stop.
+
+    One collision is deliberately *not* rejected: ``abc`` and ``ABC`` are one
+    directory on a case-insensitive filesystem. That is a different kind of
+    fault. ``victim.`` is malformed in isolation -- it does not name what it
+    appears to name -- whereas ``ABC`` names exactly ``ABC``, and the problem
+    only exists if some *other* row also claims ``abc``. Catching it means
+    comparing rows against each other, which belongs in a catalog check rather
+    than in a predicate over one value, and rejecting case variants outright
+    would break catalogs that are correct today.
+
+    A symlink planted inside the projects root is likewise out of scope. This
+    is a predicate over a string; it cannot see the filesystem, and a name that
+    happens to be a link escapes the root no matter how well-formed it looks.
+    Catching that needs a resolve-time containment check instead. It is not
+    done here because the precondition already costs more than the exploit
+    yields: anyone who can write a symlink into the projects root can just as
+    easily drop a hostile ``next-session.md`` into a legitimate project's
+    directory, and a handoff is read as instructions. Rejecting a resolved path
+    that leaves the root would also break the user who deliberately symlinks a
+    project's state onto another drive, which is a real setup and a correct
+    one.
+    """
+    if not guid or guid != guid.strip():
+        return False
+    # Rejects ".", ".." and any run of dots, plus anything Windows would trim
+    # down to a different name.
+    if guid.strip(".") == "" or guid != guid.rstrip("."):
+        return False
+    if "/" in guid or "\\" in guid:
+        return False
+    if _UNSAFE_GUID_CHARS & frozenset(guid):
+        return False
+    if guid.split(".")[0].upper() in _WINDOWS_RESERVED:
+        return False
+    # Catches the platform-specific leftovers, notably a Windows drive-relative
+    # token like `C:x`, whose final component is not the whole string.
+    return guid == Path(guid).name

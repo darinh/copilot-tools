@@ -196,6 +196,75 @@ def test_project_handoff_file_none_when_not_in_catalog(tmp_path, monkeypatch):
     assert op.project_handoff_file(project_root) is None
 
 
+@pytest.mark.parametrize("guid", ["../../elsewhere", "..", "a/b", "a\\b"])
+def test_project_handoff_file_never_resolves_outside_the_projects_root(
+        tmp_path, monkeypatch, guid):
+    """The reader must refuse the ids the writer refuses to create.
+
+    Before this guard, a catalog id of `../../elsewhere` produced
+    `~/.copilot/projects/../../elsewhere/next-session.md`, which resolves two
+    levels above the projects root -- a file the operator would then report on
+    and the next agent would read and delete.
+    """
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_text(f'"{project_root}",{guid}\n', encoding="utf-8")
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+
+    found = op.project_handoff_file(project_root)
+
+    assert found is None, f"escaped to {found.resolve() if found else None}"
+
+
+def test_project_handoff_file_rejects_a_windows_trailing_dot_id(tmp_path, monkeypatch):
+    """`victim.` and `victim` are one directory on Windows.
+
+    A plausible typo, not an attack: it would silently read and delete a
+    different project's handoff.
+    """
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_text(f'"{project_root}",victim.\n', encoding="utf-8")
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+
+    assert op.project_handoff_file(project_root) is None
+
+
+def test_project_handoff_file_reader_and_writer_agree_on_validity(tmp_path, monkeypatch):
+    """One definition of a valid id, not two that drift apart."""
+    import handoff_tool
+
+    assert op.guid_is_usable is handoff_tool.guid_is_usable
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    catalog = tmp_path / "catalog.csv"
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+    for guid in ("", "..", "../x", "victim.", "bad:stream", "CON"):
+        catalog.write_text(f'"{project_root}",{guid}\n', encoding="utf-8")
+        assert not handoff_tool.guid_is_usable(guid)
+        assert op.project_handoff_file(project_root) is None, \
+            f"reader accepted {guid!r} that the writer rejects"
+
+
+def test_project_handoff_file_still_accepts_a_real_guid(tmp_path, monkeypatch):
+    """The guard must not break the entries that work today."""
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    catalog = tmp_path / "catalog.csv"
+    catalog.write_text(
+        f'"{project_root}",a1b2c3d4-e5f6-7890-abcd-ef1234567890\n',
+        encoding="utf-8")
+    monkeypatch.setattr(op, "project_catalog_path", lambda: catalog)
+
+    found = op.project_handoff_file(project_root)
+
+    assert found is not None
+    assert found.parent.name == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+
 # ── --yolo everywhere ────────────────────────────────────────────
 def test_run_single_session_always_includes_yolo(monkeypatch, tmp_path):
     seen_args = []
