@@ -64,6 +64,18 @@ STALE_CLAIM = re.compile(
     re.IGNORECASE,
 )
 
+# A claim token is not a claim when it is being denied. "Here 'legacy' means
+# superseded, not abandoned" is the true statement, and a guard that rejects
+# the true statement forces the false one back -- so the negation is handled
+# rather than worked around by banning the word from our own prose. The window
+# stops at sentence punctuation, because a negation in the previous sentence
+# denies nothing here: "This is not the Python path. The scripts are
+# unmaintained" is still a lie.
+NEGATED = re.compile(
+    r"\b(?:not|never|nor|isn't|aren't|rather than|far from)\b[^.;:!?]{0,40}$",
+    re.IGNORECASE,
+)
+
 # The subject matcher is broader than the filenames on purpose. The sentence
 # that actually shipped was "the bash scripts themselves are left on disk,
 # untouched" -- it never named a file, and a filename-keyed scan would have
@@ -99,6 +111,38 @@ def _blocks(text: str) -> list[str]:
     objectionable and reports the paragraph clean.
     """
     return [block for block in re.split(r"\n[ \t]*\n", text) if block.strip()]
+
+
+def _stale_claims(block: str) -> list[str]:
+    """Claim tokens in `block` that are asserted rather than denied."""
+    return [
+        m.group(0) for m in STALE_CLAIM.finditer(block)
+        if not NEGATED.search(" ".join(block[:m.start()].split()))
+    ]
+
+
+def _details_sections(text: str) -> list[tuple[str, str]]:
+    """(summary, body) for every ``<details>`` block."""
+    return [
+        (m.group("summary"), m.group("body"))
+        for m in re.finditer(
+            r"<details>\s*<summary>(?P<summary>.*?)</summary>"
+            r"(?P<body>.*?)</details>",
+            text, re.DOTALL)
+    ]
+
+
+def _fenced_lines(text: str) -> list[str]:
+    """Every line inside a fenced code block -- i.e. things a reader will run."""
+    lines: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            inside = not inside
+            continue
+        if inside:
+            lines.append(line)
+    return lines
 
 
 def _test_files_exercising(script: str) -> list[str]:
@@ -149,10 +193,9 @@ def test_no_shipped_document_calls_the_maintained_scripts_dead():
         for block in _blocks(doc.read_text(encoding="utf-8", errors="replace")):
             if not SUBJECT.search(block):
                 continue
-            claim = STALE_CLAIM.search(block)
-            if claim:
+            for claim in _stale_claims(block):
                 offences.append(
-                    f"{doc.relative_to(REPO).as_posix()}: {claim.group(0)!r} in "
+                    f"{doc.relative_to(REPO).as_posix()}: {claim!r} in "
                     f"{' '.join(block.split())[:160]!r}")
     assert not offences, (
         "documentation claims the bash scripts have stopped changing, while "
@@ -181,8 +224,43 @@ def test_the_readme_names_test_modules_that_exist_and_run_the_scripts():
         "the README's bash-maintenance claim should cite at least two test "
         f"modules that actually name the scripts; it cites {sorted(relevant)}")
 
+def test_setup_sh_is_not_offered_as_a_way_to_get_a_bash_install():
+    """The premise first, then the rule -- an idea taken from a peer's version.
 
-# ── Controls ────────────────────────────────────────────────────────
+    ``docs/operator.md`` used to head its rollback recipe with ``./setup.sh``,
+    which is the one command in the repository guaranteed *not* to produce a
+    bash install: it stashes the ``operator``/``handoff`` symlinks and points
+    them at the Python console scripts. A reader who followed it got the
+    supported install and no error, which is exactly why it survived.
+
+    The premise is asserted rather than assumed, so that if ``setup.sh`` ever
+    stops migrating, this reports an expired reason instead of going on
+    quietly enforcing a rule that no longer has one.
+    """
+    setup = (REPO / "setup.sh").read_text(encoding="utf-8", errors="replace")
+    assert "stash_legacy_link operator operator.sh" in setup, (
+        "premise expired: setup.sh no longer migrates the operator symlink "
+        "off operator.sh, so it may be fine to recommend it again -- check, "
+        "then delete this rule rather than editing the docs around it")
+
+    offences = []
+    for doc in _docs():
+        text = doc.read_text(encoding="utf-8", errors="replace")
+        for summary, body in _details_sections(text):
+            if not SUBJECT.search(summary) and not re.search(
+                    r"roll(ing)? ?back", summary, re.IGNORECASE):
+                continue
+            for line in _fenced_lines(body):
+                if re.search(r"(?:^|[\s/])setup\.sh\b", line):
+                    offences.append(
+                        f"{doc.relative_to(REPO).as_posix()}: {summary!r} "
+                        f"tells the reader to run {line.strip()!r}")
+    assert not offences, (
+        "a rollback section prescribes setup.sh, which migrates away from the "
+        "bash scripts:\n  " + "\n  ".join(offences))
+
+
+
 # A detector that matches nothing reports every document clean. These pin
 # both directions: the exact prose that shipped must trip it, and the prose
 # that replaced it must not.

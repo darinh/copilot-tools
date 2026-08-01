@@ -35,25 +35,29 @@ messaging, and spec-driven workflow conventions.
 | Spec Kit workflow | ✅ | ✅ | ✅ |
 | Runtime extensions | ✅ | ✅ | ✅ |
 | `operator` / `handoff` (Python) | ✅ | ✅ | ✅ |
-| `operator.sh` / `handoff.sh` (bash, superseded, still maintained) | ❌ | rollback only | rollback only |
+| `operator.sh` / `handoff.sh` (bash, legacy — rollback target, still tested) | ❌ | rollback only | rollback only |
 | `operator restore` (Windows Terminal tabs) | ✅ (native tabs) | ✅ (WSL-hosted tabs only) | ❌ |
 
 The Python implementation is the supported entry point on every platform.
 `setup.sh` migrates existing Linux/WSL/macOS installs off the bash scripts
 automatically (see [Quick Start](#quick-start)); the bash scripts themselves
-are left on disk purely so a failed migration can never strand a user without
-a working `operator`/`handoff` command.
+are left on disk, unmodified by setup, purely so a failed migration can never
+strand a user without a working `operator`/`handoff` command.
 
-**Superseded is not the same as dead.** A rollback path is only worth having if it
-still runs, so `operator.sh`/`handoff.sh` are held to the same standard as the
-Python: bugs and portability defects in them are fixed, and the pytest suite
-executes them — `tests/test_operator_sh_bash32.py`, `tests/test_handoff_sh.py`,
+Here "legacy" means superseded, not abandoned. A rollback target is only worth
+having if it still runs, so the bash scripts stay under test: CI's "Shell
+script syntax" job parses every `*.sh` with `bash -n` on every push, and the
+suite exercises `operator.sh` and `handoff.sh` directly —
+`tests/test_operator_sh_bash32.py`, `tests/test_handoff_sh.py`,
 `tests/test_operator_sh_help.py` and `tests/test_shell_bash32_conformance.py`
-all read or run these files, and CI's "Shell script syntax" job parses them on
-every push. What they do *not* get is new features: the Python is where those
-land, and a divergence in behaviour is resolved by changing the bash to match.
-`tests/test_legacy_bash_status.py` fails if this paragraph and that test
-coverage ever stop agreeing.
+all read or run them, the last of those because macOS `/bin/bash` is
+permanently 3.2 and macOS is exactly where someone is most likely to need the
+fallback. They still get bug fixes; they get no new features, and a divergence
+in behaviour is resolved by changing the bash to match the Python. Don't
+install them on purpose — see [rolling
+back](docs/operator.md#installation) for the one supported reason to.
+`tests/test_legacy_bash_status.py` fails if this paragraph and that coverage
+ever stop agreeing.
 
 `operator restore` re-launches tracked Windows Terminal tabs. It works from
 both native Windows PowerShell and from inside WSL (via `wt.exe`/`wsl.exe`

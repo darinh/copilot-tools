@@ -47,21 +47,27 @@ extensions, and installs configuration templates. It is safe to rerun and will
 not overwrite edited configuration without asking.
 
 <details>
-<summary>Rolling back to the bash entry point (Linux/WSL only)</summary>
+<summary>Rolling back to the bash implementation (Linux/WSL/macOS)</summary>
 
-`./setup.sh` does **not** install the bash entry point any more — it migrates
-*away* from it, moving a `~/.local/bin/operator` symlink that resolves to this
-checkout's `operator.sh` aside and deleting it once the Python console scripts
-are confirmed working. So the symlink below is a rollback, not an install:
+The bash scripts are a rollback target, not an install option, and
+**`./setup.sh` will not give you one** — it migrates `operator`/`handoff` *off*
+the bash scripts and onto the Python console scripts, which is the opposite of
+what this section is for. A reader who followed the old version of these
+instructions got the supported install and no error, which is why that stood
+for as long as it did.
+
+Roll back by pointing the symlinks at the scripts yourself:
 
 ```bash
 ln -sf /path/to/copilot-tools/operator.sh ~/.local/bin/operator
 ln -sf /path/to/copilot-tools/handoff.sh ~/.local/bin/handoff
 ```
 
-The next `./setup.sh` run will migrate it away again, by design. Both scripts
-are still maintained and still exercised by the test suite, so a rollback lands
-on working code rather than on whatever they looked like at the migration.
+Re-running `./setup.sh` afterwards migrates them back to Python, by design. The
+scripts are kept parsing and running so this stays a real escape hatch — CI runs
+`bash -n` over every `*.sh`, and the suite exercises these two directly,
+including a bash 3.2 conformance scan for macOS — but they receive bug fixes
+only, never new features.
 </details>
 
 ## Architecture

@@ -28,8 +28,45 @@
 # ═══════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# Resolve the directory where this script lives (follows symlinks)
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Resolve the directory where this script lives (follows symlinks).
+#
+# NOT `readlink -f`. That is GNU-only, and macOS ships BSD readlink, which
+# rejects `-f` -- and it does not fail loudly there. The failing readlink sits
+# in a *nested* command substitution feeding `dirname`, so the assignment's
+# exit status is that of `cd ... && pwd`, which succeeds: `set -euo pipefail`
+# never fires. readlink writes to stderr and nothing to stdout, `dirname ""`
+# is `.`, and SCRIPT_DIR silently becomes THE CALLER'S working directory.
+# Measured with a stub readlink that refuses `-f` exactly as BSD's does:
+# exit 0, no abort, SCRIPT_DIR=/ when invoked from /.
+#
+# That is why this matters here specifically: the documented rollback is a
+# symlink in ~/.local/bin invoked from wherever the user happens to be, so
+# SCRIPT_DIR was wrong precisely in the situation the script exists to serve,
+# and its real uses are all `${SCRIPT_DIR}/operator-ingest.py`. Nothing
+# warning-shaped ever appeared: capture_and_store_metrics runs in a subshell
+# opened with `set +e` whose last statement is a successful `log`, so the
+# subshell exits 0 and the "(non-fatal)" arm never fires, while python's
+# "can't open file" is captured by 2>&1 and printed as an ordinary
+# `Metrics: ...` line. A macOS loop looked healthy and stored no metrics.
+# `setup.sh` already avoids this call for this reason.
+resolve_script_dir() {
+    local src="$1" dir hops=0
+    # `readlink` with no flags is POSIX and resolves one hop, which is all BSD
+    # offers; the loop is what `-f` was doing. Bounded, because a symlink
+    # cycle here would hang the launcher rather than fail it.
+    while [ -L "$src" ]; do
+        hops=$((hops + 1))
+        [ "$hops" -le 40 ] || break
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in
+            /*) ;;
+            *) src="${dir}/${src}" ;;
+        esac
+    done
+    ( cd -P "$(dirname "$src")" && pwd )
+}
+SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"
 
 # ── Constants ───────────────────────────────────────────────────
 # All operator state lives in ~/.operator/ (NOT ~/.copilot/).
