@@ -56,6 +56,44 @@ only `operator.sh`, which is how `handoff.sh` kept an associative array
 through the change that removed operator.sh's — a rule enforced against one
 file is not a rule, it is that file's history.
 
+## Every third-party import must be declared
+
+CI went red on the two Python 3.12 legs on 2026-08-01 and stayed green on the
+other four. `tests/test_worktree_install_guard.py` imports `setuptools`, and
+nothing in `pyproject.toml` ever said so — it worked for as long as Python
+shipped `setuptools` in a fresh environment, and 3.12 stopped. A full green
+local suite could not see it (this machine is 3.11 with `setuptools` ambiently
+installed) and neither could four adversarial review passes across three
+models, because an *absent* line in `pyproject.toml` is not in the diff.
+
+`tests/test_dependency_declaration_conformance.py` is what looks now. Every
+top-level import in every first-party `*.py` must resolve to the standard
+library, another module in this repo, or a distribution named in
+`pyproject.toml` — `[project] dependencies`, any
+`[project.optional-dependencies]` extra, or `[build-system] requires`. If you
+add an import, declare it in the same commit.
+
+There is no exemption list, deliberately: `try: import x / except ImportError`
+and imports under `TYPE_CHECKING` are reported too, because both still bet on
+the environment supplying the name. Declare the optional dependency in an
+extra instead. Prefer that to `pytest.importorskip`, which turns "the library
+is missing" into a silent skip and retires the guarantee while staying green.
+
+The scan carries its own narrow TOML reader, because `tomllib` is 3.11+ and
+the floor is 3.10. Two things about it are load-bearing. `IMPORT_NAMES` — the
+table saying PyYAML is imported as `yaml` — is checked against
+`importlib.metadata.packages_distributions()`, so a wrong entry fails rather
+than silently widening the allow-list. And the parser's controls must contain
+a quote or a bracket *inside the comment*: the first draft's comment cases
+used `# why`, which a parser that never strips comments at all handles
+identically, so the whole control set passed with comment handling removed.
+A commented-out `# "ghost",` in a dependency array is the shape that matters.
+
+Modules removed from the standard library after 3.10 (`distutils`, gone in
+3.12) are reported on the newer legs only. That is the correct verdict and it
+is the setuptools shape exactly. Modules *added* after 3.10 belong to
+`tests/test_python_floor_conformance.py`, not here.
+
 ## Spec-kit workflow
 
 - Read `.specify/memory/constitution.md` and the active feature under `specs/`
