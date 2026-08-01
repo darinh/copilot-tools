@@ -268,6 +268,7 @@ copilot-tools/
     ├── skills.md                  # Skills reference
     ├── versioning.md              # Install manifest and upgrade strategies
     ├── checkout-guard.md          # Stray-artifact guard, and how to tell it is running
+    ├── experimental-default.md    # Measurement: the CLI loads no extensions without --experimental
     └── spec-kit.md                # GitHub spec-kit documentation
 ```
 
