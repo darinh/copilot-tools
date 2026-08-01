@@ -564,7 +564,7 @@ def annotated_uses(source: str) -> list[tuple[int, str]]:
     return out
 
 
-def _first_party_python() -> list[Path]:
+def _first_party_python(root: Path = REPO) -> list[Path]:
     """Every Python file this repository ships or runs on CI.
 
     Both the shipped modules and ``tests/``, because CI runs the test suite
@@ -572,14 +572,23 @@ def _first_party_python() -> list[Path]:
     floor exactly like one in a module, and the sibling bash scan covers
     every first-party script rather than the ones that ship.
 
-    Filtered on the path *relative to the repo*, because every agent here
+    Filtered on the path *relative to* ``root``, because every agent here
     works in ``<repo>/.worktrees/<branch>/`` and an absolute-path filter
     matches ``.worktrees`` for every file in the tree — leaving an empty
     population, which passes every "no file contains X" assertion below.
+
+    ``root`` is a parameter for one reason: without it the only test of that
+    filter is whether *this* checkout happens to sit under a ``.worktrees``
+    path. It does for an agent and it does not on CI, so the assertion would
+    hold in the place that already knows about the trap and lapse in the
+    place that runs the suite eight times. Mutation-testing this scan turned
+    the absolute-path filter back on and nothing failed, purely because the
+    export under test was in a temp directory. See
+    :func:`test_the_population_filter_survives_a_worktree_path`.
     """
     return sorted(
-        p for p in [*REPO.glob("*.py"), *REPO.glob("tests/*.py")]
-        if not any(part in NOT_SOURCE for part in p.relative_to(REPO).parts)
+        p for p in [*root.glob("*.py"), *root.glob("tests/*.py")]
+        if not any(part in NOT_SOURCE for part in p.relative_to(root).parts)
     )
 
 
@@ -682,6 +691,40 @@ def test_the_population_is_not_empty_and_holds_what_we_ship() -> None:
         assert expected in names, (
             f"{expected} is not being scanned; the population filter is wrong"
         )
+
+
+def test_the_population_filter_survives_a_worktree_path(tmp_path: Path) -> None:
+    """A repo living under ``.worktrees/`` must still have a population.
+
+    The test above cannot make this claim. It reads whichever checkout is
+    running it, so it only exercises the trap when that checkout happens to
+    sit under a ``.worktrees`` path — true for an agent, false on CI, where
+    the suite runs eight times and would never notice the filter regressing.
+
+    That is not a hypothetical. Mutation-testing this scan changed the filter
+    back to the absolute path and *nothing failed*, because the tree under
+    test was an export in a temp directory. Re-run from a directory with
+    ``.worktrees`` in it, the same mutation emptied the population
+    immediately. The mutation had not been caught; it had been asked in a
+    place where it made no difference.
+
+    So the invariant is asserted against a tree built for the purpose, and
+    the assertion now means the same thing everywhere it runs.
+    """
+    root = tmp_path / ".worktrees" / "some-branch"
+    (root / "tests").mkdir(parents=True)
+    (root / "copilot_operator.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "tests" / "test_thing.py").write_text("y = 2\n", encoding="utf-8")
+    (root / "__pycache__").mkdir()
+    (root / "__pycache__" / "stale.py").write_text("z = 3\n", encoding="utf-8")
+
+    found = {p.name for p in _first_party_python(root)}
+    assert found == {"copilot_operator.py", "test_thing.py"}, (
+        f"a repository checked out under a `.worktrees` path yielded "
+        f"{found or 'nothing'}. The filter is matching against the absolute "
+        f"path, so every file in every agent's worktree is excluded and the "
+        f"population is empty - which passes every assertion above."
+    )
 
 
 def test_every_annotation_carries_a_reason() -> None:

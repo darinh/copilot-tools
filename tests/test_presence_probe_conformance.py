@@ -133,7 +133,7 @@ NOT_SOURCE = (".git", ".worktrees", "node_modules", "__pycache__",
               ".specify", "build", "dist")
 
 
-def _shipped_modules() -> list[Path]:
+def _shipped_modules(root: Path = REPO) -> list[Path]:
     """The Python this repository ships and runs.
 
     Top-level ``*.py`` is the whole of it: ``extensions/`` is JavaScript,
@@ -149,16 +149,22 @@ def _shipped_modules() -> list[Path]:
     them would be several hundred annotations that all say the same thing,
     and an exemption list that large stops being read.
 
-    Filtered on the path *relative to the repo*. Every agent on this project
+    Filtered on the path relative to ``root``. Every agent on this project
     works in ``<repo>/.worktrees/<branch>/``, so an absolute-path filter
     matches ``.worktrees`` for every file in the tree, the population comes
     back empty, and an empty population passes every "no module contains X"
     assertion in this file. That is not hypothetical — it is what the sibling
     bash scan did when it was first written.
+
+    ``root`` is a parameter so that claim can be *tested* rather than
+    described. Without it the only exercise of the filter is whether this
+    checkout happens to live under a ``.worktrees`` path — true for an agent,
+    false on CI, so the assertion lapses exactly where the suite runs eight
+    times. See :func:`test_the_population_filter_survives_a_worktree_path`.
     """
     return sorted(
-        p for p in REPO.glob("*.py")
-        if not any(part in NOT_SOURCE for part in p.relative_to(REPO).parts)
+        p for p in root.glob("*.py")
+        if not any(part in NOT_SOURCE for part in p.relative_to(root).parts)
     )
 
 
@@ -513,6 +519,37 @@ def test_the_population_is_not_empty_and_holds_the_modules_we_ship() -> None:
             f"{expected} has held this defect before and is no longer being "
             f"scanned; the population filter is wrong"
         )
+
+
+def test_the_population_filter_survives_a_worktree_path(tmp_path: Path) -> None:
+    """A repo living under ``.worktrees/`` must still have a population.
+
+    The test above cannot make this claim: it reads whichever checkout is
+    running it, so it only exercises the trap when that checkout happens to
+    sit under a ``.worktrees`` path. True for an agent, false on CI — the
+    assertion lapses exactly where the suite runs eight times.
+
+    Found by mutation-testing the sibling floor scan, which has the same
+    filter: switching it back to the absolute path failed nothing, because
+    the tree under test was an export in a temp directory. Re-run from a
+    directory containing ``.worktrees``, the same mutation emptied the
+    population at once. The mutation had not been caught, it had been asked
+    somewhere it made no difference — so the question is now asked against a
+    tree built for it.
+    """
+    root = tmp_path / ".worktrees" / "some-branch"
+    root.mkdir(parents=True)
+    (root / "setup_tools.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "__pycache__").mkdir()
+    (root / "__pycache__" / "stale.py").write_text("z = 3\n", encoding="utf-8")
+
+    found = {p.name for p in _shipped_modules(root)}
+    assert found == {"setup_tools.py"}, (
+        f"a repository checked out under a `.worktrees` path yielded "
+        f"{found or 'nothing'}. The filter is matching against the absolute "
+        f"path, so every module in every agent's worktree is excluded and "
+        f"the population is empty - which passes every assertion above."
+    )
 
 
 def test_every_annotation_carries_a_reason() -> None:
