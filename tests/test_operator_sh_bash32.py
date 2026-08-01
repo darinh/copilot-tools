@@ -47,61 +47,96 @@ def _run(script: str, tmp_path, *argv: str) -> subprocess.CompletedProcess:
 
 
 @bash
-def test_set_contains_answers_membership_and_not_substring(tmp_path):
-    """The set is a string now, so the failure mode is a substring match.
+def test_in_list_answers_membership_and_not_substring(tmp_path):
+    """Exact membership, against the near-misses a cheaper encoding allows.
 
-    Every case runs in one script and reports its own answer, so a false
-    positive and a false negative are both visible in a single failure --
-    and the members that must be found sit alongside the near-misses that
-    must not be, which is what stops this passing against a `set_contains`
-    that has been broken into always returning false.
+    The first version of this joined the names with newlines and asked whether
+    the string contained one. That is what these cases are aimed at: a
+    substring of a member, a member split by an embedded newline, and a query
+    holding glob metacharacters. Every case runs in one script and reports its
+    own answer, so a false positive and a false negative are both visible in a
+    single failure -- and the members that must be found sit alongside the
+    near-misses that must not be, which is what stops this passing against an
+    `in_list` broken into always returning false.
     """
     script = (
         "set -euo pipefail\n"
-        f"set_contains() {{\n{_shell_function('set_contains')}}}\n"
-        "s=\"\"\n"
-        "for m in alpha-one beta 'star*name'; do s+=\"$m\"$'\\n'; done\n"
-        'check() { if set_contains "$s" "$1"; then printf "IN|%s\\n" "$1"; '
-        'else printf "OUT|%s\\n" "$1"; fi; }\n'
-        "check alpha-one\n"
-        "check beta\n"
-        "check 'star*name'\n"
-        "check alpha\n"
-        "check one\n"
-        "check eta\n"
-        "check '*'\n"
-        "check 'star?name'\n"
-        "check ''\n"
+        f"in_list() {{\n{_shell_function('in_list')}}}\n"
+        "s=(alpha-one beta 'star*name' 'two words' $'multi\\nline')\n"
+        'check() { if in_list "$1" "${s[@]}"; then printf "IN|%s\\n" "$2"; '
+        'else printf "OUT|%s\\n" "$2"; fi; }\n'
+        "check alpha-one alpha-one\n"
+        "check beta beta\n"
+        "check 'star*name' 'star*name'\n"
+        "check 'two words' 'two words'\n"
+        "check $'multi\\nline' multiline-whole\n"
+        "check alpha alpha\n"
+        "check one one\n"
+        "check eta eta\n"
+        "check '*' star\n"
+        "check 'star?name' 'star?name'\n"
+        "check multi multi-half\n"
+        "check line line-half\n"
+        "check '' empty\n"
     )
     proc = _run(script, tmp_path)
     assert proc.returncode == 0, proc.stderr
-    # Delimited rather than whitespace-split: one of the queries is the empty
-    # string, and splitting that row on whitespace loses the field entirely.
     answers = {}
     for line in proc.stdout.splitlines():
         if "|" in line:
             verdict, name = line.split("|", 1)
             answers[name] = verdict
-    assert len(answers) == 9, f"expected every query to answer: {proc.stdout}"
+    assert len(answers) == 13, f"expected every query to answer: {proc.stdout}"
 
-    # Real members. If these are OUT the set is simply broken, and the
-    # absences below would pass for the wrong reason.
+    # Real members. If these are OUT the membership test is simply broken, and
+    # the absences below would pass for the wrong reason.
     assert answers["alpha-one"] == "IN"
     assert answers["beta"] == "IN"
     assert answers["star*name"] == "IN"
+    assert answers["two words"] == "IN"
+    assert answers["multiline-whole"] == "IN"
 
-    # Near misses. Each is a substring of a real member, at a different
-    # position -- prefix, suffix, interior -- because a membership test built
-    # on `case`/`[[` patterns can get the anchors right at one end only.
+    # Near misses: substrings of a real member at each position -- prefix,
+    # suffix, interior.
     assert answers["alpha"] == "OUT"
     assert answers["one"] == "OUT"
     assert answers["eta"] == "OUT"
 
+    # Either half of a member containing a newline. A newline-delimited set
+    # answers IN to both of these, because one member has become two -- and a
+    # marker filename may contain a newline, so this is reachable rather than
+    # theoretical. `stop_operator` hands every name it calls a member to
+    # `tmux kill-session`.
+    assert answers["multi-half"] == "OUT"
+    assert answers["line-half"] == "OUT"
+
     # Glob metacharacters in the *query* must be literal. Unquoted, `*` would
-    # match every member and report that any name is managed -- which on the
-    # `operator stop` path means killing sessions the operator does not own.
-    assert answers["*"] == "OUT"
+    # match every member and report that any name is managed.
+    assert answers["star"] == "OUT"
     assert answers["star?name"] == "OUT"
+
+    assert answers["empty"] == "OUT"
+
+
+@bash
+def test_in_list_says_no_to_an_empty_list(tmp_path):
+    """The list is empty whenever no markers exist, which is the common case
+    on a machine with no operator running -- and expanding an empty array is
+    the other bash 3.2 abort, so this is a conformance check too."""
+    script = (
+        "set -euo pipefail\n"
+        f"in_list() {{\n{_shell_function('in_list')}}}\n"
+        "s=()\n"
+        'if in_list alpha ${s[@]+"${s[@]}"}; then echo IN; else echo OUT; fi\n'
+        "s=(alpha)\n"
+        'if in_list alpha ${s[@]+"${s[@]}"}; then echo IN; else echo OUT; fi\n'
+    )
+    proc = _run(script, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    # The second line is the control: the same call, one member added, must
+    # flip. Without it "OUT" proves nothing -- a function that never matches
+    # anything would satisfy the first line perfectly.
+    assert proc.stdout.split() == ["OUT", "IN"], proc.stdout
 
 
 @bash
@@ -123,7 +158,7 @@ def test_list_instances_shows_managed_sessions_and_hides_the_rest(tmp_path):
         f'RESTART_DIR="{restart_dir.as_posix()}"\n'
         'tmux() { printf "%s\\n" "alpha: 1 windows" "gamma: 1 windows" '
         '"beta: 2 windows"; }\n'
-        f"set_contains() {{\n{_shell_function('set_contains')}}}\n"
+        f"in_list() {{\n{_shell_function('in_list')}}}\n"
         f"list_instances() {{\n{_shell_function('list_instances')}}}\n"
         "list_instances\n"
     )
@@ -163,7 +198,7 @@ def test_stop_operator_kills_only_the_sessions_it_manages(tmp_path):
         '        kill-session) printf "KILLED %s\\n" "$3" ;;\n'
         '    esac\n'
         '}\n'
-        f"set_contains() {{\n{_shell_function('set_contains')}}}\n"
+        f"in_list() {{\n{_shell_function('in_list')}}}\n"
         f"stop_operator() {{\n{_shell_function('stop_operator')}}}\n"
         "stop_operator\n"
     )

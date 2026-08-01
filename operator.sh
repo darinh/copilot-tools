@@ -239,18 +239,30 @@ load_instance_state() {
 # there is not a subtly different array, it is `declare: -A: invalid option`,
 # and under this script's `set -e` that ends the run. Three places wanted a
 # set, all of them for the same question: is this name one of the ones I
-# collected? So a set is a newline-delimited string, and membership is a
-# substring test on it.
+# collected?
 #
-# The delimiter is safe rather than merely convenient: every producer here is
-# already line-based — `while IFS= read -r` over `tmux list-sessions` output or
-# over basenames — so a value containing a newline cannot reach the set in the
-# first place. Adding a member is a plain `set+="$member"$'\n'` at the call
-# site; only the test needs to be shared.
-set_contains() {
-    # Both operands are quoted inside the pattern, so a name containing `*` or
-    # `?` is matched literally instead of globbing against its neighbours.
-    [[ $'\n'"$1" == *$'\n'"$2"$'\n'* ]]
+# So membership is an exact scan of an indexed array, which is the one kind of
+# array bash 3.2 does have. The obvious cheaper encoding — join the names with
+# newlines and ask whether the string contains one — is what this used first,
+# and it is wrong: `for f in "$RESTART_DIR"/*.managed` yields whatever
+# filenames exist, and a filename may contain a newline. `operator --name` with
+# a newline in it creates the marker with `touch` before tmux rejects the name,
+# so the poisoned marker outlives the failed launch; one such marker splits
+# into two logical members, and `stop_operator` passes every name it believes
+# is a member to `tmux kill-session`. An exact comparison has no encoding to
+# corrupt, and n here is the number of tmux sessions on the box.
+#
+# Usage: in_list "$needle" ${arr[@]+"${arr[@]}"}
+in_list() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        # `"$needle"` is quoted, so a name containing `*` or `?` is compared
+        # literally instead of being used as a pattern against its neighbours.
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
 }
 
 list_instances() {
@@ -258,19 +270,19 @@ list_instances() {
     echo
     local found=false
     # Collect names of sessions managed by operator (have a .managed or .state marker)
-    local managed_sessions=""
+    local managed_sessions=()
     for f in "${RESTART_DIR}"/*.state "${RESTART_DIR}"/*.managed; do
         [[ -e "$f" ]] || continue
         local base
         base=$(basename "$f")
         base="${base%.state}"
         base="${base%.managed}"
-        managed_sessions+="$base"$'\n'
+        managed_sessions+=("$base")
     done
     while IFS= read -r line; do
         local name
         name=$(echo "$line" | cut -d: -f1)
-        if set_contains "$managed_sessions" "$name"; then
+        if in_list "$name" ${managed_sessions[@]+"${managed_sessions[@]}"}; then
             echo "  $line"
             found=true
         fi
@@ -822,17 +834,17 @@ stop_operator() {
     else
         local count=0
         # Find all operator-managed sessions via .managed and .state markers
-        local managed_sessions=""
+        local managed_sessions=()
         for f in "${RESTART_DIR}"/*.managed "${RESTART_DIR}"/*.state; do
             [[ -e "$f" ]] || continue
             local base
             base=$(basename "$f")
             base="${base%.managed}"
             base="${base%.state}"
-            managed_sessions+="$base"$'\n'
+            managed_sessions+=("$base")
         done
         while IFS= read -r name; do
-            if set_contains "$managed_sessions" "$name"; then
+            if in_list "$name" ${managed_sessions[@]+"${managed_sessions[@]}"}; then
                 tmux kill-session -t "$name"
                 rm -f "${RESTART_DIR}/${name}" "${RESTART_DIR}/${name}.state" "${RESTART_DIR}/${name}.managed"
                 log "Stopped: $name"
@@ -954,14 +966,14 @@ start_copilot_in_tmux() {
         log "     ${SCRIPT_DIR:-<your copilot-tools checkout>}/diagnose-restart-deleter.sh"
         mkdir -p "$RESTART_DIR"
         if (( ${#PRE_LAUNCH_MARKERS[@]} > 0 )); then
-            local _live_sessions=""
+            local _live_sessions=()
             local _s
             while IFS= read -r _s; do
-                [[ -n "$_s" ]] && _live_sessions+="$_s"$'\n'
+                [[ -n "$_s" ]] && _live_sessions+=("$_s")
             done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
             local _name
             for _name in "${PRE_LAUNCH_MARKERS[@]}"; do
-                if set_contains "$_live_sessions" "$_name"; then
+                if in_list "$_name" ${_live_sessions[@]+"${_live_sessions[@]}"}; then
                     touch "${RESTART_DIR}/${_name}.managed"
                     log "  Restored marker for live instance: $_name"
                 else

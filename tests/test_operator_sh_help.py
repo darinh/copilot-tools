@@ -18,6 +18,7 @@ the docs cannot drift from it again: change the defaults and the docs fail
 until they are updated to match.
 """
 import re
+import shlex
 
 import pytest
 
@@ -29,14 +30,22 @@ def _injected_flags(function: str) -> str:
 
     Reads the real `local copilot_args=(...)` line rather than a copy of the
     list, so this cannot certify docs against a second stale transcription.
+
+    Parsed with `shlex` rather than by pulling out double-quoted runs. A regex
+    for `"([^"]*)"` silently drops any element written bare or in single
+    quotes, and the resulting failure message would name a *shorter* flag list
+    as the expected one -- so the test would not merely miss the drift, it
+    would talk the next person into documenting it wrongly.
     """
     body = _shell_function(function)
     match = re.search(r"^\s*local copilot_args=\((.*?)\)\s*$", body, re.MULTILINE)
     assert match, f"{function}() no longer builds copilot_args in one line"
-    elements = re.findall(r'"([^"]*)"', match.group(1))
+    elements = shlex.split(match.group(1))
     assert elements, f"{function}() builds copilot_args from nothing"
     assert any(e.startswith("--") for e in elements), (
         f"{function}() builds copilot_args with no flags at all: {elements}")
+    assert not any('"' in e or "'" in e for e in elements), (
+        f"{function}()'s defaults did not parse as shell words: {elements}")
     return " ".join(elements)
 
 
