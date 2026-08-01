@@ -11,11 +11,13 @@ unregistered project and mints a duplicate GUID.
 from __future__ import annotations
 
 import csv
+import os
 import platform
 import subprocess
 from pathlib import Path
 
-__all__ = ["primary_repo_root", "guid_is_usable", "projects_root", "project_dir"]
+__all__ = ["primary_repo_root", "guid_is_usable", "projects_root",
+           "project_dir", "resolved_str", "catalog_rows"]
 
 # A background supervisor with no console of its own would otherwise flash a
 # real console window for each of these calls on Windows.
@@ -80,6 +82,35 @@ _WINDOWS_RESERVED = {
 # `mkdir` -- and an embedded NUL raises ValueError, which is not an OSError and
 # so slips straight through the usual guards.
 _UNSAFE_GUID_CHARS = frozenset('<>:"|?*') | frozenset(chr(c) for c in range(32))
+
+
+def resolved_str(path) -> str:
+    """``str`` of ``path`` resolved, falling back to a lexical absolute path.
+
+    ``Path.resolve`` is not total, and it fails three ways rather than one. A
+    symlink loop raises ``RuntimeError`` on every interpreter this project
+    supports; a component that cannot be traversed raises ``OSError``; an
+    embedded NUL raises ``ValueError`` from deep inside ``stat``. Only the
+    middle one is an ``OSError``, so a guard written for filesystem trouble
+    catches a third of the problem and the other two leave as tracebacks.
+
+    This lives here rather than in one caller for the reason
+    :func:`guid_is_usable` does. ``handoff_tool`` resolves a project root to
+    write the handoff, ``copilot_operator`` resolves the same root to find it
+    again, and ``operator_ingest`` resolves a log path -- and the version that
+    had the guard was the one nobody else imported, so both of the others
+    re-derived it and one of them re-derived it wrong. A rule that lives in
+    one module is that module's history.
+
+    The fallback does not follow links, so it can only be *less* resolved than
+    the real answer, never differently resolved. Any comparison that puts both
+    sides through this same function therefore matches a path that will not
+    resolve literally or not at all; it cannot come to name something else.
+    """
+    try:
+        return str(Path(path).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return os.path.abspath(str(path))
 
 
 def projects_root() -> Path:

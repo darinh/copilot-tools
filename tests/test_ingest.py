@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -277,6 +278,78 @@ def test_ingest_all_on_missing_directory_is_empty(tmp_path, db_path):
 def test_missing_file_raises(tmp_path, db_path):
     with pytest.raises(FileNotFoundError):
         operator_ingest.ingest_file(tmp_path / "absent.log", db_path)
+
+
+def _resolve_raises(monkeypatch, target, exc):
+    """Make ``Path.resolve`` fail for ``target`` only.
+
+    Patched on ``pathlib.Path`` rather than on a name inside
+    ``operator_ingest``, so the control still means something against a
+    revision that spells the call differently -- the point is what the CLI
+    does when resolving this path fails, not which local it happens to use.
+    Every other path keeps the real implementation, because ingestion resolves
+    more than one and a blanket failure would abort before reaching the
+    branch under test.
+    """
+    real = Path.resolve
+    wanted = str(Path(target))
+
+    def boom(self, *args, **kwargs):
+        if str(self) == wanted:
+            raise exc
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", boom)
+
+
+@pytest.mark.parametrize("exc", [
+    RuntimeError("Symlink loop from 'absent.log'"),
+    ValueError("stat: embedded null character in path"),
+], ids=["symlink-loop", "embedded-nul"])
+def test_a_log_path_that_will_not_resolve_gets_a_sentence_not_a_traceback(
+        tmp_path, db_path, monkeypatch, capsys, exc):
+    """``resolve`` fails three ways and ``main`` handled one family of them.
+
+    A symlink loop raises ``RuntimeError`` and an embedded NUL raises
+    ``ValueError``; neither is an ``OSError``. ``main`` catches
+    ``FileNotFoundError`` and ``OSError`` -- two handlers written precisely so
+    that an unusable log gets a named refusal -- and both of these walked past
+    them and left the ``operator-ingest`` CLI as a traceback.
+
+    The exit code is not the assertion. ``main`` returns 1 from both handlers
+    and from nothing else, so ``rc == 1`` cannot tell a refusal from the
+    refusal for a different reason; the sentence the user reads is what
+    changed.
+    """
+    missing = tmp_path / "absent.log"
+    _resolve_raises(monkeypatch, missing, exc)
+    rc = operator_ingest.main([str(missing), str(db_path)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert str(missing) in err, err
+    assert "not found" in err or "could not be read" in err, err
+
+
+def test_a_real_log_behind_an_unresolvable_path_is_still_ingested(
+        tmp_path, db_path, monkeypatch):
+    """The fallback is lexical, so the metrics are not lost with the resolve.
+
+    Refusing here would trade a traceback for silently dropped usage data,
+    which is the more expensive half: ``resolve`` is being used to name the
+    file, and an absolute path that does not follow links names the same one.
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    log = logs / "process-1700000000000-1.log"
+    make_log(log)
+    _resolve_raises(monkeypatch, log, RuntimeError("Symlink loop"))
+    result = operator_ingest.ingest_file(log, db_path)
+    assert result.startswith("OK "), result
+    with operator_ingest.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE log_file = ?",
+            (log.name,),
+        ).fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("value,expected", [
