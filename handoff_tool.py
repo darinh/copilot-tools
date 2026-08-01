@@ -116,12 +116,6 @@ NOTICE_BANKED_UNPUBLISHED = (
     "> not replaced and these words were banked here instead. This copy is\n"
     "> newer than the `next-session.md` beside it."
 )
-NOTICE_BANKED_UNPUBLISHED = (
-    "> **⚠ Banked copy — this handoff was never published.** The handoff\n"
-    "> already at `next-session.md` could not be preserved first, so it was\n"
-    "> not replaced and these words were banked here instead. This copy is\n"
-    "> newer than the `next-session.md` beside it."
-)
 # A handoff is a few kilobytes of prose. Anything past this is not one, and
 # slurping it to "preserve" it would be the denial of service, not the fix.
 MAX_PRESERVE_BYTES = 8 * 1024 * 1024

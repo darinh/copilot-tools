@@ -357,12 +357,28 @@ handoff is the one that is gone. When the spare could *not* be banked, the
 unlocked writer has no copy either, and whichever of the two loses the race
 leaves nothing behind.
 
-The practical consequence is narrow but worth knowing: after a
-`Warning: another handoff is in progress for this project`, the file at
-`next-session.md` is not guaranteed to be the most recent handoff, and the
-other one may exist only in `superseded/`. Read both. Closing the windows
-properly means making the publish itself the exclusive operation rather than
-guarding it with a lock the tool is willing to proceed without.
+The practical consequence is narrow but worth knowing, and the files now say so
+themselves rather than leaving it to a stderr warning that dies with the
+session that caused it. A handoff published without the lock carries a notice
+under its title saying it was written unserialised, that it may have
+overwritten a concurrent handoff or been overwritten by one since, and that
+`superseded/` should be read alongside it; the spare banked on that path
+carries a different notice saying those words may never have reached
+`next-session.md` at all. That is what makes a banked copy distinguishable from
+an unread predecessor, which is otherwise the same kind of file under the same
+kind of name — and only one of the two can be *newer* than the handoff beside
+it. Neither notice asserts an outcome, because both are written before their
+outcome is known: the published one is chosen before the bank is attempted and
+the banked one before the publish is attempted, and either can then fail.
+
+So: after a `Warning: another handoff is in progress for this project`, the
+file at `next-session.md` is still not guaranteed to be the most recent
+handoff, and the other one may exist only in `superseded/`. Read both. The one
+case with nothing left to record it is the spare that could not be banked —
+there was no file to write the notice into — so that warning is still worth
+repeating by hand. Closing the windows properly means making the publish itself
+the exclusive operation rather than guarding it with a lock the tool is willing
+to proceed without.
 
 #### Never pruned
 
