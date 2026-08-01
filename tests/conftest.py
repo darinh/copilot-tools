@@ -1,6 +1,7 @@
 """Shared fixtures for the copilot-tools test suite."""
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import pathlib
@@ -36,6 +37,48 @@ if os.environ.get("COPILOT_TOOLS_GUARD_HOME") == "1":
 
 # Churn that is not a test artifact: tooling caches and developer worktrees.
 _GUARD_IGNORED = frozenset({".git", ".pytest_cache", "__pycache__", ".worktrees"})
+
+# The user's real project catalog, watched by CONTENT rather than by name.
+#
+# The directory guard above compares the set of names before and after a test,
+# which cannot see a file that is overwritten in place: the name is there both
+# times. That is precisely how this file was destroyed. A test suite rewrote
+# the real ~/.copilot/projects/catalog.csv with a single fixture row, six real
+# project registrations were lost, and nothing failed. It surfaced only because
+# `handoff` refused to start minutes later, by which point nothing connected the
+# two events.
+#
+# It is watched even though the enclosing directory is not, and the reason the
+# directory is excluded does not fully apply here. That reason is concurrency:
+# peer agents write handoff files under ~/.copilot/projects constantly, so
+# blaming the running test for a new name there would be a fabricated
+# accusation. Writes to the catalog itself are rare by comparison -- no
+# production code writes it at all; handoff_tool and copilot_operator only read
+# it -- so the false-positive rate is low enough to be worth the cover.
+#
+# Low is not zero, and it is worth being exact about that, because the first
+# draft of this guard restored the old bytes on the strength of "nothing but a
+# test writes this file". That premise was falsified within the hour: an agent
+# appended two recovered rows BY HAND while this was being written. Registration
+# is a manual act and it is not announced. So the guard reports and preserves;
+# it never puts anything back. See _catalog_complaint.
+_REAL_CATALOG = Path.home() / ".copilot" / "projects" / "catalog.csv"
+
+# Distinct from None, which means "checked, and the file is not there". A read
+# that fails establishes nothing at all, and the two must not be conflated:
+# install_manifest already spells this rule as "a destination that cannot be
+# examined is UNREADABLE, never ABSENT".
+_UNREADABLE = object()
+
+
+def _catalog_state():
+    """The catalog's exact bytes, ``None`` if absent, ``_UNREADABLE`` if unknown."""
+    try:
+        return _REAL_CATALOG.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _UNREADABLE
 
 
 def _snapshot_guarded() -> dict[Path, tuple[bool, frozenset[str]]]:
@@ -122,6 +165,86 @@ def _no_stray_artifacts(request: pytest.FixtureRequest):
     strays = _find_strays(before, _snapshot_guarded())
     if strays:
         raise AssertionError(_stray_report(request.node.nodeid, strays))
+
+
+def _bank(before: bytes) -> Path | None:
+    """Copy the pre-test bytes beside the catalog, never overwriting anything."""
+    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+    for n in range(20):
+        suffix = f".pre-test-{stamp}" + (f"-{n}" if n else "")
+        dest = _REAL_CATALOG.with_name(_REAL_CATALOG.name + suffix)
+        try:
+            # O_EXCL: a banked copy that overwrites a banked copy is a
+            # preserver that destroys.
+            with open(dest, "xb") as fh:
+                fh.write(before)
+            return dest
+        except FileExistsError:
+            continue
+        except OSError:
+            return None
+    return None
+
+
+def _catalog_complaint(before, nodeid: str) -> str | None:
+    """Bank the catalog's pre-test bytes if this test changed it, and say so.
+
+    Returns ``None`` when nothing changed or when nothing could be established.
+
+    It deliberately does NOT put the old contents back. Restoring assumes the
+    new contents are the test's doing, and this file has exactly one other
+    writer: a human or an agent registering a project, which can land at any
+    moment and is not announced. Overwriting it to undo a suspected clobber
+    would destroy a legitimate registration on a guess -- a preserver that
+    destroys, which is the failure this whole guard exists to catch. So it
+    copies the old bytes to a fresh name, touches nothing that already exists,
+    and hands the decision to someone who can tell the two apart.
+    """
+    if before is _UNREADABLE:
+        # Nothing was established going in, so nothing can be concluded coming
+        # out. Staying silent beats inventing a verdict from an unknown.
+        return None
+    after = _catalog_state()
+    if after is _UNREADABLE:
+        # Symmetrically: the file could not be read on the way out, so nothing
+        # about it has been established either. Falling through would compare
+        # the sentinel against real bytes, find them unequal, and convict the
+        # running test of a change nobody observed -- a sharing violation from
+        # a peer's open handle is enough to do it.
+        return None
+    if after == before:
+        return None
+    banked = _bank(before) if before is not None else None
+    where = (f"Its pre-test contents are banked at {banked}\n" if banked
+             else "")
+    # The bytes go in the message too: a bank can fail, and a report naming a
+    # file whose contents nobody recorded is a report of an unrecoverable loss.
+    original = "(did not exist)" if before is None else before.decode(
+        "utf-8", errors="replace")
+    return (
+        f"{nodeid} modified the REAL project catalog at {_REAL_CATALOG}.\n"
+        f"{where}"
+        f"Its contents before this test were:\n{original}\n"
+        "Nothing has been overwritten -- put it back by hand once you have "
+        "checked that another agent did not legitimately register a project "
+        "mid-run.\n"
+        "A test must never touch the user's home. Point the code under test "
+        "at a temporary root -- monkeypatch handoff_tool.CATALOG, or patch "
+        "Path.home -- and remember that a subprocess inherits neither."
+    )
+
+
+@pytest.fixture(autouse=True)
+def _real_catalog_is_never_rewritten(request: pytest.FixtureRequest):
+    """Fail the test that changes the user's real catalog, and bank the old bytes.
+
+    It does not put the file back. See _catalog_complaint for why not.
+    """
+    before = _catalog_state()
+    yield
+    complaint = _catalog_complaint(before, request.node.nodeid)
+    if complaint:
+        raise AssertionError(complaint)
 
 
 @pytest.fixture
