@@ -42,9 +42,15 @@ and non-ASCII characters (FR-007).
 
 | Mode | Injected |
 |---|---|
-| Single session | `--autopilot --effort high`, plus `--experimental` when the user gave neither `--experimental` nor `--no-experimental` |
-| Loop mode | `--yolo --autopilot --no-ask-user --effort high`, plus `--experimental` when the user gave neither `--experimental` nor `--no-experimental`, plus `--agent <name>` when absent, plus the autonomous preamble via `-i` |
+| Single session | `--autopilot --effort high --experimental` (`copilot_operator.py` also injects `--yolo` here; `operator.sh` does not — a pre-existing disparity, not resolved by this contract) |
+| Loop mode | `--yolo --autopilot --no-ask-user --effort high --experimental`, plus `--agent <name>` when absent, plus the autonomous preamble via `-i` |
 | Both | `--log-level debug`, unless the user set `--log-level` or `COPILOT_OPERATOR_NO_DEBUG_LOG=1`. Required because Copilot only writes usage data at debug level. |
+
+`--experimental` is injected **unconditionally**, and always ahead of the user's own arguments.
+Runtime extensions load only in experimental mode. A user who passes `--no-experimental` still
+gets it, because the CLI resolves conflicting spellings last-wins (measured, both orders, CLI
+1.0.77). The operator deliberately does **not** inspect the user's arguments to decide, because it
+cannot tell a flag from a value: `-p --no-experimental` is a prompt, not a ruling.
 
 In loop mode with saved state, `--resume=<session-id>` is appended **exactly once**, and is suppressed
 when the user already specified a session argument (FR-012).

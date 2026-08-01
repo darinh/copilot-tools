@@ -650,15 +650,6 @@ extract_agent_from_args() {
     echo "anvil:anvil"
 }
 
-has_experimental_flag() {
-    for arg in "$@"; do
-        case "$arg" in
-            --experimental|--no-experimental|--experimental=*) return 0 ;;
-        esac
-    done
-    return 1
-}
-
 args_have_explicit_session() {
     local prev=""
     for arg in "$@"; do
@@ -998,12 +989,13 @@ restart_copilot() {
 
 # ── Single Session Mode ────────────────────────────────────────
 run_single_session() {
-    # `--experimental` unless the caller ruled on it: runtime extensions load
-    # only in experimental mode, and the flag is sticky global state in
-    # ~/.copilot/settings.json that any other session can flip. See
-    # with_experimental() in copilot_operator.py for the full reasoning.
-    local copilot_args=("--autopilot" "--effort" "high")
-    has_experimental_flag "$@" || copilot_args+=("--experimental")
+    # `--experimental` always, and always ahead of "$@": runtime extensions
+    # load only in experimental mode, and the flag is sticky global state in
+    # ~/.copilot/settings.json that any other session can flip. The CLI
+    # resolves conflicting spellings last-wins, so a user's own
+    # `--no-experimental` still beats this. See with_experimental() in
+    # copilot_operator.py for the full reasoning.
+    local copilot_args=("--autopilot" "--effort" "high" "--experimental")
     copilot_args+=("$@")
 
     handle_existing_session
@@ -1042,8 +1034,7 @@ run_loop_mode() {
 
     trap cleanup SIGINT SIGTERM
 
-    local copilot_args=("--yolo" "--autopilot" "--no-ask-user" "--effort" "high")
-    has_experimental_flag "${user_args[@]}" || copilot_args+=("--experimental")
+    local copilot_args=("--yolo" "--autopilot" "--no-ask-user" "--effort" "high" "--experimental")
 
     local agent_name
     agent_name=$(extract_agent_from_args "${user_args[@]}")

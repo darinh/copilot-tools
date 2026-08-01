@@ -18,12 +18,21 @@ hypothetical: agent sessions on this machine ran for over an hour with no
 `checkout-guard` at all, in the shared primary checkout it exists to protect,
 and nothing inside them could have told.
 
-`operator` therefore passes `--experimental` on every launch unless the caller
-ruled on it (see `with_experimental` in `copilot_operator.py`). If you start
-`copilot` by hand and want the extensions, pass it yourself:
+`operator` therefore passes `--experimental` on **every** launch, ahead of your
+own arguments (see `with_experimental` in `copilot_operator.py`). Passing
+`--no-experimental` yourself still wins, because the CLI resolves conflicting
+spellings last-wins. If you start `copilot` by hand and want the extensions,
+pass it yourself:
 
 ```bash
 copilot --experimental
+```
+
+To check what mode you are in, read the key the CLI persists — an extension
+cannot tell you it failed to load:
+
+```bash
+grep experimental ~/.copilot/settings.json
 ```
 
 | Extension | Hook | What it does |

@@ -145,32 +145,19 @@ def test_has_agent_flag(args, expected):
 
 
 # ── extensions load only in experimental mode ───────────────────
-@pytest.mark.parametrize("args,expected", [
-    (["--experimental"], True),
-    (["--no-experimental"], True),
-    (["--experimental=true"], True),
-    (["--yolo"], False),
-    ([], False),
-    (["--experimentalish"], False),
+@pytest.mark.parametrize("defaults", [
+    ["--yolo"],
+    [],
+    ["--yolo", "--no-experimental"],
 ])
-def test_has_experimental_flag(args, expected):
-    assert op.has_experimental_flag(args) is expected
+def test_with_experimental_always_adds_the_flag(defaults):
+    """Unconditionally, and last, so anything appended after it wins.
 
-
-def test_with_experimental_adds_the_flag_when_the_user_said_nothing():
-    assert op.with_experimental(["--yolo"], []) == ["--yolo", "--experimental"]
-
-
-@pytest.mark.parametrize("opt_out", [["--no-experimental"], ["--experimental"]])
-def test_with_experimental_leaves_an_explicit_choice_alone(opt_out):
-    """A caller who ruled on it owns the decision, either way.
-
-    `--no-experimental` is the one that matters: overriding it would make the
-    flag impossible to turn off through the operator. `--experimental` is here
-    so the flag is never passed twice.
+    Deciding by inspecting the caller's arguments is what the first version of
+    this did, and it could not tell a flag from a value: `-p --no-experimental`
+    reads as a ruling and suppressed the injected flag.
     """
-    defaults = ["--yolo"]
-    assert op.with_experimental(defaults, opt_out) == defaults
+    assert op.with_experimental(defaults) == [*defaults, "--experimental"]
 
 
 def _capture_launch_args(monkeypatch):
@@ -188,6 +175,16 @@ def _capture_launch_args(monkeypatch):
     return seen
 
 
+def _run_single(monkeypatch, args):
+    seen = _capture_launch_args(monkeypatch)
+    monkeypatch.setattr(op.MUX, "attach", lambda session: None)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
+    monkeypatch.setattr(op, "wait_for_exit", lambda instance, timeout=10: True)
+    op.run_single_session(op.Instance("exp-single"), args)
+    assert seen, "the session never launched, so nothing about its args was tested"
+    return seen[0]
+
+
 def test_single_session_launches_copilot_in_experimental_mode(monkeypatch):
     """Runtime extensions load only in experimental mode.
 
@@ -196,15 +193,7 @@ def test_single_session_launches_copilot_in_experimental_mode(monkeypatch):
     found the checkout clean. Measured, not assumed: sessions on this machine
     ran over an hour with no guard in the shared primary checkout.
     """
-    seen = _capture_launch_args(monkeypatch)
-    monkeypatch.setattr(op.MUX, "attach", lambda session: None)
-    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
-    monkeypatch.setattr(op, "wait_for_exit", lambda instance, timeout=10: True)
-
-    op.run_single_session(op.Instance("exp-single"), [])
-
-    assert seen, "the session never launched, so nothing about its args was tested"
-    assert seen[0].count("--experimental") == 1
+    assert _run_single(monkeypatch, []).count("--experimental") == 1
 
 
 def test_loop_mode_launches_copilot_in_experimental_mode(monkeypatch):
@@ -216,21 +205,52 @@ def test_loop_mode_launches_copilot_in_experimental_mode(monkeypatch):
     assert seen[0].count("--experimental") == 1
 
 
-def test_loop_mode_keeps_an_explicit_no_experimental(monkeypatch):
-    """Control: the flag is a default, not something the operator forces.
+@pytest.mark.parametrize("mode", ["single", "loop"])
+def test_an_explicit_no_experimental_comes_after_the_injected_flag(monkeypatch, mode):
+    """Control: the operator supplies a default it does not force.
 
-    Paired with the test above through the same call, so a change that simply
-    hard-coded `--experimental` unconditionally would pass that one and fail
-    this one.
+    The CLI resolves conflicting spellings last-wins -- measured against CLI
+    1.0.77, both orders -- so the opt-out only survives if the user's argument
+    is positioned after the injected one. Asserting on order rather than on
+    absence is what makes this a real control now that injection is
+    unconditional.
     """
-    seen = _capture_launch_args(monkeypatch)
+    if mode == "single":
+        launched = _run_single(monkeypatch, ["--no-experimental"])
+    else:
+        seen = _capture_launch_args(monkeypatch)
+        op.run_loop_mode(op.Instance("exp-loop-off"),
+                         ["--agent", "test:agent", "--no-experimental"], is_fresh=True)
+        assert seen, "the loop never launched, so nothing about its args was tested"
+        launched = seen[0]
 
-    op.run_loop_mode(op.Instance("exp-loop-off"),
-                     ["--agent", "test:agent", "--no-experimental"], is_fresh=True)
+    assert launched.count("--experimental") == 1
+    assert launched.index("--experimental") < launched.index("--no-experimental")
 
-    assert seen, "the loop never launched, so nothing about its args was tested"
-    assert "--experimental" not in seen[0]
-    assert "--no-experimental" in seen[0]
+
+@pytest.mark.parametrize("mode", ["single", "loop"])
+@pytest.mark.parametrize("value_flag", ["-p", "-i", "--prompt"])
+def test_a_ruling_shaped_option_value_does_not_suppress_the_flag(
+        monkeypatch, mode, value_flag):
+    """Regression: `-p --no-experimental` is a prompt, not a decision.
+
+    The first version of this feature scanned every forwarded token, so a
+    value that merely looked like a ruling silently cancelled the injected
+    flag -- putting the session back in the guardless state with no signal,
+    which is the exact failure this feature exists to abolish.
+    """
+    user_args = [value_flag, "--no-experimental"]
+    if mode == "single":
+        launched = _run_single(monkeypatch, user_args)
+    else:
+        seen = _capture_launch_args(monkeypatch)
+        op.run_loop_mode(op.Instance("exp-loop-val"),
+                         ["--agent", "test:agent", *user_args], is_fresh=True)
+        assert seen, "the loop never launched, so nothing about its args was tested"
+        launched = seen[0]
+
+    assert launched.count("--experimental") == 1
+    assert launched.index("--experimental") < launched.index(value_flag)
 
 
 # ── operator.sh must default the same way ───────────────────────
