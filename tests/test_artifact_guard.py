@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import time
+import warnings
 from pathlib import Path
 
 import pytest
@@ -16,8 +19,17 @@ import conftest
 
 
 def _guard(*entries: tuple[Path, bool]):
-    """Point the guard at throwaway directories instead of the real repo."""
-    return entries
+    """Point the guard at throwaway directories instead of the real repo.
+
+    Entries are given as (directory, recursive) and default to fatal, which is
+    the behaviour the pre-existing tests were written against.
+    """
+    return tuple((d, recursive, True) for d, recursive in entries)
+
+
+def _advisory(*entries: tuple[Path, bool]):
+    """The same, but non-fatal -- the repo root's severity."""
+    return tuple((d, recursive, False) for d, recursive in entries)
 
 
 def test_snapshot_lists_immediate_entries(tmp_path: Path, monkeypatch):
@@ -189,9 +201,16 @@ def test_guard_is_registered_as_an_autouse_fixture():
 
 
 def test_the_repo_root_and_skills_are_guarded():
-    guarded = dict(conftest._GUARDED_DIRS)
+    guarded = {d: recursive for d, recursive, _fatal in conftest._GUARDED_DIRS}
     assert guarded[conftest.ROOT] is False
     assert guarded[conftest.ROOT / "skills"] is True
+
+
+def test_the_shared_repo_root_warns_and_skills_fails():
+    """Severity follows who else writes there, not how bad the artifact is."""
+    severity = {d: fatal for d, _recursive, fatal in conftest._GUARDED_DIRS}
+    assert severity[conftest.ROOT] is False
+    assert severity[conftest.ROOT / "skills"] is True
 
 
 def test_the_real_home_is_not_guarded_by_default():
@@ -199,7 +218,7 @@ def test_the_real_home_is_not_guarded_by_default():
     if os.environ.get("COPILOT_TOOLS_GUARD_HOME") == "1":
         return
     projects = Path.home() / ".copilot" / "projects"
-    assert projects not in dict(conftest._GUARDED_DIRS)
+    assert projects not in {d for d, _recursive, _fatal in conftest._GUARDED_DIRS}
 
 
 def test_guard_survives_an_unreadable_directory(tmp_path: Path, monkeypatch):
@@ -229,6 +248,319 @@ def test_recursive_walk_errors_are_surfaced_not_swallowed(tmp_path: Path, monkey
 
     with pytest.warns(UserWarning, match="Strays under it will not be detected"):
         assert conftest._snapshot_guarded() == {tmp_path: (True, frozenset())}
+
+
+# ── severity and attribution ─────────────────────────────────────
+# What a hit DOES is a separate question from what the guard SEES. The repo
+# root has writers other than the running test -- peer agents, reviewer
+# subagents, anything not run in a worktree -- so failing on it accuses the
+# innocent intermittently, which reads as a flaky test and gets the guard
+# switched off. These grade the split and the mtime annotation that goes
+# with it.
+
+
+class _FakeNode:
+    def __init__(self, nodeid: str) -> None:
+        self.nodeid = nodeid
+
+
+class _FakeRequest:
+    """Enough of a FixtureRequest for the guard: it only reads node.nodeid."""
+
+    def __init__(self, nodeid: str = "tests/test_thing.py::test_case") -> None:
+        self.node = _FakeNode(nodeid)
+
+
+def _start_guard(nodeid: str = "tests/test_thing.py::test_case"):
+    """Drive the real autouse fixture by hand, up to its yield.
+
+    Exercising the fixture rather than the helpers is deliberate: the change
+    under test is which branch the fixture takes, and a test that only called
+    _find_strays would pass whatever the fixture then did with the result.
+    """
+    generator = conftest._no_stray_artifacts.__wrapped__(_FakeRequest(nodeid))
+    next(generator)
+    return generator
+
+
+def _finish_guard(generator) -> None:
+    with pytest.raises(StopIteration):
+        next(generator)
+
+
+def test_a_stray_in_the_shared_root_warns_instead_of_failing(
+    tmp_path: Path, monkeypatch
+):
+    """The repo root is shared, so a hit there is news and not an accusation."""
+    monkeypatch.setattr(conftest, "_GUARDED_DIRS", _advisory((tmp_path, False)))
+    generator = _start_guard()
+
+    (tmp_path / "test_cwd.js").write_text("a peer agent's probe", encoding="utf-8")
+
+    with pytest.warns(UserWarning, match="appeared in a guarded shared directory"):
+        _finish_guard(generator)
+
+
+def test_a_stray_in_an_unshared_directory_still_fails(tmp_path: Path, monkeypatch):
+    """Downgrading the root must not downgrade skills/ with it."""
+    monkeypatch.setattr(conftest, "_GUARDED_DIRS", _guard((tmp_path, False)))
+    generator = _start_guard()
+
+    (tmp_path / "leak.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="left files outside tmp_path"):
+        next(generator)
+
+
+def test_a_clean_test_neither_warns_nor_fails(tmp_path: Path, monkeypatch):
+    """The control: without it, a guard that never fires would pass every test."""
+    monkeypatch.setattr(
+        conftest, "_GUARDED_DIRS", _advisory((tmp_path, False)) + _guard((tmp_path, True))
+    )
+    generator = _start_guard()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _finish_guard(generator)
+
+    assert [w for w in caught if "appeared in a guarded" in str(w.message)] == []
+
+
+def test_an_advisory_stray_with_an_old_mtime_is_still_reported(
+    tmp_path: Path, monkeypatch
+):
+    """mtime annotates; it never suppresses.
+
+    The before/after name diff is what establishes that the path appeared
+    during this test. st_mtime is not a creation time, so filtering on it
+    could only ever subtract true positives -- shutil.copy2, os.utime, archive
+    extraction and NTFS timestamp tunnelling all produce a genuinely new
+    directory entry carrying an old timestamp.
+    """
+    monkeypatch.setattr(conftest, "_GUARDED_DIRS", _advisory((tmp_path, False)))
+    generator = _start_guard()
+
+    stale = tmp_path / "copied_with_copy2.txt"
+    stale.write_text("x", encoding="utf-8")
+    os.utime(stale, (0, 0))
+
+    with pytest.warns(UserWarning, match="copied_with_copy2.txt"):
+        _finish_guard(generator)
+
+
+def test_a_copy2_preserving_an_old_mtime_is_still_reported(
+    tmp_path: Path, monkeypatch
+):
+    """The reviewer's reproduction, kept as a test."""
+    source = tmp_path / "source"
+    source.mkdir()
+    original = source / "fixture.txt"
+    original.write_text("x", encoding="utf-8")
+    os.utime(original, (0, 0))
+
+    guarded = tmp_path / "guarded"
+    guarded.mkdir()
+    monkeypatch.setattr(conftest, "_GUARDED_DIRS", _advisory((guarded, False)))
+    generator = _start_guard()
+
+    shutil.copy2(original, guarded / "fixture.txt")
+
+    with pytest.warns(UserWarning, match="fixture.txt"):
+        _finish_guard(generator)
+
+
+def test_an_advisory_stray_with_an_unreadable_mtime_is_still_reported(
+    tmp_path: Path, monkeypatch
+):
+    """Cannot-tell must not be filed as stale.
+
+    This is the whole reason _appeared_since is three-valued. Collapsing an
+    unreadable mtime into "old" would drop the stray silently, and silent is
+    the one failure mode a detector may not have.
+    """
+    monkeypatch.setattr(conftest, "_GUARDED_DIRS", _advisory((tmp_path, False)))
+    generator = _start_guard()
+
+    victim = tmp_path / "unreadable.txt"
+    victim.write_text("x", encoding="utf-8")
+    real_lstat = os.lstat
+
+    def denied(path, *args, **kwargs):
+        if str(path) == str(victim):
+            raise PermissionError("denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", denied)
+
+    with pytest.warns(UserWarning, match="mtime unreadable"):
+        _finish_guard(generator)
+
+
+def test_an_old_mtime_does_not_excuse_a_stray_in_an_unshared_directory(
+    tmp_path: Path, monkeypatch
+):
+    """The asymmetry, stated as a test.
+
+    mtime narrows an accusation; it does not establish authorship. Using it to
+    suppress a FATAL hit would trade real detection for a heuristic -- a test
+    that unpacks a fixture with preserved timestamps writes into skills/ and
+    would never be reported. So it filters the advisory line only.
+    """
+    monkeypatch.setattr(conftest, "_GUARDED_DIRS", _guard((tmp_path, False)))
+    generator = _start_guard()
+
+    stale = tmp_path / "unpacked_with_old_timestamps.txt"
+    stale.write_text("x", encoding="utf-8")
+    os.utime(stale, (0, 0))
+
+    with pytest.raises(AssertionError, match="unpacked_with_old_timestamps"):
+        next(generator)
+
+
+def test_appeared_since_reports_unknown_rather_than_stale(tmp_path: Path, monkeypatch):
+    absent = tmp_path / "gone.txt"
+
+    assert conftest._appeared_since(str(absent), time.time()) is None
+
+
+def test_appeared_since_never_lets_an_exception_escape_teardown():
+    """os.lstat raises ValueError, not OSError, for an embedded NUL.
+
+    Unreachable from an os.scandir name, which cannot contain one, but an
+    exception escaping the fixture would fail an unrelated test -- the exact
+    misattribution this module was changed to stop producing.
+    """
+    assert conftest._appeared_since("a\x00b", time.time()) is None
+
+
+def test_appeared_since_uses_lstat_so_a_dangling_symlink_has_an_mtime(
+    tmp_path: Path, monkeypatch
+):
+    """stat follows links and would call a dangling one unreadable.
+
+    Simulated rather than skipped: creating a real symlink needs privileges
+    this suite cannot assume on Windows, and a test that opts out on one
+    platform grades nothing there. Patching os.stat while leaving os.lstat
+    alone reproduces exactly the differential a dangling link produces.
+    """
+    link = tmp_path / "broken_sym"
+    link.write_text("x", encoding="utf-8")
+    real_stat = os.stat
+
+    def follows_into_nothing(path, *args, **kwargs):
+        if str(path) == str(link):
+            raise FileNotFoundError("dangling")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", follows_into_nothing)
+
+    assert conftest._appeared_since(str(link), 0.0) is True
+
+
+def test_the_advisory_notice_states_what_was_observed_not_who_did_it():
+    """A report that overstates its evidence is one the reader learns to skip."""
+    notice = conftest._stray_notice(
+        "tests/test_integration.py::test_runner",
+        ["/repo/test_cwd.js (mtime within this test)"],
+    )
+
+    assert "tests/test_integration.py::test_runner" in notice
+    assert "/repo/test_cwd.js" in notice
+    assert "appeared" in notice
+    assert "does not establish" in notice
+
+
+def test_the_advisory_notice_distinguishes_the_three_mtime_verdicts():
+    assert conftest._describe("p", True).endswith("(mtime within this test)")
+    assert conftest._describe("p", False).endswith("(mtime before this test)")
+    assert conftest._describe("p", None).endswith("(mtime unreadable)")
+
+
+def test_a_duplicate_guarded_directory_cannot_narrow_the_scan(
+    tmp_path: Path, monkeypatch
+):
+    """Last-wins on a repeated path would hide everything nested under it.
+
+    The snapshot is keyed by directory, so listing one twice -- once recursive
+    and once not -- used to leave the shallower scan in place and report a
+    nested artifact as nothing at all. A misconfiguration may only ever fail
+    toward MORE visibility.
+    """
+    monkeypatch.setattr(
+        conftest,
+        "_GUARDED_DIRS",
+        ((tmp_path, True, True), (tmp_path, False, False)),
+    )
+    (tmp_path / "sub").mkdir()
+    before = conftest._snapshot_guarded()
+
+    (tmp_path / "sub" / "new.txt").write_text("x", encoding="utf-8")
+
+    assert conftest._find_strays(before, conftest._snapshot_guarded()) == [
+        str(tmp_path / "sub" / "new.txt")
+    ]
+
+
+def test_a_duplicate_guarded_directory_cannot_downgrade_severity(
+    tmp_path: Path, monkeypatch
+):
+    """The same rule for how loudly it objects, not just what it sees."""
+    monkeypatch.setattr(
+        conftest,
+        "_GUARDED_DIRS",
+        ((tmp_path, False, True), (tmp_path, False, False)),
+    )
+    generator = _start_guard()
+
+    (tmp_path / "leak.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="leak.txt"):
+        next(generator)
+
+
+def test_merging_duplicates_leaves_a_normal_configuration_alone():
+    """The control: the merge must not quietly rewrite the real settings."""
+    assert conftest._guarded_dirs() == tuple(conftest._GUARDED_DIRS)
+
+
+def test_a_peer_file_is_reported_once_and_not_by_every_later_test(
+    tmp_path: Path, monkeypatch
+):
+    """Removing the mtime filter must not turn one peer file into a storm.
+
+    Nothing suppresses an advisory hit any more, so the only thing keeping a
+    long suite from warning once per test is that the snapshot is taken per
+    test: a file that appeared during test N is in the BEFORE set of test
+    N+1. That is load-bearing now, so it is asserted rather than assumed.
+    """
+    monkeypatch.setattr(conftest, "_GUARDED_DIRS", _advisory((tmp_path, False)))
+
+    first = _start_guard("tests/t.py::test_one")
+    (tmp_path / "peer_wrote_this.txt").write_text("x", encoding="utf-8")
+    with pytest.warns(UserWarning, match="peer_wrote_this.txt"):
+        _finish_guard(first)
+
+    for nodeid in ("tests/t.py::test_two", "tests/t.py::test_three"):
+        later = _start_guard(nodeid)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _finish_guard(later)
+        assert [w for w in caught if "appeared in a guarded" in str(w.message)] == []
+
+
+def test_a_peer_file_deleted_and_recreated_is_reported_each_time(
+    tmp_path: Path, monkeypatch
+):
+    """The other half: reported once per appearance, not once ever."""
+    monkeypatch.setattr(conftest, "_GUARDED_DIRS", _advisory((tmp_path, False)))
+    victim = tmp_path / "churn.txt"
+
+    for round_number in range(2):
+        generator = _start_guard(f"tests/t.py::test_{round_number}")
+        victim.write_text("x", encoding="utf-8")
+        with pytest.warns(UserWarning, match="churn.txt"):
+            _finish_guard(generator)
+        victim.unlink()
 
 
 # ── the real project catalog ─────────────────────────────────────

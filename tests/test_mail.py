@@ -28,6 +28,13 @@ def test_queued_message_is_pending_for_the_recipient(tmp_path):
 
 def test_messages_are_isolated_per_recipient(tmp_path):
     _msg(tmp_path, recipient="beta")
+    # Control, through the SAME calls the assertions below use. Without it
+    # both of those pass whenever `pending` returns nothing for any reason --
+    # a wrong root, a reader that never found the inbox -- and the test would
+    # report isolation working when nothing had been delivered at all.
+    assert [m["text"] for m in operator_mail.pending(tmp_path, "beta")] == ["hello"]
+    assert operator_mail.pending_count(tmp_path, "beta") == 1
+
     assert operator_mail.pending(tmp_path, "gamma") == []
     assert operator_mail.pending_count(tmp_path, "gamma") == 0
 
