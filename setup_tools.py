@@ -24,6 +24,7 @@ Windows notes
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -33,6 +34,8 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from operator_console import enable_utf8_output
@@ -1299,6 +1302,208 @@ def _resolve_overwrite(state: str, label: str, dest: Path, assume_yes: bool) -> 
     return True
 
 
+#: The file the Copilot CLI loads an extension from. A directory without one
+#: is not an extension, however healthy the directory looks.
+EXTENSION_ENTRYPOINT = "extension.mjs"
+
+#: Written by the Copilot CLI itself. Nothing in this toolkit writes it, which
+#: is exactly how the setting it holds drifted without anyone here noticing.
+CLI_SETTINGS_NAME = "settings.json"
+
+#: Whether the CLI is in a mode that loads runtime extensions at all.
+ENABLED = "enabled"
+DISABLED = "disabled"
+UNDETERMINED = "undetermined"
+
+#: What can be concluded about a *deployed* extension's ability to load.
+LOADABLE = "loadable"
+NO_ENTRYPOINT = "no-entrypoint"
+UNPARSABLE = "unparsable"
+#: The probe could not be run or the entrypoint could not be read. Kept
+#: distinct from ``LOADABLE`` on purpose: "we could not tell" arriving dressed
+#: as "it is fine" is the bug class this whole check exists to close.
+UNCHECKED = "unchecked"
+
+
+@dataclass(frozen=True)
+class ExtensionMode:
+    """Whether the CLI would load any extension at all, and how that was told."""
+
+    state: str
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class ExtensionHealth:
+    """Whether the extension deployed at a destination could load."""
+
+    key: str
+    state: str
+    detail: str = ""
+
+    @property
+    def broken(self) -> bool:
+        """True only where the probe positively established a failure."""
+        return self.state in (NO_ENTRYPOINT, UNPARSABLE)
+
+
+def describe_mode(state: str) -> str:
+    return {
+        ENABLED: "experimental mode is on — extensions load",
+        DISABLED: "experimental mode is OFF — no extension loads",
+        UNDETERMINED: "could not tell whether extensions load",
+    }.get(state, state)
+
+
+def describe_health(state: str) -> str:
+    return {
+        LOADABLE: "parses",
+        NO_ENTRYPOINT: f"no {EXTENSION_ENTRYPOINT} — cannot load",
+        UNPARSABLE: "does not parse — will not load",
+        UNCHECKED: "could not be checked",
+    }.get(state, state)
+
+
+def extension_mode(settings: Path | None = None) -> ExtensionMode:
+    """Whether the Copilot CLI is in a mode that loads extensions at all.
+
+    Extensions are an experimental CLI feature. A session that is not in
+    experimental mode loads **none** of them and says nothing about it, so it
+    is indistinguishable from a session where every extension ran and found
+    nothing to report. That is not hypothetical: on the machine this was
+    written for, agent sessions ran for over an hour with no ``checkout-guard``
+    in the shared checkout it exists to protect, and nothing inside a session
+    could have told, because an extension that never loaded cannot report its
+    own absence.
+
+    This is the question ``--status`` has to answer *first*. Every artifact
+    can be present, linked and parsable — as they all were throughout that
+    outage — and still not one of them runs.
+
+    The CLI persists the last spelling it was given (``--experimental`` /
+    ``--no-experimental``) into a settings file this toolkit never writes, so
+    the value is sticky global state that any session, on any project, can
+    flip out from under every other one.
+
+    Anything that is not a recorded boolean is ``UNDETERMINED``, including an
+    absent key: ``copilot --help`` documents both spellings and no default, so
+    the CLI's built-in behaviour is not ours to assert. Reporting a guess as a
+    verdict is the collapse the rest of this file exists to avoid.
+
+    The path is resolved from ``COPILOT_DIR`` on each call rather than fixed
+    at import, so a caller that redirects the home directory is answered about
+    *that* home and never about the machine's real one.
+    """
+    path = COPILOT_DIR / CLI_SETTINGS_NAME if settings is None else settings
+    present = install_manifest.file_present(path)
+    if present is None:
+        return ExtensionMode(UNDETERMINED, f"{path} could not be examined")
+    if not present:
+        return ExtensionMode(UNDETERMINED, f"{path} does not exist")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return ExtensionMode(UNDETERMINED, f"{path} could not be read: {exc}")
+    if not isinstance(data, dict):
+        return ExtensionMode(UNDETERMINED, f"{path} does not hold a JSON object")
+    if "experimental" not in data:
+        return ExtensionMode(
+            UNDETERMINED,
+            f"no 'experimental' key in {path} — the CLI has not been told "
+            "either way and its own default governs")
+    value = data["experimental"]
+    if value is True:
+        return ExtensionMode(ENABLED)
+    if value is False:
+        return ExtensionMode(
+            DISABLED,
+            "start the CLI with --experimental (operator passes it for you)")
+    return ExtensionMode(UNDETERMINED,
+                         f"'experimental' is {value!r}, which is not a boolean")
+
+
+def _syntax_error_line(stderr: str) -> str:
+    """The one line of ``node --check`` output worth repeating.
+
+    Its stderr is a source excerpt, a caret, the error, a stack frame inside
+    node itself and a version banner. Only the error line names the defect,
+    and the exit code cannot: a failing extension exits 1 whether it was
+    unparsable or was denied permission, so the message and not the code is
+    what gets reported.
+    """
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    for line in lines:
+        head = line.split(":", 1)[0]
+        if head.endswith("Error") and head[:1].isupper():
+            return line
+    return lines[-1] if lines else "node --check gave no reason"
+
+
+def extension_health(dest: Path, key: str | None = None) -> ExtensionHealth:
+    """Ask whether the extension deployed at ``dest`` could load.
+
+    ``install_manifest.classify`` calls a linked extension ``CURRENT`` on the
+    strength of the destination existing, because a junction into this
+    repository has no independent content to compare against. That is true of
+    the *bytes* and says nothing about whether the CLI could load them. A
+    junction to a directory with no ``extension.mjs``, or an
+    ``extension.mjs`` that does not parse, reports as "up to date" and then
+    loads in no session at all.
+
+    This is the narrower of the two questions ``--status`` asks, and on its
+    own it is not enough: read :func:`extension_mode` first, which is what was
+    actually wrong the one time this went wrong.
+
+    The probe is ``node --check``, deliberately, and must not be "improved"
+    into an import or an execution. The CLI injects its own bundled
+    ``@github/copilot-sdk`` into extension subprocesses (see ``copilot
+    --extension-sdk-path``), and that package does not resolve from
+    ``~/.copilot/extensions`` under ordinary Node resolution — so importing a
+    perfectly *healthy* extension fails with ``MODULE_NOT_FOUND``. Parsing
+    without resolving imports is exactly the part that is ours to verify.
+
+    ``tests/test_extensions.py`` already parses every ``.mjs`` in this
+    repository. This checks the copy on the destination machine, which is a
+    different file whenever a link could not be made and setup fell back to
+    copying.
+    """
+    key = key or dest.name
+    entry = dest / EXTENSION_ENTRYPOINT
+    present = install_manifest.file_present(entry)
+    if present is None:
+        return ExtensionHealth(key, UNCHECKED, f"{entry} could not be examined")
+    if not present:
+        return ExtensionHealth(key, NO_ENTRYPOINT, f"nothing at {entry}")
+    if which("node") is None:
+        return ExtensionHealth(key, UNCHECKED, "node is not on PATH")
+    try:
+        proc = subprocess.run(["node", "--check", str(entry)],
+                              capture_output=True, text=True,
+                              env=_clean_env(), timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # `capture` is not reused here on purpose. It returns (False, "") both
+        # when node could not be started and when node ran and rejected the
+        # file — the two answers this function must keep apart — and it drops
+        # stderr, where the reason actually is.
+        return ExtensionHealth(key, UNCHECKED, f"node --check did not run: {exc}")
+    if proc.returncode == 0:
+        return ExtensionHealth(key, LOADABLE)
+    return ExtensionHealth(key, UNPARSABLE, _syntax_error_line(proc.stderr))
+
+
+def extension_report(
+    artifacts: Iterable[install_manifest.ArtifactStatus],
+) -> list[ExtensionHealth]:
+    """Loadability of every deployed extension in an artifact report.
+
+    ``ABSENT`` entries are skipped rather than probed: the artifact table
+    already says "not installed", and one missing thing should not be counted
+    as two separate faults.
+    """
+    return [extension_health(item.dest, item.key) for item in artifacts
+            if item.kind == "extension" and item.state != install_manifest.ABSENT]
+
+
 def install_extensions(assume_yes: bool = False, manifest: dict | None = None) -> None:
     print("\nInstalling runtime extensions...")
     sources = _extension_sources()
@@ -1327,6 +1532,10 @@ def install_extensions(assume_yes: bool = False, manifest: dict | None = None) -
         except OSError as exc:
             warn(f"extension '{src.name}': {exc}")
             continue
+        health = extension_health(dest, key)
+        if health.broken:
+            warn(f"extension '{src.name}': {describe_health(health.state)} "
+                 f"({health.detail})")
         if result.startswith("skipped"):
             continue
         linked = "link" in result or "junction" in result
@@ -1334,6 +1543,25 @@ def install_extensions(assume_yes: bool = False, manifest: dict | None = None) -
             manifest, key, dest, kind="extension", linked=linked,
             digest=None if linked else install_manifest.tree_digest(dest),
         )
+    report_extension_mode()
+
+
+def report_extension_mode() -> ExtensionMode:
+    """Say out loud whether anything just deployed will actually run.
+
+    Installing seven extensions into a CLI that loads none of them is a
+    successful-looking run with no effect whatsoever, and the CLI will not
+    mention it either. Setup is the last place in the sequence that can.
+    """
+    mode = extension_mode()
+    if mode.state == ENABLED:
+        info(describe_mode(mode.state))
+        return mode
+    warn(f"{describe_mode(mode.state)} ({mode.detail})")
+    if mode.state == DISABLED:
+        warn("Everything above is installed and none of it will load until "
+             "the CLI is started with --experimental.")
+    return mode
 
 
 def install_templates(assume_yes: bool = False, manifest: dict | None = None) -> None:
@@ -1478,6 +1706,31 @@ def report_status() -> int:
         print(f"  {item.key.ljust(width)}  {version:>7}  "
               f"{install_manifest.describe(item.state)}")
 
+    mode = extension_mode()
+    health = extension_report(report)
+    if health:
+        print("\nExtension loading:")
+        print(f"  {describe_mode(mode.state)}")
+        if mode.detail:
+            print(f"  {mode.detail}")
+        print("\nDeployed extensions:")
+        for item in health:
+            print(f"  {item.key.ljust(width)}  {describe_health(item.state)}"
+                  + (f" — {item.detail}" if item.detail else ""))
+
+    broken = [item for item in health if item.broken]
+    if broken:
+        warn(f"{len(broken)} deployed extension(s) cannot load. Nothing inside "
+             "a Copilot session reports this: an extension that never loaded "
+             "cannot announce its own absence.")
+    # The mode is only reported, and only counted, where something is deployed
+    # to be affected by it. On a machine with no extensions it is not this
+    # report's business what mode the CLI is in.
+    inert = bool(health) and mode.state == DISABLED
+    if health and mode.state != ENABLED:
+        warn("Until experimental mode is on, every extension above is inert "
+             "and silent, whatever its state says.")
+
     pending = install_manifest.pending_migrations(installed, TOOLKIT_VERSION)
     if pending:
         print("\nUpgrade steps setup would run:")
@@ -1492,6 +1745,8 @@ def report_status() -> int:
 
     if install_manifest.needs_update(report):
         print("\nRun setup to bring these up to date.")
+        return 1
+    if broken or inert:
         return 1
     return 0
 
