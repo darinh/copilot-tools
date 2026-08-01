@@ -41,6 +41,7 @@ from pathlib import Path
 from operator_console import enable_utf8_output
 from copilot_tools_version import __version__ as TOOLKIT_VERSION
 import install_manifest
+import project_paths
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_MACOS = platform.system() == "Darwin"
@@ -882,6 +883,30 @@ def ensure_prerequisites() -> int:
 
 
 # ── installation ────────────────────────────────────────────────
+def install_source() -> tuple[Path, Path | None]:
+    """The directory to install editably, and the worktree it replaced.
+
+    ``REPO_ROOT`` is wherever this file happens to be, and for every agent on
+    this project that is a worktree under ``<repo>/.worktrees/``. An editable
+    install records its source directory in this interpreter's import path and
+    points the console scripts at it, so installing a worktree arms a
+    machine-wide breakage for whoever later removes that worktree correctly.
+    ``worktree_guard_backend`` refuses to build such an install at all; setup's
+    job is to not ask for one in the first place, because the thing the user
+    wants -- working ``operator`` and ``handoff`` commands -- is served by the
+    primary checkout and only by it.
+
+    Best effort by design. When the primary checkout cannot be identified this
+    returns ``REPO_ROOT`` unchanged and lets the backend be the one to refuse:
+    a redirect that guessed wrong would install the wrong tree silently, which
+    is worse than a loud failure with a remedy in it.
+    """
+    primary = project_paths.primary_repo_root(REPO_ROOT)
+    if primary == REPO_ROOT:
+        return REPO_ROOT, None
+    return primary, REPO_ROOT
+
+
 def install_package(assume_yes: bool = False) -> bool:
     print("\nInstalling console scripts (operator, handoff)...")
     already = shutil.which("operator") and shutil.which("handoff")
@@ -889,7 +914,14 @@ def install_package(assume_yes: bool = False) -> bool:
         info("operator and handoff already on PATH")
         if not ask("Reinstall the package anyway?", assume_yes=False):
             return True
-    if not pip_install(["-e", str(REPO_ROOT)]):
+    source, worktree = install_source()
+    if worktree is not None:
+        warn(f"Setup is running from a git worktree ({worktree}).")
+        print("       An editable install of a worktree breaks `operator` and")
+        print("       `handoff` for every user of this interpreter the moment")
+        print("       that worktree is removed. Installing the primary")
+        print(f"       checkout instead: {source}")
+    if not pip_install(["-e", str(source)]):
         err("pip install failed. Setup cannot continue — the console scripts "
             "would be missing and the toolkit would be unusable.")
         return False

@@ -25,7 +25,14 @@ dev = ["pytest>=7.0", "PyYAML>=6.0"]
 
 [build-system]
 requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+# A thin wrapper around `setuptools.build_meta` that refuses to produce an
+# *editable* install when the source directory is a linked git worktree. Every
+# agent on this project works in one, and `pip install -e .` from a worktree
+# repoints this interpreter's console scripts at a directory whose purpose is
+# to be deleted -- which has taken out `operator` and `handoff` machine-wide
+# twice. See worktree_guard_backend.py for the full argument.
+build-backend = "worktree_guard_backend"
+backend-path = ["."]
 
 [tool.setuptools]
 py-modules = [
@@ -40,6 +47,7 @@ py-modules = [
     "handoff_tool",
     "project_paths",
     "setup_tools",
+    "worktree_guard_backend",
 ]
 
 # The version lives in one module so packaging metadata and the install
