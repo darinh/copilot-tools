@@ -126,6 +126,68 @@ NOTICE_BANKED_UNPUBLISHED = (
     "> not replaced and these words were banked here instead. This copy is\n"
     "> newer than the `next-session.md` beside it."
 )
+# The fourth fact a reader cannot otherwise recover: **who wrote this**.
+#
+# `next-session.md` is keyed by PROJECT and the restart marker is keyed by
+# INSTANCE, so every operator instance working a shared checkout publishes to
+# one mailbox and restarts on its own signal. Whichever instance restarts next
+# reads the file, whoever wrote it -- and the protocol then has that reader
+# delete it, so the author's own next session finds nothing.
+#
+# Measured on this repository, not reasoned about: ten handoffs accumulated in
+# one project's `superseded/` in a single day, written by at least three
+# distinct instances (identified by each one telling its own next session to
+# check its own `operator inbox <name>`, which is necessarily the author's).
+#
+# The document said nothing about which of them wrote it, and a handoff is
+# written in the first person -- "my worktree", "I claimed it from a peer",
+# "check operator inbox x". Read by the wrong instance those are not merely
+# unhelpful, they are wrong instructions about branches it does not own and a
+# mailbox whose read CONSUMES a peer's mail. And a reader with no author to
+# consult has no way to reach that conclusion: a session that finds a pile in
+# `superseded/` infers the documented cause, "these went unread", which fits
+# the evidence perfectly and is the wrong explanation.
+#
+# So the author goes in the bytes, for the same reason the notices do. This
+# does not make the mailbox per-instance -- project state genuinely is shared,
+# and splitting it would hide a peer's work rather than attribute it. It makes
+# the sharing VISIBLE, which is the part that was missing.
+AUTHOR_PREFIX = "*Written by operator instance:"
+
+
+def author_line(instance: str) -> str:
+    """The authorship stamp for a handoff written by ``instance``."""
+    return f"{AUTHOR_PREFIX} `{instance}`*"
+
+
+def authoring_instance(text: str) -> str | None:
+    """The instance named in ``text``'s authorship stamp, or ``None``.
+
+    ``None`` is "this document does not say", which is a real state and not a
+    failure: every handoff written before the stamp existed is unattributed,
+    and so is the synthetic document that records a replaced symlink. Callers
+    must keep it distinct from a name -- an unattributed predecessor licenses
+    no claim about who wrote it, in either direction.
+
+    Only the header is searched -- the lines above the first ``##`` section.
+    The stamp is metadata about the document, so a line in the *body* that
+    happens to begin with the prefix is a quotation, not a claim of
+    authorship, and a handoff quoting this very paragraph must not be able to
+    rewrite its own attribution.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            return None
+        if not stripped.startswith(AUTHOR_PREFIX):
+            continue
+        name = stripped[len(AUTHOR_PREFIX):].strip()
+        if name.endswith("*"):
+            name = name[:-1].strip()
+        return name.strip("`").strip() or None
+    return None
+
+
 # A handoff is a few kilobytes of prose. Anything past this is not one, and
 # slurping it to "preserve" it would be the denial of service, not the fix.
 MAX_PRESERVE_BYTES = 8 * 1024 * 1024
@@ -463,9 +525,30 @@ def _archive(handoff_file: Path, payload: bytes) -> Path:
     raise FileExistsError(f"no unused name available in {dest_dir}")
 
 
+def _archived_author(archive: Path) -> str | None:
+    """The instance that wrote the handoff now preserved at ``archive``.
+
+    Every failure answers ``None`` -- "cannot say". This runs between the
+    preserve and the publish, the one stretch where an escaping exception
+    abandons a handoff whose predecessor has *already* been copied aside; the
+    phrasing of a warning is not worth that risk. ``None`` is also already the
+    value the caller must handle, because a predecessor written before the
+    stamp existed carries no name either, so a failed read joins a state that
+    is being handled rather than inventing one.
+
+    The archive is read rather than the original: it is the copy this process
+    just created, its size is bounded by ``MAX_PRESERVE_BYTES``, and it is the
+    file the warning is about to name.
+    """
+    try:
+        text = archive.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return authoring_instance(text)
+
+
 def preserve_prior_handoff(handoff_file: Path) -> Path | None:
     """Copy an unread handoff aside before it is replaced.
-
     ``write_atomic`` guarantees a reader never sees *half* a handoff. It says
     nothing about a handoff nobody ever read: ``os.replace`` overwrites the
     destination unconditionally, so a session that hands off while the previous
@@ -477,11 +560,18 @@ def preserve_prior_handoff(handoff_file: Path) -> Path | None:
     in.
 
     The protocol says the reader deletes the file once it has been read, so an
-    occupied destination *means* unread, and the losing side is a session that
-    has already ended and cannot be asked to repeat itself. Refusing to hand
-    off would be worse: it loses the current session's context instead, and the
-    current session is the one that still exists. So neither is discarded --
-    the old one is copied into ``superseded/`` and the new one is written.
+    occupied destination means *nobody has consumed this one yet* -- which has
+    two causes, not one, and the difference is invisible here. Either this
+    instance's own predecessor went unread, or a peer sharing the project's
+    mailbox published while this session worked. Measured on this repository,
+    the second is the common case: the mailbox is per-project and the restart
+    marker is per-instance. Either way the losing side is a session that has
+    already ended and cannot be asked to repeat itself, and refusing to hand
+    off would be worse -- it loses the current session's context instead, and
+    the current session is the one that still exists. So neither is discarded
+    -- the old one is copied into ``superseded/`` and the new one is written.
+    Which of the two happened is reported by the caller, from the authorship
+    stamp in the preserved bytes; this function does not need to know.
 
     Copied, not moved: the source stays in place until the copy has succeeded,
     so there is no instant at which the only extant copy is in flight. The
@@ -670,7 +760,8 @@ def infer_instance(project_root, mux: Mux) -> str | None:
 
 
 def render(status: str, in_progress: str, next_steps: str,
-           context: str, prompt: str, notice: str = "") -> str:
+           context: str, prompt: str, notice: str = "",
+           instance: str = "") -> str:
     """The handoff document.
 
     ``notice`` is a block the *tool* has to say about the circumstances of the
@@ -678,10 +769,20 @@ def render(status: str, in_progress: str, next_steps: str,
     than above it so the file is still a handoff document to anything that
     keys on the ``# Session Handoff`` header, and above ``## Status`` so a
     reader meets it before the content it qualifies.
+
+    ``instance`` is stamped in the same band, below the notice: the notice
+    is about *this write* and may change what the reader does next, while the
+    stamp qualifies every word in the file. Both are above ``## Status``, so
+    a reader learns whose session this was before reading a document written
+    throughout in the first person. An empty ``instance`` emits no stamp at
+    all rather than an empty one -- see :func:`authoring_instance` on why
+    "does not say" must stay distinct from a name.
     """
     parts = ["# Session Handoff", ""]
     if notice:
         parts += [notice, ""]
+    if instance:
+        parts += [author_line(instance), ""]
     parts += ["## Status", status, ""]
     if in_progress:
         parts += ["## In Progress", in_progress, ""]
@@ -778,7 +879,8 @@ def main(argv: list[str] | None = None) -> int:
     # still pure string work, still nothing that can fail under the lock.
     def render_body(notice: str = "") -> str:
         return render(args.status, args.in_progress, args.next_steps,
-                      args.context, args.prompt, notice=notice)
+                      args.context, args.prompt, notice=notice,
+                      instance=instance_name)
 
     body = render_body()
     published = body
@@ -840,8 +942,23 @@ def main(argv: list[str] | None = None) -> int:
                     f"{body}")
             die(f"{exc}\nThis handoff was not lost: it is at {spare}")
         if saved is not None:
-            print(f"Warning: a handoff was already waiting at {handoff_file} "
-                  f"and had not been read.\n"
+            prior_author = _archived_author(saved)
+            if prior_author is None:
+                why = ("It does not say which instance wrote it, so it is "
+                       "either this instance's own previous session going "
+                       "unread, or a peer's published while you worked.")
+            elif prior_author == instance_name:
+                why = (f"It was written by this instance "
+                       f"({instance_name!r}), so it reached no reader.")
+            else:
+                why = (f"It was written by a DIFFERENT instance "
+                       f"({prior_author!r}), which shares this project's "
+                       f"mailbox. That session's next agent will now find "
+                       f"nothing waiting; its context is only in "
+                       f"{SUPERSEDED_DIRNAME}/.")
+            print(f"Warning: a handoff was already waiting at "
+                  f"{handoff_file}.\n"
+                  f"         {why}\n"
                   f"         It has been preserved at {saved}",
                   file=sys.stderr)
         write_atomic(handoff_file, published)
