@@ -44,6 +44,10 @@ import yaml
 import git_identity
 from git_identity import CLEAN, UNDETERMINED, VIOLATIONS, Result, is_allowed, scan
 
+# One owner for "what are the workflow files". Globbing them here is what let
+# a `.yaml` workflow escape every assertion in this file.
+from test_workflow_discovery_conformance import workflow_paths
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 ALLOWED = "darinh@gmail.com"
@@ -758,9 +762,15 @@ WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 
 
 def _workflows() -> dict:
-    """Every workflow file, parsed. Keyed by filename."""
+    """Every workflow file, parsed. Keyed by filename.
+
+    Discovery is shared rather than spelled here: GitHub loads both ``.yml``
+    and ``.yaml``, and this function used to glob only the first, so a
+    workflow with the other suffix would have been excluded from every
+    assertion below while they all kept passing.
+    """
     return {p.name: yaml.safe_load(p.read_text(encoding="utf-8"))
-            for p in sorted(WORKFLOW_DIR.glob("*.yml"))}
+            for p in workflow_paths()}
 
 
 def _jobs_running(workflow: dict, needle: str) -> list[str]:
@@ -930,7 +940,7 @@ def test_a_grep_would_pass_on_the_real_workflows_where_the_parse_does_not():
     the naive spelling of this check would pass on a file where the *step* had
     been deleted, because the script's name also appears in prose there.
     """
-    mentions = {p.name for p in WORKFLOW_DIR.glob("*.yml")
+    mentions = {p.name for p in workflow_paths()
                 if "git_identity.py" in p.read_text(encoding="utf-8")}
     running = {filename for filename, _n, _j in _scanning_jobs()}
     assert running, "premise: some workflow really does run the scan"

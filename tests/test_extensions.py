@@ -20,6 +20,9 @@ from pathlib import Path
 
 import pytest
 
+# One owner for "what are the workflow files"; GitHub loads both suffixes.
+from test_workflow_discovery_conformance import workflow_paths
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXTENSIONS_DIR = REPO_ROOT / "extensions"
 
@@ -141,8 +144,7 @@ def test_ci_runs_the_extension_checks():
     These tests are only worth writing if the pipeline executes them, and the
     Python matrix runners have node preinstalled.
     """
-    workflow = (REPO_ROOT / ".github" / "workflows").glob("*.yml")
-    text = "\n".join(p.read_text(encoding="utf-8") for p in workflow)
+    text = "\n".join(p.read_text(encoding="utf-8") for p in workflow_paths())
     assert "tests/test_extensions.py" in text or "node --test" in text
 
 
