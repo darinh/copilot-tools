@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import ast
 import fnmatch
+import os
 from pathlib import Path
 
 import pytest
@@ -83,59 +84,121 @@ def _mentions_workflows(source_segment: str | None) -> bool:
     return "workflow" in (source_segment or "").lower()
 
 
+def _workflow_alias_names(tree: ast.AST, source: str) -> set[str]:
+    """Names bound to the workflow directory under some other spelling.
+
+    ``WF_DIR = REPO / ".github" / "workflows"`` followed by ``WF_DIR.glob(...)``
+    is the same defect wearing a different variable name, and a receiver test
+    that reads only the receiver cannot see it. So assignments are read first
+    and their targets remembered.
+
+    One level of indirection, deliberately, and no further: a fixed point over
+    aliases-of-aliases buys very little against the way this code is actually
+    written, and every additional inference is another thing that can widen
+    the receiver set silently.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not _mentions_workflows(ast.get_source_segment(source, value)):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
+
+
+def _enclosing_statement(node: ast.AST, parents: dict[int, ast.AST]) -> ast.AST | None:
+    """The nearest ``ast.stmt`` containing `node`."""
+    current = parents.get(id(node))
+    while current is not None and not isinstance(current, ast.stmt):
+        current = parents.get(id(current))
+    return current
+
+
 def single_suffix_workflow_globs(source: str, filename: str) -> list[str]:
-    """Report every workflow-directory glob, if the file misses a suffix overall.
+    """Report workflow-directory globs that cannot reach both suffixes.
 
-    The verdict is per *file*, not per call site. The correct inline spelling
-    is two calls -- ``list(d.glob("*.yml")) + list(d.glob("*.yaml"))`` -- and
-    each of those, judged alone, covers exactly one suffix. Reporting per call
-    site would fail the one file in this repository that already got it right,
-    and a rule that fires on correct code gets deleted rather than obeyed.
+    Coverage is unioned per *statement*, which is the smallest scope that does
+    not fail correct code. The correct inline spelling is two calls in one
+    expression --
+    ``sorted(list(d.glob("*.yml")) + list(d.glob("*.yaml")))``, which is how
+    ``tests/test_shell_tests_are_executed.py`` already had it -- so judging
+    each call alone would fail the one file in the repository that got this
+    right, and a rule that fires on correct code gets deleted rather than
+    obeyed.
 
-    So the patterns are collected first and their coverage unioned. A file
-    whose workflow globs between them reach both suffixes is silent; one that
-    cannot is reported at every site, because any of them may be the one to
-    fix.
+    Unioning over the whole *file* was the first attempt and it was too loose:
+    an unrelated ``*.yaml`` glob anywhere in the file then masked a real
+    ``*.yml`` check elsewhere in it. A reviewer built exactly that, so the
+    scope is now the statement.
+
+    Known boundary, stated rather than implied: this sees ``Path.glob`` and
+    ``Path.rglob`` with a literal pattern. ``iterdir()`` filtered by suffix,
+    ``os.listdir``, ``glob.glob``, and a pattern assembled at runtime are all
+    invisible to it, as is a hardcoded list of filenames. It is a guard
+    against the defect being rewritten in the shape it already took, not a
+    proof that no such defect can exist.
     """
     try:
         tree = ast.parse(source, filename=filename)
     except SyntaxError as exc:                                # pragma: no cover
         pytest.fail(f"{filename}: could not parse: {exc}")
 
-    sites: list[tuple[int, str, set[str]]] = []
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+
+    aliases = _workflow_alias_names(tree, source)
+    # Keyed by the id of the enclosing statement, which is stable for as long
+    # as `tree` is alive -- and it is, for the whole of this function.
+    by_statement: dict[int, list[tuple[int, str, set[str]]]] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
         if not isinstance(func, ast.Attribute) or func.attr not in ("glob", "rglob"):
             continue
-        if not _mentions_workflows(ast.get_source_segment(source, func.value)):
+        receiver = func.value
+        named = _mentions_workflows(ast.get_source_segment(source, receiver))
+        aliased = isinstance(receiver, ast.Name) and receiver.id in aliases
+        if not (named or aliased):
             continue
         if not node.args or not isinstance(node.args[0], ast.Constant):
             continue
         pattern = node.args[0].value
         if not isinstance(pattern, str):
             continue
-        sites.append((node.lineno, pattern, _covers(pattern)))
+        statement = _enclosing_statement(node, parents)
+        key = id(statement) if statement is not None else 0
+        by_statement.setdefault(key, []).append(
+            (node.lineno, pattern, _covers(pattern)))
 
-    if not sites:
-        return []
-    reached: set[str] = set()
-    for _lineno, _pattern, covered in sites:
-        reached |= covered
-    if reached == set(_PROBE_NAMES):
-        return []
-
-    missing = sorted(set(_PROBE_NAMES) - reached)
-    absent = ", ".join("." + name.split(".")[-1] for name in missing)
-    return [
-        f"{filename}:{lineno}: enumerates the workflow directory with "
-        f"{pattern!r}, and nothing else in this file covers {absent}. GitHub "
-        "loads both .yml and .yaml, so a workflow with that suffix would be "
-        "silently excluded from the check. Use `workflow_paths()` from "
-        "test_workflow_discovery_conformance."
-        for lineno, pattern, _covered in sites
-    ]
+    out = []
+    for sites in by_statement.values():
+        reached: set[str] = set()
+        for _lineno, _pattern, covered in sites:
+            reached |= covered
+        if reached == set(_PROBE_NAMES):
+            continue
+        missing = sorted(set(_PROBE_NAMES) - reached)
+        absent = ", ".join("." + name.split(".")[-1] for name in missing)
+        for lineno, pattern, _covered in sites:
+            out.append(
+                f"{filename}:{lineno}: enumerates the workflow directory with "
+                f"{pattern!r}, and nothing else in that statement covers "
+                f"{absent}. GitHub loads both .yml and .yaml, so a workflow "
+                "with that suffix would be silently excluded from the check. "
+                "Use `workflow_paths()` from "
+                "test_workflow_discovery_conformance."
+            )
+    return sorted(out)
 
 
 # ---------------------------------------------------------------------------
@@ -167,10 +230,20 @@ def test_the_helper_returns_a_reusable_sequence(tmp_path: Path):
 
 
 def test_the_repository_really_has_workflows():
-    """Population guard. Every assertion below is satisfied by an empty tree."""
+    """Population guard. Every assertion below is satisfied by an empty tree.
+
+    Cross-checked against an independent listing rather than against a pinned
+    filename: asserting ``"ci.yml" in found`` would break on a legitimate
+    rename while proving nothing about discovery that the listing does not
+    prove better.
+    """
     found = workflow_paths()
     assert found, f"no workflow files found under {WORKFLOW_DIR}"
-    assert "ci.yml" in {p.name for p in found}
+    independent = sorted(
+        name for name in os.listdir(WORKFLOW_DIR)
+        if name.endswith(".yml") or name.endswith(".yaml")
+    )
+    assert [p.name for p in found] == independent
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +258,19 @@ def test_the_repository_really_has_workflows():
     'paths = list(WORKFLOW_DIR.rglob("*.yml"))',
     'mentions = {p.name for p in WORKFLOW_DIR.glob("*.yml") if p}',
     'paths = workflow_dir.glob("*.yml")',
+    # The receiver under another name. An alias is the same defect wearing a
+    # different variable, and reading only the receiver cannot see it.
+    'WF_DIR = REPO / ".github" / "workflows"\npaths = WF_DIR.glob("*.yml")',
+    'd = REPO / ".github" / "workflows"\npaths = d.glob("*.yml")',
+    # A real single-suffix check masked by an unrelated `*.yaml` glob
+    # elsewhere in the same file. This is why the union is per statement: over
+    # the whole file, the second line here silenced the first.
+    ('for p in WORKFLOW_DIR.glob("*.yml"):\n    pass\n'
+     '_ = list(WORKFLOW_DIR.glob("*.yaml"))\n'),
+    # The same masking one scope up: one suffix per function is not a file
+    # that reaches both, it is two half-checks that each miss one.
+    ('def a():\n    return WORKFLOW_DIR.glob("*.yml")\n\n\n'
+     'def b():\n    return WORKFLOW_DIR.glob("*.yaml")\n'),
 ])
 def test_the_scan_reports_a_single_suffix_glob(source: str):
     """Positive control: each real spelling of the defect is detected."""
@@ -194,15 +280,19 @@ def test_the_scan_reports_a_single_suffix_glob(source: str):
 @pytest.mark.parametrize("source", [
     # Both suffixes, the correct spelling.
     'paths = list(WORKFLOW_DIR.glob("*.yml")) + list(WORKFLOW_DIR.glob("*.yaml"))',
-    # Both suffixes reached from separate statements, which is why the verdict
-    # is unioned over the file rather than decided at each call site.
-    ('def a():\n    return WORKFLOW_DIR.glob("*.yml")\n\n\n'
-     'def b():\n    return WORKFLOW_DIR.glob("*.yaml")\n'),
+    # The same, spread over a statement rather than a line. This is verbatim
+    # how `tests/test_shell_tests_are_executed.py` already had it, and the
+    # scope of the union exists so that this file passes.
+    ('paths = sorted(list(WORKFLOW_DIR.glob("*.yml"))\n'
+     '               + list(WORKFLOW_DIR.glob("*.yaml")))'),
     # A pattern that covers both on its own.
     'paths = WORKFLOW_DIR.glob("*.y*ml")',
     'paths = WORKFLOW_DIR.glob("*")',
     # Not the workflow directory at all -- other single-suffix globs are fine.
     'paths = LOG_DIR.glob("*.yml")',
+    # Alias tracking must not widen to every assigned name: this one is bound
+    # to a directory that has nothing to do with workflows.
+    'LOG_DIR = REPO / "logs"\npaths = LOG_DIR.glob("*.yml")',
     'paths = (tmp_path / "cfg").glob("*.yml")',
     # Not a glob.
     'text = WORKFLOW_DIR.read_text("*.yml")',
