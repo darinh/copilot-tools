@@ -450,16 +450,18 @@ def annotated_probes(source: str) -> list[tuple[int, str]]:
 #: register therefore fails when new debt arrives, when debt changes shape,
 #: *and* when the fix lands — and the last of those is the only thing that
 #: ever gets an entry removed. Nothing here is allowed to age quietly.
-KNOWN_UNFIXED = {
-    "operator_mail.py": (
-        ("is_dir", "is_dir", "is_dir", "is_dir"),
-        "`fix/mail-unreadable-inbox` replaces all four: a mailbox that cannot "
-        "be read is being reported as a mailbox with no mail. Annotating them "
-        "here would be a false claim about known-broken code, and editing "
-        "them would collide with that branch. When it merges this entry "
-        "fails — delete it then.",
-    ),
-}
+#:
+#: It is empty, and that is the register working rather than the register
+#: being unused: ``operator_mail.py`` was its only entry, held there while
+#: `fix/mail-unreadable-inbox` was in flight, and the equality assertion
+#: failed the moment that branch merged — which is how this entry came to be
+#: deleted. An empty register means the debt it named is paid, so
+#: ``operator_mail.py`` has rejoined the scan proper above and is now held to
+#: the same rule as every other shipped module. Note that an empty dict also
+#: makes the assertion below collect *zero* cases; that is correct here, but
+#: it is only correct while the scan itself still has cases, so read the two
+#: counts together rather than the second one alone.
+KNOWN_UNFIXED: dict[str, tuple[tuple[str, ...], str]] = {}
 
 
 # ── the scan ────────────────────────────────────────────────────
