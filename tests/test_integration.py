@@ -21,9 +21,12 @@ from conftest import make_log
 from operator_mux import Mux, MuxSessionError
 
 MUX = Mux()
-pytestmark = pytest.mark.skipif(
-    not MUX.available(), reason="no terminal multiplexer installed"
-)
+# These are the only tests allowed near the machine's real multiplexer;
+# conftest's _no_real_multiplexer makes the spawn raise for everything else.
+pytestmark = [
+    pytest.mark.real_multiplexer,
+    pytest.mark.skipif(not MUX.available(), reason="no terminal multiplexer installed"),
+]
 
 SESSION_PREFIX = "optest-"
 

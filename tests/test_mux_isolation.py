@@ -15,6 +15,7 @@ machine-dependent answer.
 from __future__ import annotations
 
 import subprocess
+import sys
 
 import pytest
 
@@ -136,11 +137,112 @@ def test_sending_keys_to_a_missing_session_raises(no_subprocess):
         FakeMux().send_keys("nobody", "hello")
 
 
+def test_a_test_that_builds_its_own_mux_still_cannot_reach_a_real_one():
+    """The hole that substituting `op.MUX` alone leaves open.
+
+    test_integration.py builds its own `Mux()` on purpose, so the pattern is
+    already in the file anyone copies from. A test that does the same by
+    accident would sail straight past the substitution -- and nothing would say
+    so, because a real `has-session` for a session that does not exist returns
+    the same answer the fake would have given.
+
+    The binary is named explicitly rather than probed: CI runs on machines with
+    no multiplexer installed, where `Mux().binary` raises MuxNotFoundError and
+    this test would pass for a reason that has nothing to do with the guard.
+    """
+    with pytest.raises(AssertionError, match="real terminal multiplexer"):
+        operator_mux.Mux(binary="tmux").has_session("nobody")
+
+
+def test_the_refusal_names_the_test_and_the_argv():
+    """A refusal that does not say who did it or what they ran is a puzzle
+    rather than a repair instruction."""
+    with pytest.raises(AssertionError) as caught:
+        operator_mux.Mux(binary="tmux")._run("kill-server")
+    message = str(caught.value)
+    assert "test_the_refusal_names_the_test_and_the_argv" in message
+    assert "kill-server" in message
+
+
+@pytest.mark.parametrize("binary", ["tmux", "psmux", "pmux", "tmux.exe", "PSMUX.EXE",
+                                    r"C:\tools\tmux.exe", "/usr/bin/tmux"])
+def test_every_multiplexer_spelling_is_refused(binary):
+    """The guard matches on the program name, so it has to survive a full path
+    and a .exe suffix. A detector with a too-narrow match reports a clean tree
+    and a clean tree the same way."""
+    with pytest.raises(AssertionError, match="real terminal multiplexer"):
+        subprocess.run([binary, "-V"], capture_output=True)
+
+
+def test_a_non_multiplexer_subprocess_is_delegated_untouched():
+    """Control. The guard must be a filter, not a blanket ban: the suite runs
+    real Python child processes and several tests depend on it. If this ever
+    fails the same way the ones above pass, the guard is refusing everything
+    and its refusals prove nothing."""
+    proc = subprocess.run([sys.executable, "-c", "print('ok')"],
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == "ok"
+
+
+def test_the_guard_does_not_nest_across_tests():
+    """A leaked guard is invisible from inside the test that leaked it, but not
+    from the next one: the fixture would wrap the PREVIOUS test's wrapper
+    instead of the real `subprocess.run`. So the honest thing to inspect is
+    what this test's guard captured, not whether one is installed."""
+    guard = operator_mux.subprocess.run
+    assert guard.__qualname__.endswith("guarded_run"), \
+        "the multiplexer guard is not installed for this test"
+    captured = dict(zip(guard.__code__.co_freevars,
+                        (cell.cell_contents for cell in guard.__closure__)))
+    delegate = captured["real_run"]
+    assert not str(getattr(delegate, "__qualname__", "")).endswith("guarded_run"), \
+        "an earlier test's guard was never removed -- the fixture's finally leaked"
+
+
 def test_sending_keys_records_the_text_and_the_enter(no_subprocess, tmp_path):
     mux = FakeMux()
     mux.new_session("s", str(tmp_path), ["python"])
     mux.send_keys("s", "hello")
     assert mux.keys == [("s", "hello"), ("s", "Enter")]
+
+
+def test_a_non_literal_send_records_the_text_and_not_just_the_enter(no_subprocess,
+                                                                    tmp_path):
+    """`send_keys(literal=False, enter=True)` puts the text and `Enter` in ONE
+    backend call. Reading only the last argument would record the submit and
+    silently drop what was typed -- and the caller could not tell, because a
+    send that delivered nothing looks exactly like one that delivered."""
+    mux = FakeMux()
+    mux.new_session("s", str(tmp_path), ["python"])
+    mux.send_keys("s", "C-c", literal=False)
+    assert mux.keys == [("s", "C-c"), ("s", "Enter")]
+
+
+def test_a_non_literal_send_without_enter_records_only_the_key(no_subprocess,
+                                                               tmp_path):
+    mux = FakeMux()
+    mux.new_session("s", str(tmp_path), ["python"])
+    mux.send_keys("s", "C-c", literal=False, enter=False)
+    assert mux.keys == [("s", "C-c")]
+
+
+def test_a_literal_send_without_enter_does_not_submit(no_subprocess, tmp_path):
+    mux = FakeMux()
+    mux.new_session("s", str(tmp_path), ["python"])
+    mux.send_keys("s", "half a line", enter=False)
+    assert mux.keys == [("s", "half a line")]
+
+
+def test_literal_text_that_looks_like_a_key_name_is_recorded_as_text(no_subprocess,
+                                                                     tmp_path):
+    """The reason `-l` exists: without it the backend reads `Enter` inside a
+    message as a submit. The double must keep the two distinguishable."""
+    mux = FakeMux()
+    mux.new_session("s", str(tmp_path), ["python"])
+    mux.send_keys("s", "press Enter to continue")
+    assert mux.keys == [("s", "press Enter to continue"), ("s", "Enter")]
 
 
 def test_pane_dead_reflects_the_modelled_state(no_subprocess, tmp_path):
@@ -190,7 +292,8 @@ def test_subprocess_is_still_reachable_outside_the_poison_fixture():
     it a spawn works, so the tests that pass are passing on the fake rather
     than on a globally broken subprocess module."""
     assert subprocess.run is operator_mux.subprocess.run
-    proc = subprocess.run([__import__("sys").executable, "-c", "print('ok')"],
-                          capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, "-c", "print('ok')"],
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
     assert proc.returncode == 0
     assert proc.stdout.strip() == "ok"

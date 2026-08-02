@@ -90,6 +90,14 @@ _REAL_CATALOG = Path.home() / ".copilot" / "projects" / "catalog.csv"
 _UNREADABLE = object()
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "real_multiplexer: drives an actual tmux/psmux server rather than the "
+        "in-memory FakeMux. Exempt from _no_real_multiplexer.",
+    )
+
+
 def _catalog_state():
     """The catalog's exact bytes, ``None`` if absent, ``_UNREADABLE`` if unknown."""
     try:
@@ -467,7 +475,18 @@ class FakeMux(operator_mux.Mux):
             name = args[2]
             if name not in self.sessions:
                 return "", f"can't find session: {name}", 1
-            self.keys.append((name, args[-1]))
+            # Three shapes reach here and only one of them is one keystroke:
+            # ("-l", text) from the literal path, (text, "Enter") from the
+            # non-literal path with enter=True, and ("Enter",) from the literal
+            # path's separate submit. Recording args[-1] would drop `text` from
+            # the middle shape and file the send as if only Enter were typed --
+            # a double answering a narrower question than the caller asked.
+            payload = list(args[3:])
+            if payload[:1] == ["-l"]:
+                # -l takes exactly one argument and refuses a trailing key name.
+                payload = payload[1:2]
+            for keystroke in payload:
+                self.keys.append((name, keystroke))
             return "", "", 0
         if verb == "display-message":
             name = args[2]
@@ -491,14 +510,40 @@ class FakeMux(operator_mux.Mux):
         )
 
 
+_MUX_BINARIES = frozenset({"tmux", "psmux", "pmux"})
+
+
+def _is_a_multiplexer_spawn(cmd) -> bool:
+    """True when ``cmd`` would start a real terminal multiplexer client."""
+    head = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else cmd
+    name = os.path.basename(str(head)).lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name in _MUX_BINARIES and False
+
+
 @pytest.fixture(autouse=True)
-def _no_real_multiplexer():
-    """Point `copilot_operator.MUX` at an empty in-memory multiplexer.
+def _no_real_multiplexer(request: pytest.FixtureRequest):
+    """Point `copilot_operator.MUX` at an empty in-memory multiplexer, and make
+    any *other* route to a real one raise.
 
     An empty one, because that is what the leaking tests were already getting
     by accident: no session of theirs exists on the real server, so every
     `has_session` came back False. The behaviour they assert is unchanged; only
     its dependence on the machine goes away.
+
+    Substituting `copilot_operator.MUX` is not on its own enough, and the gap
+    is the kind that stays quiet. It closes the route the 30 leaking tests
+    took; it does nothing about a test that builds its own `Mux()` -- which is
+    exactly what test_integration.py does, deliberately, so the pattern is
+    already in the file a newcomer copies from. A substitution cannot report
+    what it did not intercept, so the second half poisons the spawn itself: any
+    attempt to start a tmux/psmux/pmux client fails, loudly, naming the argv.
+    Every other subprocess is delegated untouched -- the suite really does run
+    Python child processes and must keep being able to.
+
+    Tests that mean to drive a real server mark themselves `real_multiplexer`
+    and are exempted from both halves.
 
     It saves and restores by hand rather than taking `monkeypatch`, and that is
     not a style choice. An autouse fixture that REQUESTS `monkeypatch` pulls
@@ -507,16 +552,37 @@ def _no_real_multiplexer():
     end-of-test scan with the test's patches STILL APPLIED. Doing that here
     turned all 26 tests in test_artifact_guard.py into teardown errors, because
     they patch `_GUARDED_DIRS` to their own tmp_path and the guard duly found
-    their fixtures there. Depending on no fixture keeps this one first to set
-    up and last to tear down, which is also the only order in which a test's
-    own `monkeypatch.setattr(op, "MUX", ...)` is undone before this restores.
+    their fixtures there. Depending on no ordinary fixture keeps this one first
+    to set up and last to tear down, which is also the only order in which a
+    test's own `monkeypatch.setattr(op, "MUX", ...)` is undone before this
+    restores. `request` is exempt from that hazard: it is not finalised into
+    the same stack.
     """
-    real = copilot_operator.MUX
+    if "real_multiplexer" in request.keywords:
+        yield
+        return
+
+    real_mux = copilot_operator.MUX
+    real_run = operator_mux.subprocess.run
+
+    def guarded_run(cmd, *args, **kwargs):
+        if _is_a_multiplexer_spawn(cmd):
+            raise AssertionError(
+                f"{request.node.nodeid} tried to start a real terminal "
+                f"multiplexer: {cmd!r}. Unit tests must not drive this "
+                f"machine's tmux/psmux server -- their answers then depend on "
+                f"what happens to be running. Use conftest's FakeMux, or mark "
+                f"the test `real_multiplexer` if it genuinely needs one."
+            )
+        return real_run(cmd, *args, **kwargs)
+
     copilot_operator.MUX = FakeMux()
+    operator_mux.subprocess.run = guarded_run
     try:
         yield
     finally:
-        copilot_operator.MUX = real
+        operator_mux.subprocess.run = real_run
+        copilot_operator.MUX = real_mux
 
 
 @pytest.fixture
