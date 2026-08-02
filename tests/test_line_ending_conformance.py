@@ -73,15 +73,22 @@ MUST_BE_FOUND = (
 )
 
 
-def _git(*args: str, text: bool = True) -> subprocess.CompletedProcess:
-    """Run git at the repository root, or fail this check loudly."""
+def _git(*args: str) -> subprocess.CompletedProcess:
+    """Run git at the repository root, decoding as UTF-8, or fail loudly.
+
+    Every caller here wants text. The one place that needs raw bytes --
+    ``_index_blobs``, where a CR is the thing being measured -- calls
+    ``subprocess.run`` itself rather than routing through a ``text=False``
+    flag, because a helper that decodes on some calls and not on others cannot
+    name its codec in a form the encoding conformance scan can read.
+    """
     if not (REPO / ".git").exists():
         pytest.skip("not a git checkout; there is no index to inspect")
     if shutil.which("git") is None:
         pytest.fail("git is required to verify line-ending attributes")
-    kwargs = {"encoding": "utf-8", "errors": "replace"} if text else {}
     return subprocess.run(
-        ["git", *args], cwd=str(REPO), check=True, capture_output=True, **kwargs
+        ["git", *args], cwd=str(REPO), check=True, capture_output=True,
+        encoding="utf-8", errors="replace",
     )
 
 
