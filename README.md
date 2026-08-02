@@ -272,6 +272,7 @@ copilot-tools/
 │   └── workflows/ci.yml           # 8 jobs: 3 OSes x 2 Pythons, shell syntax, extensions
 ├── .specify/                      # Spec Kit templates, scripts, and constitution
 ├── specs/                         # Feature specifications, plans, and tasks
+├── .gitattributes                 # Shell scripts check out LF on every platform
 ├── .gitignore                     # Caches, packaging output, and /.worktrees/
 ├── LICENSE                        # MIT
 ├── README.md                      # This file
