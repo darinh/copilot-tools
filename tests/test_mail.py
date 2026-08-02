@@ -1050,3 +1050,210 @@ def test_write_failure_raises_mail_error(tmp_path, monkeypatch):
     with pytest.raises(operator_mail.MailError):
         operator_mail.queue(tmp_path,
                             operator_mail.new_message("a", "b", "b", "t"))
+
+
+# ── a dangling symlink where the mailbox belongs ────────────────
+def _can_symlink(tmp_path: Path) -> bool:
+    try:
+        (tmp_path / "_lnk").symlink_to(tmp_path / "_nothing")
+    except (OSError, NotImplementedError):
+        return False
+    return True
+
+
+def test_a_dangling_symlink_mailbox_is_not_an_empty_mailbox(tmp_path):
+    """The real-filesystem version. Skipped where symlinks are not permitted.
+
+    `os.stat` follows symlinks, so a link whose target is gone raises
+    `FileNotFoundError` exactly as a path with nothing at all there does.
+    Walking past it as "genuinely absent" made `pending` return `[]` and
+    `pending_count` return `0` -- measured on this branch before the `lstat`
+    arm was added.
+
+    The reason this is not cosmetic is asserted below rather than described:
+    `_write`'s `mkdir(exist_ok=True)` cannot create the mailbox either, so
+    nothing can ever be delivered into one. Undeliverable *and* reported
+    empty is permanent silence that reads like a healthy empty mailbox --
+    the one outcome this module exists to make impossible.
+    """
+    if not _can_symlink(tmp_path):
+        pytest.skip("symlink creation is not permitted here")
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox.symlink_to(tmp_path / "no-such-mailbox", target_is_directory=True)
+    assert inbox.is_symlink(), "premise: the entry exists"
+    assert not inbox.is_dir(), "premise: it does not resolve to a directory"
+
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.pending(tmp_path, "beta")
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.pending_count(tmp_path, "beta")
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.consume(tmp_path, "beta")
+
+    # Why refusing is the only correct answer: nothing can be delivered here.
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.queue(tmp_path,
+                            operator_mail.new_message("a", "beta", "beta", "t"))
+
+
+def test_a_dangling_symlink_mailbox_is_refused_on_every_platform(
+    tmp_path, monkeypatch
+):
+    """The same branch, simulated, so it runs where symlinks are forbidden.
+
+    A dangling symlink is exactly this pair of answers: `scandir` and `stat`
+    raise `FileNotFoundError` because they follow the link to a target that
+    is gone, while `lstat` succeeds because the entry itself is right there.
+    Simulating the pair runs the arm on all eight CI legs rather than only
+    the ones that will create a link -- and a test that merely skips is a
+    test that reports success.
+    """
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    real_stat, real_lstat, real_scandir = os.stat, os.lstat, os.scandir
+
+    def as_dangling_link(entry_exists: bool):
+        def fake_scandir(path, *a, **k):
+            if Path(path) == inbox:
+                raise FileNotFoundError(2, "No such file or directory")
+            return real_scandir(path, *a, **k)
+
+        def fake_stat(path, *a, **k):
+            if Path(path) == inbox:
+                raise FileNotFoundError(2, "No such file or directory")
+            return real_stat(path, *a, **k)
+
+        def fake_lstat(path, *a, **k):
+            if Path(path) == inbox:
+                if not entry_exists:
+                    raise FileNotFoundError(2, "No such file or directory")
+                return real_lstat(inbox.parent)
+            return real_lstat(path, *a, **k)
+
+        monkeypatch.setattr(operator_mail.os, "scandir", fake_scandir)
+        monkeypatch.setattr(operator_mail.os, "stat", fake_stat)
+        monkeypatch.setattr(operator_mail.os, "lstat", fake_lstat)
+
+    as_dangling_link(entry_exists=True)
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.pending(tmp_path, "beta")
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.pending_count(tmp_path, "beta")
+
+    # The control that aims the test at `lstat` rather than at "something
+    # failed": the identical `scandir`/`stat` failure with NO entry behind it
+    # is a mailbox nobody has written to, and must stay empty. Without this,
+    # a fix that simply raised on every FileNotFoundError would pass above
+    # and would break every first run of every agent on the machine.
+    monkeypatch.undo()
+    as_dangling_link(entry_exists=False)
+    assert operator_mail.pending(tmp_path, "beta") == []
+    assert operator_mail.pending_count(tmp_path, "beta") == 0
+
+
+def test_an_unexaminable_mailbox_entry_is_refused_too(tmp_path, monkeypatch):
+    """`lstat` failing for a reason other than absence is not absence either.
+
+    The `OSError` arm beside the dangling-link one. A denied `lstat` says
+    nothing about whether mail is waiting, so it may not answer "none".
+    """
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    real_scandir, real_stat, real_lstat = os.scandir, os.stat, os.lstat
+
+    def fake_scandir(path, *a, **k):
+        if Path(path) == inbox:
+            raise FileNotFoundError(2, "No such file or directory")
+        return real_scandir(path, *a, **k)
+
+    def fake_stat(path, *a, **k):
+        if Path(path) == inbox:
+            raise FileNotFoundError(2, "No such file or directory")
+        return real_stat(path, *a, **k)
+
+    def fake_lstat(path, *a, **k):
+        if Path(path) == inbox:
+            raise PermissionError(13, "Permission denied")
+        return real_lstat(path, *a, **k)
+
+    monkeypatch.setattr(operator_mail.os, "scandir", fake_scandir)
+    monkeypatch.setattr(operator_mail.os, "stat", fake_stat)
+    monkeypatch.setattr(operator_mail.os, "lstat", fake_lstat)
+
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.pending(tmp_path, "beta")
+
+
+# ── a consume that fails part way through ───────────────────────
+def test_a_partial_consume_reports_what_it_already_took(tmp_path, monkeypatch):
+    """`consume` archives one at a time, so a fault mid-batch leaves a residue.
+
+    The messages already archived are genuinely read -- written to the archive
+    and unlinked from the inbox -- but raising discarded the return value, so
+    they were shown to nobody and offered to nobody ever again. The exception
+    carries them instead, which is what lets the caller stop claiming that
+    nothing was marked read.
+    """
+    _msg(tmp_path, text="first")
+    _msg(tmp_path, text="second")
+    real_write_json = operator_mail._write_json
+    calls: list[dict] = []
+
+    def fail_on_the_second(path, msg):
+        calls.append(msg)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return real_write_json(path, msg)
+
+    monkeypatch.setattr(operator_mail, "_write_json", fail_on_the_second)
+    with pytest.raises(operator_mail.MailError) as caught:
+        operator_mail.consume(tmp_path, "beta")
+
+    assert len(caught.value.consumed) == 1, (
+        "the message archived before the failure is read and must be reported")
+    survivor = caught.value.consumed[0]["text"]
+
+    monkeypatch.undo()
+    still_waiting = [m["text"] for m in operator_mail.pending(tmp_path, "beta")]
+    assert len(still_waiting) == 1, "the unarchived message stays pending"
+    assert survivor not in still_waiting, (
+        "premise: the reported message really was taken out of the inbox")
+
+
+def test_an_error_before_anything_is_taken_reports_nothing_consumed(tmp_path):
+    """The control that keeps the sentence above honest.
+
+    If `consumed` were populated on every failure the caller would warn about
+    lost mail whenever a mailbox was merely unreadable, which is the same
+    false claim pointing the other way.
+    """
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(operator_mail.MailError) as caught:
+        operator_mail.consume(tmp_path, "beta")
+    assert caught.value.consumed == []
+
+
+# ── one listing, not two ────────────────────────────────────────
+def test_selection_matches_what_glob_selected(tmp_path):
+    """The `*.json` rule survived dropping the second listing.
+
+    `_message_files` used to re-list with `glob` after `scandir`; now it
+    selects from the single listing with `os.path.normcase`, which is the
+    platform's own case rule. These are the names that distinguish the two
+    readings, so a regression in the matching shows up here rather than as
+    mail that quietly stops being found.
+    """
+    inbox = operator_mail.inbox_dir(tmp_path, "beta")
+    inbox.mkdir(parents=True, exist_ok=True)
+    for name in ("a.json", "b.txt", "c.json.bak", ".json", "d.jsonx",
+                 "e.JSON"):
+        (inbox / name).write_text("{}", encoding="utf-8")
+
+    selected = {p.name for p in operator_mail._message_files(inbox)}
+    expected = {p.name for p in inbox.glob("*.json")}
+    assert selected == expected, (
+        "the single-listing selection must pick exactly what glob picked")
+    assert "a.json" in selected and "b.txt" not in selected

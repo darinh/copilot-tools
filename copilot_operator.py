@@ -2702,8 +2702,21 @@ def show_inbox(args: list[str]) -> int:
         print(f"  {exc}", file=sys.stderr)
         print("  This is not the same as an empty inbox: messages may be "
               "waiting and unreadable.", file=sys.stderr)
-        print("  Nothing has been marked read, so anything there survives "
-              "for the next attempt.", file=sys.stderr)
+        # `consume` archives one message at a time, so a fault part way
+        # through the batch leaves the earlier ones already read. Claiming
+        # "nothing has been marked read" on that path was this module's own
+        # defect reached through its error handler: a sentence asserting an
+        # outcome nobody checked, and the messages it was wrong about had
+        # been archived unread and shown to nobody. Ask, then say.
+        if exc.consumed:
+            print(f"  {len(exc.consumed)} message(s) HAD already been marked "
+                  "read before the failure. They are printed below, because "
+                  "this is the only time they will ever be offered.",
+                  file=sys.stderr)
+            print(operator_mail.render_for_terminal(exc.consumed))
+        else:
+            print("  Nothing has been marked read, so anything there survives "
+                  "for the next attempt.", file=sys.stderr)
         return 1
 
     if as_json:

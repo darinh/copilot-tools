@@ -1246,3 +1246,43 @@ def test_mail_is_only_archived_after_the_session_starts(idle_recipient):
     assert operator_mail.pending_count(op.OPERATOR_HOME, inst.id) == 1
     operator_mail.archive(op.OPERATOR_HOME, inst.id, [m["id"] for m in waiting])
     assert operator_mail.pending_count(op.OPERATOR_HOME, inst.id) == 0
+
+
+def test_inbox_prints_the_mail_it_already_marked_read_when_consume_fails(
+    isolated_state, monkeypatch, capsys
+):
+    """A partial `consume` must not lose the messages it already archived.
+
+    `consume` archives one message at a time, so a fault mid-batch leaves the
+    earlier ones read. The handler used to print "Nothing has been marked
+    read" on that path -- a sentence asserting an outcome nobody had checked
+    -- and those messages were then archived, unread, permanently. They are
+    printed here because it is the only time they will ever be offered.
+    """
+    tmp = isolated_state
+    for text in ("first message", "second message"):
+        operator_mail.queue(tmp, operator_mail.new_message(
+            "alpha", "beta", "beta", text))
+
+    real_write_json = operator_mail._write_json
+    calls: list[dict] = []
+
+    def fail_on_the_second(path, msg):
+        calls.append(msg)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return real_write_json(path, msg)
+
+    monkeypatch.setattr(operator_mail, "_write_json", fail_on_the_second)
+    rc = op.show_inbox(["beta"])
+    out = capsys.readouterr()
+    combined = out.out + out.err
+
+    assert rc == 1, "a failed read is not a success"
+    assert "Nothing has been marked read" not in combined, (
+        "that claim is false here: a message was archived before the failure")
+    assert "HAD already been marked read" in combined
+    # The message itself, not merely a count of it.
+    consumed_text = calls[0]["text"]
+    assert consumed_text in combined, (
+        f"{consumed_text!r} was marked read and never shown to anybody")
