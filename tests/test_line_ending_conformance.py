@@ -41,10 +41,9 @@ here rather than quietly become the next file nobody on Windows can run.
 """
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -53,8 +52,25 @@ REPO = Path(__file__).resolve().parent.parent
 #: Suffixes that are a shell script regardless of content.
 SHELL_SUFFIXES = frozenset({".sh", ".bash", ".ksh", ".zsh"})
 
-#: Interpreters whose scripts break on a trailing CR.
-_SHEBANG = re.compile(rb"^#!.*?\b(?:ba|da|k|z|a)?sh\b")
+#: Interpreter names whose scripts break on a trailing CR. Matched as a whole
+#: basename rather than as a substring: an earlier spelling of this searched
+#: the shebang line for ``sh`` with a word boundary, which classed
+#: ``#!/usr/bin/perl # sh`` as a shell script -- the trailing words of a
+#: shebang are arguments, not a comment, so any interpreter can be handed a
+#: word that ends the search in the wrong place.
+SHELL_INTERPRETERS = frozenset({
+    "sh", "bash", "dash", "ksh", "ksh93", "mksh", "pdksh", "zsh", "ash",
+})
+
+#: Interpreters that only name another interpreter. ``env`` is the common one;
+#: busybox dispatches on its first argument the same way.
+_INTERPRETER_WRAPPERS = frozenset({"env", "busybox"})
+
+#: A UTF-8 byte-order mark, which a Windows editor will happily put in front of
+#: a ``#!``. The kernel then refuses the file, so such a script is broken for a
+#: second reason -- but it must not silently fall outside the line-ending rule
+#: on the way past.
+_BOM = b"\xef\xbb\xbf"
 
 #: Tracked, textual, and deliberately *outside* the rule. It anchors the
 #: control that shows an LF checkout is caused by the attribute rather than by
@@ -150,18 +166,52 @@ def _index_blobs(paths: list[str]) -> dict[str, bytes]:
     return blobs
 
 
+def _shebang_interpreter(first_line: bytes) -> str | None:
+    """The interpreter a ``#!`` line actually selects, or ``None``.
+
+    Walks the line the way the kernel and ``env`` do between them, rather than
+    searching it: the first word is the interpreter, a word beginning with
+    ``-`` is a flag (``env -S``), and a wrapper such as ``env`` or ``busybox``
+    defers to the next word. Everything after that is an argument to the
+    program already chosen, which is why a search cannot be correct here --
+    ``#!/usr/bin/perl # sh`` selects perl and passes it two arguments.
+
+    A leading UTF-8 BOM is stripped first. Such a file is already broken as a
+    script -- the kernel wants ``#!`` in the first two bytes -- but it must
+    still be classified as one, or it drops out of the population silently and
+    the line-ending rule stops covering it.
+    """
+    if first_line.startswith(_BOM):
+        first_line = first_line[len(_BOM):]
+    if not first_line.startswith(b"#!"):
+        return None
+    # `replace` rather than a raise: a decoding accident must not be able to
+    # answer "not a shell script", which is the verdict that loses coverage.
+    words = first_line[2:].decode("utf-8", "replace").split()
+    while words:
+        word = words.pop(0)
+        if word.startswith("-"):
+            continue
+        name = PurePosixPath(word.replace("\\", "/")).name
+        if name in _INTERPRETER_WRAPPERS:
+            continue
+        return name
+    return None
+
+
 def _looks_like_shell_script(path: str, blob: bytes) -> bool:
     """True if `path` is a shell script, by suffix or by shebang.
 
     The shebang branch is what keeps this from being a list of filenames. It
-    matches the interpreter word, so ``#!/usr/bin/env bash`` and ``#!/bin/sh``
-    both count while ``#!/usr/bin/env python3`` does not -- and neither does a
-    ``#!`` appearing anywhere below the first line, which is a comment.
+    resolves the interpreter and compares its basename, so ``#!/usr/bin/env
+    bash`` and ``#!/bin/sh`` both count while ``#!/usr/bin/env python3`` does
+    not -- and neither does a ``#!`` appearing anywhere below the first line,
+    which is a comment.
     """
     if Path(path).suffix.lower() in SHELL_SUFFIXES:
         return True
     first_line = blob.split(b"\n", 1)[0]
-    return _SHEBANG.match(first_line) is not None
+    return _shebang_interpreter(first_line) in SHELL_INTERPRETERS
 
 
 def _shell_scripts() -> list[str]:
@@ -327,13 +377,23 @@ def test_shell_script_checks_out_lf(path: str, tmp_path: Path):
     )
 
 
-def test_the_lf_checkout_is_caused_by_the_attribute(tmp_path: Path):
-    """Control: on a converting checkout, an uncovered file still gets CRLF.
+def _assert_control_is_usable() -> None:
+    """The causation control is only a control while nothing governs it.
 
-    Without this, every assertion above is satisfied by a platform that was
-    never going to write a CR anyway -- which is every Linux CI leg, i.e. seven
-    of the eight. This is the one test that can tell "the rule works" apart
-    from "the rule was never load-bearing here".
+    ``test_the_lf_checkout_is_caused_by_the_attribute`` reads an LF result for
+    ``CONTROL_PATH`` as "this checkout does not convert", and skips. That
+    inference holds only if ``CONTROL_PATH`` is still on the platform default.
+    Give it *any* attribute -- one line of ``setup.ps1 -text`` is enough -- and
+    the control writes LF on a machine that is converting perfectly well, so
+    the causation test skips with a reason that is simply untrue and the whole
+    file passes without its only non-vacuous assertion ever running.
+
+    Measured, not supposed: with that one line added, this file reported
+    ``51 passed, 1 skipped`` on a checkout where ``core.autocrlf=true`` and
+    ``README.md`` checked out with 345 carriage returns.
+
+    So the premise is asserted separately, and loudly, rather than being left
+    to a test that answers a failure with a skip.
     """
     assert CONTROL_PATH in _tracked(), (
         f"the control file {CONTROL_PATH} is no longer tracked; pick another "
@@ -343,11 +403,43 @@ def test_the_lf_checkout_is_caused_by_the_attribute(tmp_path: Path):
         f"{CONTROL_PATH} is now classed as a shell script and can no longer "
         "serve as the outside-the-rule control"
     )
+    governed = {attr: _check_attr(attr, [CONTROL_PATH])[CONTROL_PATH]
+                for attr in ("text", "eol")}
+    named = {a: v for a, v in governed.items() if v != "unspecified"}
+    assert not named, (
+        f"{CONTROL_PATH} is the control for 'conversion is active here', so "
+        f"it has to be on the platform default, but .gitattributes now gives "
+        f"it {named}. An LF checkout of it no longer means the platform "
+        "declined to convert, so the causation test would skip instead of "
+        "failing -- pick a different control or drop the rule"
+    )
+
+
+def test_the_causation_control_is_still_governed_by_nothing():
+    """Loud tripwire for the premise the causation test skips on.
+
+    Deliberately a separate test with no skip in it: the failure this catches
+    turns the causation test into a skip, and a skip is the one result nobody
+    reads.
+    """
+    _assert_control_is_usable()
+
+
+def test_the_lf_checkout_is_caused_by_the_attribute(tmp_path: Path):
+    """Control: on a converting checkout, an uncovered file still gets CRLF.
+
+    Without this, every assertion above is satisfied by a platform that was
+    never going to write a CR anyway -- which is every Linux CI leg, i.e. seven
+    of the eight. This is the one test that can tell "the rule works" apart
+    from "the rule was never load-bearing here".
+    """
+    _assert_control_is_usable()
     written = _checkout_index(tmp_path, [CONTROL_PATH])[CONTROL_PATH]
     if b"\r\n" not in written:
         pytest.skip(
-            "this checkout does not convert line endings (core.autocrlf is "
-            "off), so an LF result proves nothing about the attribute"
+            f"{CONTROL_PATH} is on the platform default and still checked out "
+            "LF, so this checkout does not convert line endings and an LF "
+            "result proves nothing about the attribute"
         )
     sample = _checkout_index(tmp_path, [MUST_BE_FOUND[0]])[MUST_BE_FOUND[0]]
     assert b"\r" not in sample, (
@@ -378,6 +470,19 @@ def test_the_rule_does_not_reach_beyond_shell_scripts():
         ("bin/doctor", b"#!/usr/bin/env zsh\n"),
         ("script.SH", b"echo hi\n"),
         ("script.sh", b""),
+        # `env -S` is how a shebang passes more than one argument portably;
+        # the flag names no interpreter and must be walked past.
+        ("bin/doctor", b"#!/usr/bin/env -S bash -e\n"),
+        # busybox dispatches on its first argument, like `env`.
+        ("bin/doctor", b"#!/bin/busybox sh\n"),
+        ("bin/doctor", b"#!/bin/dash\n"),
+        # A CRLF shebang: the file this rule exists to fix, classified before
+        # it is fixed. `split()` treats the CR as whitespace.
+        ("bin/doctor", b"#!/usr/bin/env bash\r\nset -e\r\n"),
+        # A UTF-8 BOM in front of the `#!`. The kernel will not run this, but
+        # it is still a shell script and must stay inside the rule rather than
+        # dropping silently out of the population.
+        ("bin/doctor", b"\xef\xbb\xbf#!/usr/bin/env bash\n"),
     ],
 )
 def test_the_detector_fires(path: str, blob: bytes):
@@ -400,6 +505,17 @@ def test_the_detector_fires(path: str, blob: bytes):
         ("notes.txt", b"a line\n#!/bin/bash\n"),
         ("shrink.py", b"#!/usr/bin/env pythonsh\n"),
         ("empty", b""),
+        # The words after the interpreter are ARGUMENTS, not a comment. A
+        # search for `sh` anywhere in the line called this a shell script.
+        ("tool.pl", b"#!/usr/bin/perl # sh\n"),
+        ("tool.rb", b"#!/usr/bin/env ruby -e 'sh'\n"),
+        # Near-misses on the interpreter name itself.
+        ("tool", b"#!/usr/bin/env bash3\n"),
+        ("tool", b"#!/usr/bin/env fish\n"),
+        ("tool", b"#!/usr/bin/env shellcheck\n"),
+        # A `#!` with no interpreter at all resolves to nothing.
+        ("tool", b"#!\n"),
+        ("tool", b"#!/usr/bin/env\n"),
     ],
 )
 def test_the_detector_stays_quiet(path: str, blob: bytes):
@@ -409,3 +525,29 @@ def test_the_detector_stays_quiet(path: str, blob: bytes):
     comment, and treating it as a shebang would demand ``eol=lf`` for prose.
     """
     assert _looks_like_shell_script(path, blob) is False
+
+
+@pytest.mark.parametrize(
+    "first_line, expected",
+    [
+        (b"#!/bin/sh", "sh"),
+        (b"#!/bin/bash -e", "bash"),
+        (b"#!/usr/bin/env bash", "bash"),
+        (b"#!/usr/bin/env -S bash -e", "bash"),
+        (b"#!/bin/busybox sh", "sh"),
+        (b"#!/usr/bin/perl # sh", "perl"),
+        (b"\xef\xbb\xbf#!/bin/bash", "bash"),
+        (b"#!/usr/bin/env", None),
+        (b"#!", None),
+        (b"not a shebang", None),
+    ],
+)
+def test_the_interpreter_is_resolved_not_searched(first_line: bytes,
+                                                  expected: str | None):
+    """The resolution itself, asserted apart from the shell/not-shell verdict.
+
+    ``#!/usr/bin/perl # sh`` is the case worth naming: it must come back as
+    ``perl``. A detector that merely answered "not a shell" could do so for the
+    wrong reason and would drift back to a substring search unnoticed.
+    """
+    assert _shebang_interpreter(first_line) == expected
