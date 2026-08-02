@@ -324,9 +324,26 @@ def test_the_scan_would_have_caught_the_defect_this_module_fixes():
 
 
 def test_no_first_party_source_enumerates_workflows_by_one_suffix():
-    """The live rule, over the whole tree rather than over one file."""
+    """The live rule, over the whole tree rather than over one file.
+
+    The population guard is not decoration. A scan whose discovery quietly
+    shrinks reports the whole tree clean, which is indistinguishable from
+    success -- so the population is pinned two ways: a floor on its size, and
+    the one file in the repository that actually globs the workflow directory,
+    by name. If that file ever stops being scanned, the rule is enforcing
+    nothing and should say so rather than pass.
+    """
     sources = _python_sources()
-    assert sources, "the python source discovery came back empty"
+    assert len(sources) > 20, (
+        f"the python source discovery came back with {len(sources)} files, "
+        "which is too few to be the repository -- the scan below would "
+        "report clean without having looked at anything"
+    )
+    relative = {str(p.relative_to(REPO)).replace("\\", "/") for p in sources}
+    assert "tests/test_shell_tests_are_executed.py" in relative, (
+        "the one file that enumerates the workflow directory is not in the "
+        "scanned population, so a regression in it would go unreported"
+    )
     offenders = []
     for path in sources:
         offenders += single_suffix_workflow_globs(
