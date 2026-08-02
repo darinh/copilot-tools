@@ -330,22 +330,26 @@ the reader deletes it, *means* nobody consumed it — the old file is copied to
 `~/.copilot/projects/{guid}/superseded/` first, and only then is the new one
 published. Both survive.
 
-One case is not covered, and it matters because the symptom is silent: when two
-handoffs race for the same project and the tool cannot take its lock, it
-publishes anyway rather than discard the live session, and one of the two can
-end up only in `superseded/`. Nothing about `next-session.md` shows this
-afterwards.
+Two handoffs can still race for the same project: if the tool cannot take its
+lock it publishes anyway rather than discard the live session, so one of the
+two can end up only in `superseded/`. That used to be silent. It is not any
+more — a handoff written without the lock says so in its own first paragraph,
+and the copy banked beside it says that it may never have reached
+`next-session.md` at all. The notice travels with the bytes, so it reaches the
+session that has to act on it rather than only the one that caused it.
 
 That makes it a rule at both ends of a session:
 
 - **Starting**: if `~/.copilot/projects/{guid}/superseded/` is non-empty, read
   what is in there alongside `next-session.md` before deciding what you are
-  picking up. The handoff file alone cannot tell you whether it is the newest
-  one.
-- **Ending**: if `handoff` printed a warning — that another handoff was in
-  progress, or that it could not bank a spare copy — say so in your final
-  message. That warning goes to stderr and dies with your session; you are the
-  only one who will ever see it.
+  picking up. A banked copy that says it may never have reached
+  `next-session.md` is a handoff that may be *newer* than the one you are
+  holding; anything else in there is an unread predecessor, and is older.
+- **Ending**: if `handoff` printed a warning — that it could not take the
+  handoff lock, or that it could not bank a spare copy — say so in your final
+  message. The first case is now recorded in the files themselves as well; the
+  second is not, because the failure *was* that no file could be written, and
+  that warning goes to stderr and dies with your session.
 
 **Nothing ever prunes `superseded/`. That is a promise, not an oversight.** A
 reaper living inside a fix for an unwanted delete is the same bug wearing the

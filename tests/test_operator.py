@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -263,6 +264,13 @@ def test_a_ruling_shaped_option_value_does_not_suppress_the_flag(
 # exactly the shape this change exists to abolish.
 OPERATOR_SH = Path(__file__).resolve().parent.parent / "operator.sh"
 
+# The interpreter macOS ships, and the only one on any CI leg that is bash
+# 3.2. It is addressed by absolute path rather than looked up, because a
+# lookup answers "a bash" and every claim these tests make needs "the bash a
+# macOS user will actually run this under" -- see `_bash_executable`.
+MACOS_SYSTEM_BASH = Path("/bin/bash")
+
+
 def _bash_executable() -> str | None:
     """A bash that can actually run a script out of a native temp directory.
 
@@ -272,12 +280,57 @@ def _bash_executable() -> str | None:
     which is the one failure mode these tests exist to refuse. Git for Windows
     ships a real msys bash that takes native paths, so prefer it, and fall
     back to PATH only where PATH bash is the genuine article.
+
+    On macOS, prefer `/bin/bash` explicitly. Everything these tests assert
+    about bash 3.2 -- see `tests/test_operator_sh_bash32.py`, whose docstring
+    calls the macOS runners "the bash 3.2 canary" -- rests on the interpreter
+    chosen here being Apple's frozen 3.2, and `shutil.which` does not promise
+    that: it promises the first `bash` on PATH. Homebrew's is 5.x and installs
+    ahead of `/bin` on a developer's machine, and a runner image is free to do
+    the same. That substitution changes nothing observable -- the suite stays
+    green, because bash 5 runs everything 3.2 runs -- so the only execution
+    coverage of 3.2 this repository has would leave without a failing test
+    anywhere. Naming the path makes the choice a decision rather than a
+    coincidence, and `test_macos_runs_these_tests_under_the_bash_apple_ships`
+    makes its loss loud. The executability probe is not ceremony: a path that
+    exists but cannot be run would be returned as "a bash that can actually
+    run a script" and turn every test in that file into a spawn error, where
+    falling through to PATH gets the suite a working interpreter instead.
     """
     if os.name == "nt":
         program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
         git_bash = program_files / "Git" / "bin" / "bash.exe"
         return str(git_bash) if git_bash.is_file() else None
+    if (sys.platform == "darwin" and MACOS_SYSTEM_BASH.is_file()
+            and os.access(MACOS_SYSTEM_BASH, os.X_OK)):
+        return str(MACOS_SYSTEM_BASH)
     return shutil.which("bash")
+
+
+def _bash_version(executable: str) -> tuple[int, int] | None:
+    """``(major, minor)`` of `executable`, or ``None`` if it could not be asked.
+
+    ``None`` means the question failed, and callers must not read it as any
+    particular version: an interpreter that cannot be interrogated is not
+    evidence of coverage, it is the absence of evidence.
+    """
+    try:
+        proc = subprocess.run(
+            [executable, "-c",
+             'printf "%s %s" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}"'],
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    parts = proc.stdout.split()
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
 
 
 bash = pytest.mark.skipif(_bash_executable() is None,
@@ -406,7 +459,8 @@ def _shell_launch_argv(function: str, user_argv: list[str], tmp_path: Path) -> l
         f'{function} "$@"\n',
         encoding="utf-8", newline="\n")
     proc = subprocess.run([_bash_executable(), "argv.sh", *user_argv], cwd=tmp_path,
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=60)
     assert proc.returncode == _LAUNCHED, (
         f"{function}() never reached generate_run_script (exit "
         f"{proc.returncode}), so nothing about its launch args was tested:\n"
@@ -452,7 +506,8 @@ def _shell_dispatch(argv: list[str], tmp_path: Path) -> tuple[str, list[str]]:
         'main "$@"\n',
         encoding="utf-8", newline="\n")
     proc = subprocess.run([_bash_executable(), "dispatch.sh", *argv], cwd=tmp_path,
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=60)
     assert proc.returncode == _LAUNCHED, (
         f"main() never reached a session function (exit {proc.returncode}), so "
         f"nothing about its dispatch was tested:\n{proc.stderr}")
@@ -601,7 +656,8 @@ def test_operator_sh_always_attaches_its_single_session(tmp_path):
         'run_single_session\n',
         encoding="utf-8", newline="\n")
     proc = subprocess.run([_bash_executable(), "attach.sh"], cwd=tmp_path,
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=60)
     assert proc.returncode == _ATTACHED, (
         "operator.sh's run_single_session did not reach `tmux attach` (exit "
         f"{proc.returncode}). If it has gained a way to launch a single "

@@ -236,7 +236,8 @@ def test_check_rejects_broken_javascript(tmp_path):
     broken = tmp_path / "broken.mjs"
     broken.write_text(BROKEN, encoding="utf-8")
     proc = subprocess.run(["node", "--check", str(broken)],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=60)
     assert proc.returncode != 0
     assert "SyntaxError" in proc.stderr
 
@@ -253,7 +254,8 @@ def test_check_does_not_read_the_files_the_entrypoint_imports(tmp_path):
                       "import { x } from './guard.mjs';\nexport const y = x;\n")
     (dest / "guard.mjs").write_text(BROKEN, encoding="utf-8")
     proc = subprocess.run(["node", "--check", str(dest / "extension.mjs")],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=60)
     assert proc.returncode == 0, (
         "node --check now follows imports; the per-module loop can be revisited")
 

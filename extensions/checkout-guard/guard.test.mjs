@@ -29,6 +29,7 @@ import {
   blockReason,
   bound,
   checkoutRoot,
+  createGuard,
   createGuardState,
   emptyDirCandidates,
   formatPathList,
@@ -1813,8 +1814,8 @@ test("every name extension.mjs imports from guard.mjs is really exported", async
     .filter(Boolean);
   // Premise, because a regex that matched an empty list would satisfy every
   // assertion below without checking anything.
-  assert.ok(imported.length > 5, `premise: names were extracted: ${imported.length}`);
-  assert.ok(imported.includes("observe"), "premise: the extracted list is the real one");
+  assert.ok(imported.length > 0, `premise: names were extracted: ${imported.length}`);
+  assert.ok(imported.includes("createGuard"), "premise: the extracted list is the real one");
 
   const exported = Object.keys(await import("./guard.mjs"));
   const missing = imported.filter((name) => !exported.includes(name));
@@ -1824,6 +1825,454 @@ test("every name extension.mjs imports from guard.mjs is really exported", async
   // `imported` -- passes identically.
   assert.ok(!exported.includes("noSuchExport"),
     "control: the export list is a real list, not a set that answers yes");
+});
+
+// ---------------------------------------------------------------------------
+// createGuard: the three hook bodies.
+//
+// These used to live in extension.mjs, where `joinSession` runs at import and
+// no test can reach a line of them. They are where every other decision in
+// guard.mjs is SEQUENCED -- which scan seeds which baseline, which tool
+// triggers a second checkout's scan, whether a report is emitted or a
+// permission denied -- and sequencing is the part that looks right when read.
+// ---------------------------------------------------------------------------
+
+const HOOK_ROOT = join(tmpdir(), "cg-hook-repo");
+const HOOK_PRIMARY = join(tmpdir(), "cg-hook-primary");
+const HOOK_SCRATCH = join(tmpdir(), "cg-hook-scratch");
+
+/**
+ * A guard wired to doubles, plus a record of what it touched.
+ *
+ * `trees` maps a checkout root to what a scan of it returns: an array, or
+ * `null` for a scan that failed. A root absent from `trees` scans as empty --
+ * which is a different answer from null, and the difference is load-bearing.
+ *
+ * Nothing here touches the filesystem or a git binary. That is the point of
+ * the injection points on `createGuard`: the sequencing is what is under test.
+ */
+function hookGuard({ trees = {}, ...overrides } = {}) {
+  const calls = { ensureDir: [], scanned: [] };
+  const guard = createGuard({
+    scratchDir: HOOK_SCRATCH,
+    disabled: false,
+    ensureDir: (dir) => { calls.ensureDir.push(dir); },
+    cwd: () => HOOK_ROOT,
+    rootOf: async () => HOOK_ROOT,
+    scan: async (root) => {
+      calls.scanned.push(root);
+      return Object.hasOwn(trees, root) ? trees[root] : [];
+    },
+    otherRoot: async () => null,
+    ...overrides,
+  });
+  return { ...guard, calls };
+}
+
+test("createGuard hands out independent guards, never a shared baseline", async () => {
+  const a = hookGuard({ trees: { [HOOK_ROOT]: ["only-a.py"] } });
+  const b = hookGuard();
+  await a.onSessionStart();
+  assert.deepEqual(a.state.lastSeen.get(HOOK_ROOT), ["only-a.py"],
+    "premise: the first guard really did seed a baseline");
+  assert.equal(b.state.lastSeen.size, 0,
+    "a second guard in the same process shares nothing with the first -- state "
+    + "held at module level would make every case in this file order-dependent");
+  // Control: `b` is not simply inert. It seeds its own baseline, and doing so
+  // does not reach into `a`'s.
+  await b.onSessionStart();
+  assert.deepEqual(b.state.lastSeen.get(HOOK_ROOT), []);
+  assert.deepEqual(a.state.lastSeen.get(HOOK_ROOT), ["only-a.py"]);
+});
+
+test("onSessionStart seeds the checkout and names what it inherited", async () => {
+  const guard = hookGuard({ trees: { [HOOK_ROOT]: ["stale.py"] } });
+  const result = await guard.onSessionStart();
+  assert.match(result.additionalContext, /stale\.py/);
+  assert.ok(result.additionalContext.includes(HOOK_SCRATCH),
+    "the briefing names where to write instead");
+  assert.deepEqual(guard.state.lastSeen.get(HOOK_ROOT), ["stale.py"],
+    "seeded as well as reported: every later hook answers 'what is new', so "
+    + "this is the only moment an inherited artifact can be named at all");
+  assert.deepEqual(guard.calls.ensureDir, [HOOK_SCRATCH]);
+  // Control: a clean checkout gets the briefing and no inherited notice, so
+  // the match above is the report firing rather than the text always saying it.
+  const clean = await hookGuard().onSessionStart();
+  assert.ok(clean.additionalContext.includes(HOOK_SCRATCH));
+  assert.doesNotMatch(clean.additionalContext, /stale\.py/);
+  assert.doesNotMatch(clean.additionalContext, /INHERITED/);
+});
+
+test("a session-start scan that failed is reported as unscanned, not as clean", async () => {
+  const guard = hookGuard({ trees: { [HOOK_ROOT]: null } });
+  const result = await guard.onSessionStart();
+  assert.match(result.additionalContext, /UNSCANNED/);
+  assert.equal(guard.state.lastSeen.has(HOOK_ROOT), false,
+    "a failed scan must not become a baseline, or the whole checkout reads as "
+    + "new the first time a command runs");
+  // Control: a scan that succeeded and found nothing says no such thing, which
+  // is what makes the notice above mean 'nobody looked'.
+  const clean = hookGuard();
+  const quiet = await clean.onSessionStart();
+  assert.doesNotMatch(quiet.additionalContext, /UNSCANNED/);
+  assert.deepEqual(clean.state.lastSeen.get(HOOK_ROOT), []);
+});
+
+test("onSessionStart seeds the primary checkout too, so its contents are never blamed on this session", async () => {
+  const guard = hookGuard({
+    trees: { [HOOK_ROOT]: [], [HOOK_PRIMARY]: ["peer.py"] },
+    otherRoot: async () => HOOK_PRIMARY,
+  });
+  const result = await guard.onSessionStart();
+  assert.deepEqual(guard.state.lastSeen.get(HOOK_PRIMARY), ["peer.py"],
+    "without this seed every existing file in the primary reads as this "
+    + "agent's doing the first time a command is run");
+  assert.match(result.additionalContext, /peer\.py/);
+  assert.ok(result.additionalContext.includes(HOOK_PRIMARY), "the notice says which tree");
+  // Control: an agent already working in the primary has no second checkout,
+  // and the primary is then not scanned twice as if it were two places.
+  const alone = hookGuard({ trees: { [HOOK_PRIMARY]: ["peer.py"] } });
+  await alone.onSessionStart();
+  assert.equal(alone.state.lastSeen.has(HOOK_PRIMARY), false);
+  assert.deepEqual(alone.calls.scanned, [HOOK_ROOT]);
+});
+
+test("an unwritable scratch directory does not fail the session", async () => {
+  let attempted = 0;
+  const guard = hookGuard({
+    ensureDir: () => { attempted++; throw new Error("EACCES"); },
+    trees: { [HOOK_ROOT]: ["stale.py"] },
+  });
+  const result = await guard.onSessionStart();
+  assert.equal(attempted, 1,
+    "premise: the failure really happened, so surviving it is a finding");
+  assert.ok(result.additionalContext.includes(HOOK_SCRATCH),
+    "the briefing still names the intended location -- a guard that breaks a "
+    + "session is worse than the artifacts it prevents");
+  assert.match(result.additionalContext, /stale\.py/,
+    "and the rest of the hook still ran; the throw was survived, not skipped");
+});
+
+test("the disable knob turns all three hooks into no-ops", async () => {
+  const off = hookGuard({ disabled: true, trees: { [HOOK_ROOT]: ["stray.py"] } });
+  assert.equal(await off.onSessionStart(), undefined);
+  assert.equal(
+    await off.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add -A" } }),
+    undefined);
+  assert.equal(await off.onPostToolUse({ toolName: "bash", toolArgs: {} }), undefined);
+  assert.deepEqual(off.calls.scanned, [], "nothing was even looked at");
+  assert.deepEqual(off.calls.ensureDir, [], "and no directory was created");
+  // Control: the identical calls against an enabled guard all do something, so
+  // the three undefineds above are the knob and not three inert arguments.
+  const on = hookGuard({ trees: { [HOOK_ROOT]: ["stray.py"] } });
+  const started = await on.onSessionStart();
+  assert.match(started.additionalContext, /stray\.py/);
+  assert.deepEqual(on.calls.ensureDir, [HOOK_SCRATCH]);
+  const denied = await on.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add -A" } });
+  assert.equal(denied, undefined,
+    "premise: nothing is outstanding yet -- the seed folded it into the baseline");
+  const noticed = await on.onPostToolUse({ toolName: "bash", toolArgs: {} });
+  assert.equal(noticed, undefined);
+  assert.ok(on.calls.scanned.length > 0, "an enabled guard looks; a disabled one does not");
+});
+
+test("onPreToolUse looks only at shell commands that mention git", async () => {
+  const guard = hookGuard({ trees: { [HOOK_ROOT]: ["junk.py"] } });
+  guard.state.lastSeen.set(HOOK_ROOT, []);
+  assert.equal(
+    await guard.onPreToolUse({ toolName: "view", toolArgs: { command: "git add -A" } }),
+    undefined, "not a shell tool");
+  assert.equal(
+    await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "ls -la" } }),
+    undefined, "not a git command");
+  assert.deepEqual(guard.calls.scanned, [],
+    "the cheap rejects come first: this hook runs on every shell command and "
+    + "the overwhelming majority of them are not git");
+  // Control: the same guard and the same outstanding artifact, with a git
+  // command -- it scans and denies. Without this, the two undefineds above are
+  // satisfied by a hook that never does anything at all.
+  const decision = await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add -A" } });
+  assert.equal(decision.permissionDecision, "deny");
+  assert.match(decision.permissionDecisionReason, /junk\.py/);
+  assert.deepEqual(guard.calls.scanned, [HOOK_ROOT]);
+});
+
+test("onPreToolUse denies a blanket stage and flags what it is naming for the first time", async () => {
+  const guard = hookGuard({ trees: { [HOOK_ROOT]: ["probe.py"] } });
+  guard.state.lastSeen.set(HOOK_ROOT, []);
+  const denied = await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add -A" } });
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /BLOCKED/);
+  assert.match(denied.permissionDecisionReason, /first time/,
+    "it arrived with no tool call of this agent's in between, so the message "
+    + "must not imply the agent made it");
+  // Control: staging the same path BY NAME is allowed. That distinction is the
+  // entire point -- the aim is to stop artifacts being committed unnoticed.
+  assert.equal(
+    await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add probe.py" } }),
+    undefined);
+  assert.deepEqual([...setFor(guard.state.outstanding, HOOK_ROOT)], ["probe.py"],
+    "still outstanding: allowing the named stage is not forgetting the artifact");
+});
+
+test("onPreToolUse reports what it noticed even when the command is not a sweep", async () => {
+  const guard = hookGuard({ trees: { [HOOK_ROOT]: ["probe.py"] } });
+  guard.state.lastSeen.set(HOOK_ROOT, []);
+  const result = await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git status" } });
+  assert.match(result.additionalContext, /probe\.py/);
+  assert.equal(result.permissionDecision, undefined, "noticing is not refusing");
+  // Control: with nothing new, the same call says nothing -- so the report
+  // above is the artifact and not a hook that always speaks.
+  assert.equal(
+    await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git status" } }),
+    undefined);
+});
+
+test("onPostToolUse folds a create/edit write into the baseline instead of reporting it", async () => {
+  const guard = hookGuard();
+  guard.state.lastSeen.set(HOOK_ROOT, []);
+  assert.equal(
+    await guard.onPostToolUse({ toolName: "create", toolArgs: { path: join(HOOK_ROOT, "notes.md") } }),
+    undefined);
+  assert.deepEqual([...setFor(guard.state.authored, HOOK_ROOT)], ["notes.md"]);
+  assert.deepEqual(guard.calls.scanned, [],
+    "no rescan: the CLI issues parallel edit calls, so a five-file edit would "
+    + "otherwise fire five concurrent whole-tree traversals");
+  // Control: a shell command producing the same path IS reported, so the
+  // silence above is the authoring branch rather than a hook that never
+  // reports anything.
+  const shell = hookGuard({ trees: { [HOOK_ROOT]: ["notes.md"] } });
+  shell.state.lastSeen.set(HOOK_ROOT, []);
+  const reported = await shell.onPostToolUse({ toolName: "bash", toolArgs: { command: "touch notes.md" } });
+  assert.match(reported.additionalContext, /notes\.md/);
+});
+
+test("onPostToolUse scans the primary after a subagent call, and not after a shell command", async () => {
+  const trees = { [HOOK_ROOT]: [], [HOOK_PRIMARY]: ["from-subagent.py"] };
+  const viaTask = hookGuard({ trees, otherRoot: async () => HOOK_PRIMARY });
+  viaTask.state.lastSeen.set(HOOK_ROOT, []);
+  viaTask.state.lastSeen.set(HOOK_PRIMARY, []);
+  const result = await viaTask.onPostToolUse({ toolName: "task", toolArgs: {} });
+  assert.match(result.additionalContext, /from-subagent\.py/);
+  assert.ok(result.additionalContext.includes(HOOK_PRIMARY), "the report says which tree");
+  assert.deepEqual([...setFor(viaTask.state.outstanding, HOOK_PRIMARY)], [],
+    "reported but never blocking: the file may be a peer's, and refusing this "
+    + "agent's commit over it lands the cost on the wrong asset");
+
+  // Control: the same guard shape and the same primary contents, reached by a
+  // bash call -- the primary is not scanned. Scanning it after every shell
+  // command would report every peer's artifacts to every other agent, and a
+  // guard that cries wolf gets switched off.
+  const viaShell = hookGuard({ trees, otherRoot: async () => HOOK_PRIMARY });
+  viaShell.state.lastSeen.set(HOOK_ROOT, []);
+  viaShell.state.lastSeen.set(HOOK_PRIMARY, []);
+  assert.equal(await viaShell.onPostToolUse({ toolName: "bash", toolArgs: {} }), undefined);
+  assert.deepEqual(viaShell.calls.scanned, [HOOK_ROOT]);
+});
+
+test("a session outside any checkout is left alone", async () => {
+  const guard = hookGuard({ rootOf: async () => null, trees: { [HOOK_ROOT]: ["x.py"] } });
+  assert.equal(
+    await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add -A" } }),
+    undefined);
+  assert.equal(await guard.onPostToolUse({ toolName: "bash", toolArgs: {} }), undefined);
+  const start = await guard.onSessionStart();
+  assert.ok(start.additionalContext.includes(HOOK_SCRATCH),
+    "session start still briefs: where to write scratch files is worth saying "
+    + "whether or not this directory is a git checkout");
+  assert.doesNotMatch(start.additionalContext, /x\.py/);
+  assert.deepEqual(guard.calls.scanned, [], "there is no root to scan");
+});
+
+// --- the budget on extension.mjs -----------------------------------------
+
+/**
+ * Whether a `/` at this point begins a regex literal rather than a division.
+ *
+ * Decided by the previous significant character, which is the standard
+ * heuristic: after a value -- identifier, `)`, `]`, digit -- a slash divides;
+ * anywhere else it opens a regex.
+ */
+function canStartRegex(last) {
+  return last === "" || !/[\w$)\]]/.test(last);
+}
+
+/**
+ * Source with comments removed and every string, template and regex literal
+ * blanked, so a token scan below sees code and only code.
+ *
+ * A regex-based stripper was written first and had a real bypass, found by
+ * adversarial review: in `const s = "x//y"; if (danger) { run(); }` the `//`
+ * inside the string literal ate the rest of the line, `if` included, and the
+ * file was reported clean. A detector that a string literal can silence is
+ * precisely the failure this extension exists to prevent -- silence with two
+ * causes -- so this is a character scanner instead.
+ *
+ * Its one known limit: a `}` inside a string inside a `${...}` substitution
+ * would end the substitution early. That is a scan of a scan, and the controls
+ * below fix the shapes that actually bypass it.
+ */
+function codeOnly(source) {
+  const out = [];
+  let last = "";
+  let i = 0;
+  const push = (ch) => {
+    out.push(ch);
+    if (ch.trim()) last = ch;
+  };
+
+  while (i < source.length) {
+    const c = source[i];
+    const d = source[i + 1];
+
+    if (c === "/" && d === "/") {
+      while (i < source.length && source[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && d === "*") {
+      i += 2;
+      while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++;
+      i += 2;
+      push(" ");
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      const quote = c;
+      i++;
+      while (i < source.length && source[i] !== quote) {
+        i += source[i] === "\\" ? 2 : 1;
+      }
+      i++;
+      push("S");
+      continue;
+    }
+    if (c === "`") {
+      i++;
+      while (i < source.length) {
+        if (source[i] === "\\") { i += 2; continue; }
+        if (source[i] === "`") { i++; break; }
+        if (source[i] === "$" && source[i + 1] === "{") {
+          i += 2;
+          const start = i;
+          let depth = 1;
+          while (i < source.length && depth > 0) {
+            if (source[i] === "{") depth++;
+            else if (source[i] === "}") depth--;
+            if (depth > 0) i++;
+          }
+          // A substitution is code again, and a ternary hides there happily.
+          out.push(codeOnly(source.slice(start, i)));
+          i++;
+          continue;
+        }
+        i++;
+      }
+      push("S");
+      continue;
+    }
+    if (c === "/" && canStartRegex(last)) {
+      i++;
+      let inClass = false;
+      while (i < source.length) {
+        if (source[i] === "\\") { i += 2; continue; }
+        if (source[i] === "\n") break;
+        if (source[i] === "[") inClass = true;
+        else if (source[i] === "]") inClass = false;
+        else if (source[i] === "/" && !inClass) { i++; break; }
+        i++;
+      }
+      while (i < source.length && /[a-z]/.test(source[i])) i++;
+      push("R");
+      continue;
+    }
+    push(c);
+    i++;
+  }
+  return out.join("");
+}
+
+const DECISION_TOKENS = [
+  [/\bif\b/, "if"],
+  [/\belse\b/, "else"],
+  [/\bfor\b/, "for"],
+  [/\bwhile\b/, "while"],
+  [/\bswitch\b/, "switch"],
+  [/\btry\b/, "try"],
+  [/\bcatch\b/, "catch"],
+  [/&&/, "&&"],
+  [/\|\|/, "||"],
+  [/\?\?/, "??"],
+  [/\?\./, "optional chaining"],
+  [/\?[^?.]/, "ternary"],
+];
+
+function decisionsIn(source) {
+  const code = codeOnly(source);
+  return DECISION_TOKENS.filter(([pattern]) => pattern.test(code)).map(([, name]) => name);
+}
+
+test("extension.mjs holds no decisions, because nothing can test one there", async () => {
+  const source = await readFile(
+    join(dirname(fileURLToPath(import.meta.url)), "extension.mjs"), "utf8");
+  const code = codeOnly(source);
+  // Premises: the scanner left the code behind. Without these, a stripper that
+  // returned "" would report the file gloriously free of decisions.
+  assert.ok(code.includes("joinSession"), "premise: the SDK call survived stripping");
+  assert.ok(code.includes("createGuard"), "premise: and the wiring under test");
+
+  assert.deepEqual(decisionsIn(source), [],
+    "a branch in extension.mjs is covered by `node --check` and by nothing "
+    + "else, because importing that file starts a session. Move it into "
+    + "guard.mjs behind createGuard, where the node suite runs it.");
+
+  const codeLines = code.split("\n").map((line) => line.trim()).filter(Boolean);
+  assert.ok(codeLines.length <= 25,
+    `extension.mjs is ${codeLines.length} lines of code and the budget is 25: `
+    + "untestable code is spent, not written");
+});
+
+test("the decision scan cannot be silenced by a comment, a string or a regex", () => {
+  // Positive control, one per detector. A scan that matches nothing calls the
+  // file clean in exactly the words it uses when the file really is clean --
+  // which is the failure this whole extension exists to make impossible.
+  const sample = "if (a) {} else {}\nfor (;;) {}\nwhile (a) {}\nswitch (a) {}\n"
+    + "try {} catch {}\na && b;\na || b;\na ?? b;\na?.b;\na ? b : c;";
+  assert.deepEqual(
+    decisionsIn(sample).sort(),
+    DECISION_TOKENS.map(([, name]) => name).sort(),
+    "every detector fires against source that has the construct");
+
+  // The negative half: prose about `if` is not code, or the scan would
+  // condemn a file for its own explanation of itself.
+  assert.deepEqual(
+    decisionsIn("// if (a) {} else {}\n/* while (b) {} */\nexport const x = 1;"), [],
+    "the same constructs inside comments are not code");
+
+  // The bypasses. Each of these hid a real `if` from the regex-based stripper
+  // this replaced -- reported by an adversarial reviewer for the first, which
+  // is how the other two came to be looked for at all.
+  assert.deepEqual(decisionsIn('const s = "x//y"; if (danger) { run(); }'), ["if"],
+    "a `//` inside a string literal must not eat the rest of the line");
+  assert.deepEqual(decisionsIn("const s = `x//y`; if (danger) { run(); }"), ["if"],
+    "nor inside a template literal");
+  assert.deepEqual(decisionsIn("const re = /\\/\\//; if (danger) { run(); }"), ["if"],
+    "nor inside a regex literal");
+  assert.deepEqual(decisionsIn('const s = "/* still code */"; if (danger) {}'), ["if"],
+    "a block comment opened inside a string is not a block comment");
+
+  // And division is not a regex: mistaking it for one would swallow code up
+  // to the next slash and silence the scan the other way round.
+  assert.deepEqual(decisionsIn("const x = a / b; const y = c / d; if (e) {}"), ["if"],
+    "a `/` after a value divides; only after an operator does it open a regex");
+
+  // A ternary inside a template substitution is still a ternary.
+  assert.deepEqual(decisionsIn("const s = `${a ? b : c}`;"), ["ternary"],
+    "a substitution is code again");
+
+  // Control on the controls: source with none of the constructs reports none,
+  // so the lists above are the detectors firing rather than a function that
+  // always returns its whole vocabulary.
+  assert.deepEqual(decisionsIn("export const x = 1;\nconst y = f(x);"), []);
 });
 
 

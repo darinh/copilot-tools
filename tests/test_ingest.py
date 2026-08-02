@@ -1,7 +1,10 @@
 """Tests for the pure-Python log parser and metrics store."""
 from __future__ import annotations
 
+import os
 import sqlite3
+import time
+from pathlib import Path
 
 import pytest
 
@@ -279,8 +282,399 @@ def test_missing_file_raises(tmp_path, db_path):
         operator_ingest.ingest_file(tmp_path / "absent.log", db_path)
 
 
+def _resolve_raises(monkeypatch, target, exc):
+    """Make ``Path.resolve`` fail for ``target`` only.
+
+    Patched on ``pathlib.Path`` rather than on a name inside
+    ``operator_ingest``, so the control still means something against a
+    revision that spells the call differently -- the point is what the CLI
+    does when resolving this path fails, not which local it happens to use.
+    Every other path keeps the real implementation, because ingestion resolves
+    more than one and a blanket failure would abort before reaching the
+    branch under test.
+    """
+    real = Path.resolve
+    wanted = str(Path(target))
+
+    def boom(self, *args, **kwargs):
+        if str(self) == wanted:
+            raise exc
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", boom)
+
+
+@pytest.mark.parametrize("exc", [
+    RuntimeError("Symlink loop from 'absent.log'"),
+    ValueError("stat: embedded null character in path"),
+], ids=["symlink-loop", "embedded-nul"])
+def test_a_log_path_that_will_not_resolve_gets_a_sentence_not_a_traceback(
+        tmp_path, db_path, monkeypatch, capsys, exc):
+    """``resolve`` fails three ways and ``main`` handled one family of them.
+
+    A symlink loop raises ``RuntimeError`` and an embedded NUL raises
+    ``ValueError``; neither is an ``OSError``. ``main`` catches
+    ``FileNotFoundError`` and ``OSError`` -- two handlers written precisely so
+    that an unusable log gets a named refusal -- and both of these walked past
+    them and left the ``operator-ingest`` CLI as a traceback.
+
+    The exit code is not the assertion. ``main`` returns 1 from both handlers
+    and from nothing else, so ``rc == 1`` cannot tell a refusal from the
+    refusal for a different reason; the sentence the user reads is what
+    changed.
+    """
+    missing = tmp_path / "absent.log"
+    _resolve_raises(monkeypatch, missing, exc)
+    rc = operator_ingest.main([str(missing), str(db_path)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert str(missing) in err, err
+    assert "not found" in err or "could not be read" in err, err
+
+
+def test_a_real_log_behind_an_unresolvable_path_is_still_ingested(
+        tmp_path, db_path, monkeypatch):
+    """The fallback is lexical, so the metrics are not lost with the resolve.
+
+    Refusing here would trade a traceback for silently dropped usage data,
+    which is the more expensive half: ``resolve`` is being used to name the
+    file, and an absolute path that does not follow links names the same one.
+
+    The simulated failure is an ``OSError`` and the choice is not arbitrary.
+    The other two failure modes cannot reach this branch on a *readable*
+    file: a genuine symlink loop makes the open fail with ``ELOOP`` as well,
+    and a path with an embedded NUL cannot name a file that exists. Only the
+    denial family can plausibly fail canonicalisation while leaving the file
+    readable -- ``resolve`` calls ``os.path.realpath``, which on Windows asks
+    the filesystem for the final path and can be refused on a share that
+    still serves reads. Writing the loop here instead would have made the
+    test assert something the OS would never hand it, which is a test that
+    passes for the wrong reason.
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    log = logs / "process-1700000000000-1.log"
+    make_log(log)
+    _resolve_raises(monkeypatch, log, OSError("cannot canonicalise"))
+    result = operator_ingest.ingest_file(log, db_path)
+    assert result.startswith("OK "), result
+    with operator_ingest.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE log_file = ?",
+            (operator_ingest.log_key(log),),
+        ).fetchone()[0] == 1
+
+
 @pytest.mark.parametrize("value,expected", [
     (0, "0"), (999, "999"), (1000, "1.0k"), (24000, "24.0k"), (1500000, "1.5M"),
 ])
 def test_fmt_tokens(value, expected):
     assert operator_ingest.fmt_tokens(value) == expected
+
+
+# ── log identity ────────────────────────────────────────────────
+def _sessions(db_path):
+    with operator_ingest.connect(db_path) as conn:
+        return conn.execute(
+            "SELECT id, log_file, work_dir, premium_requests FROM sessions "
+            "ORDER BY id").fetchall()
+
+
+def _two_named_alike(tmp_path):
+    """Two different sessions whose logs share a basename."""
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    name = "process-1700000000000-1.log"
+    return (
+        make_log(a / name, premium_calls=(("m1", 3.0),), cwd="/home/dev/alpha"),
+        make_log(b / name, premium_calls=(("m2", 5.0),), cwd="/home/dev/beta"),
+    )
+
+
+def test_logs_sharing_a_basename_are_two_sessions(tmp_path, db_path):
+    """A basename is half an identity, and the column is UNIQUE.
+
+    Copilot names a process log after a timestamp and a pid, so the same name
+    recurs in any second log directory -- another machine's logs copied in, a
+    restored backup, a ``COPILOT_LOG_DIR`` that moved. Keyed on the basename
+    the second log hit the mtime check, came back ``SKIP (already processed)``
+    and was never recorded: a whole session's spend dropped, with a message
+    saying it had been saved.
+    """
+    first, second = _two_named_alike(tmp_path)
+    assert operator_ingest.ingest_file(first, db_path).startswith("OK")
+    assert operator_ingest.ingest_file(second, db_path).startswith("OK"), (
+        "the second log was skipped as a duplicate of a different session"
+    )
+    rows = _sessions(db_path)
+    assert [r["work_dir"] for r in rows] == ["/home/dev/alpha", "/home/dev/beta"]
+
+
+def test_a_session_is_keyed_by_the_logs_full_path(tmp_path, db_path):
+    """The spelling the collision tests depend on, pinned on its own.
+
+    ``copilot_operator.manage_logs`` decides from this value whether a log has
+    been recorded and may be deleted, and it is the reader's half of
+    :func:`operator_ingest.log_key`.
+    """
+    log = make_log(tmp_path / "process-1700000000000-3.log")
+    operator_ingest.ingest_file(log, db_path)
+    assert _sessions(db_path)[0]["log_file"] == operator_ingest.log_key(log)
+    assert Path(operator_ingest.log_key(log)).is_absolute()
+
+
+def test_a_log_named_like_another_does_not_overwrite_it(tmp_path, db_path):
+    """The other half of the same defect, reached when the mtimes differ.
+
+    The mtime check then passes the log through to an ``ON CONFLICT`` upsert,
+    which overwrote the earlier session's row and deleted its ``model_usage``
+    rows -- so the credits stayed in the database but were attributed to the
+    wrong session, which is worse than losing them.
+    """
+    first, second = _two_named_alike(tmp_path)
+    os.utime(second, (time.time() + 7200, time.time() + 7200))
+    operator_ingest.ingest_file(first, db_path)
+    operator_ingest.ingest_file(second, db_path)
+
+    rows = _sessions(db_path)
+    assert len(rows) == 2, "one session's row was overwritten by the other"
+    with operator_ingest.connect(db_path) as conn:
+        per_session = conn.execute(
+            "SELECT session_id, COUNT(*) c FROM model_usage GROUP BY session_id"
+        ).fetchall()
+    assert len(per_session) == 2, "a session lost its per-model breakdown"
+
+
+def _parsed_started_at(log, tmp_path):
+    """The ``started_at`` this parser derives from ``log``, from the parser."""
+    probe = tmp_path / "started_at_probe.db"
+    operator_ingest.ingest_file(log, probe)
+    with operator_ingest.connect(probe) as conn:
+        return conn.execute("SELECT started_at FROM sessions").fetchone()[0]
+
+
+def _legacy_row(db_path, name, *, started_at="1970-01-01T00:00:00Z",
+                mtime=None, work_dir="legacy"):
+    """A row as the pre-full-path ingest wrote it: keyed by basename."""
+    operator_ingest.init_db(db_path)
+    with operator_ingest.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sessions (session_num, log_file, log_file_mtime, no_op,"
+            " started_at, ended_at, work_dir)"
+            " VALUES (99, ?, ?, 0, ?, 'y', ?)",
+            (name, mtime, started_at, work_dir),
+        )
+        conn.commit()
+
+
+def test_a_legacy_row_is_not_adopted_on_a_matching_mtime_alone(
+        tmp_path, db_path):
+    """The witness that looks like corroboration and is not.
+
+    An earlier version of this gate accepted ``started_at = ? OR
+    log_file_mtime = ?``, on the reasoning that each fact covered the other's
+    blind spot. It does not: an mtime says only when a file stopped changing,
+    to the second, and two different logs sharing a basename can trivially
+    share one -- the same equal-mtime coincidence this whole change exists to
+    stop merging silently. Accepting it re-admitted the destructive case
+    through the gate built to close it, so a log could still take over a
+    different session's row and the upsert that follows would delete that
+    session's ``model_usage`` breakdown.
+    """
+    log = make_log(tmp_path / "process-1700000000000-4.log")
+    _legacy_row(db_path, log.name,
+                mtime=operator_ingest._iso(log.stat().st_mtime),
+                started_at="2001-01-01T00:00:00Z",
+                work_dir="/a/different/session/that/shares/an/mtime")
+
+    assert operator_ingest.ingest_file(log, db_path).startswith("OK")
+    rows = _sessions(db_path)
+    assert len(rows) == 2, "a row was adopted on its mtime alone"
+    legacy = [r for r in rows if r["log_file"] == log.name]
+    assert legacy and legacy[0]["work_dir"].endswith("shares/an/mtime"), (
+        "the older session's row was overwritten by an unrelated log"
+    )
+
+
+def test_a_pre_existing_row_is_rekeyed_on_the_logs_own_start_time(
+        tmp_path, db_path):
+    """Databases written before this change key on the basename.
+
+    Left alone they would never match again, so the first ingest after the
+    change would insert a second row for the same log and every historical
+    session would be counted twice in every report -- a silent doubling of the
+    user's recorded spend. The start time is parsed from the log's own first
+    line, so it identifies the session even when the log was appended to since
+    its last ingest -- the common case for a session ingested while it was
+    still running, and the one a test on the recorded mtime fails.
+    """
+    log = make_log(tmp_path / "process-1700000000000-14.log")
+    _legacy_row(db_path, log.name,
+                started_at=_parsed_started_at(log, tmp_path),
+                mtime="a mtime from before the log grew")
+
+    assert operator_ingest.ingest_file(log, db_path).startswith("OK")
+    rows = _sessions(db_path)
+    assert len(rows) == 1, "the legacy row was left behind as a duplicate"
+    assert rows[0]["log_file"] == operator_ingest.log_key(log)
+    assert rows[0]["id"] == 1, (
+        "the row was replaced rather than re-keyed, so its model_usage rows "
+        "now point at a session id that no longer exists"
+    )
+
+
+def test_a_legacy_row_for_a_different_session_is_not_adopted(tmp_path, db_path):
+    """The failure the collision fix would otherwise reintroduce.
+
+    A legacy row names a basename and nothing else, which is exactly the
+    ambiguity being removed. Re-keying on the name alone lets a log inherit a
+    different session's row, and the upsert that follows overwrites it and
+    deletes its ``model_usage`` breakdown -- destroying history rather than
+    merely mixing it. When the start time parsed from the log does not say the
+    row is this file's, it must be left exactly as it is.
+    """
+    log = make_log(tmp_path / "process-1700000000000-15.log")
+    _legacy_row(db_path, log.name, work_dir="/some/other/session")
+
+    assert operator_ingest.ingest_file(log, db_path).startswith("OK")
+    rows = _sessions(db_path)
+    assert len(rows) == 2, "an unrelated session's row was adopted"
+    legacy = [r for r in rows if r["log_file"] == log.name]
+    assert legacy and legacy[0]["work_dir"] == "/some/other/session", (
+        "the older session's row was overwritten by this log"
+    )
+
+
+def test_rekeying_leaves_a_legacy_row_alone_when_the_path_is_recorded(
+        tmp_path, db_path):
+    """Adoption may not clobber a row that is already this log's own.
+
+    Once the full-path row exists it is the current one, and a basename row
+    beside it belongs to whatever wrote it. Renaming onto an occupied key
+    would raise on the UNIQUE constraint and abort the ingest.
+    """
+    log = make_log(tmp_path / "process-1700000000000-5.log")
+    operator_ingest.ingest_file(log, db_path)
+    _legacy_row(db_path, log.name,
+                mtime=operator_ingest._iso(log.stat().st_mtime))
+
+    assert operator_ingest.ingest_file(log, db_path, force=True).startswith("OK")
+    rows = _sessions(db_path)
+    assert len(rows) == 2
+    assert {r["log_file"] for r in rows} == {
+        log.name, operator_ingest.log_key(log)}
+
+
+def test_status_line_names_the_file_not_the_path(tmp_path, db_path):
+    """The key is the full path; the human-facing line stays the basename,
+    which is what fits on a terminal next to a directory already printed."""
+    log = make_log(tmp_path / "process-1700000000000-6.log")
+    assert operator_ingest.ingest_file(log, db_path).startswith(
+        f"OK {log.name}:")
+    assert operator_ingest.ingest_file(log, db_path) == (
+        f"SKIP {log.name} (already processed)")
+
+
+def test_the_log_is_parsed_without_holding_the_write_lock(
+        tmp_path, db_path, monkeypatch):
+    """Re-keying must not open the write transaction before the parse.
+
+    Instances share one database, so a write lock taken before ``_read_text``
+    is held across the whole read and parse of a multi-megabyte log. A
+    concurrent ingest then waits out the busy timeout and fails with
+    ``database is locked`` -- an ingest lost to a lock that was only ever held
+    for bookkeeping.
+    """
+    log = make_log(tmp_path / "process-1700000000000-16.log")
+    _legacy_row(db_path, log.name,
+                started_at=_parsed_started_at(log, tmp_path),
+                mtime="not this file's mtime, so the parse is not skipped")
+    outcome = {}
+    real_read = operator_ingest._read_text
+
+    def probing_read(path):
+        other = sqlite3.connect(str(db_path), timeout=0.2)
+        try:
+            other.execute(
+                "INSERT INTO sessions (session_num, log_file, started_at,"
+                " ended_at) VALUES (0, 'concurrent.log', 'x', 'y')")
+            other.commit()
+            outcome["blocked"] = None
+        except sqlite3.OperationalError as exc:
+            outcome["blocked"] = str(exc)
+        finally:
+            other.close()
+        return real_read(path)
+
+    monkeypatch.setattr(operator_ingest, "_read_text", probing_read)
+    operator_ingest.ingest_file(log, db_path)
+    assert outcome["blocked"] is None, (
+        f"a second ingest could not write while this one was parsing: "
+        f"{outcome['blocked']}"
+    )
+
+
+def test_a_key_does_not_drift_in_case_when_the_path_stops_resolving(
+        tmp_path, db_path, monkeypatch):
+    """``resolved_str`` is not total, and its fallback normalises less.
+
+    ``Path.resolve`` returns Windows' canonical capitalisation; the
+    ``os.path.abspath`` fallback returns whatever the caller typed. A log
+    ingested once while its path would not resolve and again once it would
+    then produced two keys for one file, two rows, and its credits counted
+    twice.
+
+    Case is the whole of what ``normcase`` closes, and this test claims no
+    more than that. ``resolve`` also expands symlinks, junctions and 8.3 short
+    names, and the fallback expands none of them; a path with such a component
+    ingested across a resolve failure still yields two keys. That is the
+    accepted cost of keeping the expansion in the runs that do resolve -- see
+    :func:`operator_ingest.log_key`.
+    """
+    if os.path.normcase("A") != "a":
+        pytest.skip("case-insensitive paths only")
+    logs = tmp_path / "Logs"
+    logs.mkdir()
+    log = make_log(logs / "process-1700000000000-17.log")
+    shouted = Path(str(log).replace("Logs", "LOGS"))
+
+    resolved = operator_ingest.log_key(shouted)
+    _resolve_raises(monkeypatch, shouted, OSError("cannot canonicalise"))
+    assert operator_ingest.log_key(shouted) == resolved
+
+
+def test_backfill_reconstructs_a_full_path_row(tmp_path, db_path):
+    """``backfill_unknown_metrics`` joins ``log_dir / row['log_file']``.
+
+    That join is what makes storing the full path safe without touching the
+    repair script: joining a directory onto an absolute path yields the
+    absolute path, so a full-path row resolves to itself and a legacy
+    basename row still resolves under the directory it was recorded from.
+    Pinned here because the script would otherwise fingerprint the wrong file
+    and silently decline every repair.
+    """
+    import backfill_unknown_metrics
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    log = make_log(elsewhere / "process-1700000000000-7.log")
+    key = operator_ingest.log_key(log)
+    assert str(Path(tmp_path / "logs") / key) == key
+
+    operator_ingest.init_db(db_path)
+    with operator_ingest.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sessions (session_num, log_file, started_at, ended_at,"
+            " api_time_seconds, session_time_seconds, lines_added,"
+            " lines_removed, raw_metrics) VALUES (1, ?, 'x', 'y', 0, 0, 0, 0,"
+            " 'Total usage est: 0 Premium requests')",
+            (key,),
+        )
+        conn.commit()
+        found = backfill_unknown_metrics.find_fabricated(conn, tmp_path / "logs")
+    assert found == [], (
+        "a log carrying a shutdown event was read as fabricated -- the path "
+        "the script reconstructed was not the log the row names"
+    )

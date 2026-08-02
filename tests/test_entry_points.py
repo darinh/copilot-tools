@@ -24,7 +24,8 @@ ENTRY_POINTS = ["copilot_operator.py", "handoff_tool.py", "operator_runner.py"]
 
 def _run_isolated(code: str, cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, "-I", "-S", "-c", code],
-                          cwd=str(cwd), capture_output=True, text=True)
+                          cwd=str(cwd), capture_output=True,
+                          encoding="utf-8", errors="replace")
 
 
 @pytest.mark.parametrize("module", ENTRY_POINTS)

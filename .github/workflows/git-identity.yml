@@ -1,0 +1,54 @@
+name: Commit identity
+
+# Purging one accidentally-committed corporate address from this repository
+# cost a full history rewrite AND the deletion and recreation of the GitHub
+# remote, because refs/pull/* kept the address alive through the rewrite. The
+# repository is public, so the gap between a push and a discovery is
+# publication, and an identity mistake is one of the very few defects here
+# that cannot be fixed forward.
+#
+# This lives in its own workflow rather than as a fourth job in ci.yml for one
+# reason: ci.yml restricts its push trigger to `main`, which is a deliberate,
+# documented and separately tested property of that file. A commit is
+# published the moment it is pushed to *any* branch of a public repository, so
+# restricting this check to main would leave the window open on every other
+# one. Unfiltered triggers below are the point of the file.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  git-identity:
+    name: Commit identity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Load-bearing. Every job in ci.yml checks out at the default depth
+          # of 1; a history scan run there would examine the tip commit,
+          # certify the hundreds behind it, and report that in green forever.
+          # git_identity.py refuses a shallow clone with exit 2 rather than
+          # passing, so deleting this line turns the job red instead of
+          # silent -- but it is still the line that makes the job mean
+          # anything.
+          fetch-depth: 0
+
+      # actions/checkout fetches refs/heads/* and refs/tags/* even at depth 0.
+      # It does not fetch refs/pull/*, and `git log --all` can only walk refs
+      # that are actually present -- so an address living only in a pull
+      # request would be published while this job reported CLEAN. That is not
+      # hypothetical here: refs/pull/* is precisely what survived this
+      # repository's history rewrite and forced the remote to be deleted and
+      # recreated.
+      #
+      # There is deliberately no `|| true`. If this fetch fails, the scan below
+      # examines a smaller population than it claims to, and a check that
+      # quietly narrows its own population is the exact failure this whole
+      # workflow exists to prevent. Fetching nothing (a repository with no pull
+      # requests) succeeds and is not the same thing as failing.
+      - name: Fetch pull request refs
+        run: git fetch --quiet origin "+refs/pull/*:refs/remotes/origin/pull/*"
+
+      - name: Every commit uses an allowed identity
+        run: python3 git_identity.py

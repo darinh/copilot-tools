@@ -1096,3 +1096,191 @@ def test_a_project_root_that_will_not_resolve_reaches_a_named_refusal(
     err = capsys.readouterr().err
     assert "No catalog entry" in err, \
         f"expected an actionable refusal, got: {err!r}"
+
+
+# ── the same bug in the modules the rule had not reached ────────
+# `copilot_operator` and `handoff_tool` were taught this one call at a time.
+# The three below answered the same question in the same wrong way and were
+# never looked at, which is what `tests/test_presence_probe_conformance.py`
+# now scans for. Each test here uses a *dangling symlink* rather than a denied
+# stat wherever it can, because that is the silent half of the defect: the
+# probe returns False and answers confidently, where a denial at least raises.
+def _skills_repo(tmp_path, monkeypatch, names=("alpha", "beta")):
+    """A fake REPO_ROOT holding `skills/<name>/SKILL.md` for each name."""
+    import setup_tools as st
+
+    root = tmp_path / "repo"
+    for name in names:
+        (root / "skills" / name).mkdir(parents=True)
+        (root / "skills" / name / "SKILL.md").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(st, "REPO_ROOT", root)
+    return st, root
+
+
+def test_a_skill_whose_manifest_is_a_dangling_link_is_still_deployed(
+        tmp_path, monkeypatch):
+    """One unexaminable SKILL.md must not delete that skill from the install.
+
+    `is_file()` follows the link, finds nothing and says False, so the skill
+    left the deploy set silently -- and `deployed_artifacts` reads from the
+    same function, so `--status` agreed with the installer and the absence was
+    invisible from either side.
+    """
+    if not _can_symlink(tmp_path):
+        pytest.skip("no symlink privilege on this machine")
+    st, root = _skills_repo(tmp_path, monkeypatch)
+    manifest = root / "skills" / "beta" / "SKILL.md"
+    manifest.unlink()
+    manifest.symlink_to(root / "skills" / "beta" / "gone.md")
+
+    names = [p.name for p in st._skill_sources()]
+
+    assert "alpha" in names, "premise: the readable skill is still found"
+    assert "beta" in names, (
+        f"a skill whose SKILL.md could not be examined was dropped from "
+        f"everything setup deploys, silently: {names}"
+    )
+
+
+def test_an_unlistable_skills_directory_says_so_instead_of_shipping_nothing(
+        tmp_path, monkeypatch, capsys):
+    """`return []` here is a claim that the repository ships no skills.
+
+    The directory is a link whose target is gone, which is the silent half of
+    the defect: `is_dir()` follows it, finds nothing, and answers False with
+    no error anywhere. Setup then installed no skills and reported success.
+    """
+    if not _can_symlink(tmp_path):
+        pytest.skip("no symlink privilege on this machine")
+    import setup_tools as st
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "skills").symlink_to(tmp_path / "gone", target_is_directory=True)
+    monkeypatch.setattr(st, "REPO_ROOT", root)
+
+    found = st._skill_sources()
+
+    out = capsys.readouterr().out
+    assert found is None, (
+        f"an unlistable skills/ answered the same as a repository that ships "
+        f"none, and the caller cannot tell them apart from the return: {found!r}"
+    )
+    assert "could not be listed" in out, (
+        f"a skills/ that could not be read was reported as a repository that "
+        f"ships no skills, with nothing said about it: {out!r}"
+    )
+
+
+def test_an_unreadable_extensions_directory_is_not_reported_as_absent(
+        tmp_path, monkeypatch, capsys):
+    """The skip message is the only trace either state leaves behind.
+
+    ``_extension_sources`` returned ``[]`` for a directory it could not read,
+    so ``install_extensions`` printed "No extensions/ directory found" — a
+    cause nobody measured, for a directory that was found and was unreadable.
+    A wrong sentence here is worse than none, because it closes the question.
+    """
+    if not _can_symlink(tmp_path):
+        pytest.skip("no symlink privilege on this machine")
+    import setup_tools as st
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "extensions").symlink_to(tmp_path / "gone", target_is_directory=True)
+    monkeypatch.setattr(st, "REPO_ROOT", root)
+
+    st.install_extensions(assume_yes=True)
+
+    out = capsys.readouterr().out
+    assert "could not be read" in out, (
+        f"the run said nothing about an extensions/ it could not examine: "
+        f"{out!r}"
+    )
+    assert "absent" not in out, (
+        f"an unreadable extensions/ was reported as an absent one: {out!r}"
+    )
+    assert "No extensions/ directory found" not in out, (
+        f"the original false sentence came back: {out!r}"
+    )
+
+
+def test_an_absent_extensions_directory_is_still_reported_as_absent(
+        tmp_path, monkeypatch, capsys):
+    """Negative control for the test above.
+
+    Without this, wording the unreadable branch so that it never says "absent"
+    would pass by making *both* branches say "could not be read", which is the
+    same defect with the polarity reversed.
+    """
+    import setup_tools as st
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setattr(st, "REPO_ROOT", root)
+
+    st.install_extensions(assume_yes=True)
+
+    out = capsys.readouterr().out
+    assert "absent" in out, (
+        f"a genuinely missing extensions/ did not say so: {out!r}"
+    )
+    assert "could not be read" not in out, (
+        f"a missing extensions/ was reported as an unreadable one: {out!r}"
+    )
+
+
+def test_backup_path_will_not_hand_back_a_name_that_is_occupied(
+        tmp_path, monkeypatch):
+    """The function's first line promises never to overwrite an earlier backup.
+
+    A backup that is there but unexaminable -- here a link whose target is
+    gone -- answers False to `exists()`, so the name was reused and the file
+    it destroyed was the one this function exists to preserve.
+    """
+    if not _can_symlink(tmp_path):
+        pytest.skip("no symlink privilege on this machine")
+    import backfill_unknown_metrics as bf
+
+    db = tmp_path / "metrics.db"
+    db.write_text("x", encoding="utf-8")
+    taken = db.with_suffix(db.suffix + ".bak-prezero")
+    taken.symlink_to(tmp_path / "gone")
+
+    chosen = bf.backup_path(db)
+
+    assert chosen != taken, (
+        f"backup_path chose a name that is already occupied by something it "
+        f"could not examine; writing there destroys it: {chosen}"
+    )
+
+
+def test_an_unexaminable_log_directory_is_not_an_empty_ingest(
+        tmp_path, monkeypatch, capsys):
+    """"No Copilot logs found" plus exit 0 is a census, and this is not one.
+
+    `manage_logs` learned this and got a test. `ingest_all` answered the same
+    question about the same directory with a bare `is_dir()` and reported a
+    successful run that ingested nothing -- which is what a machine that has
+    silently stopped recording metrics also looks like.
+    """
+    if not _can_symlink(tmp_path):
+        pytest.skip("no symlink privilege on this machine")
+    import operator_ingest as oi
+
+    logs = tmp_path / "logs-link"
+    logs.symlink_to(tmp_path / "gone", target_is_directory=True)
+    monkeypatch.setattr(op, "COPILOT_LOG_DIR", logs)
+
+    assert oi.ingest_all(logs, tmp_path / "m.db") is None, (
+        "ingest_all reported a census of a directory it never read"
+    )
+    code = op.ingest_all_logs()
+
+    out = capsys.readouterr().out
+    assert "No Copilot logs found" not in out, (
+        f"a log directory that could not be examined was reported as holding "
+        f"nothing: {out!r}"
+    )
+    assert code != 0, \
+        "an unexaminable log directory was reported as a successful ingest"

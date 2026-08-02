@@ -91,6 +91,28 @@ jobs:
         timeout-minutes: 10
         run: bash tests/test_setup_sh.sh
 
+      # The parallel-agent claim protocol, executed rather than read.
+      # tests/test-todo-claims.sh was committed and then run by nothing for as
+      # long as it existed: `bash -n` above parsed it on every push, which is
+      # why it never looked broken, and a parse is not an execution. Its
+      # assertions had never once run in CI.
+      # tests/test_shell_tests_are_executed.py now fails if any tests/*.sh
+      # loses its run step again -- and it parses this file rather than
+      # grepping it, so naming the script in this comment cannot stand in for
+      # the step below.
+      #
+      # sqlite3 is present on the GitHub-hosted ubuntu images, so the install
+      # is a fallback rather than the normal path -- but the script exits 1
+      # when sqlite3 is missing, and a hard failure on an image change is a
+      # worse outcome than one conditional apt-get.
+      - name: todo-claim protocol tests
+        timeout-minutes: 5
+        run: |
+          command -v sqlite3 >/dev/null 2>&1 || {
+            sudo apt-get update && sudo apt-get install -y sqlite3
+          }
+          bash tests/test-todo-claims.sh
+
   extensions:
     # extensions/ ships JavaScript that runs inside every Copilot session on a
     # developer's machine, and until this job existed no part of the pipeline

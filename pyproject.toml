@@ -21,11 +21,22 @@ operator-ingest = "operator_ingest:main"
 operator-runner = "operator_runner:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+# setuptools is a genuine test dependency, not a stray build artefact:
+# tests/test_worktree_install_guard.py compares our build backend's hooks
+# against setuptools.build_meta's, and Python 3.12 stopped shipping
+# setuptools in a fresh environment, so it has to be asked for by name.
+dev = ["pytest>=7.0", "PyYAML>=6.0", "setuptools>=64"]
 
 [build-system]
 requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+# A thin wrapper around `setuptools.build_meta` that refuses to produce an
+# *editable* install when the source directory is a linked git worktree. Every
+# agent on this project works in one, and `pip install -e .` from a worktree
+# repoints this interpreter's console scripts at a directory whose purpose is
+# to be deleted -- which has taken out `operator` and `handoff` machine-wide
+# twice. See worktree_guard_backend.py for the full argument.
+build-backend = "worktree_guard_backend"
+backend-path = ["."]
 
 [tool.setuptools]
 py-modules = [
@@ -40,12 +51,26 @@ py-modules = [
     "handoff_tool",
     "project_paths",
     "setup_tools",
+    "worktree_guard_backend",
 ]
 
 # The version lives in one module so packaging metadata and the install
 # manifest cannot disagree about what is installed.
+#
+# `worktree_guard_backend` is build-time only and is declared above anyway,
+# deliberately: `backend-path = ["."]` means an sdist that omits that file
+# cannot be built from at all, and declaring it is the mechanism that puts it
+# in the sdist -- verified by a build_sdist/install round trip. The cost is
+# one 10 KB module in site-packages under a name nothing else would want.
 [tool.setuptools.dynamic]
 version = { attr = "copilot_tools_version.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `tests/` is on the path deliberately, not by accident of the default
+# import mode. The conformance scans share their AST helpers by importing
+# one another, and under `--import-mode=importlib` pytest stops prepending
+# the rootdir of a test file to `sys.path` -- so that sharing would become a
+# collection-time `ModuleNotFoundError` the day someone passes that flag.
+# One line here says the arrangement is intended and makes it survive.
+pythonpath = ["tests"]
