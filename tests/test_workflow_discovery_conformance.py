@@ -67,10 +67,12 @@ _LISTING_METHODS = ("iterdir",)
 #: ``os`` functions of the same shape.
 _LISTING_FUNCTIONS = ("listdir", "scandir")
 
-#: Receivers that make ``x.y(...)`` a module-level call rather than a method
-#: on a path. ``glob.glob`` and ``Path.glob`` are spelled identically as an
-#: attribute, and they take their directory in opposite positions.
-_MODULE_RECEIVERS = ("glob", "os")
+#: Calls whose string arguments are doing the filtering. A suffix filter is
+#: spelled as a comparison or as one of these; a literal anywhere else in the
+#: statement is not filtering, and reading it as though it were is what let a
+#: stray both-suffix string silence a real defect.
+_FILTER_CALLS = ("endswith", "startswith", "match", "full_match",
+                 "fnmatch", "fnmatchcase")
 
 
 def workflow_paths(directory: Path | None = None) -> list[Path]:
@@ -114,31 +116,87 @@ def _admits(literal: str) -> set[str]:
             if fnmatch.fnmatch(name, candidate) or name.endswith(candidate)}
 
 
-def _filter_coverage(node: ast.AST) -> set[str] | None:
-    """What the suffix filtering under `node` admits, or ``None`` for none.
+def _filter_coverage(literals: set[str]) -> set[str] | None:
+    """What `literals` admit between them, or ``None`` if none of them filter.
 
     ``None`` and ``set()`` are deliberately different answers, and collapsing
-    them is the bug this repository keeps finding in its own code: no filter
-    at all means an unfiltered listing, which reaches *both* suffixes and is
-    correct, while a filter that admits nothing recognisable is a listing
-    narrowed by something this scan cannot read.
-
-    Literals are collected blind, from anywhere under the node. That
-    over-matches -- a ``".yml"`` in the statement for some unrelated reason
-    makes a correct unfiltered listing report -- and that direction is the
-    cheap one, because it fails loudly on code a human then reads. The
-    expensive direction is the other one, and it survives here: a stray
-    literal that admits *both* suffixes silences the statement.
+    them is the bug class this repository keeps finding in its own code: no
+    filter at all means an unfiltered listing, which reaches *both* suffixes
+    and is correct, while a filter that admits nothing recognisable is a
+    listing narrowed by something this scan cannot read.
     """
     reached: set[str] = set()
     found = False
-    for sub in ast.walk(node):
-        if not (isinstance(sub, ast.Constant) and isinstance(sub.value, str)):
-            continue
-        admitted = _admits(sub.value)
+    for literal in literals:
+        admitted = _admits(literal)
         if admitted:
             found = True
             reached |= admitted
+    return reached if found else None
+
+
+def _string_constants(node: ast.AST) -> set[str]:
+    """Every string literal anywhere under `node`."""
+    return {sub.value for sub in ast.walk(node)
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str)}
+
+
+def _called_name(node: ast.Call) -> str:
+    """The bare name a call is spelled with, receiver ignored."""
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    return ""
+
+
+def _filter_terms(node: ast.AST, negated: bool,
+                  out: list[tuple[bool, str]]) -> None:
+    """Collect ``(negated, literal)`` for every literal in a filtering position.
+
+    Filtering positions are comparison operands and the arguments of the
+    calls that narrow a name -- ``n.endswith(".yml")``, ``p.match("*.yml")``,
+    ``p.suffix in {".yml", ".yaml"}``. Reading *every* literal under the
+    statement was the first attempt, and a reviewer showed what it cost: a
+    string merely co-located with a real single-suffix filter, if it happened
+    to admit both suffixes, silenced the statement.
+
+    Polarity is tracked because an exclusion is not evidence that a suffix is
+    reached -- it is evidence of the opposite. ``p.suffix == ".yml" and
+    "yaml" not in p.name`` is a genuinely single-suffix filter, and reading
+    its second half as "and .yaml is covered too" is how a second reviewer
+    silenced it again after the first fix.
+    """
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        _filter_terms(node.operand, not negated, out)
+        return
+    if isinstance(node, ast.Compare):
+        left = node.left
+        for op, comparator in zip(node.ops, node.comparators):
+            flipped = negated != isinstance(op, (ast.NotIn, ast.NotEq))
+            for operand in (left, comparator):
+                out += [(flipped, literal) for literal in _string_constants(operand)]
+            left = comparator
+    elif isinstance(node, ast.Call) and _called_name(node) in _FILTER_CALLS:
+        arguments = list(node.args) + [kw.value for kw in node.keywords]
+        for operand in arguments:
+            out += [(negated, literal) for literal in _string_constants(operand)]
+    for child in ast.iter_child_nodes(node):
+        _filter_terms(child, negated, out)
+
+
+def _statement_filter_coverage(node: ast.AST) -> set[str] | None:
+    """What the filtering in `node` admits, or ``None`` if it does not filter."""
+    terms: list[tuple[bool, str]] = []
+    _filter_terms(node, False, terms)
+    reached: set[str] = set()
+    found = False
+    for negated, literal in terms:
+        admitted = _admits(literal)
+        if not admitted:
+            continue
+        found = True
+        reached |= (set(_PROBE_NAMES) - admitted) if negated else admitted
     return reached if found else None
 
 
@@ -193,12 +251,20 @@ def _enclosing_statement(node: ast.AST, parents: dict[int, ast.AST]) -> ast.AST 
 
 
 def _names_workflows(node: ast.AST | None, source: str, aliases: set[str]) -> bool:
-    """True if `node` is the workflow directory, spelled out or aliased."""
+    """True if `node` is, or is built from, the workflow directory.
+
+    The alias search runs over the whole sub-tree rather than over the node
+    itself, because the directory rarely arrives naked: ``str(WF_DIR)`` and
+    ``WF_DIR / "*.yml"`` are the argument ``os.listdir`` and ``glob.glob``
+    actually get, and neither the source text nor the top-level node type
+    says "workflow" once the name has been aliased.
+    """
     if node is None:
         return False
     if _mentions_workflows(ast.get_source_segment(source, node)):
         return True
-    return isinstance(node, ast.Name) and node.id in aliases
+    return any(isinstance(sub, ast.Name) and sub.id in aliases
+               for sub in ast.walk(node))
 
 
 def _argument_names_workflows(node: ast.Call, source: str, aliases: set[str]) -> bool:
@@ -210,6 +276,51 @@ def _argument_names_workflows(node: ast.Call, source: str, aliases: set[str]) ->
     """
     arguments = list(node.args) + [kw.value for kw in node.keywords]
     return any(_names_workflows(arg, source, aliases) for arg in arguments)
+
+
+def _imported_names(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """The names by which ``glob``'s and ``os``'s enumerators reached this file.
+
+    ``from glob import glob as find`` is the same call wearing a different
+    name, and a rule keyed on the literal spellings cannot see it. The plain
+    spellings stay in the sets whether or not the file imports anything,
+    because a scan that only recognises what it can prove was imported goes
+    quiet on a file whose imports it failed to read.
+    """
+    pattern_names = set(_PATTERN_FUNCTIONS)
+    listing_names = set(_LISTING_FUNCTIONS)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        for alias in node.names:
+            if node.module == "glob" and alias.name in _PATTERN_FUNCTIONS:
+                pattern_names.add(alias.asname or alias.name)
+            elif node.module == "os" and alias.name in _LISTING_FUNCTIONS:
+                listing_names.add(alias.asname or alias.name)
+    return pattern_names, listing_names
+
+
+def _literal_pattern(node: ast.Call) -> str | None:
+    """The literal pattern `node` was called with, if it has one.
+
+    ``Path.glob`` takes its pattern as an ordinary parameter, so
+    ``WORKFLOW_DIR.glob(pattern="*.yml")`` runs and means exactly what the
+    positional spelling means. An f-string with nothing interpolated into it
+    is a literal too -- it is only a different node type.
+    """
+    candidate: ast.AST | None = node.args[0] if node.args else None
+    if candidate is None:
+        for keyword in node.keywords:
+            if keyword.arg == "pattern":
+                candidate = keyword.value
+                break
+    if isinstance(candidate, ast.Constant) and isinstance(candidate.value, str):
+        return candidate.value
+    if isinstance(candidate, ast.JoinedStr) and all(
+            isinstance(part, ast.Constant) and isinstance(part.value, str)
+            for part in candidate.values):
+        return "".join(part.value for part in candidate.values)
+    return None
 
 
 def single_suffix_workflow_scans(source: str, filename: str) -> list[str]:
@@ -245,13 +356,27 @@ def single_suffix_workflow_scans(source: str, filename: str) -> list[str]:
     ``*.yml`` check elsewhere in it. A reviewer built exactly that, so the
     scope is now the statement.
 
-    Known boundary, stated rather than implied: a pattern assembled at
-    runtime is invisible, as is a hardcoded list of filenames, a filter
-    written as a regex, and a listing whose filtering happens in a *later*
-    statement (``names = os.listdir(d)`` then ``[n for n in names if ...]``).
-    ``os.walk`` is not read either. It is a guard against the defect being
-    rewritten in the shapes it has actually taken, not a proof that no such
-    defect can exist.
+    Known boundaries, stated rather than implied. Each of these is a genuinely
+    single-suffix read that goes unreported, and every one was constructed by
+    a reviewer rather than imagined here:
+
+    * the filter in a *later* statement -- ``names = os.listdir(d)`` and then
+      ``[n for n in names if n.endswith(".yml")]``;
+    * the filter behind a helper -- ``if keep(p)``, where ``keep`` compares
+      the suffix;
+    * the suffix set bound to a name -- ``suffixes = {".yml"}`` and then
+      ``p.suffix in suffixes``;
+    * a filter spelled as a regex, or as anything that is neither a
+      comparison nor one of ``_FILTER_CALLS``;
+    * a pattern assembled at runtime, and a hardcoded list of filenames;
+    * a pattern reaching the call through ``**kwargs``;
+    * the directory itself spelled so that neither its source text nor a
+      one-level alias says "workflow" -- ``REPO / ".github" / ("work" +
+      "flows")``;
+    * ``os.walk``, which is not read at all.
+
+    It is a guard against the defect being rewritten in the shapes it has
+    actually taken, not a proof that no such defect can exist.
     """
     try:
         tree = ast.parse(source, filename=filename)
@@ -264,59 +389,64 @@ def single_suffix_workflow_scans(source: str, filename: str) -> list[str]:
             parents[id(child)] = node
 
     aliases = _workflow_alias_names(tree, source)
+    pattern_names, listing_names = _imported_names(tree)
+    # Every enumerator name this file could be using. Checked before the
+    # receiver is examined at all, because `ast.get_source_segment` re-splits
+    # the whole file on every call and asking it about every call node in the
+    # repository turned this scan from 30 seconds into three minutes.
+    enumerators = (set(_PATTERN_METHODS) | set(_LISTING_METHODS)
+                   | pattern_names | listing_names)
     # Keyed by the id of the enclosing statement, which is stable for as long
     # as `tree` is alive -- and it is, for the whole of this function.
     by_statement: dict[int, list[tuple[int, str, set[str]]]] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        func = node.func
-        if isinstance(func, ast.Name):
-            name, receiver, module_call = func.id, None, True
-        elif isinstance(func, ast.Attribute):
-            name, receiver = func.attr, func.value
-            module_call = (isinstance(receiver, ast.Name)
-                           and receiver.id in _MODULE_RECEIVERS)
-        else:
+        name = _called_name(node)
+        if name not in enumerators:
             continue
+        # Dispatch on where the directory actually is, not on how the
+        # receiver is spelled. `glob.glob` and `Path.glob` are the same
+        # attribute and take the directory in opposite positions, and a
+        # heuristic keyed on the name `glob` fails in both directions: a
+        # local named `glob` holding the workflow directory reads as the
+        # module, and `helpers.glob(str(WORKFLOW_DIR / "*.yml"))` reads as a
+        # path whose receiver says nothing about workflows.
+        receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
+        on_workflows = _names_workflows(receiver, source, aliases)
+        of_workflows = _argument_names_workflows(node, source, aliases)
 
         statement = _enclosing_statement(node, parents)
         site: tuple[str, set[str]] | None = None
 
-        if not module_call and name in _PATTERN_METHODS:
-            if not _names_workflows(receiver, source, aliases):
-                continue
-            if not node.args or not isinstance(node.args[0], ast.Constant):
-                continue
-            pattern = node.args[0].value
-            if not isinstance(pattern, str):
+        if on_workflows and name in _PATTERN_METHODS:
+            pattern = _literal_pattern(node)
+            if pattern is None:
                 continue
             site = (f"enumerates the workflow directory with {pattern!r}",
                     _covers(pattern))
-        elif module_call and name in _PATTERN_FUNCTIONS:
-            if not _argument_names_workflows(node, source, aliases):
-                continue
-            covered = _filter_coverage(node)
+        elif of_workflows and name in pattern_names:
+            covered = _filter_coverage(_string_constants(node))
             if covered is None:
                 # A pattern with no readable suffix in it cannot be
                 # classified, so it is not reported -- the same answer this
                 # scan has always given `glob(pattern)`.
                 continue
             site = (f"enumerates the workflow directory with {name}()", covered)
-        elif not module_call and name in _LISTING_METHODS:
-            if not _names_workflows(receiver, source, aliases):
+        elif ((on_workflows and name in _LISTING_METHODS)
+                or (of_workflows and name in listing_names)):
+            covered = (_statement_filter_coverage(statement)
+                       if statement is not None else None)
+            if covered is None:
+                # No filter beside it: the listing reaches both suffixes and
+                # there is nothing to report. Crediting it with both instead
+                # would make it a *site*, and a site covering both suffixes
+                # masks every other site in the same statement -- an
+                # unfiltered `iterdir()` would then silence a single-suffix
+                # `glob()` written next to it.
                 continue
-            covered = _filter_coverage(statement) if statement is not None else None
             site = (f"lists the workflow directory with {name}() and filters "
-                    "it by suffix",
-                    set(_PROBE_NAMES) if covered is None else covered)
-        elif module_call and name in _LISTING_FUNCTIONS:
-            if not _argument_names_workflows(node, source, aliases):
-                continue
-            covered = _filter_coverage(statement) if statement is not None else None
-            site = (f"lists the workflow directory with {name}() and filters "
-                    "it by suffix",
-                    set(_PROBE_NAMES) if covered is None else covered)
+                    "it by suffix", covered)
         else:
             continue
 
@@ -433,6 +563,53 @@ def test_the_repository_really_has_workflows():
     'paths = glob.glob(str(WORKFLOW_DIR / "*.yml"))',
     'paths = list(glob.iglob(str(WORKFLOW_DIR) + "/*.yaml"))',
     'paths = glob(str(WORKFLOW_DIR / "*.yml"))',
+    'paths = glob.glob(os.path.join(WORKFLOW_DIR, "*.yml"))',
+    'paths = glob.glob(f"{WORKFLOW_DIR}/*.yml")',
+    # --- everything below was constructed by an adversarial reviewer against
+    # the first draft of this scan, and every one of them went unreported ---
+    # `Path.glob` takes its pattern as an ordinary parameter, so the keyword
+    # spelling runs and means the same thing.
+    'paths = WORKFLOW_DIR.glob(pattern="*.yml")',
+    # An import alias is the same call wearing a different name.
+    'import glob as g\npaths = g.glob(str(WORKFLOW_DIR / "*.yml"))',
+    'from glob import glob as find\npaths = find(str(WORKFLOW_DIR / "*.yml"))',
+    'import os as o\nnames = [n for n in o.listdir(WORKFLOW_DIR) if n.endswith(".yml")]',
+    'from os import listdir as ls\nnames = [n for n in ls(WORKFLOW_DIR) if n.endswith(".yml")]',
+    # The aliased directory wrapped in a call, which is how it actually
+    # reaches `os.listdir` and `glob.glob`: neither the source text of the
+    # argument nor its top-level node says "workflow" any more.
+    ('WF_DIR = REPO / ".github" / "workflows"\n'
+     'paths = glob.glob(str(WF_DIR / "*.yml"))'),
+    ('WF_DIR = REPO / ".github" / "workflows"\n'
+     'names = [n for n in os.listdir(str(WF_DIR)) if n.endswith(".yml")]'),
+    ('WF_DIR = REPO / ".github" / "workflows"\n'
+     'names = [n for n in os.listdir(path=str(WF_DIR)) if n.endswith(".yml")]'),
+    # A local named `glob` holding the workflow directory. Reading it as the
+    # module sends the call down the branch that looks for the directory in
+    # the arguments, where it is not.
+    'glob = WORKFLOW_DIR\npaths = glob.glob("*.yml")',
+    # A stray literal admitting both suffixes, sitting in the same statement
+    # as a real single-suffix filter but not in a filtering position. Reading
+    # every literal under the statement let this silence the defect.
+    'paths = [p for p in WORKFLOW_DIR.iterdir() if p.suffix == ".yml" and ("*.y*ml" or True)]',
+    'x = ([p for p in WORKFLOW_DIR.iterdir() if p.suffix == ".yml"], "*.y*ml")',
+    # An unfiltered listing beside a single-suffix glob. Crediting the
+    # listing with both suffixes made it mask the glob.
+    'x = (list(WORKFLOW_DIR.iterdir()), list(WORKFLOW_DIR.glob("*.yml")), ".yaml")',
+    'x = (list(WORKFLOW_DIR.iterdir()), list(WORKFLOW_DIR.glob("*.yml")))',
+    # An f-string with nothing interpolated is a literal wearing a different
+    # node type.
+    'paths = WORKFLOW_DIR.glob(f"*.yml")',
+    # An *exclusion* is not evidence that a suffix is reached. Reading the
+    # second half of this as "and .yaml is covered" silenced a filter that
+    # explicitly throws .yaml away.
+    'paths = [p for p in WORKFLOW_DIR.iterdir() if p.suffix == ".yml" and "yaml" not in p.name]',
+    'paths = [p for p in WORKFLOW_DIR.iterdir() if p.suffix != ".yaml"]',
+    'names = [n for n in os.listdir(WORKFLOW_DIR) if not n.endswith(".yaml")]',
+    # A module that is not spelled `glob` or `os` still takes the directory
+    # as an argument, and dispatching on the receiver's name looked past it.
+    'paths = helpers.glob(str(WORKFLOW_DIR / "*.yml"))',
+    'names = [n for n in helpers.listdir(WORKFLOW_DIR) if n.endswith(".yml")]',
 ])
 def test_the_scan_reports_a_single_suffix_glob(source: str):
     """Positive control: each real spelling of the defect is detected."""
@@ -490,11 +667,50 @@ def test_the_scan_reports_a_single_suffix_glob(source: str):
     # A runtime-assembled pattern cannot be classified, the same answer this
     # scan has always given `WORKFLOW_DIR.glob(pattern)`.
     'paths = glob.glob(str(WORKFLOW_DIR / pattern))',
+    # A literal that is not filtering anything. Stripping the suffix off the
+    # names of an unfiltered listing narrows nothing, and reading every
+    # literal under the statement reported this correct code as a fault.
+    'entries = sorted(WORKFLOW_DIR.iterdir(), key=lambda p: p.name.removesuffix(".yml"))',
+    'names = [p.name.removesuffix(".yml") for p in WORKFLOW_DIR.iterdir()]',
+    # Both suffixes reached through spellings other than a set literal.
+    'paths = [p for p in WORKFLOW_DIR.iterdir() if p.suffix in frozenset({".yml", ".yaml"})]',
+    'names = [n for n in os.listdir(WORKFLOW_DIR) if n.endswith((".yml", ".yaml"))]',
     # Nothing to see.
     'x = 1',
 ])
 def test_the_scan_stays_quiet(source: str):
     """Negative control: the correct spellings are not reported as faults."""
+    assert single_suffix_workflow_scans(source, "probe.py") == []
+
+
+@pytest.mark.parametrize("source", [
+    # The filter in a later statement.
+    ('names = os.listdir(WORKFLOW_DIR)\n'
+     'only = [n for n in names if n.endswith(".yml")]'),
+    # The filter behind a helper.
+    ('def keep(p):\n    return p.suffix == ".yml"\n'
+     'paths = [p for p in WORKFLOW_DIR.iterdir() if keep(p)]'),
+    # The suffix set bound to a name.
+    'suffixes = {".yml"}\npaths = [p for p in WORKFLOW_DIR.iterdir() if p.suffix in suffixes]',
+    # A regex filter: the literal is neither a comparison operand nor an
+    # argument of a filtering call, and it would not classify if it were.
+    'names = [n for n in os.listdir(WORKFLOW_DIR) if re.search(r"\\.yml$", n)]',
+    # The directory spelled so that neither its source text nor a one-level
+    # alias contains the word.
+    'd = REPO / ".github" / ("work" + "flows")\npaths = d.glob("*.yml")',
+    # The pattern reaching the call through a mapping.
+    'kwargs = {"pattern": "*.yml"}\npaths = WORKFLOW_DIR.glob(**kwargs)',
+])
+def test_the_documented_boundaries_are_really_boundaries(source: str):
+    """The misses named in the docstring, asserted as misses.
+
+    Not a blessing -- a tripwire on the prose. A boundary list is the one
+    part of a guard nobody re-derives, so it rots into a claim that the scan
+    is weaker than it is, and the next author writes a second guard for a
+    shape that was already covered. If one of these starts being reported,
+    this test fails and whoever closed it edits the docstring in the same
+    change.
+    """
     assert single_suffix_workflow_scans(source, "probe.py") == []
 
 
@@ -515,61 +731,46 @@ def test_the_scan_would_have_caught_the_defect_this_module_fixes():
     assert ".yaml" in reported[0]
 
 
-def test_the_scan_clears_the_real_both_suffix_listings():
-    """The two correct listings this repository actually contains, from disk.
-
-    The negative controls above are strings I chose; these are the files, and
-    a detector that reports them would be deleted within the hour rather than
-    obeyed. The premise assertions matter as much as the verdict: if either
-    file stops listing the workflow directory in the shape the detector was
-    written for, this test would keep passing while proving nothing, which is
-    the failure mode the whole module exists to argue against.
-    """
-    listings = {
-        "tests/test_shell_tests_are_executed.py": "WORKFLOW_DIR.iterdir()",
-        "tests/test_workflow_discovery_conformance.py": "os.listdir(WORKFLOW_DIR)",
-    }
-    for relative, spelling in listings.items():
-        source = (REPO / relative).read_text(encoding="utf-8")
-        assert spelling in source, (
-            f"{relative} no longer contains {spelling!r}, so clearing it "
-            "proves nothing about the listing detector"
-        )
-        assert single_suffix_workflow_scans(source, relative) == []
-
-
-@pytest.mark.parametrize("shape, correct, broken", [
+@pytest.mark.parametrize("relative, correct, broken", [
     (
-        "iterdir",
-        'found = {p.name for p in WORKFLOW_DIR.iterdir()\n'
-        '         if p.suffix in {".yml", ".yaml"}}',
-        'found = {p.name for p in WORKFLOW_DIR.iterdir()\n'
-        '         if p.suffix in {".yml"}}',
+        "tests/test_shell_tests_are_executed.py",
+        'if p.suffix in {".yml", ".yaml"}',
+        'if p.suffix in {".yml"}',
     ),
     (
-        "os.listdir",
-        'independent = sorted(\n'
-        '    name for name in os.listdir(WORKFLOW_DIR)\n'
-        '    if name.endswith(".yml") or name.endswith(".yaml")\n'
-        ')',
-        'independent = sorted(\n'
-        '    name for name in os.listdir(WORKFLOW_DIR)\n'
-        '    if name.endswith(".yml")\n'
-        ')',
+        "tests/test_workflow_discovery_conformance.py",
+        'if name.endswith(".yml") or name.endswith(".yaml")',
+        'if name.endswith(".yml")',
     ),
 ])
-def test_dropping_one_suffix_from_a_real_listing_is_reported(
-        shape: str, correct: str, broken: str):
-    """Falsifiability, per shape: the clean verdict has to be losable.
+def test_the_real_listings_are_cleared_and_the_clearance_is_losable(
+        relative: str, correct: str, broken: str):
+    """Both halves, against the files rather than against strings I chose.
 
-    A detector that clears the real code is only evidence if the same code
-    with one suffix removed goes red -- otherwise "no offenders" is equally
-    consistent with a detector that never looked. Both halves are asserted
-    here so a future change cannot satisfy one by breaking the other.
+    The negative controls elsewhere in this module are inputs I wrote; these
+    two are the listings this repository actually contains, and a detector
+    that reported them would be deleted within the hour rather than obeyed.
+
+    Clearing them proves nothing on its own, though -- "no offenders" is
+    equally consistent with a detector that never looked -- so the same file
+    is scanned again with one suffix removed and has to go red. That second
+    half is also what makes the premise honest. Asserting the spelling is
+    *present* in the source is a substring test, and a reviewer pointed out
+    that a commented-out listing satisfies it; the mutation does not care,
+    because a commented-out listing produces no report and the test fails.
     """
-    assert single_suffix_workflow_scans(correct, "probe.py") == [], shape
-    reported = single_suffix_workflow_scans(broken, "probe.py")
-    assert reported, f"{shape}: dropping a suffix went unreported"
+    source = (REPO / relative).read_text(encoding="utf-8")
+    mutated = source.replace(correct, broken)
+    assert mutated != source, (
+        f"{relative} no longer contains {correct!r}, so neither half of this "
+        "test is about the code it was written for"
+    )
+    assert single_suffix_workflow_scans(source, relative) == []
+    reported = single_suffix_workflow_scans(mutated, relative)
+    assert reported, (
+        f"{relative} with one suffix dropped went unreported, so clearing "
+        "the real file proves nothing about the detector"
+    )
     assert ".yaml" in reported[0]
 
 
