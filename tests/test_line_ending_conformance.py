@@ -81,11 +81,13 @@ def _git(*args: str) -> subprocess.CompletedProcess:
     ``subprocess.run`` itself rather than routing through a ``text=False``
     flag, because a helper that decodes on some calls and not on others cannot
     name its codec in a form the encoding conformance scan can read.
+
+    It takes no environment guards. Whether this is a checkout and whether git
+    exists are settled once, at import, by ``_require_git_checkout`` -- because
+    a guard *inside* the helper cannot help the module-level discovery that
+    calls it, and ``pytest.skip`` raised during collection is a collection
+    error rather than a skip.
     """
-    if not (REPO / ".git").exists():
-        pytest.skip("not a git checkout; there is no index to inspect")
-    if shutil.which("git") is None:
-        pytest.fail("git is required to verify line-ending attributes")
     return subprocess.run(
         ["git", *args], cwd=str(REPO), check=True, capture_output=True,
         encoding="utf-8", errors="replace",
@@ -110,6 +112,14 @@ def _index_blobs(paths: list[str]) -> dict[str, bytes]:
     what comes back is the bytes that are committed -- which is the thing the
     CR assertion needs, and precisely what reading the working-tree file would
     not tell you on a platform that converts.
+
+    The two non-blob replies are handled by name rather than left to the
+    ``blob`` assertion, because getting them wrong is not a local mistake. A
+    ``missing`` record has no size and no payload, and ``git cat-file`` still
+    exits 0 for it, so ``check=True`` does not notice; consuming ``size + 1``
+    bytes off the front for the *next* path then mis-slices every remaining
+    reply in the batch. The failure would surface as a wrong verdict about
+    some unrelated file rather than as a complaint about this one.
     """
     if not paths:
         return {}
@@ -123,8 +133,16 @@ def _index_blobs(paths: list[str]) -> dict[str, bytes]:
     for path in paths:
         header, _, rest = rest.partition(b"\n")
         fields = header.split(b" ")
+        # `<spec> missing` -- two fields, no payload line follows.
+        assert fields[-1:] != [b"missing"], (
+            f"{path!r} is listed by `git ls-files` but has no blob in the "
+            "index; the two views of the index disagree, so the shell-script "
+            "population cannot be trusted"
+        )
         assert len(fields) == 3 and fields[1] == b"blob", (
-            f"unexpected `git cat-file --batch` header for {path!r}: {header!r}"
+            f"unexpected `git cat-file --batch` header for {path!r}: "
+            f"{header!r}. A gitlink (submodule) reads as `commit` here; it "
+            "would need excluding from the population rather than parsing"
         )
         size = int(fields[2])
         blobs[path], rest = rest[:size], rest[size + 1:]
@@ -186,7 +204,77 @@ def _checkout_index(dest: Path, paths: list[str]) -> dict[str, bytes]:
     return {p: (dest / p).read_bytes() for p in paths}
 
 
-SHELL_SCRIPTS = _shell_scripts() if (REPO / ".git").exists() else []
+def _require_git_checkout() -> None:
+    """Settle the environment once, at import, before anything discovers.
+
+    The two unusable environments are not the same and must not get the same
+    verdict:
+
+    * **Not a checkout** (an unpacked sdist, a copied tree) has no index and no
+      attributes, so there is genuinely nothing to measure. Skip the module.
+    * **A checkout with no ``git``** is a case where the check was supposed to
+      run and could not. Skipping it would report a clean tree, which is the
+      failure direction this whole file exists to prevent -- so it is loud.
+
+    Both verdicts are reached at import rather than inside ``_git``, because
+    ``SHELL_SCRIPTS`` is computed at import and feeds ``parametrize``. A guard
+    that only fires inside a test body arrives after the parametrised cases
+    have already been built from an empty list -- at which point they do not
+    fail, they cease to exist.
+    """
+    if not (REPO / ".git").exists():
+        pytest.skip(
+            "not a git checkout; there is no index or attributes file to "
+            "inspect here",
+            allow_module_level=True,
+        )
+    if shutil.which("git") is None:
+        pytest.fail(
+            "git is required to verify line-ending attributes, and this is a "
+            "checkout where they were meant to be verified",
+            pytrace=False,
+        )
+
+
+_require_git_checkout()
+
+SHELL_SCRIPTS = _shell_scripts()
+
+
+def test_the_batch_parser_refuses_a_path_with_no_blob():
+    """Positive control for the ``missing`` branch of `_index_blobs`.
+
+    ``git cat-file --batch`` answers an unresolvable spec with ``<spec>
+    missing`` and **exits 0**, so ``check=True`` lets it through. Measured
+    here rather than assumed: the branch is unreachable from the live
+    population, because every path comes from ``git ls-files`` and does
+    resolve. An unexercised branch in a parser is the parser's least trusted
+    line, and this one guards a desync rather than a wrong answer.
+    """
+    with pytest.raises(AssertionError, match="no blob in the index"):
+        _index_blobs(["no/such/path/at/all.sh"])
+
+
+def test_the_batch_parser_keeps_replies_aligned_with_their_paths():
+    """Negative control: the size/delimiter arithmetic over a real batch.
+
+    The bug the ``missing`` guard prevents is a *silent* one -- a mis-sliced
+    reply hands file A's bytes back under file B's name, and every assertion
+    downstream then judges the wrong file while still passing or failing for
+    reasons that look plausible. So check that a multi-path batch comes back
+    attributed correctly, against bytes read independently of git.
+    """
+    sample = [p for p in MUST_BE_FOUND if p in SHELL_SCRIPTS][:3]
+    assert len(sample) >= 2, "need at least two known scripts to detect a desync"
+    batched = _index_blobs(sample)
+    assert set(batched) == set(sample)
+    for path in sample:
+        alone = _index_blobs([path])[path]
+        assert batched[path] == alone, (
+            f"{path} came back with different bytes in a batch than alone; "
+            "the `git cat-file --batch` reply framing is being mis-sliced"
+        )
+        assert batched[path], f"{path} came back empty, which no script is"
 
 
 def test_the_population_is_not_empty_and_holds_the_scripts_we_ship():
