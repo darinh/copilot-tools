@@ -184,7 +184,16 @@ def authoring_instance(text: str) -> str | None:
         name = stripped[len(AUTHOR_PREFIX):].strip()
         if name.endswith("*"):
             name = name[:-1].strip()
-        return name.strip("`").strip() or None
+        if len(name) >= 2 and name.startswith("`") and name.endswith("`"):
+            # Delimited, so what sits between the ticks is exactly the name
+            # and nothing further may be trimmed. `str.strip` is greedy and
+            # would eat a backtick or a space the name legitimately carries --
+            # `--instance` is free text -- and every consumer compares this
+            # for equality against a live instance name, so a silently
+            # shortened one attributes the handoff to an agent that does not
+            # exist while looking exactly like a successful read.
+            return name[1:-1] or None
+        return name or None
     return None
 
 

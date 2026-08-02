@@ -98,9 +98,31 @@ def test_render_without_an_instance_is_byte_identical_to_before():
     Paired with the notice control above for the same reason: a stamp
     rendered as an empty string would put a stray blank line into every
     handoff written by a caller that does not know the parameter exists.
+
+    The prefix is asserted absent as well as the two renderings being equal.
+    Equality alone is unfalsifiable for this property -- a stamp emitted
+    unconditionally appears on *both* sides and the comparison still holds,
+    which mutation testing demonstrated.
     """
     assert ho.render("s", "wip", "n", "ctx", "p", instance="") == \
         ho.render("s", "wip", "n", "ctx", "p")
+    assert ho.AUTHOR_PREFIX not in ho.render("s", "wip", "n", "ctx", "p")
+
+
+def test_a_name_wrapped_in_backticks_survives_containing_them():
+    """`--instance` is free text, and `str.strip` is greedy.
+
+    A name that begins or ends with a backtick -- or with a space -- must not
+    come back short: every consumer of the stamp compares it to a live
+    instance name, so a silently truncated one attributes the handoff to an
+    agent that does not exist, while looking exactly like a successful read.
+
+    Two independent reviewers found this on the first draft, which used a
+    blanket `strip("`")`. It is delimiter removal, not normalisation.
+    """
+    for name in ("`x", "x`", "`x`", "``", " padded ", "\ttabbed"):
+        assert ho.authoring_instance(
+            ho.render("s", "", "n", "", "", instance=name)) == name
 
 
 def test_authoring_instance_reads_back_what_render_wrote():
