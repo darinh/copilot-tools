@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,7 +65,27 @@ _CONTROL = re.compile(
 
 
 class MailError(Exception):
-    """A message could not be stored or read."""
+    """A message could not be stored or read.
+
+    ``consumed`` carries the messages that were already archived before the
+    failure, and is empty for every error that happens before anything is
+    moved. :func:`consume` archives one message at a time, so a fault part
+    way through the batch leaves the earlier ones genuinely read -- written
+    to the archive and unlinked from the inbox -- while the exception
+    discards the return value that would have shown them to anybody.
+
+    Without this the caller cannot tell the two situations apart, and
+    ``operator inbox`` told the agent "nothing has been marked read" on the
+    one path where that sentence is false. Those messages were then archived,
+    unread, permanently, and nothing anywhere said so -- the module's own
+    defect class, reached through its error handler instead of its happy
+    path: a claim about an outcome the code never checked.
+    """
+
+    def __init__(self, *args: object,
+                 consumed: list[dict] | None = None) -> None:
+        super().__init__(*args)
+        self.consumed: list[dict] = consumed if consumed is not None else []
 
 
 def _utcnow() -> str:
@@ -121,8 +142,22 @@ def _write_json(path: Path, msg: dict) -> None:
         raise
 
 
+def _ensure_dir(directory: Path) -> None:
+    """Create ``directory``, reporting a refusal as :class:`MailError`.
+
+    ``exist_ok=True`` forgives an existing *directory*, not a plain file
+    sitting where one belongs -- that raises ``FileExistsError``. Uncaught,
+    those escaped as raw tracebacks from `operator send` and from the
+    supervisor loop, both of which only know how to handle a ``MailError``.
+    """
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise MailError(f"could not open mailbox {directory}: {exc}") from exc
+
+
 def _write(directory: Path, msg: dict) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(directory)
     path = directory / f"{msg['id']}.json"
     try:
         _write_json(path, msg)
@@ -226,11 +261,147 @@ def _read_message(path: Path) -> dict | None | _Unreadable:
     return data if isinstance(data, dict) else None
 
 
-def _load_dir(directory: Path) -> list[tuple[Path, dict]]:
-    if not directory.is_dir():
+def _blocking_ancestor(directory: Path) -> Path | None:
+    """The nearest existing component of ``directory`` that is not a directory.
+
+    ``None`` means the path is merely absent, with nothing in the way -- the
+    normal state of a mailbox that has never been written to.
+
+    ``os.stat`` is used rather than ``Path.exists``/``Path.is_dir`` on
+    purpose: those swallow a documented set of errnos, which is precisely the
+    kind of quiet substitution of "no" for "could not tell" this module is
+    being cleaned of. A component that cannot be stat'ed at all is returned as
+    a blocker, because an unreadable ancestor is not evidence of an empty
+    mailbox either.
+
+    ``os.stat`` alone is not enough, though, and the gap it leaves is this
+    module's own defect wearing a different hat. ``os.stat`` *follows*
+    symlinks, so it raises ``FileNotFoundError`` both for a component that is
+    not there and for one that is very much there as a link whose target has
+    gone. Walking past the second as though it were the first reported a
+    dangling symlink at the mailbox path as "genuinely absent", so ``pending``
+    returned ``[]`` and ``pending_count`` returned ``0`` -- measured on this
+    branch before this was added, not deduced.
+
+    That is not a cosmetic hole, because such a mailbox is *undeliverable*
+    rather than merely unread: ``_write``'s ``mkdir(exist_ok=True)`` raises
+    ``FileExistsError`` on a dangling symlink, so nothing can ever be
+    delivered into one while every reader calls it empty -- permanent silence
+    that reads exactly like a healthy empty mailbox, which is the single
+    outcome this module exists to make impossible.
+
+    ``os.lstat`` asks about the entry itself and separates the two. A link
+    whose target is missing is therefore a blocker, in the way, and reported.
+    """
+    for candidate in (directory, *directory.parents):
+        try:
+            st = os.stat(candidate)
+        except FileNotFoundError:
+            try:
+                os.lstat(candidate)
+            except FileNotFoundError:
+                # Nothing here at all: keep walking up.
+                continue
+            except OSError:
+                # The entry cannot even be examined, which is not evidence of
+                # absence -- the same reading as the ``OSError`` arm below.
+                return candidate
+            # The entry exists; only its target does not. It is in the way.
+            return candidate
+        except OSError:
+            return candidate
+        return None if stat.S_ISDIR(st.st_mode) else candidate
+    return None
+
+
+def _message_files(directory: Path) -> list[Path]:
+    """Message files in ``directory``, oldest name first.
+
+    An absent mailbox is genuinely empty and returns ``[]``: nobody has ever
+    written to it, which is a complete answer. Anything else that stops the
+    listing -- a permission fault, or a plain file sitting where the mailbox
+    belongs -- is not an answer at all, and raises :class:`MailError`.
+
+    A first draft of this separated those two by whether they would clear on a
+    retry, and reported ENOTDIR as empty on the grounds that raising would jam
+    the supervisor loop for ever. That reasoning was wrong twice over, and the
+    second reviewer to look at it said so. It does not jam anything: the loop
+    catches :class:`MailError`, logs it and launches anyway. And "will not
+    clear on a retry" is an argument for reporting it *harder*, not for
+    reporting it as the one state that reads as healthy -- a mailbox that is a
+    plain file is permanently deaf, so calling it empty is a silence that
+    lasts for ever and that nothing anywhere complains about. Permanence is
+    the axis that matters one level down in ``_read_message``, where a bad
+    file can be moved aside and a jam is real; at the directory level there is
+    nothing to move aside and no jam to avoid.
+
+    That distinction is the whole point of this function, and it cannot be
+    made with the ``is_dir()``-then-``glob()`` pair it replaces, because both
+    halves of that pair lose it in opposite directions. ``Path.glob`` catches
+    ``PermissionError`` internally and yields nothing, so an unreadable inbox
+    holding real mail produced exactly the observation an empty one produces
+    -- measured, not deduced: ``pending``, ``pending_count`` and ``consume``
+    all returned 0 for an inbox holding a message. And ``Path.is_dir`` fails
+    the other way, re-raising EACCES rather than swallowing it (it only
+    ignores ENOENT, ENOTDIR, EBADF, ELOOP and three WinErrors), so the guard
+    meant to make the listing safe was itself the thing that could escape
+    through ``pending()`` on every poll of the supervisor loop.
+
+    This is the module's own established reading one level up: ``_read_message``
+    already refuses to let a file it could not open pass as a file that said
+    nothing. The same care was missing for the directory holding them, where
+    the cost is higher -- a message that cannot be seen is a peer waiting on a
+    reply that will never come, and silence is what a healthy empty mailbox
+    looks like too.
+
+    The listing happens exactly once, and the selection is made from what that
+    one listing returned. An earlier draft used ``scandir`` only to establish
+    that the directory could be read and then re-listed it with ``glob`` to
+    select, on the reasoning that this kept the matching rules untouched. A
+    reviewer pointed out what that costs: ``Path.glob`` swallows
+    ``PermissionError`` and ``NotADirectoryError`` and yields nothing, so
+    anything that went wrong in the window *between* the two listings came
+    back as an empty mailbox -- the precise defect this function exists to
+    remove, reintroduced in the gap between the check and the use.
+
+    The matching rule is preserved without the second listing.
+    ``os.path.normcase`` is the platform's own case rule -- it lower-cases on
+    Windows and is the identity on POSIX -- which is exactly the difference
+    between ``glob("*.json")`` on the two, so ``normcase(name)`` ending in
+    ``.json`` selects precisely what ``glob`` selected. Directory entries are
+    deliberately still included: a directory named ``*.json`` is not a
+    message, and ``_read_message`` one level down is what recognises it and
+    moves it aside, which it can only do if it is listed.
+    """
+    try:
+        with os.scandir(directory) as entries:
+            names = [entry.name for entry in entries]
+    except FileNotFoundError as exc:
+        # Not as obvious as it looks, and a reviewer caught it here. On
+        # Windows a *parent* component that is a plain file also arrives as
+        # FileNotFoundError -- winerror 3, errno 2 -- identical in type and
+        # errno to a mailbox nobody has ever written to. Measured: scandir on
+        # `<file>/child` and on a simply-absent path are indistinguishable
+        # from the exception alone, so returning [] here would have restored
+        # the very defect this function exists to remove, one level up the
+        # path. The ancestor walk is what separates them.
+        blocker = _blocking_ancestor(directory)
+        if blocker is not None:
+            raise MailError(
+                f"could not read mailbox {directory}: {blocker} is not a "
+                f"directory") from exc
+        # Genuinely absent: nobody has messaged this instance yet, which is
+        # the ordinary state of every mailbox on its first run.
         return []
+    except OSError as exc:
+        raise MailError(f"could not read mailbox {directory}: {exc}") from exc
+    return sorted(directory / name for name in names
+                  if os.path.normcase(name).endswith(".json"))
+
+
+def _load_dir(directory: Path) -> list[tuple[Path, dict]]:
     found: list[tuple[Path, dict]] = []
-    for path in sorted(directory.glob("*.json")):
+    for path in _message_files(directory):
         data = _read_message(path)
         # Neither a corrupt file nor an unreadable one can be listed, but
         # nothing is destroyed here, so skipping is safe for both: a message
@@ -241,15 +412,17 @@ def _load_dir(directory: Path) -> list[tuple[Path, dict]]:
 
 
 def pending(root: Path, instance_id: str) -> list[dict]:
-    """Unread messages, oldest first."""
+    """Unread messages, oldest first.
+
+    Raises :class:`MailError` if the inbox exists but cannot be read, rather
+    than reporting the empty list that would mean "nothing is waiting".
+    """
     return [msg for _, msg in _load_dir(inbox_dir(root, instance_id))]
 
 
 def pending_count(root: Path, instance_id: str) -> int:
-    directory = inbox_dir(root, instance_id)
-    if not directory.is_dir():
-        return 0
-    return sum(1 for _ in directory.glob("*.json"))
+    """How many messages are waiting. Raises :class:`MailError` if unknown."""
+    return len(_message_files(inbox_dir(root, instance_id)))
 
 
 def consume(root: Path, instance_id: str) -> list[dict]:
@@ -260,12 +433,13 @@ def consume(root: Path, instance_id: str) -> list[dict]:
     """
     inbox = inbox_dir(root, instance_id)
     archive = archive_dir(root, instance_id)
-    if not inbox.is_dir():
+    messages = _message_files(inbox)
+    if not messages:
         return []
     read_at = _utcnow()
     taken: list[dict] = []
-    archive.mkdir(parents=True, exist_ok=True)
-    for path in sorted(inbox.glob("*.json")):
+    _ensure_dir(archive)
+    for path in messages:
         data = _read_message(path)
         if data is UNREADABLE:
             # The read failed, so this message has not been seen by anybody.
@@ -285,7 +459,8 @@ def consume(root: Path, instance_id: str) -> list[dict]:
         try:
             _write_json(archive / path.name, data)
         except OSError as exc:
-            raise MailError(f"could not archive message: {exc}") from exc
+            raise MailError(f"could not archive message: {exc}",
+                            consumed=taken) from exc
         try:
             path.unlink()
         except FileNotFoundError:
@@ -295,7 +470,8 @@ def consume(root: Path, instance_id: str) -> list[dict]:
             # undo and no reason to abandon the rest of the batch.
             pass
         except OSError as exc:
-            raise MailError(f"could not archive message: {exc}") from exc
+            raise MailError(f"could not archive message: {exc}",
+                            consumed=taken) from exc
         taken.append(data)
     return taken
 
@@ -333,12 +509,12 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
     """
     inbox = inbox_dir(root, instance_id)
     destination = archive_dir(root, instance_id)
-    if not inbox.is_dir() or not ids:
+    if not ids:
         return 0
     wanted = {i for i in ids if isinstance(i, str)}
     if not wanted:
         return 0
-    files = sorted(inbox.glob("*.json"))
+    files = _message_files(inbox)
     chosen: set[Path] = set()
     found: set[str] = set()
     for path in files:
@@ -380,7 +556,7 @@ def archive(root: Path, instance_id: str, ids: list[str]) -> int:
     if not chosen:
         return 0
     read_at = _utcnow()
-    destination.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(destination)
     return sum(_archive_one(path, destination, read_at)
                for path in files if path in chosen)
 
