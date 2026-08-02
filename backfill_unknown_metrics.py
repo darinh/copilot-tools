@@ -24,6 +24,7 @@ import argparse
 import sqlite3
 from pathlib import Path
 
+import install_manifest
 from operator_ingest import BUSY_TIMEOUT
 
 COLUMNS = ("api_time_seconds", "session_time_seconds",
@@ -159,12 +160,24 @@ def backup_path(db: Path) -> Path:
     first did not, so its backup is not a superset of the first one. Silently
     replacing the earlier file would destroy the only record of the rows run
     one cleared.
+
+    That guarantee is why the probe is not ``Path.exists``. ``exists`` answers
+    False for a name that is occupied but unexaminable -- a symlink whose
+    target is gone, a symlink loop, a disconnected network home (WINERROR 21)
+    -- and it *raises* on a permission denial, which aborts a repair that had
+    not yet touched anything. Either way the promise in the first line is the
+    one thing it cannot keep: False here means the caller writes over that
+    name, and the file it destroys is the one this function exists to
+    preserve. :func:`install_manifest.path_present` keeps "cannot tell" apart
+    from "absent", and this fold sends it to *occupied*, so an unexaminable
+    backup costs one more suffix rather than the record it holds.
     """
     base = db.with_suffix(db.suffix + ".bak-prezero")
-    if not base.exists():
+    if install_manifest.path_present(base) is False:
         return base
     n = 2
-    while base.with_name(f"{base.name}.{n}").exists():
+    while install_manifest.path_present(
+            base.with_name(f"{base.name}.{n}")) is not False:
         n += 1
     return base.with_name(f"{base.name}.{n}")
 
@@ -285,8 +298,32 @@ def main(argv: list[str] | None = None) -> int:
                              "measured session has)")
     args = parser.parse_args(argv)
 
-    if not args.db.exists():
-        print(f"No metrics database at {args.db}")
+    # `file_present`, not `path_present`. The question here is not "is this
+    # name occupied" but "can this be opened as a database", and the two
+    # differ exactly where it costs something: `path_present` is lstat-based,
+    # so a dangling symlink is True, and spending that True on `connect`
+    # below creates a fresh 0-byte database *at the link's target* — a write
+    # outside anything the user pointed this tool at — and then dies on the
+    # first query. `backup_path` wants the lstat answer because there the
+    # cost of treating a name as occupied is one more suffix. Here the cost
+    # is a file written somewhere nobody named.
+    usable = install_manifest.file_present(args.db)
+    if usable is None:
+        # Refusing is right either way -- nothing below can run without the
+        # database. Which sentence gets printed is the whole difference: "no
+        # database" sends the reader to create one, and they will find one
+        # already sitting there. The permission denial, the dangling symlink
+        # and the disconnected network home all reach here, and none of them
+        # is an absent file.
+        print(f"Cannot examine {args.db} (it is there, or something is, but "
+              f"it could not be read)")
+        return 1
+    if usable is False:
+        if install_manifest.path_present(args.db) is False:
+            print(f"No metrics database at {args.db}")
+        else:
+            print(f"Cannot use {args.db} as a metrics database (the name is "
+                  f"occupied, but not by a readable regular file)")
         return 1
 
     conn = connect(args.db)

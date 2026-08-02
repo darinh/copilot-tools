@@ -28,8 +28,47 @@
 # ═══════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# Resolve the directory where this script lives (follows symlinks)
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Resolve the directory where this script lives, following symlinks.
+#
+# `readlink -f` is GNU-only. macOS ships BSD readlink, which has no `-f` at
+# all -- setup.sh has said so in a comment since it was written, and this was
+# the last script in the repo still relying on it.
+#
+# The failure it produced was not the abort you would hope for. The failing
+# `readlink` sits inside `$(dirname "$(...)")`, so `set -e` never sees it: the
+# assignment takes the status of the OUTER `$(cd ... && pwd)`, which succeeds.
+# `dirname ""` is ".", so `cd .` works, and SCRIPT_DIR silently became the
+# CALLER'S working directory. The two `operator-ingest.py` invocations below
+# then looked for it wherever the user happened to be standing, and the only
+# other symptom was one line of readlink usage text on stderr.
+#
+# The loop below is the portable equivalent: plain `readlink` with no `-f`
+# exists on BSD and GNU alike, and resolving one link at a time arrives at the
+# same place. CDPATH is emptied because a user's CDPATH can make `cd` print a
+# directory and jump somewhere else entirely. The hop limit stands in for the
+# ELOOP that `readlink -f` would have raised on a circular link; failing loudly
+# there is the opposite of the bug being fixed, and deliberately so.
+resolve_script_dir() {
+    local src="$1" dir hops=0
+    while [ -L "$src" ]; do
+        # An assignment, not `(( hops++ ))` -- an arithmetic command whose
+        # result is 0 returns status 1, which under `set -e` would end the
+        # script on the first hop.
+        hops=$((hops + 1))
+        if [ "$hops" -gt 40 ]; then
+            echo "operator.sh: too many symbolic links resolving $1" >&2
+            return 1
+        fi
+        dir="$(CDPATH="" cd "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in
+            /*) ;;
+            *) src="$dir/$src" ;;
+        esac
+    done
+    CDPATH="" cd "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"
 
 # ── Constants ───────────────────────────────────────────────────
 # All operator state lives in ~/.operator/ (NOT ~/.copilot/).
@@ -972,7 +1011,7 @@ start_copilot_in_tmux() {
                 [[ -n "$_s" ]] && _live_sessions+=("$_s")
             done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
             local _name
-            for _name in "${PRE_LAUNCH_MARKERS[@]}"; do
+            for _name in ${PRE_LAUNCH_MARKERS[@]+"${PRE_LAUNCH_MARKERS[@]}"}; do
                 if in_list "$_name" ${_live_sessions[@]+"${_live_sessions[@]}"}; then
                     touch "${RESTART_DIR}/${_name}.managed"
                     log "  Restored marker for live instance: $_name"

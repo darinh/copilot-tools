@@ -20,7 +20,6 @@ never under ``~/.copilot``, which the Copilot CLI wholesale-deletes on startup.
 from __future__ import annotations
 
 import atexit
-import csv
 import json
 import os
 import platform
@@ -59,6 +58,7 @@ from operator_mux import (                                    # noqa: E402
     Mux, MuxError, MuxNotFoundError, safe_instance_id,
 )
 from project_paths import (                                   # noqa: E402
+    catalog_rows,
     guid_is_usable,
     primary_repo_root,
     project_dir,
@@ -1327,14 +1327,27 @@ def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
     catalog = project_catalog_path()
     if file_present(catalog) is False:
         return None
-    target = str(primary_repo_root(cwd).resolve())
-    if IS_WINDOWS:
-        target = target.lower()
     # "No row matched" is only an answer if every row was actually compared.
     undecided = False
     try:
+        target = str(primary_repo_root(cwd).resolve())
+    except (OSError, ValueError, RuntimeError):
+        # Nothing can be compared against a target that will not resolve, so
+        # every row below is undecided rather than unmatched. Reporting "not
+        # registered" here would tell a restarting session its project has no
+        # handoff, which is the one thing this must never say on a guess.
+        return CATALOG_UNREADABLE
+    if IS_WINDOWS:
+        target = target.lower()
+    try:
         with open(catalog, "r", encoding="utf-8", errors="replace", newline="") as fh:
-            for row in csv.reader(fh):
+            for row in catalog_rows(fh):
+                if row is None:
+                    # The line would not parse at all. Same reasoning as an
+                    # unresolvable row below: it is a row not compared, not a
+                    # row that failed to match.
+                    undecided = True
+                    continue
                 if len(row) < 2:
                     continue
                 path, guid = row[0].strip().strip('"'), row[1].strip().strip('"')
@@ -1349,10 +1362,14 @@ def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
                     continue
                 try:
                     resolved = str(Path(path).resolve())
-                except OSError:
+                except (OSError, ValueError, RuntimeError):
                     # This row could not be compared. Skipping it is right, but
                     # it means the "not registered" verdict below is no longer
-                    # established for this catalog.
+                    # established for this catalog. All three arrive here: the
+                    # catalog is a hand-edited CSV, so a row can name a symlink
+                    # loop (RuntimeError, or OSError(ELOOP) on newer
+                    # interpreters) or carry an embedded NUL (ValueError) just
+                    # as easily as it can name a denied path (OSError).
                     undecided = True
                     continue
                 if IS_WINDOWS:
@@ -2082,6 +2099,10 @@ def reload_instance(target: str | None) -> int:
 def ingest_all_logs(force: bool = False) -> int:
     operator_ingest.init_db(METRICS_DB)
     results = operator_ingest.ingest_all(COPILOT_LOG_DIR, METRICS_DB, force=force)
+    if results is None:
+        print(f"Cannot examine {COPILOT_LOG_DIR} — no logs were ingested, and "
+              f"whether any are there is unknown")
+        return 1
     if not results:
         print(f"No Copilot logs found in {COPILOT_LOG_DIR}")
         return 0
@@ -2172,7 +2193,18 @@ def manage_logs(args: list[str]) -> int:
     removed = skipped = 0
     freed = 0
     for f in old:
-        if f.name not in known:
+        # The full path only. `known` also holds bare basenames, from rows
+        # written before a log was keyed by path, and accepting those here
+        # would delete a log this database has no record of: a legacy row
+        # names a file in a directory nobody wrote down, so a same-named log
+        # in the current one matches it without being it. That is the loss
+        # this function exists to prevent -- the log is the only record of the
+        # session, and it would be gone before it could ever be ingested.
+        # A legacy row is re-keyed the next time its log is ingested, so the
+        # cost of the strict test is that an old database prunes nothing until
+        # `operator ingest` has run once, which is what the line below tells
+        # the user to do.
+        if operator_ingest.log_key(f) not in known:
             skipped += 1
             continue
         freed += f.stat().st_size
@@ -2348,20 +2380,45 @@ def _inbox_usage(stream=None) -> None:
           "other\n  instance is live here; pass your own name.", file=stream)
 
 
-def _dir_matches(child: str | None, parent: Path) -> bool:
-    """True when ``child`` is ``parent`` or lives beneath it.
+def _dir_matches(child: str | None, parent: Path) -> bool | None:
+    """True when ``child`` is ``parent`` or lives beneath it, None when the
+    two could not be compared at all.
 
     Path comparison follows the convention used elsewhere in this file:
     resolve first, then lowercase on Windows, where ``C:\\Repo`` and
     ``c:\\repo`` are the same directory.
+
+    Three answers rather than two, for the reason
+    :func:`install_manifest.path_present` gives about the presence probes:
+    ``False`` here does not mean "could not tell", it means *somewhere else*,
+    and that is a placement this comparison is in no position to make. The
+    only caller is the census behind a destructive mail read, where an
+    instance reported elsewhere is an instance that does not stop the read.
+
+    ``Path.resolve`` declines to answer in three different ways, and the
+    handler this replaced caught one of them:
+
+    * a **symlink loop** raises ``RuntimeError`` on the interpreters this
+      project supports and ``OSError(ELOOP)`` on newer ones -- so both are
+      caught, and which one arrives is a version detail, not a behaviour;
+    * an **embedded NUL** raises ``ValueError``. The recorded directory comes
+      out of a hand-editable launch-spec JSON, and JSON carries ``\\u0000``
+      happily;
+    * everything else -- a denial, a disconnected network home, WINERROR 21 --
+      raises ``OSError``, which *was* caught and answered ``False``.
+
+    The first two were not caught at all, so ``operator inbox`` ended in a
+    traceback rather than a decision. ``parent`` is resolved here too, so a
+    parent that will not resolve made *every* comparison answer "elsewhere"
+    and the census came back confidently empty.
     """
     if not child:
         return False
     try:
         cp = str(Path(child).resolve())
         pp = str(parent.resolve())
-    except OSError:
-        return False
+    except (OSError, ValueError, RuntimeError):
+        return None
     if IS_WINDOWS:
         cp, pp = cp.lower(), pp.lower()
     if cp == pp:
@@ -2394,7 +2451,10 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
     backend there are no sessions to miss, so that answers the empty list.
     The same rule applies one record down: an unreadable launch spec, tab
     registry or state directory refuses the census rather than quietly
-    dropping the instance it could not place.
+    dropping the instance it could not place. So does a directory that will
+    not compare — a path the backend reported happily and :func:`_dir_matches`
+    cannot resolve places an instance nowhere, which is not the same as
+    placing it elsewhere.
     """
     try:
         if not MUX.available():
@@ -2425,7 +2485,8 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
         else:
             pane_failed = False
         recorded = _tracked_cwd_for_id(ident)
-        if _dir_matches(pane, cwd):
+        pane_here = _dir_matches(pane, cwd)
+        if pane_here:
             found.append(ident)
             continue
         if recorded is UNPLACEABLE:
@@ -2435,8 +2496,17 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
             # directory — the same refusal as a failed pane lookup, one
             # record further down.
             return None
-        if _dir_matches(recorded, cwd):
+        recorded_here = _dir_matches(recorded, cwd)
+        if recorded_here:
             found.append(ident)
+        elif (pane_here is None or recorded_here is None) and ident in known:
+            # The backend answered, and the answer was a path that cannot be
+            # compared to this directory — a symlink loop, an embedded NUL, a
+            # denial part-way down. `pane_failed` is False, so without this
+            # the instance would fall past every branch below and simply not
+            # be in the list: the same hole in the census as a failed pane
+            # lookup, arriving one step later.
+            return None
         elif pane_failed and ident in known:
             # The backend refused to say where this instance is and the
             # recorded directory does not place it here either. That is not
@@ -3341,7 +3411,7 @@ def _spawn_background_loop(instance: Instance, copilot_args: list[str],
         )
     else:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(cmd, **kwargs)
+    proc = subprocess.Popen(cmd, **kwargs)  # decode-ok: every stream is DEVNULL
     return proc.pid
 
 

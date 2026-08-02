@@ -11,4 +11,4 @@ rewriting state that is already on disk, add a matching ``upgrade_vX_Y_Z_to_...`
 function in ``install_manifest.py``.
 """
 
-__version__ = "1.2.6"
+__version__ = "1.2.7"

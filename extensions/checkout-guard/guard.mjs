@@ -7,7 +7,7 @@
 // lives behind an untestable import is verified only by assertion.
 
 import { execFile } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { mkdirSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, join, relative, isAbsolute } from "node:path";
 
@@ -1311,4 +1311,147 @@ export function noteAuthored(state, root, filePath, { cwd = process.cwd() } = {}
   const seen = state.lastSeen.get(root);
   if (seen && !seen.includes(rel)) state.lastSeen.set(root, [...seen, rel]);
   return rel;
+}
+
+// ---------------------------------------------------------------------------
+// The hook bodies.
+//
+// These live here, and not in extension.mjs beside the `joinSession` call they
+// are handed to, for the reason stated at the top of this file: importing
+// extension.mjs starts a session, so anything defined there is reachable by
+// `node --check` and by no test at all. The three hooks are where every other
+// decision in this file is actually SEQUENCED -- which scan seeds which
+// baseline, which tool triggers a second checkout's scan, whether a report is
+// emitted or a permission denied -- and sequencing is exactly the kind of
+// logic that looks right when read and is wrong when run.
+//
+// Every environment touch is a parameter with a real default rather than a
+// direct call, so a test can drive a hook without a git binary, a checkout, or
+// a writable temp directory. The defaults are the production behaviour; a
+// caller that passes nothing gets what extension.mjs got when this code lived
+// there.
+// ---------------------------------------------------------------------------
+
+/**
+ * The guard's three hook bodies, closed over one session's state.
+ *
+ * A factory rather than three exported functions over a module-level state,
+ * for the same reason `createGuardState` is a factory: two guards in one
+ * process -- which is what a test file is -- must not share a baseline.
+ * `createGuard()` twice yields two guards that cannot see each other.
+ *
+ * The returned `state` and `scratchDir` are exposed for tests and for nothing
+ * else; the extension uses only the three hooks.
+ */
+export function createGuard({
+  scratchDir = scratchDirFor(),
+  disabled = guardDisabled(),
+  state = createGuardState(),
+  ensureDir = (dir) => mkdirSync(dir, { recursive: true }),
+  cwd = () => process.cwd(),
+  rootOf = checkoutRoot,
+  scan = scanCheckoutTree,
+  otherRoot = otherRootToWatch,
+  look = observe,
+} = {}) {
+  async function onSessionStart() {
+    if (disabled) return;
+    try {
+      ensureDir(scratchDir);
+    } catch {
+      // An unwritable temp directory is not a reason to fail a session; the
+      // briefing still names the intended location.
+    }
+    const root = await rootOf(cwd());
+    const seeds = [];
+    if (root) {
+      const initial = await scan(root);
+      if (initial !== null) state.lastSeen.set(root, initial);
+      // Seeded AND reported. A stray present at seed time is invisible to
+      // every later hook by construction -- `observe` answers "what is new",
+      // and this never will be again -- so a session not told here is never
+      // told at all. `sessionContext` drops a null scan rather than reporting
+      // an empty checkout.
+      seeds.push({ strays: initial, root });
+      // Seed the primary too, or its entire contents would read as new the
+      // first time a command is run and every existing file in it would be
+      // reported as this agent's doing.
+      const other = await otherRoot(state, root);
+      if (other) {
+        const seedOther = await scan(other);
+        if (seedOther !== null) state.lastSeen.set(other, seedOther);
+        // The seed that motivated this: an agent working in a worktree is the
+        // one for whom strays in the primary are both invisible and most
+        // expensive, and `root` is not the primary for that agent.
+        seeds.push({ strays: seedOther, root: other, primary: true });
+      }
+    }
+    return { additionalContext: sessionContext(scratchDir, seeds) };
+  }
+
+  async function onPreToolUse(input) {
+    if (disabled) return;
+    if (!SHELL_TOOLS.has(input.toolName)) return;
+    const command = String(input.toolArgs?.command || "");
+    // Cheap reject first: this hook runs on every shell command, and the
+    // overwhelming majority of them are not git.
+    if (!/\bgit\b/i.test(command)) return;
+    const root = await rootOf(cwd());
+    if (!root) return;
+    // Re-observe rather than trusting the last scan. Anything this turns up
+    // arrived without a tool call of this agent's in between -- a peer agent
+    // in the same checkout, or a background process -- so it has never been
+    // reported, and the block message says so rather than implying the agent
+    // made it. Silently folding it into the outstanding set would produce a
+    // block citing artifacts the agent had never been shown.
+    const unannounced = await look(state, root, { scan });
+    const decision = sweepDecision(command, [...setFor(state.outstanding, root)]);
+    if (!decision) {
+      if (unannounced.length === 0) return;
+      return { additionalContext: strayReport(unannounced, scratchDir) };
+    }
+    return {
+      permissionDecision: "deny",
+      permissionDecisionReason: blockReason({ ...decision, unannounced }),
+    };
+  }
+
+  async function onPostToolUse(input) {
+    if (disabled) return;
+    const root = await rootOf(cwd());
+    if (!root) return;
+
+    if (AUTHORING_TOOLS.has(input.toolName)) {
+      const filePath = String(input.toolArgs?.path || "");
+      if (filePath) noteAuthored(state, root, filePath, { cwd: cwd() });
+      return;
+    }
+
+    if (!SHELL_TOOLS.has(input.toolName) && !SUBAGENT_TOOLS.has(input.toolName)) return;
+    const fresh = await look(state, root, { scan });
+    // The primary is scanned as well as, never instead of, the working
+    // checkout -- but only after a SUBAGENT call, not after every command.
+    //
+    // Both real incidents came from subagents, and the restriction is what
+    // keeps this from being noise: the primary is shared, so scanning it after
+    // every shell command would report every peer agent's artifacts to every
+    // other agent, and a guard that cries wolf gets switched off. This agent's
+    // own shell commands cannot surprise it in another tree -- it would have
+    // had to name the path.
+    const other = SUBAGENT_TOOLS.has(input.toolName)
+      ? await otherRoot(state, root)
+      : null;
+    const elsewhere = other
+      ? await look(state, other, { blocking: false, scan })
+      : [];
+    if (fresh.length === 0 && elsewhere.length === 0) return;
+    const reports = [];
+    if (fresh.length > 0) reports.push(strayReport(fresh, scratchDir));
+    if (elsewhere.length > 0) {
+      reports.push(primaryStrayReport(elsewhere, scratchDir, other));
+    }
+    return { additionalContext: reports.join("\n\n") };
+  }
+
+  return { state, scratchDir, disabled, onSessionStart, onPreToolUse, onPostToolUse };
 }

@@ -10,12 +10,28 @@ Usage:
 
 Exit codes: 0=success/skip, 1=error, 2=no shutdown event
 """
-import re, sys, subprocess, os, argparse, json
+import re, sys, subprocess, os, argparse, json, stat
 from datetime import datetime, timezone
 
 
 def run_cmd(cmd, timeout=30):
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    """Run a command and return (stdout, returncode).
+
+    The encoding is named rather than inherited. `text=True` alone decodes
+    with the locale's preferred encoding -- cp1252 on Windows -- and this
+    program's whole input is copilot's UTF-8 telemetry log. A byte outside the
+    codepage raises UnicodeDecodeError inside subprocess's reader thread,
+    which leaves `r.stdout` as None while the process still exits 0; callers
+    here do `out.strip()` and `json.loads(out)`, so a log line with an
+    accented path would have surfaced as an AttributeError rather than as a
+    parse failure. `errors="replace"` cannot raise. A None stdout is reported
+    as a non-zero return so that "the read failed" never reads as "the command
+    found nothing".
+    """
+    r = subprocess.run(cmd, capture_output=True,
+                       encoding="utf-8", errors="replace", timeout=timeout)
+    if r.stdout is None:
+        return "", r.returncode or 1
     return r.stdout, r.returncode
 
 
@@ -137,7 +153,22 @@ def main():
     logfile = os.path.abspath(args.logfile)
     log_basename = os.path.basename(logfile)
 
-    if not os.path.isfile(logfile):
+    # `os.stat` rather than `os.path.isfile`. os.path swallows every OSError
+    # and answers False, so a log that is there but cannot be examined -- a
+    # denial, a dangling symlink, a disconnected network home -- was reported
+    # to the user as "not found", which sends them looking for a file that is
+    # sitting right where they left it. This script stays stdlib-only (it is
+    # invoked directly by operator.sh), so it spells out what
+    # `install_manifest.file_present` does for the importable modules.
+    try:
+        usable = stat.S_ISREG(os.stat(logfile).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        usable = False
+    except OSError as exc:
+        print(f"ERROR: {logfile} could not be examined ({exc})",
+              file=sys.stderr)
+        sys.exit(1)
+    if not usable:
         print(f"ERROR: {logfile} not found", file=sys.stderr)
         sys.exit(1)
 
@@ -213,8 +244,9 @@ def main():
     if work_dir:
         try:
             r = subprocess.run(['git', '-C', work_dir, 'rev-parse', '--abbrev-ref', 'HEAD'],
-                               capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
+                               capture_output=True,
+                               encoding="utf-8", errors="replace", timeout=5)
+            if r.returncode == 0 and r.stdout is not None:
                 git_branch = r.stdout.strip()
         except:
             pass

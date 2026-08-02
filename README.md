@@ -35,14 +35,31 @@ messaging, and spec-driven workflow conventions.
 | Spec Kit workflow | ✅ | ✅ | ✅ |
 | Runtime extensions | ✅ | ✅ | ✅ |
 | `operator` / `handoff` (Python) | ✅ | ✅ | ✅ |
-| `operator.sh` / `handoff.sh` (bash, legacy, unmaintained) | ❌ | rollback only | rollback only |
+| `operator.sh` / `handoff.sh` (bash, legacy — rollback target, still tested) | ❌ | rollback only | rollback only |
 | `operator restore` (Windows Terminal tabs) | ✅ (native tabs) | ✅ (WSL-hosted tabs only) | ❌ |
 
 The Python implementation is the supported entry point on every platform.
 `setup.sh` migrates existing Linux/WSL/macOS installs off the bash scripts
 automatically (see [Quick Start](#quick-start)); the bash scripts themselves
-are left on disk, untouched, purely so a failed migration can never strand a
-user without a working `operator`/`handoff` command.
+are left on disk, unmodified by setup, purely so a failed migration can never
+strand a user without a working `operator`/`handoff` command.
+
+Here "legacy" means superseded, not abandoned. A rollback target is only worth
+having if it still runs, so the bash scripts stay under test: CI's "Shell
+script syntax" job parses every `*.sh` with `bash -n` on every pull request
+and every push to `main`, and the
+suite exercises `operator.sh` and `handoff.sh` directly —
+`tests/test_operator_sh_bash32.py`, `tests/test_handoff_sh.py`,
+`tests/test_operator_sh_entrypoint.py`, `tests/test_operator_sh_help.py` and
+`tests/test_shell_bash32_conformance.py`
+all read or run them, the last of those because macOS `/bin/bash` is
+permanently 3.2 and macOS is exactly where someone is most likely to need the
+fallback. They still get bug fixes; they get no new features, and a divergence
+in behaviour is resolved by changing the bash to match the Python. Don't
+install them on purpose — see [rolling
+back](docs/operator.md#installation) for the one supported reason to.
+`tests/test_legacy_bash_status.py` fails if this paragraph and that coverage
+ever stop agreeing.
 
 `operator restore` re-launches tracked Windows Terminal tabs. It works from
 both native Windows PowerShell and from inside WSL (via `wt.exe`/`wsl.exe`
@@ -113,6 +130,31 @@ directly if you don't need the migration step below.
 `sqlite3` is **not** required — the toolkit uses Python's standard-library
 `sqlite3` module.
 
+### Never install this editably from a git worktree
+
+`pip install -e` copies nothing. It writes the *source directory* into the
+interpreter's import path and points the `operator` and `handoff` console
+scripts at it, machine-wide for that interpreter. A git worktree exists in
+order to be deleted, so an editable install made from one breaks every console
+script the moment somebody else correctly finishes that branch and runs `git
+worktree remove` — and it breaks for *them*, days later, with no path back to
+the cause. That has happened twice here.
+
+So the project's PEP 517 backend (`worktree_guard_backend.py`) refuses to
+build an editable install when the source directory is a linked worktree, and
+tells you which checkout to install from instead. Wheels and sdists are
+unaffected, submodules are allowed, and
+`COPILOT_TOOLS_ALLOW_WORKTREE_INSTALL=1` overrides the refusal if you really
+mean it. `setup_tools.py` run from a worktree redirects to the primary
+checkout on its own and says so.
+
+Repairing a machine that already has one: reinstall from the primary checkout,
+naming it explicitly rather than relying on the working directory.
+
+```bash
+python -m pip install -e /path/to/the/primary/checkout --no-deps
+```
+
 <details>
 <summary>What <code>setup.sh</code> does beyond <code>setup_tools.py</code> (Linux/WSL/macOS)</summary>
 
@@ -135,7 +177,8 @@ That migration is all `setup.sh` still does on its own. Anvil,
 `dotnet-roslyn-mcp`, and the Spec Kit CLI used to be installed here, which
 meant Windows users never got them; they're now provisioned by
 `setup_tools.py` on every platform. `operator.sh`/`handoff.sh` themselves are
-left on disk unchanged; they're just no longer the thing installed into
+still on disk and still maintained (see [Platform
+Support](#platform-support)); they're just no longer the thing installed into
 `PATH`.
 </details>
 
@@ -244,14 +287,16 @@ copilot-tools/
 ├── setup_tools.py                 # Cross-platform environment setup
 ├── install_manifest.py            # Records what setup deployed; upgrade strategies
 ├── copilot_tools_version.py       # The single source of the version number
+├── worktree_guard_backend.py      # PEP 517 backend; refuses `pip install -e` of a worktree
 ├── backfill_unknown_metrics.py    # One-off repair: fabricated zeros to NULL
 ├── verify_cross_platform.py       # Stdlib-only verification; runs without pytest
+├── git_identity.py                # Refuses to certify a history it could not read
 ├── e2e_restart_loop.py            # End-to-end restart-loop check, real processes
 ├── setup.sh                       # POSIX bootstrap; finds Python, runs setup_tools
 ├── setup.ps1                      # Windows bootstrap; same, winget if no Python
-├── operator.sh                    # Legacy bash wrapper (Linux/WSL)
+├── operator.sh                    # Legacy bash wrapper (Linux/WSL/macOS)
 ├── operator-ingest.py             # Legacy log parser, used by operator.sh
-├── handoff.sh                     # Legacy bash handoff (Linux/WSL)
+├── handoff.sh                     # Legacy bash handoff (Linux/WSL/macOS)
 ├── diagnose-restart-deleter.sh    # Diagnostic: who deleted the restart directory
 ├── extensions/                    # Copilot CLI runtime extensions; see its README
 ├── skills/

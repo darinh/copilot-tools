@@ -64,11 +64,15 @@ consequence you cannot derive from the protocol: when two `handoff` calls race
 and one cannot take the lock, it publishes anyway rather than throw away a live
 session, and the losing handoff can end up only in
 `~/.copilot/projects/{guid}/superseded/`. So in a shared project
-`next-session.md` is not guaranteed to be the newest handoff. If `handoff`
-warned that another was in progress, say so in your final message — that
-warning goes to stderr and dies with your session — and read `superseded/`
-alongside `next-session.md` when you start. Neither archive is ever pruned;
-[the mechanism and both residual windows are in
+`next-session.md` is not guaranteed to be the newest handoff. A handoff written
+without the lock now says so in its own first paragraph, and the copy banked
+beside it says it may never have reached `next-session.md` — so read
+`superseded/` alongside `next-session.md` when you start, and treat a copy
+marked as banked as one that may be *newer* than the file you are holding.
+Still say so in your final message if `handoff` warned it could not bank a
+spare copy at all: that is the one case with no file left to record it in, and
+the warning goes to stderr and dies with your session. Neither archive is ever
+pruned; [the mechanism and both residual windows are in
 `docs/operator.md`](../../docs/operator.md#superseded-handoffs).
 
 ## Starting one
