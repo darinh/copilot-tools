@@ -48,6 +48,7 @@ if _HERE not in sys.path:
 
 import operator_ingest                                       # noqa: E402
 import operator_mail                                         # noqa: E402
+import operator_trace                                        # noqa: E402
 from install_manifest import (                                # noqa: E402
     dir_present,
     file_present,
@@ -76,7 +77,8 @@ SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
 RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
                   "version", "forget", "logs", "tabs", "restore",
-                  "stop-loop", "stop-session", "restart-loop", "menu"}
+                  "stop-loop", "stop-session", "restart-loop", "menu",
+                  "trace"}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
@@ -3101,6 +3103,7 @@ USAGE
     operator report [type]                                     View usage reports
     operator ingest [--force]                                  Process copilot logs
     operator logs [--prune] [--days N]                         Inspect/prune copilot logs
+    operator trace [-n N] [--kind K] [--json] [--all]          Who invoked the operator, and how it ended
     operator tabs [list|remove NAME|clear]                     Manage tracked terminal tabs
     operator restore [NAME...|--all] [--dry-run]               Reopen tracked tabs after a crash
     operator help                                              Show this help
@@ -3819,9 +3822,125 @@ def show_menu() -> int:
             return rc
 
 
+def show_trace(args: list[str]) -> int:
+    """Print the invocation trace: who ran the operator, and how it ended.
+
+    The trace answers the question ``operator.log`` cannot: a line there says
+    a session was relaunched, but not whether a person asked for it, an agent
+    did, or something outside the toolkit did.
+    """
+    limit = 25
+    kind = None
+    as_json = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-n", "--limit"):
+            if i + 1 >= len(args):
+                die("--limit requires a value")
+            try:
+                limit = int(args[i + 1])
+            except ValueError:
+                die(f"--limit wants a number, got {args[i + 1]!r}")
+            i += 1
+        elif arg == "--kind":
+            if i + 1 >= len(args):
+                die("--kind requires a value")
+            kind = args[i + 1]
+            i += 1
+        elif arg == "--json":
+            as_json = True
+        elif arg in ("--all",):
+            limit = 0
+        else:
+            die(f"unknown option for `operator trace`: {arg}")
+        i += 1
+
+    records = operator_trace.read_records(OPERATOR_HOME, limit=0, kind=None)
+    if records is None:
+        # Not the same as an empty trace, and saying "no invocations" here
+        # would be the exact substitution this trace exists to catch.
+        print(f"Error: could not read the trace at "
+              f"{operator_trace.trace_path(OPERATOR_HOME)}", file=sys.stderr)
+        return 1
+
+    exits = {r.get("trace_id"): r for r in records if r.get("event") == "exit"}
+    all_invocations = [r for r in records if r.get("event") == "invoke"]
+    invocations = [
+        r for r in all_invocations
+        if not kind or (r.get("source") or {}).get("kind") == kind
+    ]
+    if limit:
+        invocations = invocations[-limit:]
+
+    if as_json:
+        print(json.dumps(invocations, indent=2))
+        return 0
+
+    if not invocations:
+        # An empty *result* and an empty *trace* are different findings, and
+        # printing one sentence for both would hide a filter that matched
+        # nothing behind a file that recorded nothing.
+        if all_invocations:
+            kinds = sorted({(r.get("source") or {}).get("kind") or "?"
+                            for r in all_invocations})
+            print(f"No invocation matched --kind {kind}. "
+                  f"{len(all_invocations)} traced so far; "
+                  f"kinds present: {', '.join(kinds)}.")
+        else:
+            print("No operator invocations have been traced yet.")
+        print(f"  Trace file: {operator_trace.trace_path(OPERATOR_HOME)}")
+        return 0
+
+    print(f"═══ Operator invocations ({len(invocations)} shown) ═══\n")
+    for rec in invocations:
+        source = rec.get("source") or {}
+        done = exits.get(rec.get("trace_id"))
+        if done is None:
+            outcome = "running/unknown"
+        else:
+            outcome = f"rc={done.get('rc')} {done.get('ms')}ms"
+        argv = " ".join(rec.get("argv") or []) or "(no arguments)"
+        print(f"{rec.get('ts', '?'):20} {str(source.get('kind', '?')):11} "
+              f"{argv[:60]:60} {outcome}")
+        why = source.get("why")
+        if why:
+            print(f"{'':20} └─ {why}")
+    print(f"\nTrace file: {operator_trace.trace_path(OPERATOR_HOME)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Entry point: trace the invocation, then dispatch it.
+
+    The trace brackets the entire command so a record shows both what was
+    asked and how it ended. Most error paths in this file leave through
+    ``die()``, which is a ``SystemExit``, and a crash leaves through an
+    exception -- ``operator.log`` renders those two identically today, and
+    they are not the same thing at all.
+    """
     enable_utf8_output()
     args = list(sys.argv[1:] if argv is None else argv)
+    traced = operator_trace.record_invocation(OPERATOR_HOME, args)
+    try:
+        rc = _dispatch_command(args)
+    except SystemExit as exc:
+        code = exc.code
+        operator_trace.record_exit(
+            traced,
+            code if isinstance(code, int) else (0 if code is None else 1))
+        raise
+    except BaseException:
+        # -1 is not a code this program can return, which is exactly why it is
+        # used: it marks a command that left through an exception rather than
+        # through a decision, and keeps the two distinguishable in the trace.
+        operator_trace.record_exit(traced, -1)
+        raise
+    operator_trace.record_exit(traced, rc)
+    return rc
+
+
+def _dispatch_command(args: list[str]) -> int:
     migrate_legacy_state()
 
     if not args:
@@ -3861,6 +3980,8 @@ def main(argv: list[str] | None = None) -> int:
         return show_inbox(args[1:])
     if head == "logs":
         return manage_logs(args[1:])
+    if head == "trace":
+        return show_trace(args[1:])
     if head == "tabs":
         return manage_tabs(args[1:])
     if head == "restore":
