@@ -300,6 +300,7 @@ copilot-tools/
 │   └── workflows/ci.yml           # 8 jobs: 3 OSes x 2 Pythons, shell syntax, extensions
 ├── .specify/                      # Spec Kit templates, scripts, and constitution
 ├── specs/                         # Feature specifications, plans, and tasks
+├── backlog/                       # Open work, one file per item; see its README
 ├── .gitattributes                 # Shell scripts check out LF on every platform
 ├── .gitignore                     # Caches, packaging output, and /.worktrees/
 ├── LICENSE                        # MIT
@@ -314,6 +315,7 @@ copilot-tools/
 ├── operator_console.py            # UTF-8 console output
 ├── project_paths.py               # Project identity: catalog and per-project dirs
 ├── handoff_tool.py                # Session handoff
+├── backlog_tool.py                # Backlog parser, validator, and HTML view
 ├── setup_tools.py                 # Cross-platform environment setup
 ├── install_manifest.py            # Records what setup deployed; upgrade strategies
 ├── copilot_tools_version.py       # The single source of the version number
