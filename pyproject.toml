@@ -17,6 +17,7 @@ classifiers = [
 [project.scripts]
 operator = "copilot_operator:main"
 handoff = "handoff_tool:main"
+backlog = "backlog_tool:main"
 operator-ingest = "operator_ingest:main"
 operator-runner = "operator_runner:main"
 
@@ -40,6 +41,7 @@ backend-path = ["."]
 
 [tool.setuptools]
 py-modules = [
+    "backlog_tool",
     "copilot_operator",
     "copilot_tools_version",
     "install_manifest",
