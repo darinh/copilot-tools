@@ -225,6 +225,7 @@ When setting up a new project, the user selects which conventions to enable:
 | **Spec-Driven Development** | Spec as source of truth. Uses GitHub spec-kit. Location: `.specify/` and `specs/`. | ON |
 | **Parallel Agents** | SQL-coordinated parallel task execution via `todo_claims`. | ON |
 | **Branching Strategy** | Feature branches in worktrees, merged to `main`, conventional commits | ON |
+| **Tracked Backlog** | `backlog/` in the repo, one file per item, enforced by tests | ON |
 
 ### What to write in a per-project file
 
@@ -236,7 +237,7 @@ or branching rules only creates something to drift. Name the enabled features an
 # {project} — project conventions
 
 Enabled features: session-handoff, session-history, spec-driven, parallel-agents,
-branching-strategy.        <!-- list only the ones actually enabled -->
+branching-strategy, tracked-backlog.   <!-- list only the ones actually enabled -->
 
 ## What this repo is
 One paragraph. What it does, and what makes changes here risky.
@@ -423,6 +424,105 @@ CREATE TABLE IF NOT EXISTS session_log (
 **On session start**: `INSERT INTO session_log (branch, task_summary) VALUES ('{branch}', '{what you are working on}');`
 
 **On session end**: `UPDATE session_log SET ended_at = CURRENT_TIMESTAMP, commits = '{shas}', files_changed = '{files}', tests_before = N, tests_after = M, learnings = '{notes}', status = 'completed' WHERE id = {id};`
+
+---
+
+## Tracked Backlog
+
+*Enabled by feature flag: `tracked-backlog`*
+
+**Open work belongs in the repository, not in a handoff.**
+
+Everything above this section is ephemeral by design. `next-session.md` is
+read-once and deleted at session start. `session_log` lives in a per-session
+database that does not persist. Both are *handover* mechanisms, and neither is
+a record. So closed work is answerable from `git log` and open work has been
+answerable from nothing at all — it survives only as a re-summarised sentence
+carried from session to session, which is lossy by construction and, worse,
+lossy undetectably.
+
+`backlog/` is the durable half. It is tracked, it is reviewed with the code,
+and it outlives every session that touched it.
+
+### One file per item
+
+`backlog/0007-short-kebab-slug.md` — four-digit id, kebab slug.
+
+This is the main design constraint, not a style choice. Parallel agents work in
+separate worktrees off the same `main`. A single `BACKLOG.md` puts every add
+and every close on the same lines of one file, so every concurrent pair
+conflicts. One file per item makes an add conflict-free by construction and a
+close a small diff.
+
+```
+---
+id: 7
+title: One line, imperative
+status: open          # open | closed | rejected
+opened: 2026-08-04
+closed:               # date, when terminal
+commit:               # closing SHA, when closed
+spec: specs/003-a-feature/spec.md   # or: none
+requirement:          # optional: text that must occur in that spec
+---
+
+## Evidence
+## Why it matters
+## Notes
+```
+
+Front matter carries no inline comments — a value is the rest of its line. The
+block above is an illustration; real items spell the vocabulary nowhere but
+their own `status` field. (YAML's comment rule would also read
+`title: Fix issue #42` as `Fix issue`, silently discarding the number.)
+
+### Mapping work to specs
+
+When spec-driven development is enabled, **every item names a spec or says
+`none` explicitly**. Writing `none` out makes "this changes no specification" a
+decision somebody recorded, rather than a silence that could equally mean
+nobody looked.
+
+`requirement` is what makes that mapping load-bearing rather than decorative:
+when set, the text must actually occur in the named spec, so renaming or
+deleting the requirement turns the suite red and someone has to revisit the
+item. An item pointing at a spec section that no longer exists is worse than
+one pointing nowhere, because it reads as though it had been checked.
+
+An item is the right place for work that is *not yet* specified. When it grows
+into a feature, run `/speckit-specify`, then point the item's `spec` at what
+that produced. The backlog is the queue; `specs/` is the contract.
+
+### Closing an item
+
+**Set `status`, `closed` and `commit` in the same commit that does the work,
+and update the linked spec in that same commit.** A close landing separately
+from its fix is a window in which the backlog is wrong, and the `commit` field
+cannot name a SHA that does not exist yet — so commit the work and amend, or
+close it in the merge commit.
+
+`rejected` means considered and declined. It takes a `closed` date and no
+`commit`, because nothing shipped: demanding a SHA there forces whoever rejects
+an item to invent one, and an invented SHA looks exactly like evidence.
+
+### Rules
+
+- **Evidence is required, and it is what was measured** — a reproduction, a
+  command and its output, a mutation that ran green. An item with no evidence
+  is a rumour, and a backlog of rumours costs every reader the time it takes to
+  find that out.
+- **Never seed an item you have not verified yourself.** Carried-forward lists
+  go stale: two of the four items this convention was first written for turned
+  out to be already fixed, and recording them would have created work that did
+  not exist.
+- **Enforce it with tests, or do not bother.** A backlog nothing reads decays
+  like any other prose. At minimum: ids match filenames and are unique, status
+  is in the vocabulary, evidence is non-empty, a closed item's SHA resolves in
+  this repository, and the directory itself is non-empty — without that last
+  one, deleting `backlog/` turns every other rule into a loop over an empty
+  list and the suite reports it clean at the moment it stopped existing.
+- **Prove each rule can fail.** Violate it in a temp copy and watch the suite
+  go red. A guard that cannot fire reads exactly like coverage.
 
 ---
 

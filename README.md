@@ -16,6 +16,7 @@ messaging, and spec-driven workflow conventions.
 | [`operator_mux.py`](docs/operator.md#platform-support) | Session-backend abstraction (tmux / psmux) |
 | [`operator_ingest.py`](operator_ingest.py) | Pure-Python log parser for copilot process logs |
 | [`handoff_tool.py`](docs/operator.md) | Atomic session handoff for agents |
+| [`backlog_tool.py`](backlog/README.md) | Reads and enforces the tracked `backlog/`; ships the `backlog` command |
 | [`operator.sh`](operator.sh), [`handoff.sh`](handoff.sh), [`operator-ingest.py`](operator-ingest.py) | Original bash implementation, retained on disk for rollback but no longer installed fresh by `setup.sh` |
 | [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | Roslyn-backed C# structural analysis |
 | [`skills/operator-agents`](skills/operator-agents/SKILL.md) | Starting parallel operator agents and messaging them |
@@ -248,6 +249,32 @@ The `templates/copilot-instructions.md` file establishes conventions for:
 - **Git Worktrees** — all work happens in `<repoRoot>/.worktrees/`; always on, not optional
 
 Copy to `~/.copilot/copilot-instructions.md` and customize for your workflow.
+
+## Backlog
+
+Open work in this repository lives in [`backlog/`](backlog/README.md), under
+version control — one Markdown file per item, with YAML front matter.
+
+```
+backlog list          # one line per item
+backlog check         # validate every item; non-zero on failure
+backlog html --open   # a self-contained page, in a browser
+```
+
+It exists because closed work is answerable from `git log` and open work was
+answerable from nothing: it lived in `next-session.md`, which is read-once and
+deleted at session start, and was carried between sessions as one
+re-summarised sentence. That carry-forward is lossy by construction and
+nothing could detect the loss.
+
+Each item names a spec under `specs/`, or the literal `none`. **Closing an item
+means setting `status`, `closed` and `commit` in the same commit that does the
+work, and updating the linked spec in that commit too** — a close landing
+separately from its fix is a window in which the backlog is wrong.
+
+`tests/test_backlog_conformance.py` enforces the format, the spec mapping, and
+that every closing SHA actually resolves. See
+[`backlog/README.md`](backlog/README.md) for the field reference.
 
 ## MCP Servers
 
