@@ -575,6 +575,49 @@ def record_exit(context: "dict | None", rc: int) -> None:
         return
 
 
+def record_session_exit(operator_home: Path, *, instance: str, session: int,
+                        pid: "int | None", markers: "dict",
+                        consecutive: int, limit: int) -> None:
+    """Record that a supervised copilot session was found gone. Never raises.
+
+    This is the event the trace was built for and the one an invocation log
+    cannot see. When seven loops died together on 2026-08-03 no operator
+    command was run at all -- each supervisor was already inside its poll
+    loop, so there was nothing to attribute. ``operator.log`` said "copilot
+    exited unexpectedly" seven times and could say nothing else, because the
+    supervisor never waits on the child: it polls liveness, and a process that
+    is gone leaves no exit code behind to read.
+
+    So "unexpected" here means only *unexplained* -- no stop, detach or
+    restart marker was set. It is not evidence of a crash, and the distinction
+    matters: the copilot logs for that incident end with an orderly
+    ``[shutdown] Shutdown complete``, and the extensions died with
+    ``0xC000013A`` (``STATUS_CONTROL_C_EXIT``), which is a console control
+    event delivered to every process sharing the console rather than a fault
+    in any one session. What is recorded here is therefore the observation and
+    the marker states it was judged against, so a later reader can re-judge
+    it. Nothing here decides what killed the session.
+    """
+    try:
+        _append(trace_path(Path(operator_home)), {
+            "ts": _utcnow(),
+            "event": "session_exit",
+            "pid": os.getpid(),
+            "instance": str(instance),
+            "session": session,
+            "session_pid": pid,
+            # Tri-state per marker: True set, False absent, None unreadable.
+            # An unreadable marker is why the supervisor waits instead of
+            # relaunching, so flattening it here would hide the reason.
+            "markers": dict(markers),
+            "consecutive": consecutive,
+            "limit": limit,
+            "giving_up": consecutive >= limit,
+        })
+    except Exception:
+        return
+
+
 def _safe_ppid() -> "int | None":
     try:
         return os.getppid()

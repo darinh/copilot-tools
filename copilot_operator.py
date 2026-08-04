@@ -3026,6 +3026,9 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                             crash_failures = 0
                         else:
                             crash_failures += 1
+                            _record_session_exit(instance, session_num,
+                                                 stop_state, detach_state,
+                                                 crash_failures)
                             log(f"Session #{session_num}: copilot exited unexpectedly "
                                 f"({crash_failures}/{MAX_LAUNCH_FAILURES}) — relaunching")
                             if crash_failures >= MAX_LAUNCH_FAILURES:
@@ -3822,6 +3825,42 @@ def show_menu() -> int:
             return rc
 
 
+def _record_session_exit(instance, session_num: int,
+                         stop_state, detach_state, consecutive: int) -> None:
+    """Trace a session found gone, with the evidence the decision was made on.
+
+    The supervisor polls liveness rather than waiting on the child, so it has
+    never had an exit *code* to log -- but the runner writes one to the exit
+    file, and that is the difference between "copilot crashed" and "copilot
+    shut down cleanly and nobody asked us to expect it". Reading it here costs
+    one file read on a path that only runs when a session has already ended.
+    """
+    try:
+        code: "int | None" = None
+        try:
+            raw = instance.exit_file.read_text(encoding="utf-8").strip()
+            code = int(raw) if raw else None
+        except (OSError, ValueError):
+            code = None
+        try:
+            pid = instance.copilot_pid()
+        except Exception:
+            pid = None
+        operator_trace.record_session_exit(
+            OPERATOR_HOME,
+            instance=instance.display_name,
+            session=session_num,
+            pid=pid,
+            markers={"stop": stop_state, "detach": detach_state,
+                     "restart": marker_state(instance.restart_marker),
+                     "exit_code": code},
+            consecutive=consecutive,
+            limit=MAX_LAUNCH_FAILURES,
+        )
+    except Exception:
+        return
+
+
 def show_trace(args: list[str]) -> int:
     """Print the invocation trace: who ran the operator, and how it ended.
 
@@ -3873,11 +3912,17 @@ def show_trace(args: list[str]) -> int:
     if limit:
         invocations = invocations[-limit:]
 
+    session_exits = [r for r in records if r.get("event") == "session_exit"]
+    if limit:
+        session_exits = session_exits[-limit:]
+
     if as_json:
-        print(json.dumps(invocations, indent=2))
+        print(json.dumps(
+            {"invocations": invocations, "session_exits": session_exits},
+            indent=2))
         return 0
 
-    if not invocations:
+    if not invocations and not session_exits:
         # An empty *result* and an empty *trace* are different findings, and
         # printing one sentence for both would hide a filter that matched
         # nothing behind a file that recorded nothing.
@@ -3906,6 +3951,37 @@ def show_trace(args: list[str]) -> int:
         why = source.get("why")
         if why:
             print(f"{'':20} └─ {why}")
+
+    if session_exits:
+        # Printed separately because they are a different kind of fact: not a
+        # command someone ran, but a supervised session found gone. These are
+        # the events a mass die-off consists of, and no operator command is
+        # invoked during one -- which is why an invocation log alone could not
+        # explain the seven simultaneous deaths this trace was written after.
+        print(f"\n═══ Supervised sessions found gone "
+              f"({len(session_exits)} shown) ═══\n")
+        for rec in session_exits:
+            markers = rec.get("markers") or {}
+            code = markers.get("exit_code")
+            # "Exited unexpectedly" only ever meant unexplained. A recorded
+            # exit code of 0 is a clean shutdown nobody asked us to expect,
+            # and reading it as a crash is how five of them end a loop.
+            if code is None:
+                verdict = "no exit code recorded"
+            elif code == 0:
+                verdict = "clean exit (rc=0), unexplained by any marker"
+            else:
+                verdict = f"rc={code}"
+            gave_up = " GIVING UP" if rec.get("giving_up") else ""
+            print(f"{rec.get('ts', '?'):20} {str(rec.get('instance', '?')):18} "
+                  f"#{rec.get('session', '?'):<5} "
+                  f"{rec.get('consecutive', '?')}/{rec.get('limit', '?')}"
+                  f"{gave_up}")
+            print(f"{'':20} └─ {verdict}; "
+                  f"copilot pid={rec.get('session_pid')}, markers "
+                  f"stop={markers.get('stop')} detach={markers.get('detach')} "
+                  f"restart={markers.get('restart')}")
+
     print(f"\nTrace file: {operator_trace.trace_path(OPERATOR_HOME)}")
     return 0
 

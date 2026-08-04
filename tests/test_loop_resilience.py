@@ -262,3 +262,47 @@ def test_stop_marker_stops_session_and_supervisor(monkeypatch):
     assert calls["kill_session"] == 1
     assert not inst.stop_marker.exists()
     assert not inst.loop_pid_file.exists()
+
+
+def test_an_unexplained_exit_is_traced_with_its_real_exit_code(monkeypatch):
+    """Reproduces the 2026-08-03 die-off: copilot shuts down cleanly, no
+    marker explains it, and the loop counts a crash.
+
+    `operator.log` can only say "exited unexpectedly", which reads as a crash
+    and is why seven loops looked like a machine-wide fault. The runner has
+    written the real code to the exit file all along; the trace now records
+    it, so rc=0 -- an orderly shutdown nobody asked us to expect -- is
+    distinguishable from a session that actually died.
+
+    This is also the event no invocation log can see: not one operator command
+    is run during it.
+    """
+    import json
+
+    import operator_trace
+
+    def clean_exit_no_marker(instance, args, session_num,
+                             remain_on_exit=False, preamble=""):
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    monkeypatch.setattr(op, "start_session", clean_exit_no_marker)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+
+    inst = op.Instance("tracer")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+    assert rc == 1, "five unexplained exits should end the loop"
+
+    lines = operator_trace.trace_path(op.OPERATOR_HOME).read_text(
+        encoding="utf-8").splitlines()
+    exits = [json.loads(x) for x in lines
+             if json.loads(x).get("event") == "session_exit"]
+    assert len(exits) == op.MAX_LAUNCH_FAILURES, (
+        "every unexplained exit should be traced, not just the last")
+    assert [e["consecutive"] for e in exits] == list(
+        range(1, op.MAX_LAUNCH_FAILURES + 1))
+    assert exits[-1]["giving_up"] is True
+    assert exits[0]["giving_up"] is False
+    assert all(e["instance"] == "tracer" for e in exits)
+    assert exits[-1]["markers"]["exit_code"] == 0, (
+        "the exit code the runner recorded is the whole point")
+    assert exits[-1]["markers"]["restart"] is False

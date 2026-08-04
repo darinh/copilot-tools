@@ -399,7 +399,11 @@ def test_trace_json_output_is_parseable(home, capsys):
     capsys.readouterr()
     op.show_trace(["--json"])
     payload = json.loads(capsys.readouterr().out)
-    assert payload and payload[0]["argv"] == ["version"]
+    assert payload["invocations"][0]["argv"] == ["version"]
+    # Present even when empty: a reader that has to guess whether the key is
+    # missing or the list is empty is back to the substitution this file is
+    # about.
+    assert payload["session_exits"] == []
 
 
 def test_trace_is_a_reserved_word_so_it_cannot_be_an_instance_name():
@@ -610,3 +614,87 @@ def test_stem_does_not_depend_on_the_hosts_path_separator(monkeypatch):
                         posixpath.basename)
     assert operator_trace._stem(r"C:\x\copilot.exe") == "copilot"
     assert operator_trace._stem("/usr/local/bin/copilot") == "copilot"
+
+
+# --- Sessions found gone ------------------------------------------------
+#
+# The event the trace was actually built for. When seven loops died together
+# no operator command ran at all, so an invocation log had nothing to show.
+
+
+def test_a_session_exit_records_the_evidence_not_a_verdict(tmp_path):
+    op_home = tmp_path / "home"
+    operator_trace.record_session_exit(
+        op_home, instance="prism", session=51, pid=34732,
+        markers={"stop": False, "detach": False, "restart": False,
+                 "exit_code": 0},
+        consecutive=5, limit=5)
+    rec = json.loads(operator_trace.trace_path(op_home)
+                     .read_text(encoding="utf-8").splitlines()[0])
+    assert rec["event"] == "session_exit"
+    assert rec["instance"] == "prism" and rec["session"] == 51
+    assert rec["session_pid"] == 34732
+    assert rec["markers"]["exit_code"] == 0
+    assert rec["giving_up"] is True
+
+
+def test_an_unreadable_marker_survives_into_the_record(tmp_path):
+    """None is why the supervisor waits instead of relaunching. Flattening it
+    to False here would erase the reason from the only place it is kept."""
+    op_home = tmp_path / "home"
+    operator_trace.record_session_exit(
+        op_home, instance="prism", session=1, pid=None,
+        markers={"stop": None, "detach": False, "restart": False,
+                 "exit_code": None},
+        consecutive=1, limit=5)
+    rec = json.loads(operator_trace.trace_path(op_home)
+                     .read_text(encoding="utf-8").splitlines()[0])
+    assert rec["markers"]["stop"] is None
+    assert rec["markers"]["exit_code"] is None
+    assert rec["session_pid"] is None
+
+
+def test_recording_a_session_exit_never_raises(tmp_path):
+    """This runs inside the supervisor's poll loop. Raising here would take
+    down the thing that keeps unattended sessions alive."""
+    blocked = tmp_path / "file"
+    blocked.write_text("not a directory", encoding="utf-8")
+    operator_trace.record_session_exit(
+        blocked / "nested", instance="x", session=1, pid=1,
+        markers={"stop": False}, consecutive=1, limit=5)
+
+    class _Unserialisable:
+        pass
+
+    operator_trace.record_session_exit(
+        tmp_path / "home2", instance="x", session=1, pid=1,
+        markers={"stop": _Unserialisable()}, consecutive=1, limit=5)
+
+
+def test_a_clean_exit_is_reported_as_clean_not_as_a_crash(home, capsys):
+    """`operator.log` can only say "exited unexpectedly", which reads as a
+    crash. The runner records the real code, and rc=0 means copilot shut down
+    in an orderly way and simply nobody set a marker to say so -- the
+    difference between a machine that is failing and a loop that is ending."""
+    operator_trace.record_session_exit(
+        op.OPERATOR_HOME, instance="prism", session=51, pid=34732,
+        markers={"stop": False, "detach": False, "restart": False,
+                 "exit_code": 0},
+        consecutive=5, limit=5)
+    op.show_trace([])
+    out = capsys.readouterr().out
+    assert "Supervised sessions found gone" in out
+    assert "clean exit (rc=0)" in out
+    assert "GIVING UP" in out
+
+
+def test_session_exits_show_even_when_nothing_was_invoked(home, capsys):
+    """The whole point: a mass die-off invokes no operator command, so a view
+    that only listed invocations would render the incident as an empty file."""
+    operator_trace.record_session_exit(
+        op.OPERATOR_HOME, instance="prism", session=1, pid=2,
+        markers={"stop": False, "exit_code": 1}, consecutive=1, limit=5)
+    op.show_trace([])
+    out = capsys.readouterr().out
+    assert "No operator invocations have been traced yet." not in out
+    assert "prism" in out
