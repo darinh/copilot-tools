@@ -1422,14 +1422,31 @@ def _uncommitted_content(path: Path) -> str | None:
     if untracked is None:
         return None
     names = [n for n in untracked.split("\0") if n and not n.endswith("/")]
-    if names:
+    # ``ls-files -z`` is NUL-delimited precisely because a filename may
+    # contain a newline, but ``hash-object --stdin-paths`` is newline-
+    # delimited and has no NUL equivalent. Feeding it such a name splits it
+    # into two paths that do not exist, so the call fails, the fingerprint
+    # collapses to "unknown", and the breaker is off for the rest of the run
+    # — silently, because "unknown" is indistinguishable from an unreadable
+    # repository. The rare name goes through argv, where no delimiter exists
+    # to be confused, and the common case keeps its single batched call.
+    batched = [n for n in names if "\n" not in n]
+    individually = [n for n in names if "\n" in n]
+    if batched:
         # One batched call: the file count is unbounded, and a process per
         # file would make the probe's cost scale with someone else's mess.
         hashed = _git_output_with_input(
-            ["hash-object", "--stdin-paths"], path, "\n".join(names) + "\n")
+            ["hash-object", "--stdin-paths"], path, "\n".join(batched) + "\n")
         if hashed is None:
             return None
         parts.append(hashed)
+    for name in individually:
+        hashed = _git_output(["hash-object", "--", name], path)
+        if hashed is None:
+            return None
+        # The name is digested alongside its content: two such files swapping
+        # contents would otherwise produce the same unordered set of hashes.
+        parts.append(f"{name}\0{hashed}")
     return "\0".join(parts)
 
 
@@ -1451,6 +1468,10 @@ def workspace_fingerprint(cwd: Path) -> str | None:
     pushes, then deletes its local branch and worktree leaves local state
     exactly as it found it, and only the remote-tracking ref still records
     that the work happened.
+
+    A detached HEAD is covered by each worktree's ``# branch.oid`` line
+    rather than by the refs, because a commit made while detached advances no
+    ref at all.
     """
     refs = _git_output(
         ["for-each-ref", "--format=%(objectname) %(refname)",
@@ -1473,8 +1494,19 @@ def workspace_fingerprint(cwd: Path) -> str | None:
             continue
         if present is None:
             return None
+        # ``--branch`` in the v2 format is what makes a detached HEAD
+        # visible. A commit on a detached checkout advances no ref, so
+        # ``for-each-ref`` above cannot see it and the tree is clean
+        # afterwards — the whole repository would fingerprint identically
+        # across a session that committed real work, and the breaker would
+        # stop a loop that was being productive. ``# branch.oid`` carries the
+        # commit itself. v2 is used rather than a second ``rev-parse`` probe
+        # because it costs no extra process and, unlike ``rev-parse HEAD``,
+        # it still exits 0 in a repository with no commits yet (reporting
+        # ``(initial)``) rather than failing and reading as "unknown".
         status = _git_output(
-            ["status", "--porcelain=v1", "--untracked-files=all"], path)
+            ["status", "--porcelain=v2", "--branch",
+             "--untracked-files=all"], path)
         if status is None:
             # The worktree we cannot read is exactly the one that might hold
             # the change, so no verdict is available for the repository.
@@ -1501,13 +1533,22 @@ def evaluate_progress(count: int | None, before: str | None,
     previous count was unreadable. Reporting known progress as "unknown"
     would leave a corrupt counter file corrupt forever, and a breaker that
     can never be re-armed is one that has silently switched itself off.
+
+    An unreadable count is healed the same way when the session demonstrably
+    changed *nothing*, by restarting the streak at one. The argument is the
+    same one, and leaving it out was a real hole: a stuck agent is exactly
+    the case where no session ever writes the counter, so a file that went
+    corrupt would stay corrupt and the breaker would be off for the rest of
+    the run — precisely when it was needed. Restarting at one can only ever
+    undercount (the streak really is at least this session), so the error it
+    can make is letting the loop run longer, never stopping a healthy one.
     """
     if before is None or after is None:
         return count, "unknown"
     if before != after:
         return 0, "changed"
     if count is None:
-        return None, "unknown"
+        return 1, "unchanged"
     return count + 1, "unchanged"
 
 
@@ -3160,8 +3201,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     else:
         baseline = workspace_fingerprint(workdir)
     if nochange is None:
-        log(f"  Progress breaker: inactive — cannot read "
-            f"{instance.nochange_file}")
+        log(f"  Progress breaker: re-arms from the next measurable session "
+            f"— cannot read {instance.nochange_file}")
     elif adopt:
         log(f"  Progress breaker: re-arms after the adopted session "
             f"(currently {nochange})")

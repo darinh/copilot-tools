@@ -91,14 +91,33 @@ def test_an_unmeasurable_session_leaves_the_counter_untouched(before, after):
     assert op.evaluate_progress(2, before, after) == (2, "unknown")
 
 
-def test_an_unreadable_counter_cannot_be_advanced():
-    """If the count itself is unknown, no verdict can be reached about it --
-    reading it as 0 would silently disarm the breaker, reading it as high
-    would stop a healthy loop."""
-    assert op.evaluate_progress(None, "abc", "abc") == (None, "unknown")
-    # Same call shape with a readable count does move, so the None above is
-    # the count's doing and not an inert function.
+def test_an_unreadable_counter_is_healed_by_a_measured_session():
+    """An unreadable count must not survive a session that *was* measurable.
+
+    The streak restarts at one rather than staying unknown. A stuck agent is
+    exactly the case where no session ever changes anything, so a counter
+    file that went corrupt would never be written again: the breaker would be
+    silently off for the rest of the run, precisely when it was the only
+    thing left to stop the loop.
+
+    Restarting at one can only undercount -- the streak really does include
+    this session -- so the worst it can do is let the loop run a little
+    longer, never stop a healthy one.
+    """
+    assert op.evaluate_progress(None, "abc", "abc") == (1, "unchanged")
+    # A readable count still accumulates rather than being pinned to 1, so
+    # the healing above is the None's doing and not a constant.
     assert op.evaluate_progress(0, "abc", "abc") == (1, "unchanged")
+    assert op.evaluate_progress(4, "abc", "abc") == (5, "unchanged")
+
+
+def test_an_unreadable_counter_stays_unknown_when_nothing_could_be_measured():
+    """Healing needs evidence. With no fingerprint to compare, the session
+    established nothing, so an unreadable count stays unreadable rather than
+    being invented as one."""
+    assert op.evaluate_progress(None, None, "abc") == (None, "unknown")
+    assert op.evaluate_progress(None, "abc", None) == (None, "unknown")
+    assert op.evaluate_progress(None, None, None) == (None, "unknown")
 
 
 def test_known_progress_heals_an_unreadable_counter():
@@ -111,9 +130,9 @@ def test_known_progress_heals_an_unreadable_counter():
     nothing in the log to say so.
     """
     assert op.evaluate_progress(None, "abc", "xyz") == (0, "changed")
-    # Still unknown when the fingerprints agree, so the healing above is the
-    # verdict's doing rather than a blanket "None counts as zero".
-    assert op.evaluate_progress(None, "abc", "abc") == (None, "unknown")
+    # Cleared to zero rather than merely decremented, and distinct from the
+    # unchanged case above, so "changed" is really being told apart.
+    assert op.evaluate_progress(9, "abc", "xyz") == (0, "changed")
 
 
 # ── the fingerprint ─────────────────────────────────────────────
@@ -169,6 +188,79 @@ def test_a_second_edit_to_an_untracked_file_changes_the_fingerprint(tmp_path):
     assert first is not None and second is not None
     assert second != first
     assert _git(repo, "status", "--porcelain=v1").strip() == "?? notes.md"
+
+
+def test_a_commit_on_a_detached_head_changes_the_fingerprint(tmp_path):
+    """A detached HEAD advances no ref, so the refs alone cannot see it.
+
+    `.worktrees/anvil-baseline-main` on this machine is exactly this shape: a
+    checkout parked on a commit rather than a branch. A session that commits
+    there moves no `refs/heads` entry, and the tree is clean again once the
+    commit lands, so a fingerprint built from refs plus uncommitted state
+    would be byte-identical either side of real work -- and three such
+    sessions would stop a loop for being productive. This is the breaker's
+    most expensive failure direction.
+    """
+    repo = make_repo(tmp_path / "repo")
+    _git(repo, "checkout", "--detach", "-q", "HEAD")
+
+    def refs() -> str:
+        return _git(repo, "for-each-ref",
+                    "--format=%(objectname) %(refname)",
+                    "refs/heads", "refs/tags", "refs/stash", "refs/remotes")
+
+    refs_before = refs()
+    before = op.workspace_fingerprint(repo)
+    (repo / "detached.txt").write_text("real work\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "committed while detached")
+    after = op.workspace_fingerprint(repo)
+
+    assert before is not None and after is not None
+    assert after != before, (
+        "a commit made on a detached HEAD is real progress and must move the "
+        "fingerprint")
+    # The trap is real rather than hypothetical: no ref moved, and the tree
+    # is clean again, so everything the fingerprint looked at before this fix
+    # is byte-identical across the commit.
+    assert refs() == refs_before
+    assert _git(repo, "status", "--porcelain=v1").strip() == ""
+
+
+def test_an_untracked_filename_containing_a_newline_stays_measurable(
+        tmp_path):
+    """`ls-files -z` is NUL-delimited because a name may contain a newline.
+
+    `hash-object --stdin-paths` is newline-delimited and has no NUL
+    equivalent, so feeding it such a name splits it into two paths that do
+    not exist. The call fails, the fingerprint collapses to `None`, and every
+    later session reads as "unknown" -- the breaker is off for the rest of
+    the run, silently, because an unreadable repository looks exactly the
+    same. A stray file someone else dropped in the tree must not be able to
+    switch the breaker off.
+    """
+    repo = make_repo(tmp_path / "repo")
+    try:
+        (repo / "od\nd name.txt").write_text("first\n", encoding="utf-8")
+    except OSError:  # pragma: no cover - some filesystems forbid it
+        pytest.skip("this filesystem does not allow newlines in filenames")
+
+    first = op.workspace_fingerprint(repo)
+    assert first is not None, (
+        "a filename with a newline must not make the repository unmeasurable")
+
+    # And it is measured, not merely tolerated: editing its contents has to
+    # move the fingerprint, or the file would be a permanent blind spot that
+    # an agent could work in without the breaker ever noticing.
+    (repo / "od\nd name.txt").write_text("second\n", encoding="utf-8")
+    second = op.workspace_fingerprint(repo)
+    assert second is not None
+    assert second != first
+
+    # Ordinary files alongside it still go through the batched call.
+    (repo / "plain.txt").write_text("x\n", encoding="utf-8")
+    third = op.workspace_fingerprint(repo)
+    assert third is not None and third != second
 
 
 def test_an_ignored_file_does_not_change_the_fingerprint(tmp_path):
@@ -571,7 +663,37 @@ def test_a_workspace_with_no_git_state_leaves_the_loop_unbounded(
     assert "Progress breaker: inactive" in capsys.readouterr().err
 
 
-def test_the_streak_survives_a_supervisor_swap(loop_in_repo, monkeypatch):
+def test_a_corrupt_counter_still_stops_a_stalled_loop(
+        loop_in_repo, monkeypatch, capsys):
+    """The breaker must survive its own state file going bad.
+
+    A stuck agent is the only situation the breaker exists for, and it is
+    also the situation in which no session ever changes anything -- so if an
+    unreadable counter were left unreadable, nothing would ever write to it
+    again and the breaker would be off for exactly the run that needed it.
+    Healing the count from the first measurable session is what closes that.
+    """
+    inst = op.Instance("corrupt-counter")
+    inst.nochange_file.write_text("not a number\n", encoding="utf-8")
+    assert inst.read_nochange_count() is None, "the fixture must start corrupt"
+
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_die(launched))
+
+    # is_fresh=False, or the corrupt file would simply be deleted and the
+    # case under test would never arise.
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert rc == op.EXIT_NO_PROGRESS, (
+        "a corrupt counter must not leave the loop unbounded")
+    assert "Progress breaker tripped" in capsys.readouterr().err
+    assert len(launched) == op.MAX_NOCHANGE_SESSIONS, (
+        "the healed streak starts at this session, so the loop is owed the "
+        "full allowance and no more")
+
+
+def test_the_streak_survives_a_supervisor_swap(loop_in_repo, monkeypatch,
+                                               capsys):
     """The counter is on disk so `operator restart-loop` cannot reset it.
 
     A breaker that lived in the supervisor's memory would forget its count
@@ -589,12 +711,13 @@ def test_the_streak_survives_a_supervisor_swap(loop_in_repo, monkeypatch):
     rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
 
     assert rc == op.EXIT_NO_PROGRESS
+    assert "Progress breaker tripped" in capsys.readouterr().err
     assert launched == [1], (
         "the inherited streak should be one session short of the limit")
 
 
 def test_a_fresh_run_does_not_inherit_a_stalled_streak(
-        loop_in_repo, monkeypatch):
+        loop_in_repo, monkeypatch, capsys):
     """`--fresh` means forget the previous run, counter included."""
     inst = op.Instance("refreshed")
     inst.save_nochange_count(op.MAX_NOCHANGE_SESSIONS - 1)
@@ -605,6 +728,7 @@ def test_a_fresh_run_does_not_inherit_a_stalled_streak(
     rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
 
     assert rc == op.EXIT_NO_PROGRESS
+    assert "Progress breaker tripped" in capsys.readouterr().err
     assert len(launched) == op.MAX_NOCHANGE_SESSIONS, (
         "a fresh run is owed the full allowance, not the one session left "
         "over from the previous run")

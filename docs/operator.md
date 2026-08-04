@@ -233,10 +233,14 @@ idle:
   and `git diff --cached`; untracked files are hashed separately. Ignored
   files are excluded, so regenerated build output and `__pycache__` cannot
   churn the fingerprint and quietly disarm the breaker.
+- **Each worktree's checked-out commit**, because a commit made on a detached
+  HEAD advances no ref at all. Without it, a session that committed real work
+  on a detached checkout would leave every ref and every diff exactly as it
+  found them and be counted as having done nothing.
 
 **Where it cannot measure, it stays off.** If the working directory has no
-readable git state, or the counter file cannot be read, the breaker announces
-itself inactive at startup and never trips:
+readable git state, the breaker announces itself inactive at startup and never
+trips:
 
 ```
   Progress breaker: inactive — no readable git state in /tmp/scratch
@@ -247,10 +251,23 @@ lock held by whoever else is working in the repository, a probe past
 `GIT_PROBE_TIMEOUT` — is neither counted toward stopping nor allowed to clear
 the streak. "Could not tell" is kept distinct from "nothing changed" the whole
 way to the decision, because collapsing the two is what silently switches a
-breaker off forever. A session that *demonstrably* changed something still
-clears the streak even when the previous count was unreadable, which is what
-lets a corrupt counter file be rewritten rather than disabling the breaker for
-the rest of the run.
+breaker off forever.
+
+**An unreadable counter heals itself.** A corrupt or unreadable
+`<id>.nochange` does not disable the breaker: the first session that can
+actually be measured rewrites it, whether that session changed something (the
+streak clears to zero) or changed nothing (the streak restarts at one). Only
+the counter is unknown in that case, never the session, and restarting the
+streak can only undercount — so the worst it does is let the loop run a little
+longer. Leaving it unknown instead would be worse than it sounds: a stalled
+agent is precisely the case where no session ever changes anything, so nothing
+would ever rewrite the file and the breaker would be off for exactly the run
+that needed it.
+
+```
+  Progress breaker: re-arms from the next measurable session — cannot read
+  /home/you/.operator/restart/myproject.nochange
+```
 
 **An adopted session is never judged.** `operator restart-loop` replaces the
 supervisor part-way through a session, and the replacement cannot know what
