@@ -51,6 +51,7 @@ def _git(cwd, *args) -> str:
         ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test",
          *args],
         cwd=str(cwd), capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
     )
     assert proc.returncode == 0, f"git {args} failed: {proc.stderr}"
     return proc.stdout
@@ -301,3 +302,191 @@ def test_cleanup_removes_the_counter():
     inst.save_nochange_count(3)
     inst.cleanup_files()
     assert inst.read_nochange_count() == 0
+
+
+# ── the loop ────────────────────────────────────────────────────
+# Everything above tests the parts. These drive `run_loop_mode` itself,
+# because the counting, the fingerprinting and the persistence can all be
+# correct while the block that wires them into the loop is not.
+@pytest.fixture
+def loop_in_repo(tmp_path, monkeypatch):
+    """A supervisor whose working directory is a real repository.
+
+    `run_loop_mode` reads `Path.cwd()` once, at startup, so the chdir has to
+    happen before it is called.
+    """
+    repo = make_repo(tmp_path / "project")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+    monkeypatch.setattr(op, "stop_session_gracefully", lambda instance: None)
+    return repo
+
+
+def _sessions_that_die(sessions: list[int], on_start=None):
+    """A `start_session` double that records each launch and dies at once."""
+    def start(instance, args, session_num, remain_on_exit=False, preamble=""):
+        sessions.append(session_num)
+        if on_start is not None:
+            on_start(session_num)
+        instance.exit_file.write_text("0", encoding="utf-8")
+    return start
+
+
+def _age_past_healthy(monkeypatch):
+    """Make every session look like it stayed up past the healthy threshold.
+
+    That resets `crash_failures` on each death, so MAX_LAUNCH_FAILURES can
+    never be reached and the breaker is the only thing that can end the loop.
+    Without this, a test that needs more than MAX_LAUNCH_FAILURES sessions is
+    stopped by the crash counter and never reaches the behaviour it is about.
+    """
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(op.time, "time", lambda: clock["t"])
+    really_running = op.is_copilot_running
+
+    def aged(instance):
+        clock["t"] += op.HEALTHY_SESSION_SECONDS + 1
+        return really_running(instance)
+
+    monkeypatch.setattr(op, "is_copilot_running", aged)
+
+
+def test_the_loop_stops_after_three_sessions_that_change_nothing(
+        loop_in_repo, monkeypatch, capsys):
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_die(launched))
+
+    inst = op.Instance("stalled")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == op.EXIT_NO_PROGRESS
+    assert launched == [1, 2, 3], (
+        "the breaker must stop the loop instead of starting a fourth session")
+    # The exit code alone would be satisfied by any path that returns 3; the
+    # reason has to be the one claimed.
+    assert "Progress breaker tripped" in capsys.readouterr().err
+
+
+def test_a_session_that_changes_the_repository_clears_the_streak(
+        loop_in_repo, monkeypatch):
+    """Two idle sessions either side of a productive one are not a stall.
+
+    Without the reset the loop would stop at the third session regardless of
+    what the second one achieved.
+    """
+    _age_past_healthy(monkeypatch)
+    launched: list[int] = []
+
+    def work_on_the_third(session_num):
+        if session_num == 3:
+            (loop_in_repo / f"session{session_num}.txt").write_text(
+                "work\n", encoding="utf-8")
+
+    monkeypatch.setattr(op, "start_session",
+                        _sessions_that_die(launched, work_on_the_third))
+
+    inst = op.Instance("productive")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == op.EXIT_NO_PROGRESS
+    assert launched == [1, 2, 3, 4, 5, 6], (
+        "session 3 changed the repository, so the streak must restart there "
+        "and the loop must survive three more sessions")
+
+
+def test_the_breaker_bounds_the_healthy_uptime_path(
+        loop_in_repo, monkeypatch, capsys):
+    """The regression this breaker exists for.
+
+    A session that stays up past HEALTHY_SESSION_SECONDS and then dies resets
+    `crash_failures`, so MAX_LAUNCH_FAILURES can never be reached and the
+    relaunching is unbounded -- see `test_loop_resilience.py::
+    test_a_session_that_ran_for_minutes_does_not_count_toward_the_give_up_
+    limit`, which asserts exactly that and has to raise KeyboardInterrupt to
+    terminate. This machine's operator.log shows the real thing: fifteen
+    sessions in seventy-eight minutes, each up for minutes, none of them
+    changing anything.
+
+    Nothing in the crash counter can stop that. The breaker is the only bound
+    on it, so it has to hold with the counter being reset underneath it.
+    """
+    _age_past_healthy(monkeypatch)
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_die(launched))
+
+    inst = op.Instance("healthy-but-idle")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == op.EXIT_NO_PROGRESS
+    assert len(launched) == op.MAX_NOCHANGE_SESSIONS
+    err = capsys.readouterr().err
+    assert "Progress breaker tripped" in err
+    # The crash counter really was being reset, so the stop cannot be
+    # credited to it: this is the negative control for the claim above.
+    assert "not a crash loop, resetting the exit count" in err
+
+
+def test_a_workspace_with_no_git_state_leaves_the_loop_unbounded(
+        tmp_path, monkeypatch, capsys):
+    """The breaker is off where it cannot measure, and says so.
+
+    This is the isolation `test_loop_resilience.py` depends on. If it ever
+    stopped holding, every counter test in that file would silently start
+    measuring the breaker instead.
+    """
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    monkeypatch.chdir(plain)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+    monkeypatch.setattr(op, "stop_session_gracefully", lambda instance: None)
+
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_die(launched))
+
+    inst = op.Instance("unmeasurable")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc != op.EXIT_NO_PROGRESS, "nothing was measurable to stop on"
+    assert len(launched) == op.MAX_LAUNCH_FAILURES, (
+        "the crash counter, not the breaker, must be what ends this loop")
+    assert "Progress breaker: inactive" in capsys.readouterr().err
+
+
+def test_the_streak_survives_a_supervisor_swap(loop_in_repo, monkeypatch):
+    """The counter is on disk so `operator restart-loop` cannot reset it.
+
+    A breaker that lived in the supervisor's memory would forget its count
+    every time the supervisor was replaced, and a loop that is restarted
+    more often than MAX_NOCHANGE_SESSIONS could never trip it.
+    """
+    inst = op.Instance("swapped")
+    inst.save_nochange_count(op.MAX_NOCHANGE_SESSIONS - 1)
+
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_die(launched))
+
+    # is_fresh=False: a replacement supervisor continues the run rather than
+    # starting one, which is the case the on-disk counter exists for.
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert rc == op.EXIT_NO_PROGRESS
+    assert launched == [1], (
+        "the inherited streak should be one session short of the limit")
+
+
+def test_a_fresh_run_does_not_inherit_a_stalled_streak(
+        loop_in_repo, monkeypatch):
+    """`--fresh` means forget the previous run, counter included."""
+    inst = op.Instance("refreshed")
+    inst.save_nochange_count(op.MAX_NOCHANGE_SESSIONS - 1)
+
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_die(launched))
+
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == op.EXIT_NO_PROGRESS
+    assert len(launched) == op.MAX_NOCHANGE_SESSIONS, (
+        "a fresh run is owed the full allowance, not the one session left "
+        "over from the previous run")
+
