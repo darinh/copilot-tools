@@ -1,6 +1,8 @@
 """Loop-mode resilience: a launch failure must not kill an unattended loop."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 import copilot_operator as op
@@ -20,6 +22,19 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(op, "POLL_INTERVAL", 0)
     monkeypatch.setattr(op, "LAUNCH_BACKOFF_BASE", 0)
     monkeypatch.setattr(op, "RESTART_PAUSE_SECONDS", 0)
+    # Every test in this file is about the launch/exit counters, and every one
+    # of them relaunches a session that changes nothing. Run from a directory
+    # with no git state so the progress breaker is inactive and cannot stop a
+    # loop before the counter under test reaches its cap. The assertion is the
+    # point: without it, a breaker that started firing here would silently
+    # shorten these runs and every assertion about the counters would then be
+    # measuring the breaker instead.
+    workdir = tmp_path / "not-a-repo"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    assert op.workspace_fingerprint(workdir) is None, (
+        "these tests require the progress breaker to be inactive; "
+        f"{workdir} unexpectedly has readable git state")
     return tmp_path
 
 
@@ -215,6 +230,11 @@ def test_a_session_that_ran_for_minutes_does_not_count_toward_the_give_up_limit(
     only genuinely rapid failures can still exhaust it. The negative control is
     `test_repeated_unexpected_exits_eventually_give_up`, whose sessions die
     instantly and must still give up at the cap.
+
+    What is left unbounded here is bounded elsewhere: this fixture runs with
+    the progress breaker inactive, and in a real project it is the breaker
+    that stops a loop relaunching healthy-but-idle sessions forever. See
+    `test_circuit_breaker.py::test_the_breaker_bounds_the_healthy_uptime_path`.
     """
     clock = {"t": 1_000.0}
     monkeypatch.setattr(op.time, "time", lambda: clock["t"])

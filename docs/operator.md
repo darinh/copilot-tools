@@ -186,6 +186,115 @@ operator --loop --name myproject --agent=anvil:anvil --model=claude-opus-4.6-1m
 
 Ctrl+C (from an attached pane) captures final metrics and shows an aggregate run summary.
 
+### The progress circuit breaker
+
+The crash counter above bounds a *hot* relaunch spin — sessions that die
+immediately. It cannot bound the opposite failure, and that one is more
+expensive: a session that comes up, stays healthy for minutes, achieves
+nothing, and exits. Every one of those *resets* the crash counter, because
+staying up past `HEALTHY_SESSION_SECONDS` is what "not a crash loop" means. So
+the relaunching is unbounded. This machine's `operator.log` has the real thing
+recorded: fifteen sessions in seventy-eight minutes, each up for minutes, none
+of them changing anything.
+
+The progress breaker is the bound. After each session ends, the supervisor
+fingerprints the repository. Three consecutive sessions that change nothing
+stop the loop:
+
+```
+Session #3: changed nothing in /path/to/project (3/3)
+Progress breaker tripped: 3 consecutive sessions changed nothing.
+Stopping instead of starting session #4.
+  Resume with: operator --loop --name myproject
+```
+
+The supervisor exits **3** (`EXIT_NO_PROGRESS`) — distinct from a crash-loop
+give-up, so a wrapper can tell "the agent had nothing to do" from "the agent
+kept dying". Resuming is a plain `operator --loop --name NAME`; the counter is
+cleared when the breaker trips, so a resumed loop gets the full allowance
+again.
+
+**What counts as a change** is every local ref (`refs/heads`, `refs/tags`,
+`refs/stash`) and every remote-tracking ref (`refs/remotes`), plus the
+uncommitted state of *every* worktree attached to the repository, not just the
+directory the supervisor was started in. That scope is deliberate, and each
+piece of it is there because leaving it out reports a productive session as
+idle:
+
+- **Every worktree**, because work here happens on branches in linked
+  worktrees under `.worktrees/`, so a session can commit an entire feature
+  without the primary checkout's `HEAD` or `git status` moving at all.
+- **`refs/remotes`**, because a session that commits, pushes, and then deletes
+  its local branch and worktree leaves local state exactly as it found it.
+  Only the remote-tracking ref still records that the work happened.
+- **File contents, not just paths.** `git status` names what changed and never
+  what is in it, so an agent iterating on one uncommitted file emits an
+  identical ` M app.py` every session. Tracked bytes are covered by `git diff`
+  and `git diff --cached`; untracked files are hashed separately. Ignored
+  files are excluded, so regenerated build output and `__pycache__` cannot
+  churn the fingerprint and quietly disarm the breaker.
+- **Each worktree's checked-out commit**, because a commit made on a detached
+  HEAD advances no ref at all. Without it, a session that committed real work
+  on a detached checkout would leave every ref and every diff exactly as it
+  found them and be counted as having done nothing.
+
+**Where it cannot measure, it stays off.** If the working directory has no
+readable git state, the breaker announces itself inactive at startup and never
+trips:
+
+```
+  Progress breaker: inactive — no readable git state in /tmp/scratch
+```
+
+A session whose before/after comparison comes back unknown — git missing, a
+lock held by whoever else is working in the repository, a probe past
+`GIT_PROBE_TIMEOUT` — is neither counted toward stopping nor allowed to clear
+the streak. "Could not tell" is kept distinct from "nothing changed" the whole
+way to the decision, because collapsing the two is what silently switches a
+breaker off forever.
+
+**An unreadable counter heals itself.** A corrupt or unreadable
+`<id>.nochange` does not disable the breaker: the first session that can
+actually be measured rewrites it, whether that session changed something (the
+streak clears to zero) or changed nothing (the streak restarts at one). Only
+the counter is unknown in that case, never the session, and restarting the
+streak can only undercount — so the worst it does is let the loop run a little
+longer. Leaving it unknown instead would be worse than it sounds: a stalled
+agent is precisely the case where no session ever changes anything, so nothing
+would ever rewrite the file and the breaker would be off for exactly the run
+that needed it.
+
+```
+  Progress breaker: re-arms from the next measurable session — cannot read
+  /home/you/.operator/restart/myproject.nochange
+```
+
+**An adopted session is never judged.** `operator restart-loop` replaces the
+supervisor part-way through a session, and the replacement cannot know what
+the repository looked like when that session started. Measuring its end
+against a baseline taken at adoption would read work it had already finished
+as no work at all, so the adopted session is skipped and the breaker re-arms
+from its end state:
+
+```
+  Progress breaker: re-arms after the adopted session (currently 2)
+```
+
+The count lives on disk (`~/.operator/restart/<id>.nochange`) rather than in
+the supervisor's memory, so `operator restart-loop` cannot launder a stall: a
+breaker that forgot its count every time the supervisor was replaced would
+never trip on a loop that is restarted often. `--fresh` does clear it —
+forgetting the previous run is what `--fresh` means — and it clears it whether
+or not the file could actually be deleted. If the counter cannot be *written*,
+the supervisor warns and carries on; losing the count costs the breaker its
+memory across a swap, while raising would cost an unattended loop its
+supervisor.
+
+The breaker is implemented in the Python supervisor, which is what the
+`operator` console script runs. The bash rollback path (`./operator.sh --loop`)
+has no equivalent and relaunches healthy-but-idle sessions without bound; if
+you are running that one deliberately, it is still on you to notice a stall.
+
 ### Loop vs. session: stopping just one
 
 Loop mode has two independent lifecycles: the background supervisor and the
@@ -677,6 +786,7 @@ logs.
 | `~/.operator/restart/<id>.pid` | PID of the launched Copilot process, while running |
 | `~/.operator/restart/<id>.session` | Copilot CLI session UUID |
 | `~/.operator/restart/<id>.exit` | Exit code, written after metrics capture |
+| `~/.operator/restart/<id>.nochange` | Consecutive sessions that changed nothing, for [the progress circuit breaker](#the-progress-circuit-breaker). On disk so a supervisor swap cannot reset it |
 | `~/.operator/restart/<id>.launch.json` | Launch spec for the session |
 | `~/.operator/restart/<id>.runner.log` | Supervisor log for the instance |
 | `~/.operator/tabs.json` | Tracked terminal tabs, used by `operator restore` |
