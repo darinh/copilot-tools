@@ -186,6 +186,69 @@ operator --loop --name myproject --agent=anvil:anvil --model=claude-opus-4.6-1m
 
 Ctrl+C (from an attached pane) captures final metrics and shows an aggregate run summary.
 
+### The progress circuit breaker
+
+The crash counter above bounds a *hot* relaunch spin — sessions that die
+immediately. It cannot bound the opposite failure, and that one is more
+expensive: a session that comes up, stays healthy for minutes, achieves
+nothing, and exits. Every one of those *resets* the crash counter, because
+staying up past `HEALTHY_SESSION_SECONDS` is what "not a crash loop" means. So
+the relaunching is unbounded. This machine's `operator.log` has the real thing
+recorded: fifteen sessions in seventy-eight minutes, each up for minutes, none
+of them changing anything.
+
+The progress breaker is the bound. After each session ends, the supervisor
+fingerprints the repository. Three consecutive sessions that change nothing
+stop the loop:
+
+```
+Session #3: changed nothing in /path/to/project (3/3)
+Progress breaker tripped: 3 consecutive sessions changed nothing.
+Stopping instead of starting session #4.
+  Resume with: operator --loop --name myproject
+```
+
+The supervisor exits **3** (`EXIT_NO_PROGRESS`) — distinct from a crash-loop
+give-up, so a wrapper can tell "the agent had nothing to do" from "the agent
+kept dying". Resuming is a plain `operator --loop --name NAME`; the counter is
+cleared when the breaker trips, so a resumed loop gets the full allowance
+again.
+
+**What counts as a change** is every local ref (`refs/heads`, `refs/tags`,
+`refs/stash`) plus the uncommitted state of *every* worktree attached to the
+repository, not just the directory the supervisor was started in. That scope is
+deliberate. Work here happens on branches in linked worktrees under
+`.worktrees/`, so a session can commit an entire feature without the primary
+checkout's `HEAD` or `git status` moving at all — fingerprinting only the
+current directory would file a productive session as idle and eventually stop a
+loop that was working perfectly.
+
+**Where it cannot measure, it stays off.** If the working directory has no
+readable git state, or the counter file cannot be read, the breaker announces
+itself inactive at startup and never trips:
+
+```
+  Progress breaker: inactive — no readable git state in /tmp/scratch
+```
+
+A session whose before/after comparison comes back unknown — git missing, a
+lock held by whoever else is working in the repository, a probe past
+`GIT_PROBE_TIMEOUT` — is neither counted toward stopping nor allowed to clear
+the streak. "Could not tell" is kept distinct from "nothing changed" the whole
+way to the decision, because collapsing the two is what silently switches a
+breaker off forever.
+
+The count lives on disk (`~/.operator/restart/<id>.nochange`) rather than in
+the supervisor's memory, so `operator restart-loop` cannot launder a stall: a
+breaker that forgot its count every time the supervisor was replaced would
+never trip on a loop that is restarted often. `--fresh` does clear it —
+forgetting the previous run is what `--fresh` means.
+
+The breaker is implemented in the Python supervisor, which is what the
+`operator` console script runs. The bash rollback path (`./operator.sh --loop`)
+has no equivalent and relaunches healthy-but-idle sessions without bound; if
+you are running that one deliberately, it is still on you to notice a stall.
+
 ### Loop vs. session: stopping just one
 
 Loop mode has two independent lifecycles: the background supervisor and the
@@ -677,6 +740,7 @@ logs.
 | `~/.operator/restart/<id>.pid` | PID of the launched Copilot process, while running |
 | `~/.operator/restart/<id>.session` | Copilot CLI session UUID |
 | `~/.operator/restart/<id>.exit` | Exit code, written after metrics capture |
+| `~/.operator/restart/<id>.nochange` | Consecutive sessions that changed nothing, for [the progress circuit breaker](#the-progress-circuit-breaker). On disk so a supervisor swap cannot reset it |
 | `~/.operator/restart/<id>.launch.json` | Launch spec for the session |
 | `~/.operator/restart/<id>.runner.log` | Supervisor log for the instance |
 | `~/.operator/tabs.json` | Tracked terminal tabs, used by `operator restore` |
