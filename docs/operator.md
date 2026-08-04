@@ -215,13 +215,24 @@ cleared when the breaker trips, so a resumed loop gets the full allowance
 again.
 
 **What counts as a change** is every local ref (`refs/heads`, `refs/tags`,
-`refs/stash`) plus the uncommitted state of *every* worktree attached to the
-repository, not just the directory the supervisor was started in. That scope is
-deliberate. Work here happens on branches in linked worktrees under
-`.worktrees/`, so a session can commit an entire feature without the primary
-checkout's `HEAD` or `git status` moving at all — fingerprinting only the
-current directory would file a productive session as idle and eventually stop a
-loop that was working perfectly.
+`refs/stash`) and every remote-tracking ref (`refs/remotes`), plus the
+uncommitted state of *every* worktree attached to the repository, not just the
+directory the supervisor was started in. That scope is deliberate, and each
+piece of it is there because leaving it out reports a productive session as
+idle:
+
+- **Every worktree**, because work here happens on branches in linked
+  worktrees under `.worktrees/`, so a session can commit an entire feature
+  without the primary checkout's `HEAD` or `git status` moving at all.
+- **`refs/remotes`**, because a session that commits, pushes, and then deletes
+  its local branch and worktree leaves local state exactly as it found it.
+  Only the remote-tracking ref still records that the work happened.
+- **File contents, not just paths.** `git status` names what changed and never
+  what is in it, so an agent iterating on one uncommitted file emits an
+  identical ` M app.py` every session. Tracked bytes are covered by `git diff`
+  and `git diff --cached`; untracked files are hashed separately. Ignored
+  files are excluded, so regenerated build output and `__pycache__` cannot
+  churn the fingerprint and quietly disarm the breaker.
 
 **Where it cannot measure, it stays off.** If the working directory has no
 readable git state, or the counter file cannot be read, the breaker announces
@@ -236,13 +247,31 @@ lock held by whoever else is working in the repository, a probe past
 `GIT_PROBE_TIMEOUT` — is neither counted toward stopping nor allowed to clear
 the streak. "Could not tell" is kept distinct from "nothing changed" the whole
 way to the decision, because collapsing the two is what silently switches a
-breaker off forever.
+breaker off forever. A session that *demonstrably* changed something still
+clears the streak even when the previous count was unreadable, which is what
+lets a corrupt counter file be rewritten rather than disabling the breaker for
+the rest of the run.
+
+**An adopted session is never judged.** `operator restart-loop` replaces the
+supervisor part-way through a session, and the replacement cannot know what
+the repository looked like when that session started. Measuring its end
+against a baseline taken at adoption would read work it had already finished
+as no work at all, so the adopted session is skipped and the breaker re-arms
+from its end state:
+
+```
+  Progress breaker: re-arms after the adopted session (currently 2)
+```
 
 The count lives on disk (`~/.operator/restart/<id>.nochange`) rather than in
 the supervisor's memory, so `operator restart-loop` cannot launder a stall: a
 breaker that forgot its count every time the supervisor was replaced would
 never trip on a loop that is restarted often. `--fresh` does clear it —
-forgetting the previous run is what `--fresh` means.
+forgetting the previous run is what `--fresh` means — and it clears it whether
+or not the file could actually be deleted. If the counter cannot be *written*,
+the supervisor warns and carries on; losing the count costs the breaker its
+memory across a swap, while raising would cost an unattended loop its
+supervisor.
 
 The breaker is implemented in the Python supervisor, which is what the
 `operator` console script runs. The bash rollback path (`./operator.sh --loop`)
