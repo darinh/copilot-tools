@@ -378,10 +378,17 @@ def test_a_filter_matching_nothing_is_not_reported_as_an_empty_trace(
 
     A filter that matched nothing and a file that recorded nothing are
     different findings, and a reader told the wrong one stops looking.
+
+    The filter is a kind that no classifier can produce. Filtering on a real
+    kind -- this asked for `external` -- makes the test depend on how the
+    machine running it happens to classify pytest: green here, where the
+    suite runs under a copilot session and classifies as `agent`, and red on
+    every CI leg, where it has no copilot ancestor and is `external`, so the
+    filter matched the very record it was meant to miss.
     """
     op.main(["version"])
     capsys.readouterr()
-    op.show_trace(["--kind", "external"])
+    op.show_trace(["--kind", "no-such-kind"])
     out = capsys.readouterr().out
     assert "No operator invocations have been traced yet" not in out
     assert "No invocation matched" in out
