@@ -48,6 +48,7 @@ if _HERE not in sys.path:
 
 import operator_ingest                                       # noqa: E402
 import operator_mail                                         # noqa: E402
+import operator_trace                                        # noqa: E402
 from install_manifest import (                                # noqa: E402
     dir_present,
     file_present,
@@ -76,7 +77,8 @@ SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
 RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
                   "version", "forget", "logs", "tabs", "restore",
-                  "stop-loop", "stop-session", "restart-loop", "menu"}
+                  "stop-loop", "stop-session", "restart-loop", "menu",
+                  "trace"}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
@@ -3024,6 +3026,9 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                             crash_failures = 0
                         else:
                             crash_failures += 1
+                            _record_session_exit(instance, session_num,
+                                                 stop_state, detach_state,
+                                                 crash_failures)
                             log(f"Session #{session_num}: copilot exited unexpectedly "
                                 f"({crash_failures}/{MAX_LAUNCH_FAILURES}) — relaunching")
                             if crash_failures >= MAX_LAUNCH_FAILURES:
@@ -3101,6 +3106,7 @@ USAGE
     operator report [type]                                     View usage reports
     operator ingest [--force]                                  Process copilot logs
     operator logs [--prune] [--days N]                         Inspect/prune copilot logs
+    operator trace [-n N] [--kind K] [--json] [--all]          Who invoked the operator, and how it ended
     operator tabs [list|remove NAME|clear]                     Manage tracked terminal tabs
     operator restore [NAME...|--all] [--dry-run]               Reopen tracked tabs after a crash
     operator help                                              Show this help
@@ -3819,9 +3825,198 @@ def show_menu() -> int:
             return rc
 
 
+def _record_session_exit(instance, session_num: int,
+                         stop_state, detach_state, consecutive: int) -> None:
+    """Trace a session found gone, with the evidence the decision was made on.
+
+    The supervisor polls liveness rather than waiting on the child, so it has
+    never had an exit *code* to log -- but the runner writes one to the exit
+    file, and that is the difference between "copilot crashed" and "copilot
+    shut down cleanly and nobody asked us to expect it". Reading it here costs
+    one file read on a path that only runs when a session has already ended.
+    """
+    try:
+        code: "int | None" = None
+        try:
+            raw = instance.exit_file.read_text(encoding="utf-8").strip()
+            code = int(raw) if raw else None
+        except (OSError, ValueError):
+            code = None
+        try:
+            pid = instance.copilot_pid()
+        except Exception:
+            pid = None
+        operator_trace.record_session_exit(
+            OPERATOR_HOME,
+            instance=instance.display_name,
+            session=session_num,
+            pid=pid,
+            markers={"stop": stop_state, "detach": detach_state,
+                     "restart": marker_state(instance.restart_marker),
+                     "exit_code": code},
+            consecutive=consecutive,
+            limit=MAX_LAUNCH_FAILURES,
+        )
+    except Exception:
+        return
+
+
+def show_trace(args: list[str]) -> int:
+    """Print the invocation trace: who ran the operator, and how it ended.
+
+    The trace answers the question ``operator.log`` cannot: a line there says
+    a session was relaunched, but not whether a person asked for it, an agent
+    did, or something outside the toolkit did.
+    """
+    limit = 25
+    kind = None
+    as_json = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-n", "--limit"):
+            if i + 1 >= len(args):
+                die("--limit requires a value")
+            try:
+                limit = int(args[i + 1])
+            except ValueError:
+                die(f"--limit wants a number, got {args[i + 1]!r}")
+            i += 1
+        elif arg == "--kind":
+            if i + 1 >= len(args):
+                die("--kind requires a value")
+            kind = args[i + 1]
+            i += 1
+        elif arg == "--json":
+            as_json = True
+        elif arg in ("--all",):
+            limit = 0
+        else:
+            die(f"unknown option for `operator trace`: {arg}")
+        i += 1
+
+    records = operator_trace.read_records(OPERATOR_HOME, limit=0, kind=None)
+    if records is None:
+        # Not the same as an empty trace, and saying "no invocations" here
+        # would be the exact substitution this trace exists to catch.
+        print(f"Error: could not read the trace at "
+              f"{operator_trace.trace_path(OPERATOR_HOME)}", file=sys.stderr)
+        return 1
+
+    exits = {r.get("trace_id"): r for r in records if r.get("event") == "exit"}
+    all_invocations = [r for r in records if r.get("event") == "invoke"]
+    invocations = [
+        r for r in all_invocations
+        if not kind or (r.get("source") or {}).get("kind") == kind
+    ]
+    if limit:
+        invocations = invocations[-limit:]
+
+    session_exits = [r for r in records if r.get("event") == "session_exit"]
+    if limit:
+        session_exits = session_exits[-limit:]
+
+    if as_json:
+        print(json.dumps(
+            {"invocations": invocations, "session_exits": session_exits},
+            indent=2))
+        return 0
+
+    if not invocations and not session_exits:
+        # An empty *result* and an empty *trace* are different findings, and
+        # printing one sentence for both would hide a filter that matched
+        # nothing behind a file that recorded nothing.
+        if all_invocations:
+            kinds = sorted({(r.get("source") or {}).get("kind") or "?"
+                            for r in all_invocations})
+            print(f"No invocation matched --kind {kind}. "
+                  f"{len(all_invocations)} traced so far; "
+                  f"kinds present: {', '.join(kinds)}.")
+        else:
+            print("No operator invocations have been traced yet.")
+        print(f"  Trace file: {operator_trace.trace_path(OPERATOR_HOME)}")
+        return 0
+
+    print(f"═══ Operator invocations ({len(invocations)} shown) ═══\n")
+    for rec in invocations:
+        source = rec.get("source") or {}
+        done = exits.get(rec.get("trace_id"))
+        if done is None:
+            outcome = "running/unknown"
+        else:
+            outcome = f"rc={done.get('rc')} {done.get('ms')}ms"
+        argv = " ".join(rec.get("argv") or []) or "(no arguments)"
+        print(f"{rec.get('ts', '?'):20} {str(source.get('kind', '?')):11} "
+              f"{argv[:60]:60} {outcome}")
+        why = source.get("why")
+        if why:
+            print(f"{'':20} └─ {why}")
+
+    if session_exits:
+        # Printed separately because they are a different kind of fact: not a
+        # command someone ran, but a supervised session found gone. These are
+        # the events a mass die-off consists of, and no operator command is
+        # invoked during one -- which is why an invocation log alone could not
+        # explain the seven simultaneous deaths this trace was written after.
+        print(f"\n═══ Supervised sessions found gone "
+              f"({len(session_exits)} shown) ═══\n")
+        for rec in session_exits:
+            markers = rec.get("markers") or {}
+            code = markers.get("exit_code")
+            # "Exited unexpectedly" only ever meant unexplained. A recorded
+            # exit code of 0 is a clean shutdown nobody asked us to expect,
+            # and reading it as a crash is how five of them end a loop.
+            if code is None:
+                verdict = "no exit code recorded"
+            elif code == 0:
+                verdict = "clean exit (rc=0), unexplained by any marker"
+            else:
+                verdict = f"rc={code}"
+            gave_up = " GIVING UP" if rec.get("giving_up") else ""
+            print(f"{rec.get('ts', '?'):20} {str(rec.get('instance', '?')):18} "
+                  f"#{rec.get('session', '?'):<5} "
+                  f"{rec.get('consecutive', '?')}/{rec.get('limit', '?')}"
+                  f"{gave_up}")
+            print(f"{'':20} └─ {verdict}; "
+                  f"copilot pid={rec.get('session_pid')}, markers "
+                  f"stop={markers.get('stop')} detach={markers.get('detach')} "
+                  f"restart={markers.get('restart')}")
+
+    print(f"\nTrace file: {operator_trace.trace_path(OPERATOR_HOME)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Entry point: trace the invocation, then dispatch it.
+
+    The trace brackets the entire command so a record shows both what was
+    asked and how it ended. Most error paths in this file leave through
+    ``die()``, which is a ``SystemExit``, and a crash leaves through an
+    exception -- ``operator.log`` renders those two identically today, and
+    they are not the same thing at all.
+    """
     enable_utf8_output()
     args = list(sys.argv[1:] if argv is None else argv)
+    traced = operator_trace.record_invocation(OPERATOR_HOME, args)
+    try:
+        rc = _dispatch_command(args)
+    except SystemExit as exc:
+        code = exc.code
+        operator_trace.record_exit(
+            traced,
+            code if isinstance(code, int) else (0 if code is None else 1))
+        raise
+    except BaseException:
+        # -1 is not a code this program can return, which is exactly why it is
+        # used: it marks a command that left through an exception rather than
+        # through a decision, and keeps the two distinguishable in the trace.
+        operator_trace.record_exit(traced, -1)
+        raise
+    operator_trace.record_exit(traced, rc)
+    return rc
+
+
+def _dispatch_command(args: list[str]) -> int:
     migrate_legacy_state()
 
     if not args:
@@ -3861,6 +4056,8 @@ def main(argv: list[str] | None = None) -> int:
         return show_inbox(args[1:])
     if head == "logs":
         return manage_logs(args[1:])
+    if head == "trace":
+        return show_trace(args[1:])
     if head == "tabs":
         return manage_tabs(args[1:])
     if head == "restore":
