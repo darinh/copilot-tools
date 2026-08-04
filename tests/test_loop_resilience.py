@@ -200,6 +200,58 @@ def test_repeated_unexpected_exits_eventually_give_up(monkeypatch):
     assert attempts["n"] == op.MAX_LAUNCH_FAILURES
 
 
+def test_a_session_that_ran_for_minutes_does_not_count_toward_the_give_up_limit(
+        monkeypatch):
+    """Five deaths hours apart must not retire a loop the way five in a minute do.
+
+    The consecutive-exit limit is there to stop a hot relaunch spin, but it
+    counted exits and never their spacing. This machine's operator.log shows
+    what that costs: on four separate occasions every instance died within
+    seconds of every other, independent of when each was launched, each having
+    run for minutes. Five such waves and every supervisor retired itself, so
+    the user came back to nothing running.
+
+    A session that stayed up past the healthy threshold restarts the count, so
+    only genuinely rapid failures can still exhaust it. The negative control is
+    `test_repeated_unexpected_exits_eventually_give_up`, whose sessions die
+    instantly and must still give up at the cap.
+    """
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(op.time, "time", lambda: clock["t"])
+
+    attempts = {"n": 0}
+    keep_going = op.MAX_LAUNCH_FAILURES * 3
+
+    def dies(instance, args, session_num, remain_on_exit=False, preamble=""):
+        attempts["n"] += 1
+        if attempts["n"] > keep_going:
+            # Unbounded by construction now, so the test must end it.
+            raise KeyboardInterrupt
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    really_running = op.is_copilot_running
+
+    def aged(instance):
+        # Age the session past the healthy threshold before its death is
+        # noticed, which is the only way the supervisor can tell a session
+        # that ran from one that never started.
+        clock["t"] += op.HEALTHY_SESSION_SECONDS + 1
+        return really_running(instance)
+
+    monkeypatch.setattr(op, "start_session", dies)
+    monkeypatch.setattr(op, "is_copilot_running", aged)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+    monkeypatch.setattr(op, "stop_session_gracefully", lambda instance: None)
+
+    inst = op.Instance("long-lived")
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert attempts["n"] > op.MAX_LAUNCH_FAILURES, (
+        "the supervisor gave up at the cap even though every session had been "
+        "up for longer than HEALTHY_SESSION_SECONDS before it died")
+    assert attempts["n"] == keep_going + 1
+
+
 def test_detach_marker_leaves_session_running(monkeypatch):
     """`operator stop-loop NAME` (a touched detach marker) must stop the
     supervisor without touching the session or calling stop_session_gracefully."""
@@ -262,3 +314,47 @@ def test_stop_marker_stops_session_and_supervisor(monkeypatch):
     assert calls["kill_session"] == 1
     assert not inst.stop_marker.exists()
     assert not inst.loop_pid_file.exists()
+
+
+def test_an_unexplained_exit_is_traced_with_its_real_exit_code(monkeypatch):
+    """Reproduces the 2026-08-03 die-off: copilot shuts down cleanly, no
+    marker explains it, and the loop counts a crash.
+
+    `operator.log` can only say "exited unexpectedly", which reads as a crash
+    and is why seven loops looked like a machine-wide fault. The runner has
+    written the real code to the exit file all along; the trace now records
+    it, so rc=0 -- an orderly shutdown nobody asked us to expect -- is
+    distinguishable from a session that actually died.
+
+    This is also the event no invocation log can see: not one operator command
+    is run during it.
+    """
+    import json
+
+    import operator_trace
+
+    def clean_exit_no_marker(instance, args, session_num,
+                             remain_on_exit=False, preamble=""):
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    monkeypatch.setattr(op, "start_session", clean_exit_no_marker)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+
+    inst = op.Instance("tracer")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+    assert rc == 1, "five unexplained exits should end the loop"
+
+    lines = operator_trace.trace_path(op.OPERATOR_HOME).read_text(
+        encoding="utf-8").splitlines()
+    exits = [json.loads(x) for x in lines
+             if json.loads(x).get("event") == "session_exit"]
+    assert len(exits) == op.MAX_LAUNCH_FAILURES, (
+        "every unexplained exit should be traced, not just the last")
+    assert [e["consecutive"] for e in exits] == list(
+        range(1, op.MAX_LAUNCH_FAILURES + 1))
+    assert exits[-1]["giving_up"] is True
+    assert exits[0]["giving_up"] is False
+    assert all(e["instance"] == "tracer" for e in exits)
+    assert exits[-1]["markers"]["exit_code"] == 0, (
+        "the exit code the runner recorded is the whole point")
+    assert exits[-1]["markers"]["restart"] is False

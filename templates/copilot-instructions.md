@@ -269,6 +269,16 @@ When the user greets you (e.g., "hey", "hello", "hi"), **immediately**:
 1. **Check for unmerged work**: Run `git branch --no-merged main` (the ref matters — with no argument git compares against HEAD, which tells you nothing). If any feature branches have unmerged commits, tell the user: *"Found unmerged work on branch X (N commits). Want to continue that, merge it, or start fresh?"*
 2. **Read handoff**: Check if `~/.copilot/projects/{guid}/next-session.md` exists. If it does:
    - Read it and use it as your starting context.
+   - **Check who wrote it.** The file names its author: *"Written by operator
+     instance: `name`"*. The mailbox is per-**project** but the restart signal
+     is per-**instance**, so on a shared checkout the handoff you are holding
+     may well be a *peer's*, not your own previous session's. A handoff is
+     written in the first person — "my worktree", "I claimed this", "check
+     `operator inbox x`" — and every one of those is wrong when read by the
+     wrong agent, `operator inbox` destructively so, because reading consumes.
+     If the author is not you, treat the branch claims and mailbox
+     instructions as that peer's, not yours. An older handoff names no author;
+     then you cannot tell, and should not assume.
    - Tell the user what was left in progress and what you're picking up.
    - Delete the file after reading it (it's a one-time handoff, not permanent docs).
 3. **Log the session**: Insert a row into the `session_log` table in the session database (see Session History below).
@@ -325,27 +335,46 @@ touch ~/.operator/restart/{instance-name}
 ### Superseded handoffs
 
 `handoff` does not silently replace an unread handoff. If `next-session.md` is
-still sitting there when a new one is written — which, given the protocol says
-the reader deletes it, *means* nobody consumed it — the old file is copied to
+still sitting there when a new one is written, the old file is copied to
 `~/.copilot/projects/{guid}/superseded/` first, and only then is the new one
 published. Both survive.
 
-One case is not covered, and it matters because the symptom is silent: when two
-handoffs race for the same project and the tool cannot take its lock, it
-publishes anyway rather than discard the live session, and one of the two can
-end up only in `superseded/`. Nothing about `next-session.md` shows this
-afterwards.
+**An occupied `next-session.md` does not mean the handoff went unread.** It
+means nobody has consumed *that* one yet, and there are two ways to get there.
+The mailbox is keyed by **project**; the restart marker is keyed by
+**instance**. So on a checkout worked by more than one agent, every instance
+publishes to the same file and restarts on its own signal — and the ordinary
+case is not a missed read at all, it is a peer publishing while you worked.
+Measured on this toolkit's own repository: ten handoffs accumulated in one
+project's `superseded/` in a single day, written by at least three distinct
+instances. A session that found that pile read it as ten dropped contexts,
+which fits the evidence perfectly and is the wrong explanation. The `handoff`
+command now names the author in the file and says in its warning which of the
+two happened, so neither end has to guess.
+
+Two handoffs can still race for the same project: if the tool cannot take its
+lock it publishes anyway rather than discard the live session, so one of the
+two can end up only in `superseded/`. That used to be silent. It is not any
+more — a handoff written without the lock says so in its own first paragraph,
+and the copy banked beside it says that it may never have reached
+`next-session.md` at all. The notice travels with the bytes, so it reaches the
+session that has to act on it rather than only the one that caused it.
 
 That makes it a rule at both ends of a session:
 
 - **Starting**: if `~/.copilot/projects/{guid}/superseded/` is non-empty, read
   what is in there alongside `next-session.md` before deciding what you are
-  picking up. The handoff file alone cannot tell you whether it is the newest
-  one.
-- **Ending**: if `handoff` printed a warning — that another handoff was in
-  progress, or that it could not bank a spare copy — say so in your final
-  message. That warning goes to stderr and dies with your session; you are the
-  only one who will ever see it.
+  picking up. A banked copy that says it may never have reached
+  `next-session.md` is a handoff that may be *newer* than the one you are
+  holding; anything else in there is an unread predecessor, and is older.
+  Read the author stamps too: a pile written by several instances is peers
+  sharing one mailbox, which is a different situation from your own handoffs
+  going unread, and calls for a different response.
+- **Ending**: if `handoff` printed a warning — that it could not take the
+  handoff lock, or that it could not bank a spare copy — say so in your final
+  message. The first case is now recorded in the files themselves as well; the
+  second is not, because the failure *was* that no file could be written, and
+  that warning goes to stderr and dies with your session.
 
 **Nothing ever prunes `superseded/`. That is a promise, not an oversight.** A
 reaper living inside a fix for an unwanted delete is the same bug wearing the

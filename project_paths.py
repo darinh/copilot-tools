@@ -10,11 +10,14 @@ unregistered project and mints a duplicate GUID.
 """
 from __future__ import annotations
 
+import csv
+import os
 import platform
 import subprocess
 from pathlib import Path
 
-__all__ = ["primary_repo_root", "guid_is_usable", "projects_root", "project_dir"]
+__all__ = ["primary_repo_root", "guid_is_usable", "projects_root",
+           "project_dir", "resolved_str", "catalog_rows"]
 
 # A background supervisor with no console of its own would otherwise flash a
 # real console window for each of these calls on Windows.
@@ -45,6 +48,18 @@ def primary_repo_root(start=None) -> Path:
     prevent. So the probe is guarded and an unexaminable path still gets the
     git call, which either answers or fails on its own terms. See
     :func:`install_manifest.path_present` for the full polarity argument.
+
+    The encoding is named rather than inherited. ``text=True`` alone decodes
+    with the locale's preferred encoding -- cp1252 on Windows -- and git emits
+    paths as UTF-8 bytes, so a repository whose path contains a character
+    whose UTF-8 encoding includes an undefined cp1252 byte (measured: 0x81,
+    from U+0401) killed subprocess's reader thread with UnicodeDecodeError.
+    The process still exited 0, so the ``returncode`` guard below let it
+    through, and ``proc.stdout`` was None: the failure arrived as an
+    AttributeError from the loop, i.e. "the agent does not know what project
+    it is in" spelled as a crash. ``errors="replace"`` cannot raise, and the
+    explicit None check keeps a read that failed from reading as a repository
+    with no worktrees.
     """
     base = Path(start) if start is not None else Path.cwd()
     try:
@@ -55,12 +70,13 @@ def primary_repo_root(start=None) -> Path:
     try:
         proc = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            cwd=str(base), capture_output=True, text=True, timeout=10,
+            cwd=str(base), capture_output=True,
+            encoding="utf-8", errors="replace", timeout=10,
             **_POPEN_KWARGS,
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return base
-    if proc.returncode != 0:
+    if proc.returncode != 0 or proc.stdout is None:
         return base
     for line in proc.stdout.splitlines():
         if line.startswith("worktree "):
@@ -79,6 +95,35 @@ _WINDOWS_RESERVED = {
 # `mkdir` -- and an embedded NUL raises ValueError, which is not an OSError and
 # so slips straight through the usual guards.
 _UNSAFE_GUID_CHARS = frozenset('<>:"|?*') | frozenset(chr(c) for c in range(32))
+
+
+def resolved_str(path) -> str:
+    """``str`` of ``path`` resolved, falling back to a lexical absolute path.
+
+    ``Path.resolve`` is not total, and it fails three ways rather than one. A
+    symlink loop raises ``RuntimeError`` on every interpreter this project
+    supports; a component that cannot be traversed raises ``OSError``; an
+    embedded NUL raises ``ValueError`` from deep inside ``stat``. Only the
+    middle one is an ``OSError``, so a guard written for filesystem trouble
+    catches a third of the problem and the other two leave as tracebacks.
+
+    This lives here rather than in one caller for the reason
+    :func:`guid_is_usable` does. ``handoff_tool`` resolves a project root to
+    write the handoff, ``copilot_operator`` resolves the same root to find it
+    again, and ``operator_ingest`` resolves a log path -- and the version that
+    had the guard was the one nobody else imported, so both of the others
+    re-derived it and one of them re-derived it wrong. A rule that lives in
+    one module is that module's history.
+
+    The fallback does not follow links, so it can only be *less* resolved than
+    the real answer, never differently resolved. Any comparison that puts both
+    sides through this same function therefore matches a path that will not
+    resolve literally or not at all; it cannot come to name something else.
+    """
+    try:
+        return str(Path(path).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return os.path.abspath(str(path))
 
 
 def projects_root() -> Path:
@@ -103,6 +148,42 @@ def project_dir(guid: str) -> Path:
     against a retyped literal.
     """
     return projects_root() / guid
+
+
+def catalog_rows(fh):
+    """Yield one parsed row per line, or ``None`` for a line that will not parse.
+
+    This lives here for the same reason :func:`guid_is_usable` does: both the
+    writer (``handoff_tool``) and the reader (``copilot_operator``) read this
+    file, and two definitions of "what the catalog says" that drift apart is
+    the defect, not the inconvenience.
+
+    ``csv.reader`` given the file object aborts the *whole* iteration on the
+    first line it refuses, and before Python 3.11 an embedded NUL is exactly
+    such a line -- ``_csv.Error: line contains NUL``. Two things follow, and
+    both are wrong for a hand-edited file. The error escapes a caller whose
+    entire job is to answer "registered or not", and every row *after* the bad
+    one is never compared, so one mistyped character silently unregisters
+    every project below it.
+
+    Parsing each line on its own keeps the damage the size of the mistake: a
+    line that will not parse costs that line and nothing else. ``None`` says
+    "this row could not be read", which is not the same as a row that read
+    cleanly and did not match -- the caller counts it as undecided rather than
+    as evidence of absence.
+
+    The cost is that a quoted field containing a newline is no longer joined
+    across lines. The catalog is one entry per line by construction -- the
+    format the instructions template documents, and nothing in this repository
+    rewrites the file -- and a project path containing a newline cannot
+    round-trip through it whichever reader is used, so nothing that works
+    today stops working.
+    """
+    for line in fh:
+        try:
+            yield next(csv.reader([line]), None)
+        except csv.Error:
+            yield None
 
 
 def guid_is_usable(guid: str) -> bool:

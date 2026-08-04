@@ -402,7 +402,8 @@ def test_ps_quote_round_trips_through_the_real_powershell_parser(monkeypatch):
     env = {**os.environ,
            "OPERATOR_PS_INPUT": op._relaunch_command(argv, op._ps_quote)}
     proc = subprocess.run([_PS, "-NoProfile", "-NonInteractive", "-Command", _PS_PARSE],
-                          capture_output=True, text=True, timeout=120, env=env)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=120, env=env)
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout) == ["operator", *argv]
 
@@ -429,7 +430,8 @@ def test_relaunch_command_delivers_arguments_to_a_native_process(tmp_path):
     script = (f"& {op._ps_quote(sys.executable)} {op._ps_quote(str(dump))} "
               + inner[len("operator "):])
     proc = subprocess.run([_PS, "-NoProfile", "-NonInteractive", "-Command", script],
-                          capture_output=True, text=True, timeout=120)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=120)
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout) == argv
 
@@ -474,7 +476,8 @@ def _wsl_works() -> bool:
         return False
     try:
         proc = subprocess.run([exe, "--", "bash", "-lic", "echo ok"],
-                              capture_output=True, text=True, timeout=60)
+                              capture_output=True, encoding="utf-8",
+                              errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return proc.returncode == 0 and "ok" in proc.stdout

@@ -31,8 +31,12 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
 
 
 def run(args: list[str], env: dict, cwd: str) -> subprocess.CompletedProcess:
+    # Encoding named, not inherited: `text=True` decodes with the locale, and
+    # a byte outside it kills the reader thread and leaves `.stdout` None on
+    # an exit-0 process. Every `check()` below reads `.stdout`/`.stderr`.
     return subprocess.run([sys.executable, OP, *args], env=env, cwd=cwd,
-                          capture_output=True, text=True, timeout=120)
+                          capture_output=True,
+                          encoding="utf-8", errors="replace", timeout=120)
 
 
 def stub_copilot(bindir: Path) -> None:
@@ -114,6 +118,10 @@ def main() -> int:
         check("pane has a pid", old_pane_pid is not None, str(old_pane_pid))
 
         args_file = restart_dir / f"{NAME}.loopargs.json"
+        # probe-ok: both probes are the check itself — this harness reports to
+        # a human watching it, so a wrong False fails the check loudly and a
+        # raise ends the run with a traceback in front of the same person.
+        # Neither failure mode is silent, which is all this needs.
         check("loop args recorded", args_file.exists(),
               args_file.read_text(encoding="utf-8") if args_file.exists() else "")
 
@@ -161,7 +169,12 @@ def pid_alive(pid: int | None) -> bool:
         return False
     if os.name == "nt":
         out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                             capture_output=True, text=True)
+                             capture_output=True,
+                             encoding="utf-8", errors="replace")
+        # A read that failed must not read as "the process is gone": that
+        # answer makes the caller stop waiting and start cleaning up.
+        if out.stdout is None:
+            return True
         return str(pid) in out.stdout
     try:
         os.kill(pid, 0)

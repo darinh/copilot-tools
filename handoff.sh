@@ -21,6 +21,39 @@ RESTART_DIR="${COPILOT_OPERATOR_HOME:-${HOME}/.operator}/restart"
 # ── Helpers ─────────────────────────────────────────────────────
 die() { echo "Error: $*" >&2; exit 1; }
 
+# ── Set membership, without associative arrays ──────────────────
+#
+# `/bin/bash` on macOS is 3.2 and always will be — Apple froze it at the last
+# GPLv2 release — and 3.2 has no associative arrays at all. `local -A x` there
+# is not a subtly different array, it is `declare: -A: invalid option`, and
+# under the `set -e` above that ends the run. `resolve_instance` had one, and
+# it is reached on every `handoff` invoked without `--instance`.
+#
+# What made it survive is the shape of the call site: the abort happened
+# inside `$(resolve_instance ...)`, so it arrived as a non-zero status and
+# `die "Cannot infer instance. Use --instance NAME"` — the same message a
+# genuine no-match produces. On macOS the inference had never once worked, and
+# it said so in the words of a feature declining to guess.
+#
+# Membership is now an exact scan of an indexed array, which is the one kind
+# of array bash 3.2 does have. See `in_list` in operator.sh for why the
+# cheaper encoding — join the names and ask whether the string contains one —
+# is wrong: these names come from marker filenames, and a filename may contain
+# a newline.
+#
+# Usage: in_list "$needle" ${arr[@]+"${arr[@]}"}
+in_list() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        # `"$needle"` is quoted, so a name containing `*` or `?` is compared
+        # literally instead of being used as a pattern against its neighbours.
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
 resolve_guid() {
     local project_root="$1"
     [[ -f "$CATALOG" ]] || die "Catalog not found: $CATALOG"
@@ -56,19 +89,19 @@ resolve_instance() {
     normalized=$(cd "$project_root" 2>/dev/null && pwd) || return 1
 
     # Collect operator-managed session names from markers
-    local -A managed_sessions
+    local managed_sessions=()
     for f in "${RESTART_DIR}"/*.state "${RESTART_DIR}"/*.managed; do
         [[ -e "$f" ]] || continue
         local base
         base=$(basename "$f")
         base="${base%.state}"
         base="${base%.managed}"
-        managed_sessions["$base"]=1
+        managed_sessions+=("$base")
     done
 
     local matches=()
     while IFS= read -r session_name; do
-        if [[ -n "${managed_sessions[$session_name]+x}" ]]; then
+        if in_list "$session_name" ${managed_sessions[@]+"${managed_sessions[@]}"}; then
             # Check if tmux session's cwd matches our project root
             local session_cwd
             session_cwd=$(tmux display-message -t "$session_name" -p '#{pane_current_path}' 2>/dev/null || echo "")
@@ -83,7 +116,7 @@ resolve_instance() {
         return 0
     elif (( ${#matches[@]} > 1 )); then
         echo "Multiple operator instances found for this project:" >&2
-        for m in "${matches[@]}"; do
+        for m in ${matches[@]+"${matches[@]}"}; do
             echo "  $m" >&2
         done
         echo "Specify one with --instance NAME" >&2

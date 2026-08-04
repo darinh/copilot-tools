@@ -51,6 +51,12 @@ find_python() {
 # Setup installs what is missing rather than handing the user a homework
 # list, so a machine without a usable Python gets one here.
 install_python() {
+    # `sudo_cmd` is empty whenever setup runs as root, which is the ordinary
+    # case in a container image — and expanding an empty array as
+    # `"${a[@]}"` under the `set -u` above is an unbound-variable abort on
+    # every bash before 4.4, macOS's 3.2 included. Guarded uniformly rather
+    # than case by case: which arrays are reachable while empty is a fact
+    # about today's callers, not a property of the array.
     local sudo_cmd=()
     if [[ "$(id -u)" -ne 0 ]] && command -v sudo &>/dev/null; then
         sudo_cmd=(sudo)
@@ -58,16 +64,16 @@ install_python() {
     if command -v brew &>/dev/null; then
         brew install python@3.12 || brew install python3 || return 1
     elif command -v apt-get &>/dev/null; then
-        "${sudo_cmd[@]}" apt-get update || true
-        DEBIAN_FRONTEND=noninteractive "${sudo_cmd[@]}" apt-get install -y python3 python3-pip python3-venv || return 1
+        ${sudo_cmd[@]+"${sudo_cmd[@]}"} apt-get update || true
+        DEBIAN_FRONTEND=noninteractive ${sudo_cmd[@]+"${sudo_cmd[@]}"} apt-get install -y python3 python3-pip python3-venv || return 1
     elif command -v dnf &>/dev/null; then
-        "${sudo_cmd[@]}" dnf install -y python3 python3-pip || return 1
+        ${sudo_cmd[@]+"${sudo_cmd[@]}"} dnf install -y python3 python3-pip || return 1
     elif command -v pacman &>/dev/null; then
-        "${sudo_cmd[@]}" pacman -S --noconfirm python python-pip || return 1
+        ${sudo_cmd[@]+"${sudo_cmd[@]}"} pacman -S --noconfirm python python-pip || return 1
     elif command -v zypper &>/dev/null; then
-        "${sudo_cmd[@]}" zypper install -y python3 python3-pip || return 1
+        ${sudo_cmd[@]+"${sudo_cmd[@]}"} zypper install -y python3 python3-pip || return 1
     elif command -v apk &>/dev/null; then
-        "${sudo_cmd[@]}" apk add python3 py3-pip || return 1
+        ${sudo_cmd[@]+"${sudo_cmd[@]}"} apk add python3 py3-pip || return 1
     else
         return 1
     fi
@@ -88,6 +94,41 @@ fi
 info "Using $PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
 echo ""
 
+# ── Query-only modes: report, never migrate ─────────────────────
+# --status, --check-only and --help ask setup_tools.py a question; they
+# install nothing. Everything below this point is an install: it moves the
+# user's ~/.local/bin/{operator,handoff} aside and only puts them back on
+# evidence that an install happened. Running that machinery for a question
+# is not merely noisy, it is destructive -- a --status on a machine whose
+# report exits non-zero was relabelled "Python setup failed" and rolled
+# back, and a --status on a machine that already had `operator` elsewhere on
+# PATH DELETED ~/.local/bin/operator outright while reporting a successful
+# migration.
+#
+# So the question is answered without touching anything, and setup_tools.py's
+# exit code is forwarded verbatim: --status returns 1 for a machine that is
+# merely out of date or has inert extensions, and that is a report, not a
+# failure of setup -- which could not fix it in any case, since this toolkit
+# never writes the CLI settings file that governs it.
+QUERY_ONLY=0
+# `$#` is checked first because bash 3.2 -- still the system bash on macOS --
+# treats "$@" as unset under `set -u` when there are no positional parameters.
+if (( $# > 0 )); then
+    for arg in "$@"; do
+        case "$arg" in
+            --status|--check-only|--help|-h) QUERY_ONLY=1 ;;
+        esac
+    done
+fi
+
+if (( QUERY_ONLY )); then
+    set +e
+    "$PYTHON_BIN" "${SCRIPT_DIR}/setup_tools.py" "$@"
+    status=$?
+    set -e
+    exit "$status"
+fi
+
 canon() { "$PYTHON_BIN" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || true; }
 
 # ── Step 2: Set aside anything currently at ~/.local/bin/{operator,handoff} ──
@@ -105,18 +146,16 @@ canon() { "$PYTHON_BIN" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))
 # Either way the original is renamed (never deleted outright), so a failed
 # or interrupted Python install below can never strand the user without a
 # working `operator`/`handoff` command: see restore_legacy_links() and the
-# INT/TERM trap right after this step.
+# INT/TERM trap, both of which are set up before the first rename happens.
 echo "Checking ~/.local/bin/{operator,handoff} before installing..."
 mkdir -p "$LOCAL_BIN"
 OPERATOR_BACKUP=""; OPERATOR_KIND=""
 HANDOFF_BACKUP=""; HANDOFF_KIND=""
 
 stash_legacy_link() {
-    # Sets STASH_RESULT to the backup path and STASH_KIND to "legacy" or
-    # "foreign" if something was set aside, or both to "" if there was
-    # nothing at $link to begin with.
-    STASH_RESULT=""
-    STASH_KIND=""
+    # Records the backup path and kind into OPERATOR_BACKUP/OPERATOR_KIND or
+    # HANDOFF_BACKUP/HANDOFF_KIND, or leaves them empty if there was nothing
+    # at $link to begin with.
     local name="$1" script="$2" link="${LOCAL_BIN}/${1}"
 
     if [[ -L "$link" && ! -e "$link" ]]; then
@@ -152,40 +191,60 @@ stash_legacy_link() {
         while [[ -e "${backup}.${n}" || -L "${backup}.${n}" ]]; do n=$((n+1)); done
         backup="${backup}.${n}"
     fi
+    # Published BEFORE the rename, not after it. Publishing after leaves a
+    # window -- small, but reachable -- where the file has moved and nothing
+    # records where it went, so a signal there fires a correctly-armed trap
+    # that restores nothing and the user's only copy is orphaned under a name
+    # they have no reason to look for. Publishing first inverts the failure:
+    # the rollback can now be armed a moment too EARLY instead of a moment too
+    # late, and restore_legacy_links checks that the backup actually exists,
+    # which is what makes too-early harmless. There is no third option in
+    # bash; an assignment and a rename cannot be made one operation.
+    if [[ "$name" == "operator" ]]; then
+        OPERATOR_BACKUP="$backup"; OPERATOR_KIND="$kind"
+    else
+        HANDOFF_BACKUP="$backup"; HANDOFF_KIND="$kind"
+    fi
     mv "$link" "$backup"
     if [[ "$kind" == "legacy" ]]; then
         info "Set aside legacy symlink ${link} -> ${target} (finalized after install succeeds)"
     else
         warn "${link} doesn't point at this checkout's ${script} — moved existing '${name}' aside to ${backup} so it won't be silently overwritten (not auto-deleted)"
     fi
-    STASH_RESULT="$backup"
-    STASH_KIND="$kind"
 }
-
-stash_legacy_link operator operator.sh
-OPERATOR_BACKUP="$STASH_RESULT"; OPERATOR_KIND="$STASH_KIND"
-stash_legacy_link handoff handoff.sh
-HANDOFF_BACKUP="$STASH_RESULT"; HANDOFF_KIND="$STASH_KIND"
-if [[ -z "$OPERATOR_BACKUP" && -z "$HANDOFF_BACKUP" ]]; then
-    info "Nothing at ~/.local/bin/{operator,handoff} yet"
-fi
-echo ""
 
 restore_legacy_links() {
     local reason="$1"
-    if [[ -n "$OPERATOR_BACKUP" ]]; then
+    # Guarded on the backup existing, not merely on the variable being set.
+    # The path is published before the rename that creates it (see above), so
+    # this can be reached with a name recorded but nothing yet moved -- in
+    # which case the original is still exactly where the user left it and the
+    # right thing to do is nothing. -L as well as -e: a symlink whose target
+    # is gone still has to be moved back.
+    if [[ -n "$OPERATOR_BACKUP" && ( -e "$OPERATOR_BACKUP" || -L "$OPERATOR_BACKUP" ) ]]; then
         mv "$OPERATOR_BACKUP" "${LOCAL_BIN}/operator"
         warn "Restored ${LOCAL_BIN}/operator ($reason)"
     fi
-    if [[ -n "$HANDOFF_BACKUP" ]]; then
+    if [[ -n "$HANDOFF_BACKUP" && ( -e "$HANDOFF_BACKUP" || -L "$HANDOFF_BACKUP" ) ]]; then
         mv "$HANDOFF_BACKUP" "${LOCAL_BIN}/handoff"
         warn "Restored ${LOCAL_BIN}/handoff ($reason)"
     fi
 }
 
-# A Ctrl-C (or kill) between the stash above and the commit/rollback below
-# must not leave the user with neither the old command nor the new one.
+# Armed BEFORE the first stash, not after both of them. A Ctrl-C (or kill)
+# between the stash below and the commit/rollback further down must not leave
+# the user with neither the old command nor the new one -- and the interval
+# that matters starts at the first `mv`, not once both have returned. Arming
+# it here is safe because both backup variables are empty until a stash fills
+# one in, and restore_legacy_links does nothing with an empty one.
 trap 'restore_legacy_links "setup interrupted"; exit 130' INT TERM
+
+stash_legacy_link operator operator.sh
+stash_legacy_link handoff handoff.sh
+if [[ -z "$OPERATOR_BACKUP" && -z "$HANDOFF_BACKUP" ]]; then
+    info "Nothing at ~/.local/bin/{operator,handoff} yet"
+fi
+echo ""
 
 # ── Step 3: Hand off to the cross-platform Python installer ────
 # Installs the operator/handoff/operator-ingest console scripts, runtime
@@ -209,9 +268,29 @@ for name in operator handoff; do
     command -v "$name" &>/dev/null || { err "'${name}' does not resolve on PATH after setup."; (( missing++ )) || true; }
 done
 
+# `command -v` answers "does SOME `operator` resolve on PATH?", which is a
+# narrower question than the one the finalization below turns on: "did this
+# install put one where the original was set aside?". A user who already has
+# an `operator` further along PATH answers the first question yes while
+# ~/.local/bin/operator does not exist at all -- and the legacy branch of the
+# finalization deletes the backup on that answer, destroying the only
+# remaining copy while reporting a successful migration.
+#
+# So the stashed paths are checked directly. -e alone is not enough: a
+# symlink whose target is gone is not -e, and it is still something that has
+# to be treated as installed rather than silently overwritten.
+for name in operator handoff; do
+    if [[ "$name" == "operator" ]]; then backup="$OPERATOR_BACKUP"; else backup="$HANDOFF_BACKUP"; fi
+    [[ -n "$backup" ]] || continue
+    if [[ ! -e "${LOCAL_BIN}/${name}" && ! -L "${LOCAL_BIN}/${name}" ]]; then
+        err "'${name}' was set aside but setup installed nothing at ${LOCAL_BIN}/${name}."
+        (( missing++ )) || true
+    fi
+done
+
 if (( missing > 0 )); then
-    restore_legacy_links "new install isn't resolvable on PATH yet"
-    err "Fix PATH (see warnings above from setup_tools.py) and re-run ./setup.sh."
+    restore_legacy_links "the new install isn't in place yet"
+    err "Fix the problem reported above, then re-run ./setup.sh."
     exit 1
 fi
 

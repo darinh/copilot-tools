@@ -6,6 +6,7 @@ import stat
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,129 @@ def test_render_includes_supplied_optional_sections():
     out = ho.render("s", "wip", "n", "ctx", "prompt text")
     for heading in ("## In Progress", "## Context", "## Prompt"):
         assert heading in out
+
+
+def test_render_places_a_notice_under_the_title_and_above_the_status():
+    """Position is the whole of its usefulness.
+
+    Above the title it would stop the file being a handoff document to
+    anything keying on the header; below `## Status` a reader meets the
+    content before the caveat that qualifies it.
+    """
+    out = ho.render("s", "", "n", "", "", notice="> NOTE")
+    assert out.index("# Session Handoff") < out.index("> NOTE") < out.index("## Status")
+
+
+def test_render_without_a_notice_is_byte_identical_to_before():
+    """No notice must mean no trace of one -- not even a blank line."""
+    assert ho.render("s", "wip", "n", "ctx", "p", notice="") == \
+        ho.render("s", "wip", "n", "ctx", "p")
+    assert ho.render("s", "", "n", "", "") == \
+        "# Session Handoff\n\n## Status\ns\n\n## Next Steps\nn\n"
+
+
+# ── authorship ──────────────────────────────────────────────────
+def test_render_stamps_the_authoring_instance_above_the_status():
+    """A first-person document has to say whose person it is.
+
+    Everything under `## Status` is written as "my worktree", "I claimed
+    this" -- so the reader must meet the author before the content, exactly
+    as with a notice.
+    """
+    out = ho.render("s", "", "n", "", "", instance="peer-1")
+    assert "peer-1" in out
+    assert out.index("# Session Handoff") < out.index("peer-1") < out.index("## Status")
+
+
+def test_render_puts_the_stamp_below_the_notice():
+    """Both sit in the same band, and the order is not arbitrary.
+
+    The notice can change what the reader *does next* (go read
+    `superseded/`); the stamp qualifies every word that follows. The
+    actionable one goes first.
+    """
+    out = ho.render("s", "", "n", "", "", notice="> NOTE", instance="peer-1")
+    assert out.index("> NOTE") < out.index("peer-1") < out.index("## Status")
+
+
+def test_render_without_an_instance_is_byte_identical_to_before():
+    """The stamp is opt-in, and an absent one leaves no trace.
+
+    Paired with the notice control above for the same reason: a stamp
+    rendered as an empty string would put a stray blank line into every
+    handoff written by a caller that does not know the parameter exists.
+
+    The prefix is asserted absent as well as the two renderings being equal.
+    Equality alone is unfalsifiable for this property -- a stamp emitted
+    unconditionally appears on *both* sides and the comparison still holds,
+    which mutation testing demonstrated.
+    """
+    assert ho.render("s", "wip", "n", "ctx", "p", instance="") == \
+        ho.render("s", "wip", "n", "ctx", "p")
+    assert ho.AUTHOR_PREFIX not in ho.render("s", "wip", "n", "ctx", "p")
+
+
+def test_a_name_wrapped_in_backticks_survives_containing_them():
+    """`--instance` is free text, and `str.strip` is greedy.
+
+    A name that begins or ends with a backtick -- or with a space -- must not
+    come back short: every consumer of the stamp compares it to a live
+    instance name, so a silently truncated one attributes the handoff to an
+    agent that does not exist, while looking exactly like a successful read.
+
+    Two independent reviewers found this on the first draft, which used a
+    blanket `strip("`")`. It is delimiter removal, not normalisation.
+    """
+    for name in ("`x", "x`", "`x`", "``", " padded ", "\ttabbed"):
+        assert ho.authoring_instance(
+            ho.render("s", "", "n", "", "", instance=name)) == name
+
+
+def test_authoring_instance_reads_back_what_render_wrote():
+    """Round-trip, including the instance name that broke `operator send`.
+
+    A live instance on this box is literally named `a,b`. Any stamp format
+    that cannot survive a comma is a format that silently drops the one
+    agent hardest to attribute.
+    """
+    for name in ("x", "copilot-tools", "a,b", "agent 7"):
+        assert ho.authoring_instance(
+            ho.render("s", "", "n", "", "", instance=name)) == name
+
+
+def test_authoring_instance_says_nothing_for_an_unstamped_handoff():
+    """Every handoff written before this change is unattributed.
+
+    `None` is "does not say", and must not be confused with a name -- the
+    caller's warning offers both causes on exactly this input.
+    """
+    assert ho.authoring_instance(
+        "# Session Handoff\n\n## Status\nolder than the stamp\n") is None
+    assert ho.authoring_instance("") is None
+
+
+def test_a_stamp_in_the_body_is_not_authorship():
+    """A handoff quoting this mechanism must not be able to re-attribute itself.
+
+    Handoffs on this project routinely quote the tooling they describe, and
+    a scan over the whole document would let `## Context` prose overwrite the
+    header's answer. This is the repo's own string-literal-silences-the-scan
+    defect, aimed the other way.
+    """
+    forged = ho.render("s", "", "n", ho.author_line("impostor"), "",
+                       instance="real")
+    assert ho.authoring_instance(forged) == "real"
+
+    # And with no header stamp at all, a body line is still not an answer.
+    assert ho.authoring_instance(
+        "# Session Handoff\n\n## Status\n" + ho.author_line("impostor")
+    ) is None
+
+
+def test_the_author_stamp_is_not_mistakable_for_handoff_prose():
+    """The parse anchors on this prefix, so it has to be unlikely by accident."""
+    assert ho.author_line("x").startswith(ho.AUTHOR_PREFIX)
+    assert "operator instance" in ho.AUTHOR_PREFIX
 
 
 # ── path handling ───────────────────────────────────────────────
@@ -856,6 +980,298 @@ def test_handoff_banks_a_spare_copy_when_it_cannot_take_the_lock(
     assert any("CONTENDED CONTEXT" in text for text in banked)
 
 
+def test_an_unserialised_publish_says_so_in_the_file_it_publishes(
+        env, monkeypatch):
+    """The reader is the party the stderr warning never reaches.
+
+    A handoff written without the lock may be replaced by the concurrent
+    writer moments later, so `next-session.md` cannot be trusted to be the
+    newest one -- and until this notice existed, nothing in it said so. The
+    session that caused the race sees a warning on stderr and then ends; the
+    session that has to act on the consequence reads only the file.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-30\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-30"
+    project_dir.mkdir(parents=True)
+    (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
+
+    assert ho.main([
+        "--instance", "proj", "--status", "RACED CONTEXT", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    published = (project_dir / "next-session.md").read_text(encoding="utf-8")
+    assert "RACED CONTEXT" in published
+    assert ho.NOTICE_UNSERIALISED in published
+    # The published file is not the banked copy and must not claim to be one:
+    # a reader told "this may never have reached next-session.md" by the very
+    # file at next-session.md learns nothing it can act on.
+    assert ho.NOTICE_BANKED_UNSERIALISED not in published
+
+
+def test_the_banked_copy_says_it_may_never_have_been_published(
+        env, monkeypatch):
+    """A file in `superseded/` cannot otherwise be told apart from a predecessor.
+
+    Both arrive by the same route and are named by the same scheme. Only one
+    of them may be *newer* than the handoff beside it, and that is exactly the
+    thing a reader has to know before deciding what to pick up.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-31\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-31"
+    project_dir.mkdir(parents=True)
+    (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
+
+    assert ho.main([
+        "--instance", "proj", "--status", "BANKED CONTEXT", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    banked = [p.read_text(encoding="utf-8")
+              for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]
+    assert any("BANKED CONTEXT" in text and ho.NOTICE_BANKED_UNSERIALISED in text
+               for text in banked)
+    assert not any(ho.NOTICE_UNSERIALISED in text for text in banked)
+
+
+def test_a_handoff_that_was_never_published_says_so_in_its_banked_copy(
+        env, monkeypatch):
+    """This copy is not a loser of a race -- it is the only copy there is.
+
+    The predecessor could not be preserved, so it was not replaced: the words
+    banked here never reached `next-session.md` at all, and the file sitting
+    there is strictly older than this one.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-32\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-32"
+    project_dir.mkdir(parents=True)
+    prior = project_dir / "next-session.md"
+    prior.write_text("UNREADABLE PREDECESSOR", encoding="utf-8")
+
+    def refuse(handoff_file):
+        raise ho.PreserveError("cannot preserve")
+
+    monkeypatch.setattr(ho, "preserve_prior_handoff", refuse)
+    with pytest.raises(SystemExit):
+        ho.main(["--instance", "proj", "--status", "NEVER PUBLISHED",
+                 "--next", "n", "--project-root", str(env["project"])])
+
+    assert prior.read_text(encoding="utf-8") == "UNREADABLE PREDECESSOR"
+    banked = [p.read_text(encoding="utf-8")
+              for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]
+    assert any("NEVER PUBLISHED" in text and ho.NOTICE_BANKED_UNPUBLISHED in text
+               for text in banked)
+
+
+def test_an_uncontended_handoff_carries_no_notice(env, monkeypatch):
+    """The control that stops the notice becoming furniture.
+
+    A banner printed on every handoff is one a reader learns to skip, and then
+    it is worth nothing on the one occasion it is true. The ordinary path --
+    lock taken, nothing waiting -- must produce the same bytes it always did.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-33\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    assert ho.main([
+        "--instance", "proj", "--status", "ordinary", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-33"
+    published = (project_dir / "next-session.md").read_text(encoding="utf-8")
+    assert published == ho.render("ordinary", "", "n", "", "",
+                                  instance="proj")
+    for notice in (ho.NOTICE_UNSERIALISED, ho.NOTICE_BANKED_UNSERIALISED,
+                   ho.NOTICE_BANKED_UNPUBLISHED):
+        assert notice not in published
+
+
+def test_the_three_notices_are_pairwise_distinct():
+    """Otherwise every assertion above proves less than it appears to.
+
+    Three tests each pin "this file carries notice X and not notice Y". If two
+    of the notices were the same string -- a copy-paste away -- those
+    assertions would contradict each other and one of them would be asserting
+    a tautology. Identity is the property they all rest on, so it is asserted
+    once, directly.
+    """
+    notices = [ho.NOTICE_UNSERIALISED, ho.NOTICE_BANKED_UNSERIALISED,
+               ho.NOTICE_BANKED_UNPUBLISHED]
+    assert len(set(notices)) == 3
+    for notice in notices:
+        # A notice a reader can mistake for handoff prose is not a notice.
+        assert notice.startswith("> ")
+        assert notice.strip()
+
+
+def test_a_preserved_predecessor_is_never_stamped(env, monkeypatch):
+    """The notice describes *this* write. Somebody else's bytes are evidence.
+
+    `preserve_prior_handoff` archives a predecessor verbatim, and a stamp
+    added there would be this tool editing a file whose whole point is that it
+    was not altered.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-34\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-34"
+    project_dir.mkdir(parents=True)
+    original = "# Session Handoff\n\nthe predecessor's own words"
+    (project_dir / "next-session.md").write_text(original, encoding="utf-8")
+
+    assert ho.main([
+        "--instance", "proj", "--status", "successor", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    archived = list((project_dir / ho.SUPERSEDED_DIRNAME).iterdir())
+    assert len(archived) == 1
+    assert archived[0].read_text(encoding="utf-8") == original
+
+
+def test_the_published_notice_does_not_depend_on_the_spare_copy(
+        env, monkeypatch):
+    """It is chosen before the bank is attempted, so it cannot report one.
+
+    Adversarial review found the first version of this: `published` was set to
+    a notice reading "a copy of this handoff was banked in `superseded/`" and
+    then the bank raised, leaving `next-session.md` pointing a reader at a
+    copy that does not exist -- and, worse, at a `superseded/` whose only
+    occupant is the preserved predecessor, which is *older*. The notice now
+    claims nothing about the spare, which is the only phrasing that is true on
+    both branches.
+    """
+    def publish(guid, bank_works):
+        env["catalog"].write_text(
+            f'"{env["project"].resolve()}",{guid}\n', encoding="utf-8")
+        project_dir = env["home"] / ".copilot" / "projects" / guid
+        project_dir.mkdir(parents=True)
+        (project_dir / "next-session.md.lock").write_text(
+            "held", encoding="utf-8")
+        real_archive = ho._archive
+        if not bank_works:
+            monkeypatch.setattr(
+                ho, "_archive",
+                lambda f, p: (_ for _ in ()).throw(OSError("no room")))
+        try:
+            assert ho.main([
+                "--instance", "proj", "--status", "SAME WORDS", "--next", "n",
+                "--project-root", str(env["project"]),
+            ]) == 0
+        finally:
+            monkeypatch.setattr(ho, "_archive", real_archive)
+        return (project_dir / "next-session.md").read_text(encoding="utf-8")
+
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    banked = publish("guid-35", bank_works=True)
+    unbanked = publish("guid-36", bank_works=False)
+
+    assert banked == unbanked, (
+        "the published handoff differs by whether the spare copy succeeded, "
+        "so it is making a claim about the spare that one of the two cases "
+        "will falsify")
+    # And the literal false statement, named, because "they are equal" would
+    # also be satisfied by both of them being wrong in the same way.
+    assert "was banked" not in ho.NOTICE_UNSERIALISED
+
+
+def test_the_banked_notice_does_not_claim_the_publish_happened(
+        env, monkeypatch):
+    """It is written before the publish is attempted, and the publish can abort.
+
+    Lock held *and* the predecessor unpreservable: the spare is banked, then
+    `preserve_prior_handoff` refuses and the tool dies without publishing. A
+    banked copy asserting "this session published unserialised" is then simply
+    false -- and it contradicts the second copy banked moments later on the
+    same invocation, which correctly says the handoff was never published.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-37\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-37"
+    project_dir.mkdir(parents=True)
+    (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
+    prior = project_dir / "next-session.md"
+    prior.write_text("PREDECESSOR", encoding="utf-8")
+
+    def refuse(handoff_file):
+        raise ho.PreserveError("cannot preserve")
+
+    monkeypatch.setattr(ho, "preserve_prior_handoff", refuse)
+    with pytest.raises(SystemExit):
+        ho.main(["--instance", "proj", "--status", "ABANDONED PUBLISH",
+                 "--next", "n", "--project-root", str(env["project"])])
+
+    # The publish never happened, so nothing may say that it did.
+    assert prior.read_text(encoding="utf-8") == "PREDECESSOR"
+    banked = [p.read_text(encoding="utf-8")
+              for p in (project_dir / ho.SUPERSEDED_DIRNAME).iterdir()]
+    assert len(banked) == 2, \
+        "both banks should have run on this path: insurance, then the refusal"
+    assert all("ABANDONED PUBLISH" in text for text in banked)
+    assert any(ho.NOTICE_BANKED_UNSERIALISED in text for text in banked)
+    assert any(ho.NOTICE_BANKED_UNPUBLISHED in text for text in banked)
+    assert "this session published" not in ho.NOTICE_BANKED_UNSERIALISED
+
+
+def test_the_unserialised_notices_do_not_claim_a_peer_was_writing(
+        env, monkeypatch):
+    """A missing lock is not evidence of a concurrent handoff.
+
+    ``handoff_lock`` yields False for three different reasons: a lock still
+    held at the deadline, a lock file that could not be written, and a
+    directory that will not take a lock file at all. Only the first is even
+    possibly a live peer -- and not reliably, because a lock left behind by a
+    process that died reads exactly like one held by a process that is working.
+
+    This drives the least ambiguous of the three: ``os.open`` refuses the lock
+    path outright, so there is provably no other writer, and a notice saying
+    "another handoff is in progress" would be a plain falsehood in a file whose
+    only purpose is to be believed.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-38\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-38"
+    project_dir.mkdir(parents=True)
+
+    real_open = ho.os.open
+
+    def refuse_the_lock(path, *args, **kwargs):
+        if str(path).endswith(".lock"):
+            raise PermissionError("this directory will not take a lock file")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(ho.os, "open", refuse_the_lock)
+    assert ho.main([
+        "--instance", "proj", "--status", "NO PEER ANYWHERE", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    published = (project_dir / "next-session.md").read_text(encoding="utf-8")
+    assert ho.NOTICE_UNSERIALISED in published, \
+        "the lock was not taken, so the reader must still be warned"
+    # The notices, named, because the assertion above passes for any wording.
+    for notice in (ho.NOTICE_UNSERIALISED, ho.NOTICE_BANKED_UNSERIALISED):
+        lowered = notice.lower()
+        for claim in ("another handoff", "another writer", "in progress",
+                      "was held by", "concurrent handoff was"):
+            assert claim not in lowered, (
+                f"{claim!r} asserts a cause the tool cannot know at the point "
+                f"it writes this notice")
+
+
 def test_a_failed_spare_copy_does_not_stop_the_handoff(env, monkeypatch):
     """Insurance is a second chance, never a reason to lose the first one."""
     env["catalog"].write_text(
@@ -1163,7 +1579,12 @@ def test_handoff_preserves_an_unread_predecessor(env, monkeypatch, capsys):
     archives = list((project_dir / ho.SUPERSEDED_DIRNAME).iterdir())
     assert len(archives) == 1
     assert "the first agent's context" in archives[0].read_text(encoding="utf-8")
-    assert "had not been read" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "a handoff was already waiting" in err
+    # The predecessor here carries no authorship stamp, so the warning may
+    # not pick a cause. It must offer both and claim neither.
+    assert "does not say which instance wrote it" in err
+    assert "had not been read" not in err
 
 
 def test_handoff_leaves_no_archive_when_nothing_was_waiting(env, monkeypatch):
@@ -1255,3 +1676,134 @@ def test_handoff_refuses_rather_than_destroying_what_it_cannot_preserve(
             "--project-root", str(env["project"]),
         ])
     assert handoff.read_text(encoding="utf-8") == "PRECIOUS"
+
+
+# ── authorship, end to end ──────────────────────────────────────
+def _publish(env, monkeypatch, guid, instance, status="s"):
+    """Run a real handoff for `instance` into `guid`, and return its project dir."""
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",{guid}\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+    assert ho.main([
+        "--instance", instance, "--status", status, "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+    return env["home"] / ".copilot" / "projects" / guid
+
+
+def test_the_published_handoff_names_the_instance_that_wrote_it(env, monkeypatch):
+    """The whole point, asserted through `main` rather than through `render`.
+
+    `render` taking the parameter proves nothing if `main` never passes it,
+    and `main` is where the instance name is actually known.
+    """
+    project_dir = _publish(env, monkeypatch, "guid-90", "copilot-tools")
+    published = (project_dir / "next-session.md").read_text(encoding="utf-8")
+    assert ho.authoring_instance(published) == "copilot-tools"
+
+
+def test_a_predecessor_from_a_peer_is_named_as_a_peer(env, monkeypatch, capsys):
+    """The case that cost this project ten handoffs in one day.
+
+    `next-session.md` is keyed by project and the restart marker by instance,
+    so peers sharing a checkout overwrite each other. The warning must say
+    which one, because "unread" and "a peer published" call for completely
+    different responses from the agent reading it.
+    """
+    project_dir = _publish(env, monkeypatch, "guid-91", "peer-x",
+                           status="peer-x's context")
+    capsys.readouterr()
+
+    assert ho.main([
+        "--instance", "a,b", "--status", "a,b's context", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    err = capsys.readouterr().err
+    assert "DIFFERENT instance" in err
+    assert "peer-x" in err
+    assert "had not been read" not in err
+    # And the peer's words survived, which is what makes the warning worth
+    # printing rather than merely true.
+    archived = list((project_dir / ho.SUPERSEDED_DIRNAME).iterdir())
+    assert len(archived) == 1
+    assert "peer-x's context" in archived[0].read_text(encoding="utf-8")
+
+
+def test_a_predecessor_from_this_instance_is_reported_as_unread(env, monkeypatch, capsys):
+    """The other half, and the one the old message got right.
+
+    Without this, "DIFFERENT instance" above could pass against a warning
+    that says it unconditionally.
+    """
+    _publish(env, monkeypatch, "guid-92", "solo")
+    capsys.readouterr()
+
+    assert ho.main([
+        "--instance", "solo", "--status", "second", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    err = capsys.readouterr().err
+    assert "written by this instance" in err
+    assert "DIFFERENT instance" not in err
+
+
+def test_an_unreadable_archive_costs_a_warning_and_not_the_handoff(env, monkeypatch, capsys):
+    """Attribution is a nicety; publishing is the job.
+
+    `_archived_author` runs after the predecessor has been copied aside and
+    before the new file is written -- the one stretch where an escaping
+    exception loses both. So a read that fails must degrade to "cannot say".
+    """
+    project_dir = _publish(env, monkeypatch, "guid-93", "peer-x")
+    capsys.readouterr()
+
+    def refuse(self, *a, **kw):
+        if ho.SUPERSEDED_DIRNAME in self.parts:
+            raise PermissionError(13, "denied")
+        return real_read_text(self, *a, **kw)
+
+    real_read_text = Path.read_text
+    monkeypatch.setattr(Path, "read_text", refuse)
+
+    assert ho.main([
+        "--instance", "later", "--status", "still published", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+    monkeypatch.undo()
+
+    err = capsys.readouterr().err
+    assert "does not say which instance wrote it" in err
+    published = (project_dir / "next-session.md").read_text(encoding="utf-8")
+    assert "still published" in published
+
+
+def test_the_stamp_reaches_a_banked_copy_too(env, monkeypatch, capsys):
+    """A copy in `superseded/` is read by the same agent, with the same question.
+
+    The banked paths re-render the body to carry a notice; a stamp that were
+    dropped there would go missing on exactly the contended writes where
+    knowing the author matters most.
+    """
+    env["catalog"].write_text(
+        f'"{env["project"].resolve()}",guid-94\n', encoding="utf-8")
+    monkeypatch.setattr(ho.Mux, "available", lambda self: False)
+
+    @contextmanager
+    def no_lock(handoff_file):
+        yield False
+
+    monkeypatch.setattr(ho, "handoff_lock", no_lock)
+    assert ho.main([
+        "--instance", "banker", "--status", "s", "--next", "n",
+        "--project-root", str(env["project"]),
+    ]) == 0
+
+    project_dir = env["home"] / ".copilot" / "projects" / "guid-94"
+    banked = list((project_dir / ho.SUPERSEDED_DIRNAME).iterdir())
+    assert len(banked) == 1
+    assert ho.authoring_instance(
+        banked[0].read_text(encoding="utf-8")) == "banker"
+    assert ho.authoring_instance(
+        (project_dir / "next-session.md").read_text(encoding="utf-8")) == "banker"

@@ -18,35 +18,53 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   addIsBlanket,
   blockReason,
+  bound,
   checkoutRoot,
+  createGuard,
+  createGuardState,
   emptyDirCandidates,
   formatPathList,
   git,
   gitInvocations,
   gitSubcommand,
+  guardDisabled,
   holdsNoFiles,
   invisibleDirStrays,
   newEntries,
+  noteAuthored,
+  observe,
+  otherRootToWatch,
   parseStatusPaths,
   parseUntracked,
   nestedWorktreePrefixes,
   primaryCheckoutRoot,
+  relativeToCheckout,
   rootToWatch,
+  scratchDirFor,
+  setFor,
+  AUTHORING_TOOLS,
+  MAX_TRACKED,
+  SHELL_TOOLS,
+  SUBAGENT_TOOLS,
   UNKNOWN_ROOT,
+  inheritedStrayReport,
   primaryStrayReport,
   scanCheckout,
   scanCheckoutTree,
+  unscannedRootsNotice,
   withoutNestedWorktrees,
   withoutIgnored,
   sessionBriefing,
+  sessionContext,
   stashTakesUntracked,
   strayReport,
   sweepDecision,
@@ -306,6 +324,248 @@ test("PRIMARY in the headline is a marker only the primary report can produce", 
   assert.ok(forged.includes(forgery), "premise: the forged name really does reach the report body");
   assert.ok(!headline(forged).includes("PRIMARY checkout"),
     "a path reaches the body, never the headline");
+});
+
+
+// --- inherited strays: what was already there when the session began -----
+
+test("the inherited report names the paths, the tree, and why now is the only chance", () => {
+  const report = inheritedStrayReport(["archivedir3/", "no_read/"], "/repo/primary");
+  assert.match(report, /archivedir3\//);
+  assert.match(report, /no_read\//);
+  assert.match(report, /\/repo\/primary/, "an agent cannot act on a report that does not say where");
+  // The justification for the feature existing at all. Without it the reader
+  // has no reason to act during this session rather than "later", and later
+  // is precisely when the information is gone.
+  assert.match(report, /only point at which/i);
+  assert.match(report, /git status.*does not list/is,
+    "empty directories are the population git structurally cannot report");
+});
+
+test("the inherited report does not order a deletion and does not send anyone hunting", () => {
+  const report = inheritedStrayReport(["probe.py"], "/repo");
+  // Same rule as primaryStrayReport: a peer's live experiment and a dead
+  // subagent's leftovers are indistinguishable from here.
+  assert.match(report, /do not delete on this report\s+alone/i);
+  assert.match(report, /ask the other agents/i);
+  // Unattributable, not merely unattributed -- the distinction the wording is
+  // carrying. "Unknown owner" starts a search; there is no owner to find,
+  // because the session that made the artifact has ended. A reader told the
+  // search is futile does the cheap thing instead.
+  assert.match(report, /cannot find out who made/i);
+  assert.match(report, /neither can anyone\s+else later/i);
+  // And it says what WOULD license a deletion, so "nobody claimed it" cannot
+  // quietly become the standard of evidence.
+  assert.match(report, /inert/i);
+  assert.match(report, /mtimes/i);
+});
+
+test("the inherited report does not assert that its own contents are agent leftovers", () => {
+  // The population is the checkout's ENTIRE untracked state, which contains a
+  // human's uncommitted work and unignored build output as readily as it
+  // contains a dead subagent's probe script. An earlier draft told the reader
+  // flatly that "the session that produced it is over" -- a confident cause
+  // asserted over an ambiguous observation, which is the exact collapse this
+  // guard exists to catch, committed by the guard itself. A developer told
+  // their own work in progress is an orphaned artifact switches the guard off.
+  const report = inheritedStrayReport(["my_wip.js"], "/repo");
+  assert.match(report, /may be your own uncommitted work/i);
+  assert.match(report, /not a list of suspects/i);
+  // The futility claim must survive, but SCOPED: it applies to whichever of
+  // these are not the reader's, and the report must say it cannot tell which.
+  assert.match(report, /for any that are NOT yours/i);
+  // The specific overclaim must not come back. Asserted over the whole text
+  // rather than the headline on purpose: this is a claim about what the
+  // report never says, and the body is where it used to say it.
+  assert.ok(!/the session that produced (it|them) is over/i.test(report), report);
+});
+
+test("INHERITED in the headline is a marker only the inherited report can produce", () => {
+  // Same exclusivity rule as the PRIMARY marker above, and needed for the
+  // same reason: all of these reports are joined into one additionalContext
+  // string, so an assertion of the form `context.includes(path)` cannot tell
+  // which report produced the line without a marker no other report emits.
+  const inheritedReport = inheritedStrayReport(["a.py"], "/repo");
+  assert.ok(headline(inheritedReport).startsWith("[checkout-guard] INHERITED:"),
+    headline(inheritedReport));
+  // Controls through the neighbouring calls, positive first: an absence
+  // asserted about a function that produced no text proves nothing.
+  const during = strayReport(["a.py"], "/tmp/s");
+  const elsewhere = primaryStrayReport(["a.py"], "/tmp/s", "/repo/primary");
+  assert.match(during, /a\.py/, "control: the during-session report does report the path");
+  assert.match(elsewhere, /a\.py/, "control: so does the primary report");
+  assert.ok(!headline(during).includes("INHERITED"), headline(during));
+  assert.ok(!headline(elsewhere).includes("INHERITED"), headline(elsewhere));
+
+  // A path cannot forge the marker, because the headline is built before any
+  // name is formatted. The forged input must be the exact substring the
+  // attribution keys off, not a shorter relative of it.
+  const forgery = "[checkout-guard] INHERITED:";
+  const forged = strayReport([forgery], "/tmp/s");
+  assert.ok(forged.includes(forgery), "premise: the forged name really does reach the body");
+  assert.ok(!headline(forged).startsWith(forgery), "a path reaches the body, never the headline");
+});
+
+test("the primary variant says which tree, and the working variant does not claim to be it", () => {
+  // An agent in a worktree is the whole reason this distinction exists: for
+  // them the primary is a different tree, and a report that reads as a note
+  // about the current directory gets skimmed past.
+  const other = inheritedStrayReport(["a.py"], "/repo/primary", { primary: true });
+  const here = inheritedStrayReport(["a.py"], "/repo/wt");
+  assert.ok(headline(other).includes("PRIMARY checkout"), headline(other));
+  assert.match(other, /not the checkout you are working in/);
+  assert.match(here, /a\.py/, "control: the working-tree variant produces a report at all");
+  assert.ok(!headline(here).includes("PRIMARY checkout"), headline(here));
+  // It must not inherit primaryStrayReport's "during your last command",
+  // which is false of everything this function reports.
+  assert.ok(!other.includes("during your last command"), other);
+});
+
+test("inherited pluralisation is correct at one and many", () => {
+  assert.match(inheritedStrayReport(["a"], "/r"), /1 untracked path was/);
+  assert.match(inheritedStrayReport(["a", "b"], "/r"), /2 untracked paths were/);
+
+  // Pronoun CASE, not just number. Every other pronoun in the report is in
+  // object position ("mention them", "leave them alone"), so a single
+  // object-case variable reads correctly nearly everywhere -- and then reads
+  // as "the only point at which them can be raised" at the one place the
+  // pronoun is a subject. A plural-number-only assertion passes straight
+  // through that, which is how it shipped: the singular branch is grammatical
+  // either way, so nothing that tests one stray can see it.
+  const one = inheritedStrayReport(["a"], "/r");
+  const many = inheritedStrayReport(["a", "b"], "/r");
+  assert.match(one, /point at which it can be raised/, one);
+  assert.match(many, /point at which they can be raised/, many);
+  assert.ok(!/which them can/.test(many), many);
+
+  // The control: object position stays object-case in the same report, so
+  // this is not just "every pronoun was renamed to they".
+  assert.match(many, /Nothing will mention them again/, many);
+});
+
+test("UNSCANNED is a headline marker of its own, and a mixed session gets both reports", () => {
+  // The realistic failure: one tree answers and the other does not. The
+  // answered one must still be reported, and the unanswered one must not be
+  // quietly folded into it -- otherwise a partial session start reads as a
+  // complete one.
+  const context = sessionContext("/tmp/s", [
+    { strays: ["wip.js"], root: "/repo/wt" },
+    { strays: null, root: "/repo/primary", primary: true },
+  ]);
+  assert.match(context, /wip\.js/, context);
+  assert.match(context, /UNSCANNED/, context);
+  assert.match(context, /\/repo\/primary/, context);
+  const lines = context.split("\n");
+  assert.equal(lines.filter((l) => l.startsWith("[checkout-guard] INHERITED:")).length, 1, context);
+  assert.equal(lines.filter((l) => l.startsWith("[checkout-guard] UNSCANNED:")).length, 1, context);
+
+  // Exclusivity, with positive controls first: each neighbouring report must
+  // produce text, or an absence asserted about it proves nothing.
+  const inheritedOnly = inheritedStrayReport(["a.py"], "/r");
+  const unscannedOnly = unscannedRootsNotice(["/r"]);
+  assert.match(inheritedOnly, /a\.py/, "control: the inherited report produces text");
+  assert.match(unscannedOnly, /\/r/, "control: the unscanned notice produces text");
+  assert.ok(!headline(inheritedOnly).includes("UNSCANNED"), headline(inheritedOnly));
+  assert.ok(!headline(unscannedOnly).includes("INHERITED"), headline(unscannedOnly));
+
+  // A root name cannot forge the marker: the headline is built before any
+  // name is formatted, so a path reaches the body and never line 0.
+  const forgery = "[checkout-guard] UNSCANNED:";
+  const forged = inheritedStrayReport([forgery], "/r");
+  assert.ok(forged.includes(forgery), "premise: the forged name really does reach the body");
+  assert.ok(!headline(forged).startsWith(forgery), headline(forged));
+});
+
+test("the unscanned notice pluralises at one and many, in number and in case", () => {
+  // Symmetric to the inherited pluralisation test, and added because the
+  // inherited one caught a real pronoun-case defect while this function --
+  // which has three independent singular/plural ternaries -- had no plural
+  // coverage at all. Every existing UNSCANNED assertion passes exactly one
+  // root, so a swapped ternary arm survives the whole suite. The count is
+  // almost always 1 in practice (a single primary that failed to scan),
+  // which is precisely why nothing would ever surface the other branch.
+  const one = unscannedRootsNotice(["/a"]);
+  const many = unscannedRootsNotice(["/a", "/b"]);
+
+  assert.match(one, /1 checkout could not be examined/, one);
+  assert.match(many, /2 checkouts could not be examined/, many);
+
+  // The load-bearing sentence: it must not read as a clean bill of health at
+  // either arity.
+  assert.match(one, /not a report that it is clean/, one);
+  assert.match(many, /not a report that they are clean/, many);
+
+  assert.match(one, /sitting in it will go unmentioned/, one);
+  assert.match(many, /sitting in them will go unmentioned/, many);
+
+  assert.match(one, /when it was taken/, one);
+  assert.match(many, /when they were taken/, many);
+
+  // Controls against a swapped arm: each arity must NOT carry the other's
+  // wording. Without these, a ternary with both arms set to the same string
+  // would satisfy every assertion above at one of the two counts.
+  assert.ok(!/they are clean/.test(one), one);
+  assert.ok(!/it is clean/.test(many), many);
+  assert.ok(!/when they were taken/.test(one), one);
+  assert.ok(!/when it was taken/.test(many), many);
+});
+
+test("sessionContext emits the briefing byte-identically when nothing was inherited", () => {
+  // The change is additive or it is a rewrite. A clean checkout must see the
+  // exact text it saw before this function existed -- and an empty array and
+  // a checkout that was never scanned must both count as nothing to report.
+  const bare = sessionBriefing("/tmp/s");
+  assert.equal(sessionContext("/tmp/s"), bare);
+  assert.equal(sessionContext("/tmp/s", []), bare);
+  assert.equal(sessionContext("/tmp/s", [{ strays: [], root: "/repo" }]), bare);
+});
+
+test("a scan that failed is not reported as a clean checkout", () => {
+  // null means the scan established nothing. Rendering it as an empty
+  // checkout is the collapse this whole toolkit exists to remove: an
+  // unanswered question spent as the confident answer. Silence would BE that
+  // collapse here, because a clean checkout is silent too -- so the failed
+  // scan has to produce text a clean one never produces.
+  const context = sessionContext("/tmp/s", [{ strays: null, root: "/repo" }]);
+  assert.notEqual(context, sessionBriefing("/tmp/s"), context);
+  assert.match(context, /UNSCANNED/, context);
+  assert.match(context, /\/repo/, context);
+  assert.match(context, /not a report that it is clean/i, context);
+  // It must not be reported as an INHERITED finding either -- there are no
+  // findings, that is the point.
+  assert.ok(!context.includes("INHERITED"), context);
+  // Control through the same call: a non-null scan at the same position
+  // produces the other report, so the assertions above are about null and not
+  // about sessionContext emitting this text unconditionally.
+  const answered = sessionContext("/tmp/s", [{ strays: ["a.py"], root: "/repo" }]);
+  assert.ok(answered.includes("INHERITED"), answered);
+  assert.ok(!answered.includes("UNSCANNED"), answered);
+  // And a scan that succeeded and found nothing is silent, which is what
+  // makes the notice above informative rather than decorative.
+  assert.equal(sessionContext("/tmp/s", [{ strays: [], root: "/repo" }]),
+    sessionBriefing("/tmp/s"));
+});
+
+test("both seeded checkouts reach the session context", () => {
+  // The failure this pins is silent and was predicted before it could
+  // happen: the strays that motivated the feature live in the PRIMARY, and
+  // an agent working in a worktree seeds the primary through a second,
+  // separate scan. Wire only the first and the feature ships with its own
+  // motivating case still unreported, with every unit test around it green.
+  const context = sessionContext("/tmp/s", [
+    { strays: ["wt-probe.py"], root: "/repo/wt" },
+    { strays: ["archivedir3/"], root: "/repo/primary", primary: true },
+  ]);
+  assert.match(context, /wt-probe\.py/);
+  assert.match(context, /archivedir3\//);
+  // Two reports, not one merged list: the primary finding must keep its own
+  // headline or the reader cannot tell which tree either path is in.
+  const headlines = context.split("\n").filter((l) => l.startsWith("[checkout-guard] INHERITED:"));
+  assert.equal(headlines.length, 2, context);
+  assert.equal(headlines.filter((l) => l.includes("PRIMARY checkout")).length, 1, context);
+  // The briefing still leads, because it names the scratch directory that
+  // makes the reports actionable rather than merely alarming.
+  assert.ok(context.startsWith(sessionBriefing("/tmp/s")), context.slice(0, 200));
 });
 
 // --- integration: a real git binary against a real repository ------------
@@ -1043,6 +1303,62 @@ test("a stray in the primary is invisible to a worktree scan and visible to the 
   });
 });
 
+test("the motivating case, end to end: an invisible empty directory in the primary reaches the session briefing", async () => {
+  // Everything above tests a piece. This tests the sentence the feature
+  // exists to produce, against a real git binary, with the exact fixture
+  // that survived three sessions unreported: an agent in a worktree, an
+  // empty directory in the primary, and a name that stats as a directory
+  // while reading as a file.
+  await withWorktree(async ({ primary, worktree }) => {
+    await mkdir(join(primary, "archivedir3", "testfile.txt"), { recursive: true });
+    await mkdir(join(primary, "no_read"), { recursive: true });
+
+    // Premise, through the shipped call: git itself reports NEITHER planted
+    // path, which is why nobody has ever been told about them. Without this
+    // the assertions below are satisfied by a report about paths git would
+    // have surfaced anyway. (Its output is not empty -- the fixture repo has
+    // no `/.worktrees/` ignore rule, so git names the nested worktree, which
+    // `scanCheckoutTree` filters out. That is a different population.)
+    const status = await git(["status", "--porcelain", "-uall"], primary);
+    assert.ok(!status.stdout.includes("archivedir3"),
+      `premise: git cannot see the empty tree -- got ${JSON.stringify(status.stdout)}`);
+    assert.ok(!status.stdout.includes("no_read"),
+      `premise: git cannot see the empty directory -- got ${JSON.stringify(status.stdout)}`);
+
+    // Exactly what onSessionStart does: seed the working root, then the
+    // primary, and hand both arrays to the briefing.
+    const root = await checkoutRoot(worktree);
+    const other = rootToWatch(root, await primaryCheckoutRoot(worktree)).watch;
+    assert.ok(other && other !== root, `premise: the primary is a second tree: ${other}`);
+    const context = sessionContext("/tmp/s", [
+      { strays: await scanCheckoutTree(root), root },
+      { strays: await scanCheckoutTree(other), root: other, primary: true },
+    ]);
+
+    assert.match(context, /archivedir3\//, context);
+    assert.match(context, /no_read\//, context);
+    // Attributed to the primary report specifically, not merely present
+    // somewhere in a string that concatenates several reports.
+    const primaryReport = context
+      .split("\n\n")
+      .find((part) => part.startsWith("[checkout-guard] INHERITED:") &&
+        part.includes("PRIMARY checkout"));
+    assert.ok(primaryReport, context);
+    assert.match(primaryReport, /archivedir3\//, primaryReport);
+
+    // Control through the same call: with the primary clean, the same
+    // pipeline says nothing, so the report above is caused by the artifacts
+    // and not by the pipeline reporting unconditionally.
+    await rm(join(primary, "archivedir3"), { recursive: true, force: true });
+    await rm(join(primary, "no_read"), { recursive: true, force: true });
+    const clean = sessionContext("/tmp/s", [
+      { strays: await scanCheckoutTree(root), root },
+      { strays: await scanCheckoutTree(other), root: other, primary: true },
+    ]);
+    assert.equal(clean, sessionBriefing("/tmp/s"), clean);
+  });
+});
+
 test("watching the primary does not report the worktrees directory itself", async () => {
   // Without this the fix is unusable: every session that creates a worktree
   // would be told its own worktree is a stray artifact in the primary, on
@@ -1224,6 +1540,739 @@ test("the worktree exclusion applies to the tree the agent is working in too", a
     assert.ok((await scanCheckoutTree(primary)).includes("probe.py"),
       "control: the filtered scan is not simply blind");
   });
+});
+
+// ---------------------------------------------------------------------------
+// Per-session tracking state.
+//
+// All of this lived in extension.mjs, where `joinSession` runs at import and
+// no test could reach it. Everything below was covered by `node --check` and
+// nothing else until it moved.
+// ---------------------------------------------------------------------------
+
+/** A `scanCheckoutTree` double: yields each listing in turn, then repeats. */
+function scanner(...listings) {
+  let i = 0;
+  return async () => listings[Math.min(i++, listings.length - 1)];
+}
+
+test("createGuardState hands out fresh state, never a shared module binding", () => {
+  const a = createGuardState();
+  const b = createGuardState();
+  a.lastSeen.set("/repo", ["probe.py"]);
+  setFor(a.outstanding, "/repo").add("probe.py");
+  setFor(a.authored, "/repo").add("src.js");
+  a.primaryRoots.set("/repo", null);
+  // The trap the factory exists to avoid. As module-level Maps these would be
+  // shared by every importer for the life of the process, so each test in this
+  // file would inherit the previous one's state -- and the failures that
+  // produces are order-dependent and intermittent, the most expensive shape a
+  // test failure has.
+  assert.equal(b.lastSeen.size, 0);
+  assert.equal(b.outstanding.size, 0);
+  assert.equal(b.authored.size, 0);
+  assert.equal(b.primaryRoots.size, 0);
+  // Control: the writes above really did land somewhere, so the emptiness of
+  // `b` is isolation and not four writes that were no-ops.
+  assert.deepEqual(a.lastSeen.get("/repo"), ["probe.py"]);
+  assert.deepEqual([...setFor(a.outstanding, "/repo")], ["probe.py"]);
+  assert.deepEqual([...setFor(a.authored, "/repo")], ["src.js"]);
+  assert.equal(a.primaryRoots.get("/repo"), null);
+});
+
+test("setFor creates one set per root and keeps returning it", () => {
+  const map = new Map();
+  const first = setFor(map, "/repo");
+  first.add("a.py");
+  assert.equal(setFor(map, "/repo"), first, "the same root gets the same set, not a fresh one");
+  assert.deepEqual([...setFor(map, "/repo")], ["a.py"]);
+  // Control: two roots do not share a set, which is what makes the identity
+  // above a statement about keying rather than about there being only one set.
+  assert.notEqual(setFor(map, "/other"), first);
+  assert.deepEqual([...setFor(map, "/other")], []);
+});
+
+test("bound drops the oldest entries and leaves a set within the limit alone", () => {
+  const over = new Set(["a", "b", "c", "d"]);
+  bound(over, 2);
+  assert.deepEqual([...over], ["c", "d"], "insertion order decides: the oldest go first");
+  // Control: a set already within the limit is untouched, so the trimming
+  // above is the limit acting rather than the function always deleting.
+  const under = new Set(["x", "y"]);
+  bound(under, 2);
+  assert.deepEqual([...under], ["x", "y"]);
+  // And the default is the limit the extension actually runs with.
+  const many = new Set(Array.from({ length: MAX_TRACKED + 5 }, (_, i) => `p${i}`));
+  bound(many);
+  assert.equal(many.size, MAX_TRACKED);
+  assert.ok(!many.has("p0"), "the oldest is gone");
+  assert.ok(many.has(`p${MAX_TRACKED + 4}`), "the newest is kept");
+});
+
+test("relativeToCheckout reports checkout-relative posix paths, and null outside", () => {
+  const root = join(tmpdir(), "cg-rel-root");
+  assert.equal(relativeToCheckout(root, join(root, "sub", "probe.py")), "sub/probe.py",
+    "posix separators, because that is the form git reports and the sets hold");
+  assert.equal(relativeToCheckout(root, join("sub", "probe.py"), root), "sub/probe.py",
+    "a relative path resolves against the cwd it is given");
+  // Paired negatives. Both must be null rather than a `../` path: a file
+  // outside the checkout is not this checkout's artifact, and folding one in
+  // would record an authored path that no scan of this root can ever match.
+  assert.equal(relativeToCheckout(root, join(tmpdir(), "elsewhere", "probe.py")), null);
+  assert.equal(relativeToCheckout(root, root), null, "the root is not a path inside itself");
+});
+
+test("only an exact 1 disables the guard", () => {
+  assert.equal(guardDisabled({ COPILOT_CHECKOUT_GUARD_DISABLE: "1" }), true);
+  // The values someone types meaning "leave it on". A truthiness test would
+  // disable the guard on the first two -- in the one case where the operator
+  // believed it was running.
+  assert.equal(guardDisabled({ COPILOT_CHECKOUT_GUARD_DISABLE: "0" }), false);
+  assert.equal(guardDisabled({ COPILOT_CHECKOUT_GUARD_DISABLE: "false" }), false);
+  assert.equal(guardDisabled({}), false);
+});
+
+test("scratchDirFor names a per-process directory under the temp dir", () => {
+  assert.equal(scratchDirFor(4242), join(tmpdir(), "copilot-scratch", "session-4242"));
+  // Control: it is per process, so two sessions on one machine are never
+  // handed the same scratch directory to write into.
+  assert.notEqual(scratchDirFor(4243), scratchDirFor(4242));
+  assert.ok(scratchDirFor().endsWith(`session-${process.pid}`), "defaults to this process");
+});
+
+test("the tool sets keep shell, subagent and authoring tools apart", () => {
+  for (const name of ["bash", "powershell", "shell"]) {
+    assert.ok(SHELL_TOOLS.has(name), `${name} runs arbitrary commands`);
+  }
+  assert.ok(SUBAGENT_TOOLS.has("task"),
+    "the only call at which a subagent's writes can still be attributed");
+  for (const name of ["create", "edit"]) assert.ok(AUTHORING_TOOLS.has(name));
+  // The separations, each of which changes what a hook does. `task` in
+  // SHELL_TOOLS would have the pre-hook read a subagent PROMPT as a git
+  // command line; an authoring tool in either set would have the agent's own
+  // deliberate writes rescanned and reported back to it as strays.
+  assert.ok(!SHELL_TOOLS.has("task"));
+  assert.ok(!SHELL_TOOLS.has("edit") && !SUBAGENT_TOOLS.has("edit"));
+  assert.ok(!AUTHORING_TOOLS.has("bash"));
+});
+
+test("observe establishes a baseline before it calls anything new", async () => {
+  const state = createGuardState();
+  const scan = scanner(["old.py"], ["old.py", "probe.py"]);
+  assert.deepEqual(await observe(state, "/repo", { scan }), [],
+    "first sight: reporting here would blame this agent for every earlier artifact");
+  // Control through the SAME call: the mechanism can fire at all, so the empty
+  // result above is the baseline rule and not a scan double that never works.
+  assert.deepEqual(await observe(state, "/repo", { scan }), ["probe.py"]);
+});
+
+test("a scan that failed is not a checkout that is clean", async () => {
+  const state = createGuardState();
+  const scan = scanner(["old.py"], null, ["old.py", "probe.py"]);
+  await observe(state, "/repo", { scan });
+  assert.deepEqual(await observe(state, "/repo", { scan }), [],
+    "a failed scan reports nothing, because it measured nothing");
+  // And it must not have overwritten the baseline with that nothing, or the
+  // pre-existing file returns as this agent's new artifact on the next command.
+  assert.deepEqual(await observe(state, "/repo", { scan }), ["probe.py"],
+    "the surviving baseline still knows old.py was already there");
+});
+
+test("observe never reports a path the agent authored deliberately", async () => {
+  const state = createGuardState();
+  const scan = scanner(["old.py"], ["old.py", "written.py", "probe.py"]);
+  await observe(state, "/repo", { scan });
+  setFor(state.authored, "/repo").add("written.py");
+  // Paired inside one call: both paths are new by the same measurement, and
+  // only the authored one is dropped.
+  assert.deepEqual(await observe(state, "/repo", { scan }), ["probe.py"]);
+});
+
+test("only the checkout the agent works in accumulates blocking artifacts", async () => {
+  const state = createGuardState();
+  const here = scanner(["a"], ["a", "mine.py"]);
+  await observe(state, "/repo", { scan: here });
+  assert.deepEqual(await observe(state, "/repo", { scan: here }), ["mine.py"]);
+  assert.deepEqual([...setFor(state.outstanding, "/repo")], ["mine.py"],
+    "an artifact here can deny this agent's own blanket stage");
+
+  const there = scanner(["b"], ["b", "peer.py"]);
+  await observe(state, "/primary", { blocking: false, scan: there });
+  assert.deepEqual(await observe(state, "/primary", { blocking: false, scan: there }),
+    ["peer.py"], "still reported: it is worth telling the agent about");
+  assert.deepEqual([...setFor(state.outstanding, "/primary")], [],
+    "but it cannot block -- refusing this agent's commit over a peer's artifact "
+    + "lands the cost on the wrong asset");
+});
+
+test("an artifact that was cleaned up stops blocking", async () => {
+  const state = createGuardState();
+  const scan = scanner(["a"], ["a", "probe.py"], ["a"]);
+  await observe(state, "/repo", { scan });
+  await observe(state, "/repo", { scan });
+  assert.deepEqual([...setFor(state.outstanding, "/repo")], ["probe.py"],
+    "premise: it is outstanding, or the next assertion proves nothing");
+  await observe(state, "/repo", { scan });
+  assert.deepEqual([...setFor(state.outstanding, "/repo")], [],
+    "an agent that cleans up is not then blocked by the memory of a deleted file");
+});
+
+test("the outstanding set stays bounded however long an agent ignores it", async () => {
+  const state = createGuardState();
+  const many = Array.from({ length: MAX_TRACKED + 10 }, (_, i) => `p${i}.py`);
+  const scan = scanner([], many);
+  await observe(state, "/repo", { scan });
+  const fresh = await observe(state, "/repo", { scan });
+  assert.equal(fresh.length, many.length, "premise: every one of them really is new");
+  assert.equal(setFor(state.outstanding, "/repo").size, MAX_TRACKED,
+    "the report is complete; only the memory of it is capped");
+});
+
+test("noteAuthored folds a deliberate write into the baseline and clears the block", async () => {
+  const state = createGuardState();
+  const root = join(tmpdir(), "cg-authored-root");
+  const scan = scanner(["a"], ["a", "written.py", "unrelated.py"]);
+  await observe(state, root, { scan });
+  setFor(state.outstanding, root).add("written.py");
+
+  assert.equal(noteAuthored(state, root, join(root, "written.py")), "written.py");
+  assert.deepEqual([...setFor(state.outstanding, root)], [],
+    "a path the agent adopted with create/edit no longer denies its own stage");
+  assert.ok(state.lastSeen.get(root).includes("written.py"),
+    "folded into the baseline rather than rescanned: a five-file edit would "
+    + "otherwise fire five concurrent whole-tree traversals");
+  // The suppression and a positive control THROUGH THE SAME CALL. Both paths
+  // are new by the same measurement; asserting only that the authored one is
+  // absent would pass just as happily against an `observe` that had stopped
+  // reporting anything at all.
+  assert.deepEqual(await observe(state, root, { scan }), ["unrelated.py"],
+    "the next observation does not hand the agent back its own writing, and is "
+    + "not simply blind: a real stray in the same call is still reported");
+});
+
+test("noteAuthored ignores a write outside the checkout", () => {
+  const state = createGuardState();
+  const root = join(tmpdir(), "cg-authored-root2");
+  assert.equal(noteAuthored(state, root, join(tmpdir(), "elsewhere.py")), null);
+  assert.equal(state.authored.size, 0, "nothing recorded against a checkout it is not in");
+  // Control: the same call with a path inside the checkout does record, so the
+  // null above is the boundary check and not the function doing nothing at all.
+  assert.equal(noteAuthored(state, root, join(root, "inside.py")), "inside.py");
+  assert.deepEqual([...setFor(state.authored, root)], ["inside.py"]);
+});
+
+test("otherRootToWatch remembers a real answer and retries a failed lookup", async () => {
+  const state = createGuardState();
+  const worktree = "/repo/.worktrees/x";
+  const failed = [];
+  const failing = async (arg) => { failed.push(arg); return UNKNOWN_ROOT; };
+  assert.equal(await otherRootToWatch(state, worktree, { lookup: failing }), null);
+  assert.equal(await otherRootToWatch(state, worktree, { lookup: failing }), null);
+  assert.equal(failed.length, 2,
+    "a failure is an unanswered question: caching it blinds the whole session, "
+    + "and the result looks exactly like a session with nothing to watch");
+  assert.deepEqual(failed, [worktree, worktree],
+    "asked about the root being watched, never about the process cwd");
+
+  const answered = [];
+  const answering = async (arg) => { answered.push(arg); return "/repo"; };
+  assert.equal(await otherRootToWatch(state, worktree, { lookup: answering }), "/repo");
+  assert.equal(await otherRootToWatch(state, worktree, { lookup: answering }), "/repo");
+  assert.equal(answered.length, 1,
+    "control: a real answer IS remembered, so the retry above is about failure "
+    + "and not about caching being broken");
+});
+
+test("an agent already in the primary has no second checkout to watch", async () => {
+  const state = createGuardState();
+  let calls = 0;
+  const lookup = async () => { calls++; return "/repo"; };
+  assert.equal(await otherRootToWatch(state, "/repo", { lookup }), null,
+    "the two roots are never scanned as if they were separate places");
+  assert.equal(await otherRootToWatch(state, "/repo", { lookup }), null);
+  assert.equal(calls, 1,
+    "and that negative answer is cached -- it cannot change within a session, "
+    + "and an agent in the primary would otherwise pay for the lookup forever");
+  // Control: the cache is keyed by root, so a different root is asked afresh.
+  assert.equal(await otherRootToWatch(state, "/repo/.worktrees/x", { lookup }), "/repo");
+  assert.equal(calls, 2);
+});
+
+test("every name extension.mjs imports from guard.mjs is really exported", async () => {
+  // The one property of extension.mjs reachable from here. A named ESM import
+  // that does not resolve is a link error raised when the module is FIRST
+  // imported -- which for extension.mjs is inside a live Copilot session, at
+  // which point the failure is a `Failed to load extension` line in a log
+  // nobody is reading and a session that silently has no guard. `node --check`
+  // does not catch it: it parses one file and resolves nothing.
+  const source = await readFile(join(dirname(fileURLToPath(import.meta.url)), "extension.mjs"), "utf8");
+  const block = source.match(/import\s*\{([^}]*)\}\s*from\s*"\.\/guard\.mjs"/);
+  assert.ok(block, "premise: extension.mjs still imports from guard.mjs by name");
+  const imported = block[1]
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  // Premise, because a regex that matched an empty list would satisfy every
+  // assertion below without checking anything.
+  assert.ok(imported.length > 0, `premise: names were extracted: ${imported.length}`);
+  assert.ok(imported.includes("createGuard"), "premise: the extracted list is the real one");
+
+  const exported = Object.keys(await import("./guard.mjs"));
+  const missing = imported.filter((name) => !exported.includes(name));
+  assert.deepEqual(missing, [], `extension.mjs imports names guard.mjs does not export`);
+  // Control: the comparison can fail at all. Without this, an `exported` list
+  // that somehow held everything -- or a `missing` computed from an empty
+  // `imported` -- passes identically.
+  assert.ok(!exported.includes("noSuchExport"),
+    "control: the export list is a real list, not a set that answers yes");
+});
+
+// ---------------------------------------------------------------------------
+// createGuard: the three hook bodies.
+//
+// These used to live in extension.mjs, where `joinSession` runs at import and
+// no test can reach a line of them. They are where every other decision in
+// guard.mjs is SEQUENCED -- which scan seeds which baseline, which tool
+// triggers a second checkout's scan, whether a report is emitted or a
+// permission denied -- and sequencing is the part that looks right when read.
+// ---------------------------------------------------------------------------
+
+const HOOK_ROOT = join(tmpdir(), "cg-hook-repo");
+const HOOK_PRIMARY = join(tmpdir(), "cg-hook-primary");
+const HOOK_SCRATCH = join(tmpdir(), "cg-hook-scratch");
+
+/**
+ * A guard wired to doubles, plus a record of what it touched.
+ *
+ * `trees` maps a checkout root to what a scan of it returns: an array, or
+ * `null` for a scan that failed. A root absent from `trees` scans as empty --
+ * which is a different answer from null, and the difference is load-bearing.
+ *
+ * Nothing here touches the filesystem or a git binary. That is the point of
+ * the injection points on `createGuard`: the sequencing is what is under test.
+ */
+function hookGuard({ trees = {}, ...overrides } = {}) {
+  const calls = { ensureDir: [], scanned: [] };
+  const guard = createGuard({
+    scratchDir: HOOK_SCRATCH,
+    disabled: false,
+    ensureDir: (dir) => { calls.ensureDir.push(dir); },
+    cwd: () => HOOK_ROOT,
+    rootOf: async () => HOOK_ROOT,
+    scan: async (root) => {
+      calls.scanned.push(root);
+      return Object.hasOwn(trees, root) ? trees[root] : [];
+    },
+    otherRoot: async () => null,
+    ...overrides,
+  });
+  return { ...guard, calls };
+}
+
+test("createGuard hands out independent guards, never a shared baseline", async () => {
+  const a = hookGuard({ trees: { [HOOK_ROOT]: ["only-a.py"] } });
+  const b = hookGuard();
+  await a.onSessionStart();
+  assert.deepEqual(a.state.lastSeen.get(HOOK_ROOT), ["only-a.py"],
+    "premise: the first guard really did seed a baseline");
+  assert.equal(b.state.lastSeen.size, 0,
+    "a second guard in the same process shares nothing with the first -- state "
+    + "held at module level would make every case in this file order-dependent");
+  // Control: `b` is not simply inert. It seeds its own baseline, and doing so
+  // does not reach into `a`'s.
+  await b.onSessionStart();
+  assert.deepEqual(b.state.lastSeen.get(HOOK_ROOT), []);
+  assert.deepEqual(a.state.lastSeen.get(HOOK_ROOT), ["only-a.py"]);
+});
+
+test("onSessionStart seeds the checkout and names what it inherited", async () => {
+  const guard = hookGuard({ trees: { [HOOK_ROOT]: ["stale.py"] } });
+  const result = await guard.onSessionStart();
+  assert.match(result.additionalContext, /stale\.py/);
+  assert.ok(result.additionalContext.includes(HOOK_SCRATCH),
+    "the briefing names where to write instead");
+  assert.deepEqual(guard.state.lastSeen.get(HOOK_ROOT), ["stale.py"],
+    "seeded as well as reported: every later hook answers 'what is new', so "
+    + "this is the only moment an inherited artifact can be named at all");
+  assert.deepEqual(guard.calls.ensureDir, [HOOK_SCRATCH]);
+  // Control: a clean checkout gets the briefing and no inherited notice, so
+  // the match above is the report firing rather than the text always saying it.
+  const clean = await hookGuard().onSessionStart();
+  assert.ok(clean.additionalContext.includes(HOOK_SCRATCH));
+  assert.doesNotMatch(clean.additionalContext, /stale\.py/);
+  assert.doesNotMatch(clean.additionalContext, /INHERITED/);
+});
+
+test("a session-start scan that failed is reported as unscanned, not as clean", async () => {
+  const guard = hookGuard({ trees: { [HOOK_ROOT]: null } });
+  const result = await guard.onSessionStart();
+  assert.match(result.additionalContext, /UNSCANNED/);
+  assert.equal(guard.state.lastSeen.has(HOOK_ROOT), false,
+    "a failed scan must not become a baseline, or the whole checkout reads as "
+    + "new the first time a command runs");
+  // Control: a scan that succeeded and found nothing says no such thing, which
+  // is what makes the notice above mean 'nobody looked'.
+  const clean = hookGuard();
+  const quiet = await clean.onSessionStart();
+  assert.doesNotMatch(quiet.additionalContext, /UNSCANNED/);
+  assert.deepEqual(clean.state.lastSeen.get(HOOK_ROOT), []);
+});
+
+test("onSessionStart seeds the primary checkout too, so its contents are never blamed on this session", async () => {
+  const guard = hookGuard({
+    trees: { [HOOK_ROOT]: [], [HOOK_PRIMARY]: ["peer.py"] },
+    otherRoot: async () => HOOK_PRIMARY,
+  });
+  const result = await guard.onSessionStart();
+  assert.deepEqual(guard.state.lastSeen.get(HOOK_PRIMARY), ["peer.py"],
+    "without this seed every existing file in the primary reads as this "
+    + "agent's doing the first time a command is run");
+  assert.match(result.additionalContext, /peer\.py/);
+  assert.ok(result.additionalContext.includes(HOOK_PRIMARY), "the notice says which tree");
+  // Control: an agent already working in the primary has no second checkout,
+  // and the primary is then not scanned twice as if it were two places.
+  const alone = hookGuard({ trees: { [HOOK_PRIMARY]: ["peer.py"] } });
+  await alone.onSessionStart();
+  assert.equal(alone.state.lastSeen.has(HOOK_PRIMARY), false);
+  assert.deepEqual(alone.calls.scanned, [HOOK_ROOT]);
+});
+
+test("an unwritable scratch directory does not fail the session", async () => {
+  let attempted = 0;
+  const guard = hookGuard({
+    ensureDir: () => { attempted++; throw new Error("EACCES"); },
+    trees: { [HOOK_ROOT]: ["stale.py"] },
+  });
+  const result = await guard.onSessionStart();
+  assert.equal(attempted, 1,
+    "premise: the failure really happened, so surviving it is a finding");
+  assert.ok(result.additionalContext.includes(HOOK_SCRATCH),
+    "the briefing still names the intended location -- a guard that breaks a "
+    + "session is worse than the artifacts it prevents");
+  assert.match(result.additionalContext, /stale\.py/,
+    "and the rest of the hook still ran; the throw was survived, not skipped");
+});
+
+test("the disable knob turns all three hooks into no-ops", async () => {
+  const off = hookGuard({ disabled: true, trees: { [HOOK_ROOT]: ["stray.py"] } });
+  assert.equal(await off.onSessionStart(), undefined);
+  assert.equal(
+    await off.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add -A" } }),
+    undefined);
+  assert.equal(await off.onPostToolUse({ toolName: "bash", toolArgs: {} }), undefined);
+  assert.deepEqual(off.calls.scanned, [], "nothing was even looked at");
+  assert.deepEqual(off.calls.ensureDir, [], "and no directory was created");
+  // Control: the identical calls against an enabled guard all do something, so
+  // the three undefineds above are the knob and not three inert arguments.
+  const on = hookGuard({ trees: { [HOOK_ROOT]: ["stray.py"] } });
+  const started = await on.onSessionStart();
+  assert.match(started.additionalContext, /stray\.py/);
+  assert.deepEqual(on.calls.ensureDir, [HOOK_SCRATCH]);
+  const denied = await on.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add -A" } });
+  assert.equal(denied, undefined,
+    "premise: nothing is outstanding yet -- the seed folded it into the baseline");
+  const noticed = await on.onPostToolUse({ toolName: "bash", toolArgs: {} });
+  assert.equal(noticed, undefined);
+  assert.ok(on.calls.scanned.length > 0, "an enabled guard looks; a disabled one does not");
+});
+
+test("onPreToolUse looks only at shell commands that mention git", async () => {
+  const guard = hookGuard({ trees: { [HOOK_ROOT]: ["junk.py"] } });
+  guard.state.lastSeen.set(HOOK_ROOT, []);
+  assert.equal(
+    await guard.onPreToolUse({ toolName: "view", toolArgs: { command: "git add -A" } }),
+    undefined, "not a shell tool");
+  assert.equal(
+    await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "ls -la" } }),
+    undefined, "not a git command");
+  assert.deepEqual(guard.calls.scanned, [],
+    "the cheap rejects come first: this hook runs on every shell command and "
+    + "the overwhelming majority of them are not git");
+  // Control: the same guard and the same outstanding artifact, with a git
+  // command -- it scans and denies. Without this, the two undefineds above are
+  // satisfied by a hook that never does anything at all.
+  const decision = await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add -A" } });
+  assert.equal(decision.permissionDecision, "deny");
+  assert.match(decision.permissionDecisionReason, /junk\.py/);
+  assert.deepEqual(guard.calls.scanned, [HOOK_ROOT]);
+});
+
+test("onPreToolUse denies a blanket stage and flags what it is naming for the first time", async () => {
+  const guard = hookGuard({ trees: { [HOOK_ROOT]: ["probe.py"] } });
+  guard.state.lastSeen.set(HOOK_ROOT, []);
+  const denied = await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add -A" } });
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /BLOCKED/);
+  assert.match(denied.permissionDecisionReason, /first time/,
+    "it arrived with no tool call of this agent's in between, so the message "
+    + "must not imply the agent made it");
+  // Control: staging the same path BY NAME is allowed. That distinction is the
+  // entire point -- the aim is to stop artifacts being committed unnoticed.
+  assert.equal(
+    await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add probe.py" } }),
+    undefined);
+  assert.deepEqual([...setFor(guard.state.outstanding, HOOK_ROOT)], ["probe.py"],
+    "still outstanding: allowing the named stage is not forgetting the artifact");
+});
+
+test("onPreToolUse reports what it noticed even when the command is not a sweep", async () => {
+  const guard = hookGuard({ trees: { [HOOK_ROOT]: ["probe.py"] } });
+  guard.state.lastSeen.set(HOOK_ROOT, []);
+  const result = await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git status" } });
+  assert.match(result.additionalContext, /probe\.py/);
+  assert.equal(result.permissionDecision, undefined, "noticing is not refusing");
+  // Control: with nothing new, the same call says nothing -- so the report
+  // above is the artifact and not a hook that always speaks.
+  assert.equal(
+    await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git status" } }),
+    undefined);
+});
+
+test("onPostToolUse folds a create/edit write into the baseline instead of reporting it", async () => {
+  const guard = hookGuard();
+  guard.state.lastSeen.set(HOOK_ROOT, []);
+  assert.equal(
+    await guard.onPostToolUse({ toolName: "create", toolArgs: { path: join(HOOK_ROOT, "notes.md") } }),
+    undefined);
+  assert.deepEqual([...setFor(guard.state.authored, HOOK_ROOT)], ["notes.md"]);
+  assert.deepEqual(guard.calls.scanned, [],
+    "no rescan: the CLI issues parallel edit calls, so a five-file edit would "
+    + "otherwise fire five concurrent whole-tree traversals");
+  // Control: a shell command producing the same path IS reported, so the
+  // silence above is the authoring branch rather than a hook that never
+  // reports anything.
+  const shell = hookGuard({ trees: { [HOOK_ROOT]: ["notes.md"] } });
+  shell.state.lastSeen.set(HOOK_ROOT, []);
+  const reported = await shell.onPostToolUse({ toolName: "bash", toolArgs: { command: "touch notes.md" } });
+  assert.match(reported.additionalContext, /notes\.md/);
+});
+
+test("onPostToolUse scans the primary after a subagent call, and not after a shell command", async () => {
+  const trees = { [HOOK_ROOT]: [], [HOOK_PRIMARY]: ["from-subagent.py"] };
+  const viaTask = hookGuard({ trees, otherRoot: async () => HOOK_PRIMARY });
+  viaTask.state.lastSeen.set(HOOK_ROOT, []);
+  viaTask.state.lastSeen.set(HOOK_PRIMARY, []);
+  const result = await viaTask.onPostToolUse({ toolName: "task", toolArgs: {} });
+  assert.match(result.additionalContext, /from-subagent\.py/);
+  assert.ok(result.additionalContext.includes(HOOK_PRIMARY), "the report says which tree");
+  assert.deepEqual([...setFor(viaTask.state.outstanding, HOOK_PRIMARY)], [],
+    "reported but never blocking: the file may be a peer's, and refusing this "
+    + "agent's commit over it lands the cost on the wrong asset");
+
+  // Control: the same guard shape and the same primary contents, reached by a
+  // bash call -- the primary is not scanned. Scanning it after every shell
+  // command would report every peer's artifacts to every other agent, and a
+  // guard that cries wolf gets switched off.
+  const viaShell = hookGuard({ trees, otherRoot: async () => HOOK_PRIMARY });
+  viaShell.state.lastSeen.set(HOOK_ROOT, []);
+  viaShell.state.lastSeen.set(HOOK_PRIMARY, []);
+  assert.equal(await viaShell.onPostToolUse({ toolName: "bash", toolArgs: {} }), undefined);
+  assert.deepEqual(viaShell.calls.scanned, [HOOK_ROOT]);
+});
+
+test("a session outside any checkout is left alone", async () => {
+  const guard = hookGuard({ rootOf: async () => null, trees: { [HOOK_ROOT]: ["x.py"] } });
+  assert.equal(
+    await guard.onPreToolUse({ toolName: "bash", toolArgs: { command: "git add -A" } }),
+    undefined);
+  assert.equal(await guard.onPostToolUse({ toolName: "bash", toolArgs: {} }), undefined);
+  const start = await guard.onSessionStart();
+  assert.ok(start.additionalContext.includes(HOOK_SCRATCH),
+    "session start still briefs: where to write scratch files is worth saying "
+    + "whether or not this directory is a git checkout");
+  assert.doesNotMatch(start.additionalContext, /x\.py/);
+  assert.deepEqual(guard.calls.scanned, [], "there is no root to scan");
+});
+
+// --- the budget on extension.mjs -----------------------------------------
+
+/**
+ * Whether a `/` at this point begins a regex literal rather than a division.
+ *
+ * Decided by the previous significant character, which is the standard
+ * heuristic: after a value -- identifier, `)`, `]`, digit -- a slash divides;
+ * anywhere else it opens a regex.
+ */
+function canStartRegex(last) {
+  return last === "" || !/[\w$)\]]/.test(last);
+}
+
+/**
+ * Source with comments removed and every string, template and regex literal
+ * blanked, so a token scan below sees code and only code.
+ *
+ * A regex-based stripper was written first and had a real bypass, found by
+ * adversarial review: in `const s = "x//y"; if (danger) { run(); }` the `//`
+ * inside the string literal ate the rest of the line, `if` included, and the
+ * file was reported clean. A detector that a string literal can silence is
+ * precisely the failure this extension exists to prevent -- silence with two
+ * causes -- so this is a character scanner instead.
+ *
+ * Its one known limit: a `}` inside a string inside a `${...}` substitution
+ * would end the substitution early. That is a scan of a scan, and the controls
+ * below fix the shapes that actually bypass it.
+ */
+function codeOnly(source) {
+  const out = [];
+  let last = "";
+  let i = 0;
+  const push = (ch) => {
+    out.push(ch);
+    if (ch.trim()) last = ch;
+  };
+
+  while (i < source.length) {
+    const c = source[i];
+    const d = source[i + 1];
+
+    if (c === "/" && d === "/") {
+      while (i < source.length && source[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && d === "*") {
+      i += 2;
+      while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++;
+      i += 2;
+      push(" ");
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      const quote = c;
+      i++;
+      while (i < source.length && source[i] !== quote) {
+        i += source[i] === "\\" ? 2 : 1;
+      }
+      i++;
+      push("S");
+      continue;
+    }
+    if (c === "`") {
+      i++;
+      while (i < source.length) {
+        if (source[i] === "\\") { i += 2; continue; }
+        if (source[i] === "`") { i++; break; }
+        if (source[i] === "$" && source[i + 1] === "{") {
+          i += 2;
+          const start = i;
+          let depth = 1;
+          while (i < source.length && depth > 0) {
+            if (source[i] === "{") depth++;
+            else if (source[i] === "}") depth--;
+            if (depth > 0) i++;
+          }
+          // A substitution is code again, and a ternary hides there happily.
+          out.push(codeOnly(source.slice(start, i)));
+          i++;
+          continue;
+        }
+        i++;
+      }
+      push("S");
+      continue;
+    }
+    if (c === "/" && canStartRegex(last)) {
+      i++;
+      let inClass = false;
+      while (i < source.length) {
+        if (source[i] === "\\") { i += 2; continue; }
+        if (source[i] === "\n") break;
+        if (source[i] === "[") inClass = true;
+        else if (source[i] === "]") inClass = false;
+        else if (source[i] === "/" && !inClass) { i++; break; }
+        i++;
+      }
+      while (i < source.length && /[a-z]/.test(source[i])) i++;
+      push("R");
+      continue;
+    }
+    push(c);
+    i++;
+  }
+  return out.join("");
+}
+
+const DECISION_TOKENS = [
+  [/\bif\b/, "if"],
+  [/\belse\b/, "else"],
+  [/\bfor\b/, "for"],
+  [/\bwhile\b/, "while"],
+  [/\bswitch\b/, "switch"],
+  [/\btry\b/, "try"],
+  [/\bcatch\b/, "catch"],
+  [/&&/, "&&"],
+  [/\|\|/, "||"],
+  [/\?\?/, "??"],
+  [/\?\./, "optional chaining"],
+  [/\?[^?.]/, "ternary"],
+];
+
+function decisionsIn(source) {
+  const code = codeOnly(source);
+  return DECISION_TOKENS.filter(([pattern]) => pattern.test(code)).map(([, name]) => name);
+}
+
+test("extension.mjs holds no decisions, because nothing can test one there", async () => {
+  const source = await readFile(
+    join(dirname(fileURLToPath(import.meta.url)), "extension.mjs"), "utf8");
+  const code = codeOnly(source);
+  // Premises: the scanner left the code behind. Without these, a stripper that
+  // returned "" would report the file gloriously free of decisions.
+  assert.ok(code.includes("joinSession"), "premise: the SDK call survived stripping");
+  assert.ok(code.includes("createGuard"), "premise: and the wiring under test");
+
+  assert.deepEqual(decisionsIn(source), [],
+    "a branch in extension.mjs is covered by `node --check` and by nothing "
+    + "else, because importing that file starts a session. Move it into "
+    + "guard.mjs behind createGuard, where the node suite runs it.");
+
+  const codeLines = code.split("\n").map((line) => line.trim()).filter(Boolean);
+  assert.ok(codeLines.length <= 25,
+    `extension.mjs is ${codeLines.length} lines of code and the budget is 25: `
+    + "untestable code is spent, not written");
+});
+
+test("the decision scan cannot be silenced by a comment, a string or a regex", () => {
+  // Positive control, one per detector. A scan that matches nothing calls the
+  // file clean in exactly the words it uses when the file really is clean --
+  // which is the failure this whole extension exists to make impossible.
+  const sample = "if (a) {} else {}\nfor (;;) {}\nwhile (a) {}\nswitch (a) {}\n"
+    + "try {} catch {}\na && b;\na || b;\na ?? b;\na?.b;\na ? b : c;";
+  assert.deepEqual(
+    decisionsIn(sample).sort(),
+    DECISION_TOKENS.map(([, name]) => name).sort(),
+    "every detector fires against source that has the construct");
+
+  // The negative half: prose about `if` is not code, or the scan would
+  // condemn a file for its own explanation of itself.
+  assert.deepEqual(
+    decisionsIn("// if (a) {} else {}\n/* while (b) {} */\nexport const x = 1;"), [],
+    "the same constructs inside comments are not code");
+
+  // The bypasses. Each of these hid a real `if` from the regex-based stripper
+  // this replaced -- reported by an adversarial reviewer for the first, which
+  // is how the other two came to be looked for at all.
+  assert.deepEqual(decisionsIn('const s = "x//y"; if (danger) { run(); }'), ["if"],
+    "a `//` inside a string literal must not eat the rest of the line");
+  assert.deepEqual(decisionsIn("const s = `x//y`; if (danger) { run(); }"), ["if"],
+    "nor inside a template literal");
+  assert.deepEqual(decisionsIn("const re = /\\/\\//; if (danger) { run(); }"), ["if"],
+    "nor inside a regex literal");
+  assert.deepEqual(decisionsIn('const s = "/* still code */"; if (danger) {}'), ["if"],
+    "a block comment opened inside a string is not a block comment");
+
+  // And division is not a regex: mistaking it for one would swallow code up
+  // to the next slash and silence the scan the other way round.
+  assert.deepEqual(decisionsIn("const x = a / b; const y = c / d; if (e) {}"), ["if"],
+    "a `/` after a value divides; only after an operator does it open a regex");
+
+  // A ternary inside a template substitution is still a ternary.
+  assert.deepEqual(decisionsIn("const s = `${a ? b : c}`;"), ["ternary"],
+    "a substitution is code again");
+
+  // Control on the controls: source with none of the constructs reports none,
+  // so the lists above are the detectors firing rather than a function that
+  // always returns its whole vocabulary.
+  assert.deepEqual(decisionsIn("export const x = 1;\nconst y = f(x);"), []);
 });
 
 

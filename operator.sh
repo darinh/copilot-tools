@@ -20,15 +20,55 @@
 #
 # Single-session mode launches copilot in tmux and auto-attaches.
 # When copilot exits, metrics are captured and a brief summary shown.
+# It adds --autopilot --effort high --experimental.
 #
-# Loop mode (--loop) adds --yolo --autopilot --no-ask-user, sends a
+# Loop mode (--loop) adds --yolo --autopilot --no-ask-user --effort high --experimental, sends a
 # preamble for autonomous operation, and restarts copilot when the
 # agent signals via a restart marker file. Ctrl+C shows aggregate stats.
 # ═══════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# Resolve the directory where this script lives (follows symlinks)
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Resolve the directory where this script lives, following symlinks.
+#
+# `readlink -f` is GNU-only. macOS ships BSD readlink, which has no `-f` at
+# all -- setup.sh has said so in a comment since it was written, and this was
+# the last script in the repo still relying on it.
+#
+# The failure it produced was not the abort you would hope for. The failing
+# `readlink` sits inside `$(dirname "$(...)")`, so `set -e` never sees it: the
+# assignment takes the status of the OUTER `$(cd ... && pwd)`, which succeeds.
+# `dirname ""` is ".", so `cd .` works, and SCRIPT_DIR silently became the
+# CALLER'S working directory. The two `operator-ingest.py` invocations below
+# then looked for it wherever the user happened to be standing, and the only
+# other symptom was one line of readlink usage text on stderr.
+#
+# The loop below is the portable equivalent: plain `readlink` with no `-f`
+# exists on BSD and GNU alike, and resolving one link at a time arrives at the
+# same place. CDPATH is emptied because a user's CDPATH can make `cd` print a
+# directory and jump somewhere else entirely. The hop limit stands in for the
+# ELOOP that `readlink -f` would have raised on a circular link; failing loudly
+# there is the opposite of the bug being fixed, and deliberately so.
+resolve_script_dir() {
+    local src="$1" dir hops=0
+    while [ -L "$src" ]; do
+        # An assignment, not `(( hops++ ))` -- an arithmetic command whose
+        # result is 0 returns status 1, which under `set -e` would end the
+        # script on the first hop.
+        hops=$((hops + 1))
+        if [ "$hops" -gt 40 ]; then
+            echo "operator.sh: too many symbolic links resolving $1" >&2
+            return 1
+        fi
+        dir="$(CDPATH="" cd "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in
+            /*) ;;
+            *) src="$dir/$src" ;;
+        esac
+    done
+    CDPATH="" cd "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"
 
 # ── Constants ───────────────────────────────────────────────────
 # All operator state lives in ~/.operator/ (NOT ~/.copilot/).
@@ -231,24 +271,57 @@ load_instance_state() {
     return 0
 }
 
+# ── Sets, without associative arrays ────────────────────────────
+#
+# `/bin/bash` on macOS is 3.2 and always will be — Apple froze it at the last
+# GPLv2 release — and bash 3.2 has no associative arrays at all. `local -A x`
+# there is not a subtly different array, it is `declare: -A: invalid option`,
+# and under this script's `set -e` that ends the run. Three places wanted a
+# set, all of them for the same question: is this name one of the ones I
+# collected?
+#
+# So membership is an exact scan of an indexed array, which is the one kind of
+# array bash 3.2 does have. The obvious cheaper encoding — join the names with
+# newlines and ask whether the string contains one — is what this used first,
+# and it is wrong: `for f in "$RESTART_DIR"/*.managed` yields whatever
+# filenames exist, and a filename may contain a newline. `operator --name` with
+# a newline in it creates the marker with `touch` before tmux rejects the name,
+# so the poisoned marker outlives the failed launch; one such marker splits
+# into two logical members, and `stop_operator` passes every name it believes
+# is a member to `tmux kill-session`. An exact comparison has no encoding to
+# corrupt, and n here is the number of tmux sessions on the box.
+#
+# Usage: in_list "$needle" ${arr[@]+"${arr[@]}"}
+in_list() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        # `"$needle"` is quoted, so a name containing `*` or `?` is compared
+        # literally instead of being used as a pattern against its neighbours.
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
 list_instances() {
     echo "═══ Running Operator Instances ═══"
     echo
     local found=false
     # Collect names of sessions managed by operator (have a .managed or .state marker)
-    local -A managed_sessions
+    local managed_sessions=()
     for f in "${RESTART_DIR}"/*.state "${RESTART_DIR}"/*.managed; do
         [[ -e "$f" ]] || continue
         local base
         base=$(basename "$f")
         base="${base%.state}"
         base="${base%.managed}"
-        managed_sessions["$base"]=1
+        managed_sessions+=("$base")
     done
     while IFS= read -r line; do
         local name
         name=$(echo "$line" | cut -d: -f1)
-        if [[ -n "${managed_sessions[$name]+x}" ]]; then
+        if in_list "$name" ${managed_sessions[@]+"${managed_sessions[@]}"}; then
             echo "  $line"
             found=true
         fi
@@ -714,11 +787,12 @@ OPTIONS
 MODES
     Single session (default)
         Launches copilot in tmux with your args, auto-attaches.
+        Adds --autopilot --effort high --experimental automatically.
         When copilot exits, usage metrics are parsed from its process
         log and stored in the metrics database.
 
     Loop mode (--loop)
-        Adds --yolo --autopilot --no-ask-user automatically.
+        Adds --yolo --autopilot --no-ask-user --effort high --experimental automatically.
         Sends a preamble for autonomous operation. Restarts copilot
         when the agent touches the instance-specific restart marker.
         Ctrl+C captures metrics and shows an aggregate run summary.
@@ -799,17 +873,17 @@ stop_operator() {
     else
         local count=0
         # Find all operator-managed sessions via .managed and .state markers
-        local -A managed_sessions
+        local managed_sessions=()
         for f in "${RESTART_DIR}"/*.managed "${RESTART_DIR}"/*.state; do
             [[ -e "$f" ]] || continue
             local base
             base=$(basename "$f")
             base="${base%.managed}"
             base="${base%.state}"
-            managed_sessions["$base"]=1
+            managed_sessions+=("$base")
         done
         while IFS= read -r name; do
-            if [[ -n "${managed_sessions[$name]+x}" ]]; then
+            if in_list "$name" ${managed_sessions[@]+"${managed_sessions[@]}"}; then
                 tmux kill-session -t "$name"
                 rm -f "${RESTART_DIR}/${name}" "${RESTART_DIR}/${name}.state" "${RESTART_DIR}/${name}.managed"
                 log "Stopped: $name"
@@ -838,7 +912,15 @@ generate_run_script() {
             printf 'PREAMBLE=%q\n' "$SCRIPT_PREAMBLE"
         fi
         printf 'exec copilot'
-        for arg in "${copilot_args[@]}"; do
+        # Guarded like the loop path above, though every caller today builds
+        # this array from a non-empty defaults list. That non-emptiness is a
+        # fact about those lists, not an invariant of this function -- and the
+        # single-session list was shortened from six elements to four in
+        # cb10f72, by the same hand that had just verified these expansions as
+        # safe, without the coupling being visible from either end. This is the
+        # innermost consumer, so it inherits emptiness from every caller,
+        # including ones not written yet.
+        for arg in ${copilot_args[@]+"${copilot_args[@]}"}; do
             printf ' %q' "$arg"
         done
         if [[ -n "$SCRIPT_PREAMBLE" ]]; then
@@ -923,14 +1005,14 @@ start_copilot_in_tmux() {
         log "     ${SCRIPT_DIR:-<your copilot-tools checkout>}/diagnose-restart-deleter.sh"
         mkdir -p "$RESTART_DIR"
         if (( ${#PRE_LAUNCH_MARKERS[@]} > 0 )); then
-            local -A _live_sessions=()
+            local _live_sessions=()
             local _s
             while IFS= read -r _s; do
-                [[ -n "$_s" ]] && _live_sessions["$_s"]=1
+                [[ -n "$_s" ]] && _live_sessions+=("$_s")
             done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
             local _name
-            for _name in "${PRE_LAUNCH_MARKERS[@]}"; do
-                if [[ -n "${_live_sessions[$_name]+x}" ]]; then
+            for _name in ${PRE_LAUNCH_MARKERS[@]+"${PRE_LAUNCH_MARKERS[@]}"}; do
+                if in_list "$_name" ${_live_sessions[@]+"${_live_sessions[@]}"}; then
                     touch "${RESTART_DIR}/${_name}.managed"
                     log "  Restored marker for live instance: $_name"
                 else
@@ -989,7 +1071,14 @@ restart_copilot() {
 
 # ── Single Session Mode ────────────────────────────────────────
 run_single_session() {
-    local copilot_args=("--autopilot" "--effort" "high" "$@")
+    # `--experimental` always, and always ahead of "$@": runtime extensions
+    # load only in experimental mode, and the flag is sticky global state in
+    # ~/.copilot/settings.json that any other session can flip. The CLI
+    # resolves conflicting spellings last-wins, so a user's own
+    # `--no-experimental` still beats this. See with_experimental() in
+    # copilot_operator.py for the full reasoning.
+    local copilot_args=("--autopilot" "--effort" "high" "--experimental")
+    copilot_args+=("$@")
 
     handle_existing_session
 
@@ -999,7 +1088,7 @@ run_single_session() {
     log "Starting single session: $INSTANCE_NAME"
 
     SCRIPT_PREAMBLE=""
-    generate_run_script "${copilot_args[@]}"
+    generate_run_script ${copilot_args[@]+"${copilot_args[@]}"}
     start_copilot_in_tmux 1 off
 
     set_tab_title "operator - $INSTANCE_NAME"
@@ -1027,19 +1116,26 @@ run_loop_mode() {
 
     trap cleanup SIGINT SIGTERM
 
-    local copilot_args=("--yolo" "--autopilot" "--no-ask-user" "--effort" "high")
+    local copilot_args=("--yolo" "--autopilot" "--no-ask-user" "--effort" "high" "--experimental")
 
+    # `${a[@]+"${a[@]}"}` everywhere `user_args` is expanded, not `"${a[@]}"`.
+    # macOS ships bash 3.2, where an empty array is *unset* rather than
+    # set-and-empty, so `"${user_args[@]}"` under the `set -u` on line 28 is an
+    # unbound-variable error rather than zero words. `operator --loop` with no
+    # arguments of its own is the plainest way to reach that, and it died here
+    # before touching anything. bash 4.4 and later have no such quirk, which is
+    # why this only ever showed up on macOS.
     local agent_name
-    agent_name=$(extract_agent_from_args "${user_args[@]}")
+    agent_name=$(extract_agent_from_args ${user_args[@]+"${user_args[@]}"})
     local has_agent=false
-    for arg in "${user_args[@]}"; do
+    for arg in ${user_args[@]+"${user_args[@]}"}; do
         [[ "$arg" == "--agent" || "$arg" == --agent=* ]] && has_agent=true
     done
     if [[ "$has_agent" == false ]]; then
         copilot_args+=("--agent" "$agent_name")
     fi
 
-    copilot_args+=("${user_args[@]}")
+    copilot_args+=(${user_args[@]+"${user_args[@]}"})
 
     SCRIPT_PREAMBLE=$(build_preamble "$agent_name")
 
@@ -1081,9 +1177,9 @@ run_loop_mode() {
         CURRENT_SESSION_NUM=$session_num
         save_instance_state
 
-        local launch_args=("${copilot_args[@]}")
+        local launch_args=(${copilot_args[@]+"${copilot_args[@]}"})
         if [[ -n "$resume_session_id" ]]; then
-            if args_have_explicit_session "${launch_args[@]}"; then
+            if args_have_explicit_session ${launch_args[@]+"${launch_args[@]}"}; then
                 log "  Skipping automatic --resume; user args already choose a session"
             else
                 launch_args+=("--resume=$resume_session_id")
@@ -1091,7 +1187,7 @@ run_loop_mode() {
             resume_session_id=""
         fi
 
-        generate_run_script "${launch_args[@]}"
+        generate_run_script ${launch_args[@]+"${launch_args[@]}"}
         start_copilot_in_tmux "$session_num" on
 
         local restart_requested=false
@@ -1315,10 +1411,14 @@ main() {
         rm -f "$STATE_FILE"
     fi
 
+    # Guarded expansion, for the bash 3.2 reason documented in run_loop_mode().
+    # `copilot_args` above starts empty and stays empty for a bare `operator`
+    # or `operator --loop`, so on stock macOS bash both of these died here
+    # before the session ever started.
     if [[ "$loop_mode" == true ]]; then
-        run_loop_mode "${copilot_args[@]}"
+        run_loop_mode ${copilot_args[@]+"${copilot_args[@]}"}
     else
-        run_single_session "${copilot_args[@]}"
+        run_single_session ${copilot_args[@]+"${copilot_args[@]}"}
     fi
 }
 

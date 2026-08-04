@@ -20,7 +20,6 @@ never under ``~/.copilot``, which the Copilot CLI wholesale-deletes on startup.
 from __future__ import annotations
 
 import atexit
-import csv
 import hashlib
 import json
 import os
@@ -50,6 +49,7 @@ if _HERE not in sys.path:
 
 import operator_ingest                                       # noqa: E402
 import operator_mail                                         # noqa: E402
+import operator_trace                                        # noqa: E402
 from install_manifest import (                                # noqa: E402
     dir_present,
     file_present,
@@ -60,6 +60,7 @@ from operator_mux import (                                    # noqa: E402
     Mux, MuxError, MuxNotFoundError, safe_instance_id,
 )
 from project_paths import (                                   # noqa: E402
+    catalog_rows,
     guid_is_usable,
     primary_repo_root,
     project_dir,
@@ -73,6 +74,19 @@ MAX_SESSIONS = 1000
 MAX_LAUNCH_FAILURES = 5
 LAUNCH_BACKOFF_BASE = 5
 RESTART_PAUSE_SECONDS = 3
+# A session that stayed up at least this long before dying did not fail to
+# start, so it must not accumulate toward the consecutive-exit limit.
+#
+# That limit exists to stop a *hot* relaunch spin -- a session that dies on
+# startup, every time, forever. It counted exits and never their spacing, so
+# five unrelated deaths hours apart retired the supervisor exactly as fast as
+# five in a minute. This machine's own logs are the case against it: on four
+# separate occasions every instance died within seconds of every other,
+# independent of when each was launched, having each run for minutes -- an
+# external event, not a crash loop. Five such waves and the user came back to
+# nothing running at all. Sessions that were healthy for minutes now reset the
+# count, so only genuinely rapid failures can retire a loop.
+HEALTHY_SESSION_SECONDS = 120
 SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
 # Consecutive sessions that may change nothing before the loop gives up.
@@ -83,7 +97,8 @@ GIT_PROBE_TIMEOUT = 30
 EXIT_NO_PROGRESS = 3
 RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
                   "version", "forget", "logs", "tabs", "restore",
-                  "stop-loop", "stop-session", "restart-loop", "menu"}
+                  "stop-loop", "stop-session", "restart-loop", "menu",
+                  "trace"}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
@@ -1464,14 +1479,27 @@ def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
     catalog = project_catalog_path()
     if file_present(catalog) is False:
         return None
-    target = str(primary_repo_root(cwd).resolve())
-    if IS_WINDOWS:
-        target = target.lower()
     # "No row matched" is only an answer if every row was actually compared.
     undecided = False
     try:
+        target = str(primary_repo_root(cwd).resolve())
+    except (OSError, ValueError, RuntimeError):
+        # Nothing can be compared against a target that will not resolve, so
+        # every row below is undecided rather than unmatched. Reporting "not
+        # registered" here would tell a restarting session its project has no
+        # handoff, which is the one thing this must never say on a guess.
+        return CATALOG_UNREADABLE
+    if IS_WINDOWS:
+        target = target.lower()
+    try:
         with open(catalog, "r", encoding="utf-8", errors="replace", newline="") as fh:
-            for row in csv.reader(fh):
+            for row in catalog_rows(fh):
+                if row is None:
+                    # The line would not parse at all. Same reasoning as an
+                    # unresolvable row below: it is a row not compared, not a
+                    # row that failed to match.
+                    undecided = True
+                    continue
                 if len(row) < 2:
                     continue
                 path, guid = row[0].strip().strip('"'), row[1].strip().strip('"')
@@ -1486,10 +1514,14 @@ def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
                     continue
                 try:
                     resolved = str(Path(path).resolve())
-                except OSError:
+                except (OSError, ValueError, RuntimeError):
                     # This row could not be compared. Skipping it is right, but
                     # it means the "not registered" verdict below is no longer
-                    # established for this catalog.
+                    # established for this catalog. All three arrive here: the
+                    # catalog is a hand-edited CSV, so a row can name a symlink
+                    # loop (RuntimeError, or OSError(ELOOP) on newer
+                    # interpreters) or carry an embedded NUL (ValueError) just
+                    # as easily as it can name a denied path (OSError).
                     undecided = True
                     continue
                 if IS_WINDOWS:
@@ -1780,6 +1812,41 @@ def args_have_explicit_session(args: list[str]) -> bool:
 
 def has_agent_flag(args: list[str]) -> bool:
     return any(a == "--agent" or a.startswith("--agent=") for a in args)
+
+
+def with_experimental(defaults: list[str]) -> list[str]:
+    """Append `--experimental` to the operator's injected defaults.
+
+    Runtime extensions -- `checkout-guard` among them -- load ONLY when the
+    CLI is in experimental mode, and the CLI persists the last spelling it was
+    given into `~/.copilot/settings.json`. So the flag is sticky global state
+    that any other session, on any project, can flip; and when it is off,
+    every extension silently does not load. There is no error and no missing
+    output, because an extension that never loaded cannot report its own
+    absence. That was measured on this machine: agent sessions ran for over an
+    hour with no checkout-guard at all, in the shared primary checkout it
+    exists to protect, and nothing inside those sessions could have told.
+
+    Passing it explicitly on every launch is what makes the guard's silence
+    mean "scanned and found nothing" rather than "was never there".
+
+    It is added UNCONDITIONALLY, and callers must place the result BEFORE the
+    user's own arguments. A user who really wants `--no-experimental` still
+    gets it, because the CLI resolves conflicting spellings last-wins -- both
+    orders were measured against CLI 1.0.77:
+
+        copilot --experimental --no-experimental ...  -> experimental: false
+        copilot --no-experimental --experimental ...  -> experimental: true
+
+    Deciding by *inspecting* the user's arguments instead is what the earlier
+    version of this function did, and it was wrong: it could not tell a flag
+    from a value, so `-p --no-experimental` -- a prompt that merely looks like
+    a ruling -- suppressed the injected flag and put the session straight back
+    into the silent, guardless state this exists to prevent. Any such check
+    needs a list of which options take values, and that list goes stale every
+    time the CLI grows one. Ordering needs no list.
+    """
+    return [*defaults, "--experimental"]
 
 
 def handle_existing_session(instance: Instance) -> None:
@@ -2184,6 +2251,10 @@ def reload_instance(target: str | None) -> int:
 def ingest_all_logs(force: bool = False) -> int:
     operator_ingest.init_db(METRICS_DB)
     results = operator_ingest.ingest_all(COPILOT_LOG_DIR, METRICS_DB, force=force)
+    if results is None:
+        print(f"Cannot examine {COPILOT_LOG_DIR} — no logs were ingested, and "
+              f"whether any are there is unknown")
+        return 1
     if not results:
         print(f"No Copilot logs found in {COPILOT_LOG_DIR}")
         return 0
@@ -2274,7 +2345,18 @@ def manage_logs(args: list[str]) -> int:
     removed = skipped = 0
     freed = 0
     for f in old:
-        if f.name not in known:
+        # The full path only. `known` also holds bare basenames, from rows
+        # written before a log was keyed by path, and accepting those here
+        # would delete a log this database has no record of: a legacy row
+        # names a file in a directory nobody wrote down, so a same-named log
+        # in the current one matches it without being it. That is the loss
+        # this function exists to prevent -- the log is the only record of the
+        # session, and it would be gone before it could ever be ingested.
+        # A legacy row is re-keyed the next time its log is ingested, so the
+        # cost of the strict test is that an old database prunes nothing until
+        # `operator ingest` has run once, which is what the line below tells
+        # the user to do.
+        if operator_ingest.log_key(f) not in known:
             skipped += 1
             continue
         freed += f.stat().st_size
@@ -2450,20 +2532,45 @@ def _inbox_usage(stream=None) -> None:
           "other\n  instance is live here; pass your own name.", file=stream)
 
 
-def _dir_matches(child: str | None, parent: Path) -> bool:
-    """True when ``child`` is ``parent`` or lives beneath it.
+def _dir_matches(child: str | None, parent: Path) -> bool | None:
+    """True when ``child`` is ``parent`` or lives beneath it, None when the
+    two could not be compared at all.
 
     Path comparison follows the convention used elsewhere in this file:
     resolve first, then lowercase on Windows, where ``C:\\Repo`` and
     ``c:\\repo`` are the same directory.
+
+    Three answers rather than two, for the reason
+    :func:`install_manifest.path_present` gives about the presence probes:
+    ``False`` here does not mean "could not tell", it means *somewhere else*,
+    and that is a placement this comparison is in no position to make. The
+    only caller is the census behind a destructive mail read, where an
+    instance reported elsewhere is an instance that does not stop the read.
+
+    ``Path.resolve`` declines to answer in three different ways, and the
+    handler this replaced caught one of them:
+
+    * a **symlink loop** raises ``RuntimeError`` on the interpreters this
+      project supports and ``OSError(ELOOP)`` on newer ones -- so both are
+      caught, and which one arrives is a version detail, not a behaviour;
+    * an **embedded NUL** raises ``ValueError``. The recorded directory comes
+      out of a hand-editable launch-spec JSON, and JSON carries ``\\u0000``
+      happily;
+    * everything else -- a denial, a disconnected network home, WINERROR 21 --
+      raises ``OSError``, which *was* caught and answered ``False``.
+
+    The first two were not caught at all, so ``operator inbox`` ended in a
+    traceback rather than a decision. ``parent`` is resolved here too, so a
+    parent that will not resolve made *every* comparison answer "elsewhere"
+    and the census came back confidently empty.
     """
     if not child:
         return False
     try:
         cp = str(Path(child).resolve())
         pp = str(parent.resolve())
-    except OSError:
-        return False
+    except (OSError, ValueError, RuntimeError):
+        return None
     if IS_WINDOWS:
         cp, pp = cp.lower(), pp.lower()
     if cp == pp:
@@ -2496,7 +2603,10 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
     backend there are no sessions to miss, so that answers the empty list.
     The same rule applies one record down: an unreadable launch spec, tab
     registry or state directory refuses the census rather than quietly
-    dropping the instance it could not place.
+    dropping the instance it could not place. So does a directory that will
+    not compare — a path the backend reported happily and :func:`_dir_matches`
+    cannot resolve places an instance nowhere, which is not the same as
+    placing it elsewhere.
     """
     try:
         if not MUX.available():
@@ -2527,7 +2637,8 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
         else:
             pane_failed = False
         recorded = _tracked_cwd_for_id(ident)
-        if _dir_matches(pane, cwd):
+        pane_here = _dir_matches(pane, cwd)
+        if pane_here:
             found.append(ident)
             continue
         if recorded is UNPLACEABLE:
@@ -2537,8 +2648,17 @@ def live_instance_ids_under(cwd: Path) -> list[str] | None:
             # directory — the same refusal as a failed pane lookup, one
             # record further down.
             return None
-        if _dir_matches(recorded, cwd):
+        recorded_here = _dir_matches(recorded, cwd)
+        if recorded_here:
             found.append(ident)
+        elif (pane_here is None or recorded_here is None) and ident in known:
+            # The backend answered, and the answer was a path that cannot be
+            # compared to this directory — a symlink loop, an embedded NUL, a
+            # denial part-way down. `pane_failed` is False, so without this
+            # the instance would fall past every branch below and simply not
+            # be in the list: the same hole in the census as a failed pane
+            # lookup, arriving one step later.
+            return None
         elif pane_failed and ident in known:
             # The backend refused to say where this instance is and the
             # recorded directory does not place it here either. That is not
@@ -2717,7 +2837,39 @@ def show_inbox(args: list[str]) -> int:
 
 def run_single_session(instance: Instance, copilot_args: list[str],
                        headless: bool = False) -> int:
-    args = ["--yolo", "--autopilot", "--effort", "high", *copilot_args]
+    # `--yolo` waives every approval prompt for the life of the session, and
+    # whether that is right here turns entirely on whether a human is watching.
+    #
+    # ATTACHED (the default): no `--yolo`. Your terminal is attached, so you
+    # are sitting there to answer. `operator.sh` never injected it in this
+    # mode and the Python operator used to, which meant the same command
+    # granted an agent blanket approval on one platform and not the other --
+    # a difference nobody reads the source to discover. Converged on the lower
+    # authority. `operator.sh` has no headless mode at all, so the branch
+    # below is Python-only by construction and cannot re-open that gap.
+    #
+    # HEADLESS: `--yolo` AND `--no-ask-user`, and the `headless` condition is
+    # load-bearing -- do not fold this back into one list. Nothing attaches a
+    # terminal here; `operator join` is an invitation the user may never
+    # accept. Without them the session does not degrade to "more prompts", it
+    # blocks on the first question forever, and it does so while looking
+    # exactly like a session doing long work: live process, live pane, no
+    # error anywhere. The safer-looking option is the one that fails silently
+    # and unrecoverably, which is why the asymmetry decides it the other way
+    # round from the attached case.
+    #
+    # The two flags close two different mouths and both are needed. `--yolo`
+    # waives approval prompts the CLI raises before acting; `--no-ask-user`
+    # stops the agent choosing to ask a question of its own accord. Granting
+    # only the first leaves the identical hang reachable through `ask_user`,
+    # which is exactly why loop mode -- the other unattended mode -- has
+    # always injected both.
+    #
+    # Either way a user who passes these themselves is honoured: their
+    # arguments land after these, and the CLI resolves last-wins.
+    grants = ["--yolo", "--no-ask-user"] if headless else []
+    args = [*with_experimental([*grants, "--autopilot", "--effort", "high"]),
+            *copilot_args]
     handle_existing_session(instance)
     operator_ingest.init_db(METRICS_DB)
     run_started = utcnow()
@@ -2757,7 +2909,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     operator code, say — without disturbing the Copilot session it was
     watching. Everything after the initial launch is identical either way.
     """
-    copilot_args = ["--yolo", "--autopilot", "--no-ask-user", "--effort", "high"]
+    copilot_args = with_experimental(
+        ["--yolo", "--autopilot", "--no-ask-user", "--effort", "high"])
     agent = extract_agent_from_args(user_args)
     if not has_agent_flag(user_args):
         copilot_args += ["--agent", agent]
@@ -2875,6 +3028,9 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     last_launched = 0
     launch_failures = 0
     crash_failures = 0
+    # When the session now being watched went up. None until one is launched
+    # or adopted; used to tell a session that died young from one that ran.
+    session_started_at: float | None = None
     unknown_markers = 0
     resume_id_used = ""
     adopting = adopt
@@ -2911,6 +3067,11 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     adopting = False
                     log(f"Session #{session_num}: adopting the running session")
                     last_launched = session_num
+                    # An adopted session was already up for an unknown time,
+                    # which is strictly longer than nothing. Treating it as
+                    # started now is the conservative reading: it can only
+                    # delay the healthy-uptime reset, never trigger it early.
+                    session_started_at = time.time()
                 else:
                     launch_args = list(copilot_args)
                     if resume_id:
@@ -2963,6 +3124,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                                               [m["id"] for m in waiting])
                     resume_id_used = ""
                     last_launched = session_num
+                    session_started_at = time.time()
 
                 # Record the CLI session id once the runner discovers it.
                 for _ in range(SESSION_ID_WAIT):
@@ -3041,8 +3203,25 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                             log(f"Session #{session_num}: restart signal detected!")
                             crash_failures = 0
                         else:
+                            uptime = (None if session_started_at is None
+                                      else time.time() - session_started_at)
+                            if uptime is not None and uptime >= HEALTHY_SESSION_SECONDS:
+                                # Healthy run, then death: whatever killed it,
+                                # it is not the startup failure the limit is
+                                # counting. Start the count over at this one.
+                                if crash_failures:
+                                    log(f"  Previous session stayed up "
+                                        f"{int(uptime)}s — not a crash loop, "
+                                        f"resetting the exit count")
+                                crash_failures = 0
                             crash_failures += 1
-                            log(f"Session #{session_num}: copilot exited unexpectedly "
+                            _record_session_exit(instance, session_num,
+                                                 stop_state, detach_state,
+                                                 crash_failures, uptime=uptime)
+                            ran_for = ("" if uptime is None
+                                       else f" after {int(uptime)}s")
+                            log(f"Session #{session_num}: copilot exited unexpectedly"
+                                f"{ran_for} "
                                 f"({crash_failures}/{MAX_LAUNCH_FAILURES}) — relaunching")
                             if crash_failures >= MAX_LAUNCH_FAILURES:
                                 log(f"  Giving up after {crash_failures} consecutive "
@@ -3151,6 +3330,7 @@ USAGE
     operator report [type]                                     View usage reports
     operator ingest [--force]                                  Process copilot logs
     operator logs [--prune] [--days N]                         Inspect/prune copilot logs
+    operator trace [-n N] [--kind K] [--json] [--all]          Who invoked the operator, and how it ended
     operator tabs [list|remove NAME|clear]                     Manage tracked terminal tabs
     operator restore [NAME...|--all] [--dry-run]               Reopen tracked tabs after a crash
     operator help                                              Show this help
@@ -3175,10 +3355,16 @@ MODES
     Single session (default)
         Launches copilot in a multiplexer session and auto-attaches. A
         supervisor inside the session captures usage metrics when copilot
-        exits — including when you have detached. Always runs with --yolo.
+        exits — including when you have detached. Adds --autopilot --effort
+        high --experimental. Not --yolo: your terminal is attached, so you
+        are there to approve. Pass --yolo yourself if you want it. With
+        --headless, --yolo and --no-ask-user ARE added, because nothing
+        attaches and an unanswerable question would hang the session
+        silently.
 
     Loop mode (--loop)
-        Adds --yolo --autopilot --no-ask-user --effort high automatically.
+        Adds --yolo --autopilot --no-ask-user --effort high --experimental
+        automatically.
         Runs the polling supervisor in the *background* (not in your
         terminal) and then attaches you to the Copilot session directly in
         the same tab — you never have to babysit raw loop logs or dedicate a
@@ -3455,7 +3641,7 @@ def _spawn_background_loop(instance: Instance, copilot_args: list[str],
         )
     else:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(cmd, **kwargs)
+    proc = subprocess.Popen(cmd, **kwargs)  # decode-ok: every stream is DEVNULL
     return proc.pid
 
 
@@ -3863,9 +4049,200 @@ def show_menu() -> int:
             return rc
 
 
+def _record_session_exit(instance, session_num: int,
+                         stop_state, detach_state, consecutive: int,
+                         uptime: float | None = None) -> None:
+    """Trace a session found gone, with the evidence the decision was made on.
+
+    The supervisor polls liveness rather than waiting on the child, so it has
+    never had an exit *code* to log -- but the runner writes one to the exit
+    file, and that is the difference between "copilot crashed" and "copilot
+    shut down cleanly and nobody asked us to expect it". Reading it here costs
+    one file read on a path that only runs when a session has already ended.
+    """
+    try:
+        code: "int | None" = None
+        try:
+            raw = instance.exit_file.read_text(encoding="utf-8").strip()
+            code = int(raw) if raw else None
+        except (OSError, ValueError):
+            code = None
+        try:
+            pid = instance.copilot_pid()
+        except Exception:
+            pid = None
+        operator_trace.record_session_exit(
+            OPERATOR_HOME,
+            instance=instance.display_name,
+            session=session_num,
+            pid=pid,
+            markers={"stop": stop_state, "detach": detach_state,
+                     "restart": marker_state(instance.restart_marker),
+                     "exit_code": code,
+                     "uptime_s": None if uptime is None else int(uptime)},
+            consecutive=consecutive,
+            limit=MAX_LAUNCH_FAILURES,
+        )
+    except Exception:
+        return
+
+
+def show_trace(args: list[str]) -> int:
+    """Print the invocation trace: who ran the operator, and how it ended.
+
+    The trace answers the question ``operator.log`` cannot: a line there says
+    a session was relaunched, but not whether a person asked for it, an agent
+    did, or something outside the toolkit did.
+    """
+    limit = 25
+    kind = None
+    as_json = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-n", "--limit"):
+            if i + 1 >= len(args):
+                die("--limit requires a value")
+            try:
+                limit = int(args[i + 1])
+            except ValueError:
+                die(f"--limit wants a number, got {args[i + 1]!r}")
+            i += 1
+        elif arg == "--kind":
+            if i + 1 >= len(args):
+                die("--kind requires a value")
+            kind = args[i + 1]
+            i += 1
+        elif arg == "--json":
+            as_json = True
+        elif arg in ("--all",):
+            limit = 0
+        else:
+            die(f"unknown option for `operator trace`: {arg}")
+        i += 1
+
+    records = operator_trace.read_records(OPERATOR_HOME, limit=0, kind=None)
+    if records is None:
+        # Not the same as an empty trace, and saying "no invocations" here
+        # would be the exact substitution this trace exists to catch.
+        print(f"Error: could not read the trace at "
+              f"{operator_trace.trace_path(OPERATOR_HOME)}", file=sys.stderr)
+        return 1
+
+    exits = {r.get("trace_id"): r for r in records if r.get("event") == "exit"}
+    all_invocations = [r for r in records if r.get("event") == "invoke"]
+    invocations = [
+        r for r in all_invocations
+        if not kind or (r.get("source") or {}).get("kind") == kind
+    ]
+    if limit:
+        invocations = invocations[-limit:]
+
+    session_exits = [r for r in records if r.get("event") == "session_exit"]
+    if limit:
+        session_exits = session_exits[-limit:]
+
+    if as_json:
+        print(json.dumps(
+            {"invocations": invocations, "session_exits": session_exits},
+            indent=2))
+        return 0
+
+    if not invocations and not session_exits:
+        # An empty *result* and an empty *trace* are different findings, and
+        # printing one sentence for both would hide a filter that matched
+        # nothing behind a file that recorded nothing.
+        if all_invocations:
+            kinds = sorted({(r.get("source") or {}).get("kind") or "?"
+                            for r in all_invocations})
+            print(f"No invocation matched --kind {kind}. "
+                  f"{len(all_invocations)} traced so far; "
+                  f"kinds present: {', '.join(kinds)}.")
+        else:
+            print("No operator invocations have been traced yet.")
+        print(f"  Trace file: {operator_trace.trace_path(OPERATOR_HOME)}")
+        return 0
+
+    print(f"═══ Operator invocations ({len(invocations)} shown) ═══\n")
+    for rec in invocations:
+        source = rec.get("source") or {}
+        done = exits.get(rec.get("trace_id"))
+        if done is None:
+            outcome = "running/unknown"
+        else:
+            outcome = f"rc={done.get('rc')} {done.get('ms')}ms"
+        argv = " ".join(rec.get("argv") or []) or "(no arguments)"
+        print(f"{rec.get('ts', '?'):20} {str(source.get('kind', '?')):11} "
+              f"{argv[:60]:60} {outcome}")
+        why = source.get("why")
+        if why:
+            print(f"{'':20} └─ {why}")
+
+    if session_exits:
+        # Printed separately because they are a different kind of fact: not a
+        # command someone ran, but a supervised session found gone. These are
+        # the events a mass die-off consists of, and no operator command is
+        # invoked during one -- which is why an invocation log alone could not
+        # explain the seven simultaneous deaths this trace was written after.
+        print(f"\n═══ Supervised sessions found gone "
+              f"({len(session_exits)} shown) ═══\n")
+        for rec in session_exits:
+            markers = rec.get("markers") or {}
+            code = markers.get("exit_code")
+            # "Exited unexpectedly" only ever meant unexplained. A recorded
+            # exit code of 0 is a clean shutdown nobody asked us to expect,
+            # and reading it as a crash is how five of them end a loop.
+            if code is None:
+                verdict = "no exit code recorded"
+            elif code == 0:
+                verdict = "clean exit (rc=0), unexplained by any marker"
+            else:
+                verdict = f"rc={code}"
+            gave_up = " GIVING UP" if rec.get("giving_up") else ""
+            print(f"{rec.get('ts', '?'):20} {str(rec.get('instance', '?')):18} "
+                  f"#{rec.get('session', '?'):<5} "
+                  f"{rec.get('consecutive', '?')}/{rec.get('limit', '?')}"
+                  f"{gave_up}")
+            print(f"{'':20} └─ {verdict}; "
+                  f"copilot pid={rec.get('session_pid')}, markers "
+                  f"stop={markers.get('stop')} detach={markers.get('detach')} "
+                  f"restart={markers.get('restart')}")
+
+    print(f"\nTrace file: {operator_trace.trace_path(OPERATOR_HOME)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Entry point: trace the invocation, then dispatch it.
+
+    The trace brackets the entire command so a record shows both what was
+    asked and how it ended. Most error paths in this file leave through
+    ``die()``, which is a ``SystemExit``, and a crash leaves through an
+    exception -- ``operator.log`` renders those two identically today, and
+    they are not the same thing at all.
+    """
     enable_utf8_output()
     args = list(sys.argv[1:] if argv is None else argv)
+    traced = operator_trace.record_invocation(OPERATOR_HOME, args)
+    try:
+        rc = _dispatch_command(args)
+    except SystemExit as exc:
+        code = exc.code
+        operator_trace.record_exit(
+            traced,
+            code if isinstance(code, int) else (0 if code is None else 1))
+        raise
+    except BaseException:
+        # -1 is not a code this program can return, which is exactly why it is
+        # used: it marks a command that left through an exception rather than
+        # through a decision, and keeps the two distinguishable in the trace.
+        operator_trace.record_exit(traced, -1)
+        raise
+    operator_trace.record_exit(traced, rc)
+    return rc
+
+
+def _dispatch_command(args: list[str]) -> int:
     migrate_legacy_state()
 
     if not args:
@@ -3905,6 +4282,8 @@ def main(argv: list[str] | None = None) -> int:
         return show_inbox(args[1:])
     if head == "logs":
         return manage_logs(args[1:])
+    if head == "trace":
+        return show_trace(args[1:])
     if head == "tabs":
         return manage_tabs(args[1:])
     if head == "restore":

@@ -28,7 +28,8 @@ def _make_dir_link(target: Path, link: Path) -> None:
         pass
     if os.name == "nt":
         proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                              capture_output=True, text=True)
+                              capture_output=True,
+                              encoding="utf-8", errors="replace")
         if proc.returncode == 0:
             return
     pytest.skip("this platform will not create directory links")
@@ -219,6 +220,50 @@ def test_link_directory_does_not_prompt_when_the_link_is_already_ours(tmp_path, 
 
     monkeypatch.setattr(setup_tools, "ask", refuse)
     assert setup_tools._link_directory(src, dest) == "already linked"
+
+
+@pytest.mark.parametrize("exc", [
+    RuntimeError("Symlink loop"),
+    ValueError("stat: embedded null character in path"),
+], ids=["symlink-loop", "embedded-nul"])
+def test_link_directory_survives_a_source_that_will_not_resolve(
+        tmp_path, monkeypatch, exc):
+    """The "is this link already ours?" question must not abort the install.
+
+    ``resolve`` raises ``RuntimeError`` on a symlink loop and ``ValueError``
+    on an embedded NUL as well as ``OSError`` on a denial, and only the last
+    was caught. A link is the one input on this branch that can *be* a loop,
+    so the narrow handler turned "no, it points somewhere else" -- which costs
+    one prompt -- into a traceback out of the middle of setup, with every
+    later artifact left uninstalled for a reason the traceback does not name.
+
+    The refusal is asserted, not just the absence of a raise: falling through
+    must reach the user's consent prompt and keep their link, not quietly
+    replace it.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f.mjs").write_text("x", encoding="utf-8")
+
+    mine = tmp_path / "my-working-copy"
+    mine.mkdir()
+    dest = tmp_path / "dest"
+    _make_dir_link(mine, dest)
+
+    real = Path.resolve
+    wanted = str(Path(src))
+
+    def boom(self, *args, **kwargs):
+        if str(self) == wanted:
+            raise exc
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", boom)
+    monkeypatch.setattr(setup_tools, "ask", lambda *a, **k: False)
+    result = setup_tools._link_directory(src, dest)
+
+    assert "skipped" in result, result
+    assert _link_destination(dest) is not None, "the user's link was destroyed"
 
 
 def test_link_directory_keeps_a_broken_user_link_without_consent(tmp_path, monkeypatch):
@@ -1591,3 +1636,50 @@ def test_reconcile_waits_out_a_lock_restoring_the_only_copy(tmp_path, monkeypatc
     assert (dest / "SKILL.md").read_text(encoding="utf-8") == "the only copy"
     assert len(calls) == 5
 
+
+
+# ── The shell entrypoints' query-flag list must mean the same thing here ──
+
+
+@pytest.mark.parametrize("flag", ["--status", "--check-only", "--yes",
+                                  "--skip-package", "--skip-optional",
+                                  "--no-install-prereqs"])
+def test_exact_flags_are_still_accepted(flag, capsys):
+    """The spellings setup.sh and setup.ps1 match, and README documents.
+
+    A sentinel flag forces argparse to bail before ``main`` acts on anything.
+    Asserting only that the sentinel is named would pass vacuously if ``flag``
+    were rejected too -- argparse reports every unrecognized argument in one
+    message -- so the assertion that carries the weight is that ``flag`` is
+    ABSENT from the complaint.
+    """
+    with pytest.raises(SystemExit) as exc:
+        setup_tools.main([flag, "--nonexistent-sentinel"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    complaint = err.split("error:")[-1]
+    assert "--nonexistent-sentinel" in complaint
+    assert flag not in complaint, f"{flag} was itself rejected: {complaint}"
+
+
+@pytest.mark.parametrize("abbreviation", ["--stat", "--sta", "--statu",
+                                          "--check", "--check-onl"])
+def test_abbreviations_are_rejected(abbreviation, capsys):
+    """`--stat` must not quietly mean `--status`.
+
+    setup.sh and setup.ps1 decide whether an invocation is a question
+    (``--status``/``--check-only``/``--help``, which install nothing) or an
+    install, and they match exact spellings. While argparse accepted
+    unambiguous prefixes, ``./setup.sh --stat`` read as an install there and
+    as ``--status`` here -- and the install path moves the user's
+    ``~/.local/bin/{operator,handoff}`` aside on the strength of that
+    disagreement. Asserting the exit code alone would not do: `2` is also what
+    a genuinely unknown flag returns, which is the outcome we want, so the
+    message is asserted too.
+    """
+    with pytest.raises(SystemExit) as exc:
+        setup_tools.main([abbreviation])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments" in err or "invalid choice" in err, err
+    assert abbreviation in err

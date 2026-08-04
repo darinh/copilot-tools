@@ -7,7 +7,8 @@
 // lives behind an untestable import is verified only by assertion.
 
 import { execFile } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { mkdirSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve, join, relative, isAbsolute } from "node:path";
 
 // The only directories excluded on this extension's own authority. Everything
@@ -575,6 +576,81 @@ export function primaryStrayReport(strays, scratchDir, primaryRoot) {
   );
 }
 
+/**
+ * Report for artifacts that were already in a checkout when the session began.
+ *
+ * This exists because the baseline is seeded at session start and everything
+ * in that seed is, from then on, indistinguishable from the project's own
+ * content. `observe` reports what is NEW, which is the right question for
+ * attribution and the wrong one for inventory: an artifact that arrived before
+ * anyone was watching is never new again, so no later hook can ever raise it.
+ * Session start is not the best moment to name it -- it is the only one.
+ *
+ * The seeding itself is correct and is deliberately left alone. What it
+ * prevents is the sentence "you made this", which would be a fabricated
+ * accusation. It should never have been allowed to suppress the different and
+ * much weaker sentence "this is here, and nobody knows who made it" -- and the
+ * wording below is careful to be only the second. It orders no deletion for
+ * the same reason `primaryStrayReport` does not: from here a peer's live
+ * experiment and a dead subagent's leftovers look identical.
+ *
+ * It says UNATTRIBUTABLE rather than unattributed, and the distinction is the
+ * difference between this saving a session and costing one. "Unknown owner"
+ * sends a reader looking for the owner; there is no owner to find, because the
+ * session that made the artifact has ended and nothing on disk records who ran
+ * what. Naming the search as futile is what leaves the cheap action -- ask, or
+ * leave it -- as the obvious one.
+ *
+ * What it must NOT do is assert that provenance in the first place. The
+ * population here is the checkout's entire untracked state, which naturally
+ * contains a human's uncommitted work and unignored build output; an earlier
+ * draft told the reader flatly that "the session that produced it is over",
+ * which is a confident cause asserted over an ambiguous observation -- the
+ * exact collapse this guard exists to catch, committed by the guard itself.
+ * The futility claim is therefore scoped: it applies to whichever of these
+ * are not the reader's, and the report says plainly that it cannot tell which.
+ *
+ * `primary` marks the checkout the agent is NOT working in, the same split
+ * `primaryStrayReport` draws, minus its "during your last command" clause,
+ * which would be false here. Without it the report that matters most reads as
+ * a note about the current directory: an agent in a worktree is precisely the
+ * one for whom strays in the primary are both invisible and expensive.
+ */
+export function inheritedStrayReport(strays, root, { primary = false } = {}) {
+  const plural = strays.length === 1 ? "" : "s";
+  const were = strays.length === 1 ? "was" : "were";
+  const it = strays.length === 1 ? "it" : "them";
+  const they = strays.length === 1 ? "it" : "they";
+  const where = primary
+    ? `the PRIMARY checkout (${root}), which is not the checkout you are ` +
+      `working in,`
+    : `${root}`;
+  return (
+    `[checkout-guard] INHERITED: ${strays.length} untracked path${plural} ` +
+    `${were} already in ${where} before this session started:\n` +
+    formatPathList(strays) +
+    `\n\nNothing will mention ${it} again. The guard reports what appears ` +
+    `DURING a session, and anything present at the start is folded into the ` +
+    `baseline, so this is the only point at which ${they} can be raised.\n\n` +
+    `Empty directories are included, and \`git status\` does not list those -- ` +
+    `git tracks no empty directory, so a checkout can report perfectly clean ` +
+    `with artifacts sitting in its root.\n\n` +
+    `Some of these may be your own uncommitted work, or unignored build ` +
+    `output. This is the checkout's entire untracked state, not a list of ` +
+    `suspects, and nothing here can tell the two apart.\n\n` +
+    `For any that are NOT yours: you cannot find out who made ${it} from in ` +
+    `here, and neither can anyone else later. Nothing on disk records an ` +
+    `author, and the session that would have known has ended. So do not go ` +
+    `hunting, and do not delete on this report alone -- in a checkout shared ` +
+    `with peer agents a live experiment looks exactly like leftovers. Ask the ` +
+    `other agents, or leave ${it} alone. What licenses a deletion is evidence ` +
+    `that ${
+      strays.length === 1 ? "it is" : "they are"
+    } inert -- unchanged mtimes across a run of the suite, say -- never the ` +
+    `mere fact that nobody has claimed ${it}.`
+  );
+}
+
 /** Text injected at session start so the scratch directory is discoverable. */
 export function sessionBriefing(scratchDir) {
   return (
@@ -588,6 +664,74 @@ export function sessionBriefing(scratchDir) {
     `repository's primary one. A blanket \`git add -A\` is ` +
     `blocked while stray artifacts are present; staging a path by name is not.`
   );
+}
+
+/**
+ * Notice for checkouts whose session-start scan failed outright.
+ *
+ * Silence would be the collapse this file spends most of its length avoiding.
+ * `null` from `scanCheckoutTree` means the scan established nothing, and if
+ * that produces exactly the text a clean checkout produces, then a failed read
+ * has been spent as "nothing to report" at the point of decision -- the rule
+ * this repository states as "a read that fails must stay distinguishable from
+ * a read that returned nothing, all the way to the decision".
+ *
+ * It costs one line and it is the only warning there will be. A null seed is
+ * also never recorded in `lastSeen`, so the first later hook silently adopts
+ * whatever it finds as the baseline: the blind spot does not announce itself
+ * afterwards either. `tests/conftest.py` already made this exact call for the
+ * same reason, degrading to "exists, contents unknown" and saying so, because
+ * a blind spot nobody is told about is how leaks survive in the first place.
+ */
+export function unscannedRootsNotice(roots) {
+  const plural = roots.length === 1 ? "" : "s";
+  const was = roots.length === 1 ? "it was" : "they were";
+  return (
+    `[checkout-guard] UNSCANNED: ${roots.length} checkout${plural} could not ` +
+    `be examined at session start:\n` +
+    formatPathList(roots) +
+    `\n\nThis is not a report that ${
+      roots.length === 1 ? "it is" : "they are"
+    } clean -- it is a report that nobody looked. Anything already sitting ` +
+    `in ${roots.length === 1 ? "it" : "them"} will go unmentioned for the ` +
+    `rest of this session, because the baseline every later check compares ` +
+    `against is the first scan that succeeds, and whatever is there when ${was} ` +
+    `taken is adopted as normal.`
+  );
+}
+
+/**
+ * The full text injected at session start: the briefing, plus a report for
+ * each seeded checkout that already held artifacts.
+ *
+ * Composed here rather than in extension.mjs so the two properties that matter
+ * are reachable from a test. extension.mjs calls `joinSession` at import and
+ * cannot be loaded by the suite at all, so anything assembled there is covered
+ * by `node --check` and nothing else -- and "both seeds reach the output" is
+ * exactly the kind of wiring that fails silently while every unit test around
+ * it stays green.
+ *
+ * `seeds` carries the arrays already scanned by the caller. Rescanning here
+ * would cost a second traversal of two whole trees and would also reintroduce
+ * misattribution pointing the other way: a path created between the caller's
+ * scan and this one would be briefed as inherited when this session made it.
+ *
+ * A seed whose `strays` is null is never rendered as an empty checkout. It is
+ * reported separately as unscanned, because "the scan failed" and "there is
+ * nothing there" must not arrive as the same silence.
+ */
+export function sessionContext(scratchDir, seeds = []) {
+  const reports = seeds
+    .filter((seed) => seed.strays !== null && seed.strays.length > 0)
+    .map((seed) =>
+      inheritedStrayReport(seed.strays, seed.root, { primary: seed.primary }),
+    );
+  const unscanned = seeds.filter((seed) => seed.strays === null).map((seed) => seed.root);
+  if (unscanned.length > 0) reports.push(unscannedRootsNotice(unscanned));
+  // The briefing leads and is emitted unchanged when there is nothing to
+  // report, so a session in a clean checkout sees exactly the text it saw
+  // before this function existed.
+  return [sessionBriefing(scratchDir), ...reports].join("\n\n");
 }
 
 // --- checkout inspection -------------------------------------------------
@@ -970,4 +1114,344 @@ export async function scanCheckout(root, { ignoreFilter = withoutIgnored } = {})
   // ones.
   const dirs = await ignoreFilter(root, topLevelDirs(root));
   return [...untracked, ...invisibleDirStrays(dirs, known, root)];
+}
+
+// ---------------------------------------------------------------------------
+// Per-session tracking state.
+//
+// This lives here rather than in extension.mjs for one reason: extension.mjs
+// calls `joinSession` at import, so importing it has a side effect and no test
+// can reach anything it holds. Everything below is reachable by `node --test`;
+// the same code sitting a file away would be covered by `node --check` and
+// nothing else. See docs/checkout-guard.md.
+// ---------------------------------------------------------------------------
+
+/** Tools whose commands can run arbitrary code in the checkout. */
+export const SHELL_TOOLS = new Set(["bash", "powershell", "shell"]);
+/**
+ * A subagent runs its own shell in this same checkout, so its artifacts land
+ * here. The parent never sees those commands, only the `task` call, which is
+ * therefore the only point at which they can be attributed at all.
+ */
+export const SUBAGENT_TOOLS = new Set(["task", "agent"]);
+/** Tools that author content deliberately, so never produce a stray. */
+export const AUTHORING_TOOLS = new Set(["create", "edit"]);
+
+/**
+ * An agent that ignores the report would otherwise accumulate an unbounded
+ * list and be told about the same artifacts after every command it runs.
+ */
+export const MAX_TRACKED = 200;
+
+/** The scratch directory this session's agent is told to write into. */
+export function scratchDirFor(pid = process.pid) {
+  return join(tmpdir(), "copilot-scratch", `session-${pid}`);
+}
+
+/**
+ * Whether the guard has been switched off for this process.
+ *
+ * Exactly `"1"`, not truthiness: `COPILOT_CHECKOUT_GUARD_DISABLE=0` is
+ * something a person types meaning "off", and a guard that disabled itself on
+ * that would be disabled in the one case where the operator believed it was
+ * running.
+ */
+export function guardDisabled(env = process.env) {
+  return env.COPILOT_CHECKOUT_GUARD_DISABLE === "1";
+}
+
+/**
+ * Fresh per-session tracking state.
+ *
+ * A FACTORY, deliberately, rather than four module-level Maps. Module bindings
+ * are shared by every importer for the life of the process, so the moment this
+ * file is the one holding them, `guard.test.mjs` would be sharing one set of
+ * maps across all of its cases -- and the failures that produces are
+ * order-dependent and intermittent, which is the most expensive shape a test
+ * failure has. The extension creates exactly one of these, so nothing is lost
+ * by making the lifetime explicit.
+ *
+ * - `lastSeen`     untracked paths at the last observation, by checkout root.
+ * - `outstanding`  artifacts reported and not yet cleaned up, by root.
+ * - `authored`     paths written deliberately with create/edit, by root.
+ * - `primaryRoots` the primary checkout to also watch, by working root.
+ *   Cached because it costs a `git worktree list` and cannot change for a
+ *   given root within a session. Negative results are cached too -- an agent
+ *   working in the primary checkout would otherwise pay for the lookup on
+ *   every command to be told the same "there is nothing else to watch" each
+ *   time.
+ */
+export function createGuardState() {
+  return {
+    lastSeen: new Map(),
+    outstanding: new Map(),
+    authored: new Map(),
+    primaryRoots: new Map(),
+  };
+}
+
+/** The Set stored under `root`, created on first use. */
+export function setFor(map, root) {
+  let value = map.get(root);
+  if (!value) {
+    value = new Set();
+    map.set(root, value);
+  }
+  return value;
+}
+
+/** Drop oldest-inserted members until the set is within `limit`. */
+export function bound(set, limit = MAX_TRACKED) {
+  if (set.size <= limit) return;
+  const it = set.values();
+  while (set.size > limit) set.delete(it.next().value);
+}
+
+/**
+ * A create/edit path in the checkout-relative posix form git reports.
+ *
+ * `cwd` is a parameter rather than a `process.cwd()` read inside, so the
+ * relative-path case can be tested without a chdir. The default is evaluated
+ * per call, so callers that omit it see the process's cwd at the moment of the
+ * call exactly as before.
+ */
+export function relativeToCheckout(root, filePath, cwd = process.cwd()) {
+  const absolute = isAbsolute(filePath) ? filePath : resolve(cwd, filePath);
+  const rel = relative(root, absolute).replace(/\\/g, "/");
+  return rel && !rel.startsWith("../") ? rel : null;
+}
+
+/**
+ * The primary checkout, when it is a different tree from the one in use.
+ *
+ * Returns null when the agent is already working in the primary, so the two
+ * roots are never scanned as if they were separate places.
+ *
+ * A lookup that FAILED is not cached. `primaryCheckoutRoot` reports that case
+ * as `UNKNOWN_ROOT` rather than as null precisely so this can tell the two
+ * apart: caching an answer derived from one timed-out `git worktree list`
+ * would disable primary-root watching for the whole session, silently, and the
+ * session would look exactly like one that had nothing to watch.
+ *
+ * The lookup is resolved from `root`, not from `process.cwd()`. They are
+ * normally the same repository -- `root` was derived from the cwd -- but
+ * asking about the root being watched is the question actually being answered,
+ * and it cannot drift into reporting on some unrelated repository the process
+ * happens to sit in.
+ */
+export async function otherRootToWatch(state, root, { lookup = primaryCheckoutRoot } = {}) {
+  if (state.primaryRoots.has(root)) return state.primaryRoots.get(root);
+  const { watch, cache } = rootToWatch(root, await lookup(root));
+  if (cache) state.primaryRoots.set(root, watch);
+  return watch;
+}
+
+/**
+ * Refresh the record of what is in the checkout and return anything new.
+ *
+ * Artifacts that no longer exist are dropped from the outstanding set, so an
+ * agent that cleans up is not then blocked by the memory of a file it has
+ * already deleted.
+ *
+ * `blocking` is false for a checkout the agent is not working in. Such a path
+ * is worth telling them about, but it must not deny a `git add -A` here: the
+ * file may belong to a peer, and refusing this agent's commit over another
+ * agent's artifact is a refusal whose cost lands on the wrong asset -- and on
+ * work that has nothing to do with the thing being protected.
+ */
+export async function observe(state, root, { blocking = true, scan = scanCheckoutTree } = {}) {
+  const current = await scan(root);
+  if (current === null) return [];
+  const seen = state.lastSeen.get(root);
+  state.lastSeen.set(root, current);
+  // No baseline yet means nothing can honestly be called new. Reporting the
+  // whole checkout on first sight would blame this agent for every artifact
+  // any previous one left, which is the misattribution the guard exists to
+  // prevent.
+  if (seen === undefined) return [];
+
+  const alive = new Set(current);
+  const pending = setFor(state.outstanding, root);
+  for (const path of [...pending]) {
+    if (!alive.has(path)) pending.delete(path);
+  }
+
+  const deliberate = setFor(state.authored, root);
+  const fresh = newEntries(seen, current).filter((p) => !deliberate.has(p));
+  if (blocking) {
+    for (const path of fresh) pending.add(path);
+    bound(pending);
+  }
+  return fresh;
+}
+
+/**
+ * Record a create/edit write as deliberate, and return its checkout-relative
+ * form (null when the path is outside the checkout).
+ *
+ * The authored path is folded straight into the baseline instead of
+ * rescanning. A full `git status -uall` walks the entire working tree, and the
+ * CLI issues parallel edit calls in a single response, so a five-file edit
+ * would have fired five concurrent whole-tree traversals -- the guard becoming
+ * the most expensive thing in the session. The answer a rescan would give for
+ * this path is already known: the agent just wrote it.
+ *
+ * It is also removed from the outstanding set. An agent that ran a shell
+ * command producing a path and then adopted it with `create`/`edit` has
+ * authored it, and continuing to block a stage over it would be blocking over
+ * a file the agent deliberately wrote.
+ */
+export function noteAuthored(state, root, filePath, { cwd = process.cwd() } = {}) {
+  const rel = relativeToCheckout(root, filePath, cwd);
+  if (!rel) return null;
+  const deliberate = setFor(state.authored, root);
+  deliberate.add(rel);
+  bound(deliberate);
+  setFor(state.outstanding, root).delete(rel);
+  const seen = state.lastSeen.get(root);
+  if (seen && !seen.includes(rel)) state.lastSeen.set(root, [...seen, rel]);
+  return rel;
+}
+
+// ---------------------------------------------------------------------------
+// The hook bodies.
+//
+// These live here, and not in extension.mjs beside the `joinSession` call they
+// are handed to, for the reason stated at the top of this file: importing
+// extension.mjs starts a session, so anything defined there is reachable by
+// `node --check` and by no test at all. The three hooks are where every other
+// decision in this file is actually SEQUENCED -- which scan seeds which
+// baseline, which tool triggers a second checkout's scan, whether a report is
+// emitted or a permission denied -- and sequencing is exactly the kind of
+// logic that looks right when read and is wrong when run.
+//
+// Every environment touch is a parameter with a real default rather than a
+// direct call, so a test can drive a hook without a git binary, a checkout, or
+// a writable temp directory. The defaults are the production behaviour; a
+// caller that passes nothing gets what extension.mjs got when this code lived
+// there.
+// ---------------------------------------------------------------------------
+
+/**
+ * The guard's three hook bodies, closed over one session's state.
+ *
+ * A factory rather than three exported functions over a module-level state,
+ * for the same reason `createGuardState` is a factory: two guards in one
+ * process -- which is what a test file is -- must not share a baseline.
+ * `createGuard()` twice yields two guards that cannot see each other.
+ *
+ * The returned `state` and `scratchDir` are exposed for tests and for nothing
+ * else; the extension uses only the three hooks.
+ */
+export function createGuard({
+  scratchDir = scratchDirFor(),
+  disabled = guardDisabled(),
+  state = createGuardState(),
+  ensureDir = (dir) => mkdirSync(dir, { recursive: true }),
+  cwd = () => process.cwd(),
+  rootOf = checkoutRoot,
+  scan = scanCheckoutTree,
+  otherRoot = otherRootToWatch,
+  look = observe,
+} = {}) {
+  async function onSessionStart() {
+    if (disabled) return;
+    try {
+      ensureDir(scratchDir);
+    } catch {
+      // An unwritable temp directory is not a reason to fail a session; the
+      // briefing still names the intended location.
+    }
+    const root = await rootOf(cwd());
+    const seeds = [];
+    if (root) {
+      const initial = await scan(root);
+      if (initial !== null) state.lastSeen.set(root, initial);
+      // Seeded AND reported. A stray present at seed time is invisible to
+      // every later hook by construction -- `observe` answers "what is new",
+      // and this never will be again -- so a session not told here is never
+      // told at all. `sessionContext` drops a null scan rather than reporting
+      // an empty checkout.
+      seeds.push({ strays: initial, root });
+      // Seed the primary too, or its entire contents would read as new the
+      // first time a command is run and every existing file in it would be
+      // reported as this agent's doing.
+      const other = await otherRoot(state, root);
+      if (other) {
+        const seedOther = await scan(other);
+        if (seedOther !== null) state.lastSeen.set(other, seedOther);
+        // The seed that motivated this: an agent working in a worktree is the
+        // one for whom strays in the primary are both invisible and most
+        // expensive, and `root` is not the primary for that agent.
+        seeds.push({ strays: seedOther, root: other, primary: true });
+      }
+    }
+    return { additionalContext: sessionContext(scratchDir, seeds) };
+  }
+
+  async function onPreToolUse(input) {
+    if (disabled) return;
+    if (!SHELL_TOOLS.has(input.toolName)) return;
+    const command = String(input.toolArgs?.command || "");
+    // Cheap reject first: this hook runs on every shell command, and the
+    // overwhelming majority of them are not git.
+    if (!/\bgit\b/i.test(command)) return;
+    const root = await rootOf(cwd());
+    if (!root) return;
+    // Re-observe rather than trusting the last scan. Anything this turns up
+    // arrived without a tool call of this agent's in between -- a peer agent
+    // in the same checkout, or a background process -- so it has never been
+    // reported, and the block message says so rather than implying the agent
+    // made it. Silently folding it into the outstanding set would produce a
+    // block citing artifacts the agent had never been shown.
+    const unannounced = await look(state, root, { scan });
+    const decision = sweepDecision(command, [...setFor(state.outstanding, root)]);
+    if (!decision) {
+      if (unannounced.length === 0) return;
+      return { additionalContext: strayReport(unannounced, scratchDir) };
+    }
+    return {
+      permissionDecision: "deny",
+      permissionDecisionReason: blockReason({ ...decision, unannounced }),
+    };
+  }
+
+  async function onPostToolUse(input) {
+    if (disabled) return;
+    const root = await rootOf(cwd());
+    if (!root) return;
+
+    if (AUTHORING_TOOLS.has(input.toolName)) {
+      const filePath = String(input.toolArgs?.path || "");
+      if (filePath) noteAuthored(state, root, filePath, { cwd: cwd() });
+      return;
+    }
+
+    if (!SHELL_TOOLS.has(input.toolName) && !SUBAGENT_TOOLS.has(input.toolName)) return;
+    const fresh = await look(state, root, { scan });
+    // The primary is scanned as well as, never instead of, the working
+    // checkout -- but only after a SUBAGENT call, not after every command.
+    //
+    // Both real incidents came from subagents, and the restriction is what
+    // keeps this from being noise: the primary is shared, so scanning it after
+    // every shell command would report every peer agent's artifacts to every
+    // other agent, and a guard that cries wolf gets switched off. This agent's
+    // own shell commands cannot surprise it in another tree -- it would have
+    // had to name the path.
+    const other = SUBAGENT_TOOLS.has(input.toolName)
+      ? await otherRoot(state, root)
+      : null;
+    const elsewhere = other
+      ? await look(state, other, { blocking: false, scan })
+      : [];
+    if (fresh.length === 0 && elsewhere.length === 0) return;
+    const reports = [];
+    if (fresh.length > 0) reports.push(strayReport(fresh, scratchDir));
+    if (elsewhere.length > 0) {
+      reports.push(primaryStrayReport(elsewhere, scratchDir, other));
+    }
+    return { additionalContext: reports.join("\n\n") };
+  }
+
+  return { state, scratchDir, disabled, onSessionStart, onPreToolUse, onPostToolUse };
 }
