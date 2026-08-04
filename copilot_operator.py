@@ -73,6 +73,19 @@ MAX_SESSIONS = 1000
 MAX_LAUNCH_FAILURES = 5
 LAUNCH_BACKOFF_BASE = 5
 RESTART_PAUSE_SECONDS = 3
+# A session that stayed up at least this long before dying did not fail to
+# start, so it must not accumulate toward the consecutive-exit limit.
+#
+# That limit exists to stop a *hot* relaunch spin -- a session that dies on
+# startup, every time, forever. It counted exits and never their spacing, so
+# five unrelated deaths hours apart retired the supervisor exactly as fast as
+# five in a minute. This machine's own logs are the case against it: on four
+# separate occasions every instance died within seconds of every other,
+# independent of when each was launched, having each run for minutes -- an
+# external event, not a crash loop. Five such waves and the user came back to
+# nothing running at all. Sessions that were healthy for minutes now reset the
+# count, so only genuinely rapid failures can retire a loop.
+HEALTHY_SESSION_SECONDS = 120
 SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
 RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
@@ -2878,6 +2891,9 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     last_launched = 0
     launch_failures = 0
     crash_failures = 0
+    # When the session now being watched went up. None until one is launched
+    # or adopted; used to tell a session that died young from one that ran.
+    session_started_at: float | None = None
     unknown_markers = 0
     resume_id_used = ""
     adopting = adopt
@@ -2895,6 +2911,11 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     adopting = False
                     log(f"Session #{session_num}: adopting the running session")
                     last_launched = session_num
+                    # An adopted session was already up for an unknown time,
+                    # which is strictly longer than nothing. Treating it as
+                    # started now is the conservative reading: it can only
+                    # delay the healthy-uptime reset, never trigger it early.
+                    session_started_at = time.time()
                 else:
                     launch_args = list(copilot_args)
                     if resume_id:
@@ -2947,6 +2968,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                                               [m["id"] for m in waiting])
                     resume_id_used = ""
                     last_launched = session_num
+                    session_started_at = time.time()
 
                 # Record the CLI session id once the runner discovers it.
                 for _ in range(SESSION_ID_WAIT):
@@ -3025,11 +3047,25 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                             log(f"Session #{session_num}: restart signal detected!")
                             crash_failures = 0
                         else:
+                            uptime = (None if session_started_at is None
+                                      else time.time() - session_started_at)
+                            if uptime is not None and uptime >= HEALTHY_SESSION_SECONDS:
+                                # Healthy run, then death: whatever killed it,
+                                # it is not the startup failure the limit is
+                                # counting. Start the count over at this one.
+                                if crash_failures:
+                                    log(f"  Previous session stayed up "
+                                        f"{int(uptime)}s — not a crash loop, "
+                                        f"resetting the exit count")
+                                crash_failures = 0
                             crash_failures += 1
                             _record_session_exit(instance, session_num,
                                                  stop_state, detach_state,
-                                                 crash_failures)
-                            log(f"Session #{session_num}: copilot exited unexpectedly "
+                                                 crash_failures, uptime=uptime)
+                            ran_for = ("" if uptime is None
+                                       else f" after {int(uptime)}s")
+                            log(f"Session #{session_num}: copilot exited unexpectedly"
+                                f"{ran_for} "
                                 f"({crash_failures}/{MAX_LAUNCH_FAILURES}) — relaunching")
                             if crash_failures >= MAX_LAUNCH_FAILURES:
                                 log(f"  Giving up after {crash_failures} consecutive "
@@ -3826,7 +3862,8 @@ def show_menu() -> int:
 
 
 def _record_session_exit(instance, session_num: int,
-                         stop_state, detach_state, consecutive: int) -> None:
+                         stop_state, detach_state, consecutive: int,
+                         uptime: float | None = None) -> None:
     """Trace a session found gone, with the evidence the decision was made on.
 
     The supervisor polls liveness rather than waiting on the child, so it has
@@ -3853,7 +3890,8 @@ def _record_session_exit(instance, session_num: int,
             pid=pid,
             markers={"stop": stop_state, "detach": detach_state,
                      "restart": marker_state(instance.restart_marker),
-                     "exit_code": code},
+                     "exit_code": code,
+                     "uptime_s": None if uptime is None else int(uptime)},
             consecutive=consecutive,
             limit=MAX_LAUNCH_FAILURES,
         )
