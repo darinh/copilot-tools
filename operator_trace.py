@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -101,8 +102,14 @@ def _utcnow() -> str:
 
 
 def _stem(name: str) -> str:
-    """The lowercase executable name without directory or extension."""
-    base = os.path.basename(str(name)).lower()
+    """The lowercase executable name without directory or extension.
+
+    Both separators are split on, not just the host's. `os.path.basename`
+    leaves a Windows path intact on POSIX, so `C:\\x\\copilot.exe` would be
+    read whole and never match `copilot` -- and a trace is a file, which can
+    be written on one machine and read on another.
+    """
+    base = str(name).replace("\\", "/").rsplit("/", 1)[-1].lower()
     for suffix in (".exe", ".com", ".bat", ".cmd"):
         if base.endswith(suffix):
             return base[: -len(suffix)]
@@ -138,8 +145,25 @@ def _win_process_table() -> "dict[int, tuple[int, str]] | None":
 
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Declared, not inferred. ctypes defaults every restype to `c_int`,
+        # which on 64-bit Windows truncates a HANDLE and — worse — turns the
+        # INVALID_HANDLE_VALUE returned by a failed snapshot into -1, so the
+        # guard below would compare it against c_void_p(-1) (2**64-1), miss,
+        # and walk on with a handle that was never valid.
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD,
+                                                     wintypes.DWORD]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE,
+                                             ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [wintypes.HANDLE,
+                                            ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
         snap = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
-        if snap == ctypes.c_void_p(-1).value or not snap:
+        if not snap or snap == ctypes.c_void_p(-1).value:
             return None
         try:
             entry = PROCESSENTRY32W()
@@ -150,7 +174,9 @@ def _win_process_table() -> "dict[int, tuple[int, str]] | None":
                 table[int(entry.th32ProcessID)] = (
                     int(entry.th32ParentProcessID), str(entry.szExeFile))
                 ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
-            return table or None
+            # `table`, not `table or None`: the snapshot was taken, so an empty
+            # result is something we read, not something we failed to read.
+            return table
         finally:
             kernel32.CloseHandle(snap)
     except Exception:
@@ -173,6 +199,15 @@ def _win_image_path(pid: int) -> "str | None":
         from ctypes import wintypes
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                         wintypes.DWORD]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD)]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         # PROCESS_QUERY_LIMITED_INFORMATION: the weakest right that answers
         # this question, so it succeeds for processes we may not open fully.
         handle = kernel32.OpenProcess(0x1000, False, int(pid))
@@ -191,13 +226,27 @@ def _win_image_path(pid: int) -> "str | None":
         return None
 
 
+class _TreeUnreadable(Exception):
+    """Raised when the process tree could not be read, as distinct from read
+    and found empty. It exists so a permission failure cannot arrive at
+    ``classify`` wearing the same clothes as a genuine dead end."""
+
+
 def _posix_parent(pid: int) -> "tuple[int, str] | None":
-    """``(ppid, command)`` for ``pid`` on Linux, or ``None``."""
+    """``(ppid, command)`` for ``pid`` on Linux.
+
+    ``None`` means the process is gone -- a real dead end. A tree that could
+    not be read raises ``_TreeUnreadable`` instead, because those two answers
+    lead to opposite conclusions and ``None`` for both would let "we were not
+    allowed to look" be reported as "there is nothing above this process".
+    """
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8",
                                                    errors="replace")
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise _TreeUnreadable(str(exc)) from exc
     # The comm field is parenthesised and may itself contain spaces and
     # parentheses, so the fields after it are found from the LAST ')'.
     close = stat.rfind(")")
@@ -246,7 +295,9 @@ def _ps_process_table() -> "dict[int, tuple[int, str]] | None":
                                     parts[2] if len(parts) > 2 else "")
         except ValueError:
             continue
-    return table or None
+    # `table`, not `table or None`: ps ran and exited 0, so an empty result is
+    # an answer we read rather than a failure to read one.
+    return table
 
 
 def _procfs_available() -> bool:
@@ -297,30 +348,39 @@ def ancestry(pid: "int | None" = None,
 
     chain: list[dict] = []
     seen: set[int] = set()
-    while current and current > 0 and len(chain) < limit:
-        if current in seen:
-            break
-        seen.add(current)
-
-        if table is not None:
-            entry = table.get(current)
-            if entry is None:
+    try:
+        while current and current > 0 and len(chain) < limit:
+            if current in seen:
                 break
-            ppid, name = entry
-            path = _win_image_path(current) if IS_WINDOWS else None
-        else:
-            got = _posix_parent(current)
-            if got is None:
-                break
-            ppid, name = got
-            path = name or None
+            seen.add(current)
 
-        chain.append({
-            "pid": current,
-            "name": os.path.basename(name) if name else None,
-            "path": path,
-        })
-        current = ppid
+            if table is not None:
+                entry = table.get(current)
+                if entry is None:
+                    break
+                ppid, name = entry
+                path = _win_image_path(current) if IS_WINDOWS else None
+            else:
+                got = _posix_parent(current)
+                if got is None:
+                    break
+                ppid, name = got
+                path = name or None
+
+            chain.append({
+                "pid": current,
+                "name": os.path.basename(name) if name else None,
+                "path": path,
+            })
+            current = ppid
+    except _TreeUnreadable:
+        # Whatever was gathered so far is true, but it is a prefix, and a
+        # prefix is indistinguishable from a complete chain once returned.
+        # The dangerous direction is the silent one: an incomplete chain with
+        # no copilot ancestor in it reads as "launched by a human". Report
+        # that we could not look rather than let a partial answer pass as a
+        # whole one.
+        return None
 
     # A table that was readable but produced nothing for our own parent is a
     # genuine dead end rather than a failure to look, so an empty chain here
@@ -400,20 +460,33 @@ def classify(chain: "list[dict] | None", argv: "list[str]",
 # ── recording ───────────────────────────────────────────────────
 
 
+_FLAG_RE = re.compile(r"^-{1,2}[A-Za-z][A-Za-z0-9][A-Za-z0-9._-]*$|^-[A-Za-z]$")
+
+
 def _safe_argv(argv: "list[str]") -> "list[str]":
-    """Argv with message bodies replaced and long values truncated."""
+    """Argv with message bodies replaced and long values truncated.
+
+    "Starts with a dash" is not the same as "is a flag": an armoured key
+    begins ``-----BEGIN``, and treating that as a flag walks a secret straight
+    past the redaction and into the file. A flag has a shape, so the shape is
+    what is matched.
+    """
     out: list[str] = []
-    redact_from = None
-    if argv and argv[0] in _REDACT_TRAILING:
-        # Everything after the last recognised flag pair is the body. Rather
-        # than re-parse the subcommand's flags here -- a second copy of a
-        # parser is a second thing to drift -- redact any element that is long
-        # enough to be prose and is not a flag.
-        redact_from = 1
+    redacting = bool(argv) and argv[0] in _REDACT_TRAILING
     for i, arg in enumerate(argv):
         text = str(arg)
-        if (redact_from is not None and i >= redact_from
-                and not text.startswith("-") and len(text) > 40):
+        is_flag = bool(_FLAG_RE.match(text))
+        # A value belonging to the preceding flag (`--to NAME`), as opposed to
+        # a positional argument. Flag values are names and counts, which are
+        # the attribution this file exists to record; positionals after a
+        # `send` are prose the user typed.
+        prev = str(argv[i - 1]) if i else ""
+        is_flag_value = bool(_FLAG_RE.match(prev)) and "=" not in prev
+        if redacting and i >= 1 and not is_flag and not is_flag_value:
+            # Length is not a safety property. The first version redacted only
+            # arguments longer than 40 characters, which wrote `operator send
+            # "hunter2"` into the trace verbatim; a secret is not less of one
+            # for being short.
             out.append(f"<redacted:{len(text)} chars>")
         elif len(text) > _MAX_ARG:
             out.append(text[:_MAX_ARG] + f"…<+{len(text) - _MAX_ARG}>")

@@ -198,17 +198,22 @@ def test_flags_around_a_redacted_body_survive(tmp_path):
     assert rec["argv"][:5] == ["send", "--from", "alpha", "--to", "beta"]
 
 
-def test_a_short_argument_to_send_is_not_redacted(tmp_path):
-    """Negative control for redaction: it must not swallow ordinary values.
+def test_a_short_argument_to_send_is_redacted_but_its_flags_are_not(tmp_path):
+    """Negative control for redaction: it must not swallow the flag values
+    that make the record useful, while still redacting a short body.
 
-    Without this, a redactor that replaced every argument would pass the two
-    tests above.
+    The original of this test asserted that a short body survived into the
+    trace -- it was written to stop redaction eating everything, and instead
+    pinned the leak in place. A test can enforce the bug it was meant to
+    prevent.
     """
     op_home = tmp_path / "home"
     operator_trace.record_invocation(op_home, ["send", "--to", "beta", "ok"])
     rec = json.loads(operator_trace.trace_path(op_home)
                      .read_text(encoding="utf-8").splitlines()[0])
-    assert "ok" in rec["argv"]
+    assert rec["argv"][:3] == ["send", "--to", "beta"]
+    assert "ok" not in rec["argv"]
+    assert rec["argv"][-1] == "<redacted:2 chars>"
 
 
 def test_other_subcommands_are_not_redacted(tmp_path):
@@ -401,3 +406,207 @@ def test_trace_is_a_reserved_word_so_it_cannot_be_an_instance_name():
     """`operator foo` attaches to instance foo, so `trace` must be excluded
     or the subcommand would be shadowed by any instance named `trace`."""
     assert "trace" in op.RESERVED_WORDS
+
+
+# --- The tri-state, tested where it is produced -------------------------
+#
+# The tests above prove `classify` treats None and [] differently. They cannot
+# prove `ancestry` ever produces None, and for a while it did not: on Linux a
+# PermissionError reading /proc came back as None from `_posix_parent`, the
+# walk broke, and an unreadable tree was returned as an empty chain -- which
+# `classify` reads as "no ancestors", one tty away from "a human ran this".
+# A guarantee is only protected where the value is made.
+
+
+class _DeniedPath:
+    def __init__(self, *_a, **_k):
+        pass
+
+    def read_text(self, *_a, **_k):
+        raise PermissionError(13, "Permission denied")
+
+    def read_bytes(self, *_a, **_k):
+        raise PermissionError(13, "Permission denied")
+
+
+class _GonePath:
+    def __init__(self, *_a, **_k):
+        pass
+
+    def read_text(self, *_a, **_k):
+        raise FileNotFoundError(2, "No such file")
+
+    def read_bytes(self, *_a, **_k):
+        raise FileNotFoundError(2, "No such file")
+
+
+def test_posix_parent_separates_denied_from_gone(monkeypatch):
+    """Two OSErrors, two opposite meanings. Collapsing them is the bug."""
+    monkeypatch.setattr(operator_trace, "Path", _GonePath)
+    assert operator_trace._posix_parent(4242) is None
+
+    monkeypatch.setattr(operator_trace, "Path", _DeniedPath)
+    with pytest.raises(operator_trace._TreeUnreadable):
+        operator_trace._posix_parent(4242)
+
+
+def _force_procfs(monkeypatch):
+    monkeypatch.setattr(operator_trace, "IS_WINDOWS", False)
+    monkeypatch.setattr(operator_trace, "_procfs_available", lambda: True)
+
+
+def test_ancestry_returns_none_when_proc_cannot_be_read(monkeypatch):
+    """An unreadable tree must not arrive as an empty one."""
+    _force_procfs(monkeypatch)
+    monkeypatch.setattr(operator_trace, "Path", _DeniedPath)
+    assert operator_trace.ancestry(pid=4242) is None
+
+
+def test_ancestry_returns_empty_chain_when_the_parent_is_gone(monkeypatch):
+    """...and a genuine dead end must not arrive as a failure to look."""
+    _force_procfs(monkeypatch)
+    monkeypatch.setattr(operator_trace, "Path", _GonePath)
+    assert operator_trace.ancestry(pid=4242) == []
+
+
+def test_ancestry_of_a_denied_tree_never_classifies_as_user(monkeypatch):
+    """The end-to-end shape of the bug: denied /proc plus a tty read as a
+    human sitting at a terminal, which is exactly the attribution an
+    incident needs to be right about."""
+    _force_procfs(monkeypatch)
+    monkeypatch.setattr(operator_trace, "Path", _DeniedPath)
+    chain = operator_trace.ancestry(pid=4242)
+    assert operator_trace.classify(chain, [], tty=True)["kind"] == "unknown"
+
+
+def test_a_readable_but_empty_process_table_is_not_an_unreadable_one(
+        monkeypatch):
+    """`return table or None` made an empty snapshot indistinguishable from a
+    snapshot that could not be taken."""
+    monkeypatch.setattr(operator_trace, "IS_WINDOWS", True)
+    monkeypatch.setattr(operator_trace, "_win_process_table", lambda: {})
+    assert operator_trace.ancestry(pid=4242) == []
+
+    monkeypatch.setattr(operator_trace, "_win_process_table", lambda: None)
+    assert operator_trace.ancestry(pid=4242) is None
+
+
+# --- Redaction is not a length heuristic --------------------------------
+
+
+def test_a_short_message_body_is_still_redacted():
+    """The first version redacted only bodies longer than 40 characters, so
+    `operator send ... hunter2` went into the trace verbatim. A secret is not
+    less of one for being short."""
+    out = operator_trace._safe_argv(
+        ["send", "--from", "a", "--to", "b", "hunter2"])
+    assert "hunter2" not in out
+    assert out[-1] == "<redacted:7 chars>"
+
+
+def test_flag_values_survive_redaction_because_they_are_the_attribution():
+    out = operator_trace._safe_argv(
+        ["send", "--from", "copilot-tools", "--to", "prism", "hi"])
+    assert "copilot-tools" in out and "prism" in out
+
+
+def test_a_body_that_looks_like_a_flag_is_not_waved_through():
+    """`not text.startswith("-")` let a body beginning with a dash skip
+    redaction and fall through to plain truncation."""
+    out = operator_trace._safe_argv(["send", "--to", "b", "-----BEGIN KEY-----"])
+    assert not any("BEGIN KEY" in part for part in out)
+
+
+def test_non_redacted_subcommands_are_left_alone():
+    assert operator_trace._safe_argv(["version"]) == ["version"]
+    assert operator_trace._safe_argv(["join", "prism"]) == ["join", "prism"]
+
+
+# --- Controls that drive the real reader, not a stand-in ----------------
+#
+# An earlier version of the three tests below monkeypatched `_win_process_table`
+# and `_ps_process_table` themselves, so the `return table or None` they were
+# written to catch was never executed. Mutation testing found them: the bug was
+# reintroduced and the suite stayed green. A test that replaces the code it is
+# meant to guard is scenery.
+
+
+def test_ps_table_distinguishes_an_empty_listing_from_a_failed_one(
+        monkeypatch):
+    import subprocess as _sp
+
+    class _Result:
+        def __init__(self, rc, out):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: _Result(0, ""))
+    assert operator_trace._ps_process_table() == {}, (
+        "ps exited 0 with no rows: that is an answer, not a failure to look")
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: _Result(1, ""))
+    assert operator_trace._ps_process_table() is None
+
+
+class _FakeFn:
+    """A stand-in for a kernel32 export that still accepts the restype and
+    argtypes assignments the module makes before calling it."""
+
+    def __init__(self, result):
+        self._result = result
+        self.restype = None
+        self.argtypes = None
+
+    def __call__(self, *_a, **_k):
+        return self._result
+
+
+class _FakeKernel32:
+    def __init__(self, snapshot=1234, first=0):
+        self.CreateToolhelp32Snapshot = _FakeFn(snapshot)
+        self.Process32FirstW = _FakeFn(first)
+        self.Process32NextW = _FakeFn(0)
+        self.CloseHandle = _FakeFn(1)
+
+
+@pytest.mark.skipif(not operator_trace.IS_WINDOWS,
+                    reason="ctypes.wintypes is Windows-only")
+def test_win_table_distinguishes_an_empty_snapshot_from_a_failed_one(
+        monkeypatch):
+    import ctypes
+
+    monkeypatch.setattr(ctypes, "WinDLL",
+                        lambda *a, **k: _FakeKernel32(snapshot=1234, first=0))
+    assert operator_trace._win_process_table() == {}, (
+        "the snapshot was taken and held no rows: still an answer")
+
+    monkeypatch.setattr(ctypes, "WinDLL",
+                        lambda *a, **k: _FakeKernel32(snapshot=0))
+    assert operator_trace._win_process_table() is None
+
+
+@pytest.mark.skipif(not operator_trace.IS_WINDOWS,
+                    reason="ctypes.wintypes is Windows-only")
+def test_an_invalid_handle_is_recognised_as_failure(monkeypatch):
+    """CreateToolhelp32Snapshot reports failure as INVALID_HANDLE_VALUE. With
+    ctypes' default 32-bit restype that arrived as -1 and was compared against
+    c_void_p(-1).value (2**64-1), so a failed snapshot was walked as a good
+    one. The declared restype is what makes this comparison meaningful."""
+    import ctypes
+
+    invalid = ctypes.c_void_p(-1).value
+    monkeypatch.setattr(ctypes, "WinDLL",
+                        lambda *a, **k: _FakeKernel32(snapshot=invalid))
+    assert operator_trace._win_process_table() is None
+
+
+def test_stem_does_not_depend_on_the_hosts_path_separator(monkeypatch):
+    r"""`os.path.basename` leaves `C:\x\copilot.exe` whole on POSIX, so the
+    ancestry of a Windows-written trace would stop being recognised the moment
+    it was read anywhere else. Forcing the POSIX implementation reproduces
+    that here, on any host."""
+    import posixpath
+
+    monkeypatch.setattr(operator_trace.os.path, "basename",
+                        posixpath.basename)
+    assert operator_trace._stem(r"C:\x\copilot.exe") == "copilot"
+    assert operator_trace._stem("/usr/local/bin/copilot") == "copilot"

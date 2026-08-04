@@ -20,6 +20,7 @@ messaging, and spec-driven workflow conventions.
 | [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | Roslyn-backed C# structural analysis |
 | [`skills/operator-agents`](skills/operator-agents/SKILL.md) | Starting parallel operator agents and messaging them |
 | [`operator_mail.py`](docs/operator.md#parallel-agents-and-messaging) | Message store behind `operator send` / `operator inbox` |
+| [`operator_trace.py`](operator_trace.py) | Records who invoked the operator and how each invocation ended, for attributing incidents |
 | [`install_manifest.py`](docs/versioning.md) | Records what setup deployed and its hash, so upgrades know what's safe to replace |
 | [`extensions/`](extensions/README.md) | Copilot CLI runtime extensions: open-in-vs-code, lint-on-edit, security-shield, test-enforcer, architecture-enforcer, checkout-guard, copy-to-clipboard-tool |
 | [`templates/`](templates/) | Configuration templates for copilot-instructions, MCP servers, and per-project setup |
@@ -282,6 +283,7 @@ copilot-tools/
 ├── operator_mux.py                # Session-backend abstraction (tmux / psmux)
 ├── operator_ingest.py             # Pure-Python log parser
 ├── operator_mail.py               # Agent-to-agent mail, live and queued delivery
+├── operator_trace.py              # Who invoked the operator, and how it ended
 ├── operator_console.py            # UTF-8 console output
 ├── project_paths.py               # Project identity: catalog and per-project dirs
 ├── handoff_tool.py                # Session handoff
