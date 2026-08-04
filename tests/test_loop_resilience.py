@@ -200,6 +200,58 @@ def test_repeated_unexpected_exits_eventually_give_up(monkeypatch):
     assert attempts["n"] == op.MAX_LAUNCH_FAILURES
 
 
+def test_a_session_that_ran_for_minutes_does_not_count_toward_the_give_up_limit(
+        monkeypatch):
+    """Five deaths hours apart must not retire a loop the way five in a minute do.
+
+    The consecutive-exit limit is there to stop a hot relaunch spin, but it
+    counted exits and never their spacing. This machine's operator.log shows
+    what that costs: on four separate occasions every instance died within
+    seconds of every other, independent of when each was launched, each having
+    run for minutes. Five such waves and every supervisor retired itself, so
+    the user came back to nothing running.
+
+    A session that stayed up past the healthy threshold restarts the count, so
+    only genuinely rapid failures can still exhaust it. The negative control is
+    `test_repeated_unexpected_exits_eventually_give_up`, whose sessions die
+    instantly and must still give up at the cap.
+    """
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(op.time, "time", lambda: clock["t"])
+
+    attempts = {"n": 0}
+    keep_going = op.MAX_LAUNCH_FAILURES * 3
+
+    def dies(instance, args, session_num, remain_on_exit=False, preamble=""):
+        attempts["n"] += 1
+        if attempts["n"] > keep_going:
+            # Unbounded by construction now, so the test must end it.
+            raise KeyboardInterrupt
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    really_running = op.is_copilot_running
+
+    def aged(instance):
+        # Age the session past the healthy threshold before its death is
+        # noticed, which is the only way the supervisor can tell a session
+        # that ran from one that never started.
+        clock["t"] += op.HEALTHY_SESSION_SECONDS + 1
+        return really_running(instance)
+
+    monkeypatch.setattr(op, "start_session", dies)
+    monkeypatch.setattr(op, "is_copilot_running", aged)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+    monkeypatch.setattr(op, "stop_session_gracefully", lambda instance: None)
+
+    inst = op.Instance("long-lived")
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert attempts["n"] > op.MAX_LAUNCH_FAILURES, (
+        "the supervisor gave up at the cap even though every session had been "
+        "up for longer than HEALTHY_SESSION_SECONDS before it died")
+    assert attempts["n"] == keep_going + 1
+
+
 def test_detach_marker_leaves_session_running(monkeypatch):
     """`operator stop-loop NAME` (a touched detach marker) must stop the
     supervisor without touching the session or calling stop_session_gracefully."""
