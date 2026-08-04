@@ -20,6 +20,7 @@ never under ``~/.copilot``, which the Copilot CLI wholesale-deletes on startup.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import platform
@@ -88,6 +89,12 @@ RESTART_PAUSE_SECONDS = 3
 HEALTHY_SESSION_SECONDS = 120
 SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
+# Consecutive sessions that may change nothing before the loop gives up.
+MAX_NOCHANGE_SESSIONS = 3
+# Seconds any single git probe may take before its answer is "unknown".
+GIT_PROBE_TIMEOUT = 30
+# run_loop_mode's exit code when the progress circuit breaker stopped it.
+EXIT_NO_PROGRESS = 3
 RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
                   "version", "forget", "logs", "tabs", "restore",
                   "stop-loop", "stop-session", "restart-loop", "menu",
@@ -514,6 +521,16 @@ class Instance:
         return RESTART_DIR / f"{self.id}.loopargs.json"
 
     @property
+    def nochange_file(self) -> Path:
+        """Consecutive sessions that left the project's git state untouched.
+
+        On disk rather than in memory because a supervisor can be replaced
+        mid-run (``operator restart-loop``), and a breaker that forgets its
+        count every time the supervisor is swapped would never trip.
+        """
+        return RESTART_DIR / f"{self.id}.nochange"
+
+    @property
     def restart_lock_file(self) -> Path:
         """Held while a supervisor handoff is in progress.
 
@@ -635,11 +652,47 @@ class Instance:
         except (OSError, ValueError):
             return None
 
+    def read_nochange_count(self) -> int | None:
+        """Consecutive no-change sessions recorded so far.
+
+        ``None`` means the count could not be established, which is not the
+        same as zero: silently reading an unreadable counter as "no evidence
+        of stalling yet" is how a circuit breaker ends up permanently off
+        without anyone noticing.
+        """
+        present = path_present(self.nochange_file)
+        if present is False:
+            return 0
+        if present is None:
+            return None
+        try:
+            value = int(self.nochange_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    def save_nochange_count(self, count: int) -> bool:
+        """Persist the streak. ``False`` when it could not be written.
+
+        Losing this costs the breaker its memory across a supervisor swap,
+        never the running session, so — like ``_save_loop_args`` — it must not
+        take an unattended supervisor down with it.
+        """
+        tmp = RESTART_DIR / f"{self.id}.nochange.tmp"
+        try:
+            tmp.write_text(f"{count}\n", encoding="utf-8")
+            os.replace(tmp, self.nochange_file)
+        except OSError as exc:
+            log(f"  Warning: could not record the no-change count: {exc}")
+            return False
+        return True
+
     def cleanup_files(self) -> None:
         for path in (self.restart_marker, self.managed_file, self.spec_file,
                      self.pid_file, self.exit_file, self.session_file,
                      self.loop_pid_file, self.detach_marker, self.stop_marker,
-                     self.loop_args_file, self.restart_lock_file):
+                     self.loop_args_file, self.restart_lock_file,
+                     self.nochange_file):
             remove_file(path)
 
 
@@ -1275,6 +1328,228 @@ def _report_metrics(subcmd: str = "summary") -> int:
         print(f"      Rows predating 2026-06-01 are costed at "
               f"${_LEGACY_USD:.2f}/premium request.")
     return 0
+
+
+def _git_output(args: list[str], cwd: Path) -> str | None:
+    """Run a read-only git command. ``None`` when it could not be answered.
+
+    Every failure mode collapses to ``None`` on purpose: git missing, the
+    directory not being a repository, a lock held by whoever is working in
+    there, a timeout. The caller must treat that as "unknown", never as
+    "nothing changed".
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=GIT_PROBE_TIMEOUT, **NO_WINDOW_KWARGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _git_output_with_input(args: list[str], cwd: Path,
+                           stdin_text: str) -> str | None:
+    """``_git_output`` for a command that reads paths on stdin.
+
+    Same contract: every failure mode collapses to ``None``, meaning
+    "unknown", never "nothing changed".
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args], cwd=str(cwd), input=stdin_text,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=GIT_PROBE_TIMEOUT, **NO_WINDOW_KWARGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _worktree_paths(cwd: Path) -> list[Path] | None:
+    """Every checkout attached to this repository, primary first."""
+    out = _git_output(["worktree", "list", "--porcelain"], cwd)
+    if out is None:
+        return None
+    paths = [line[len("worktree "):].strip()
+             for line in out.splitlines() if line.startswith("worktree ")]
+    if not paths:
+        # A repository always has at least its primary checkout, so an empty
+        # list means the output was not what we think it was.
+        return None
+    return [Path(p) for p in paths]
+
+
+def _uncommitted_content(path: Path) -> str | None:
+    """The *content* of everything uncommitted in one worktree.
+
+    ``git status`` names the paths that changed and how, but not what is in
+    them: a file edited twice produces the identical ``" M app.py"`` line
+    both times. A loop iterating on the same uncommitted file would therefore
+    fingerprint identically session after session and be stopped for making
+    no progress, which is the most expensive way this breaker can be wrong.
+
+    ``git diff`` (worktree against index) and ``git diff --cached`` (index
+    against HEAD) together cover every tracked byte, and neither needs HEAD to
+    exist — in a repository with no commits yet ``--cached`` diffs against the
+    empty tree instead of failing, so no unborn-HEAD special case is needed.
+    Untracked files are in neither diff, so their contents are hashed
+    separately. ``--exclude-standard`` applies the ignore rules, which is what
+    keeps build output and ``__pycache__`` from churning the fingerprint on
+    every run and silently disarming the breaker. Entries ending in ``/`` are
+    skipped: git does not descend into a nested repository, so it reports one
+    collapsed directory entry that ``hash-object`` cannot read. A linked
+    worktree is the common case and loses nothing, because every worktree is
+    fingerprinted in its own right; anything else still registers through the
+    ``git status`` line that names it.
+
+    ``None`` means the question could not be answered.
+    """
+    parts = []
+    for args in (["diff"], ["diff", "--cached"]):
+        out = _git_output(args, path)
+        if out is None:
+            return None
+        parts.append(out)
+    untracked = _git_output(
+        ["ls-files", "--others", "--exclude-standard", "-z"], path)
+    if untracked is None:
+        return None
+    names = [n for n in untracked.split("\0") if n and not n.endswith("/")]
+    # ``ls-files -z`` is NUL-delimited precisely because a filename may
+    # contain a newline, but ``hash-object --stdin-paths`` is newline-
+    # delimited and has no NUL equivalent. Feeding it such a name splits it
+    # into two paths that do not exist, so the call fails, the fingerprint
+    # collapses to "unknown", and the breaker is off for the rest of the run
+    # — silently, because "unknown" is indistinguishable from an unreadable
+    # repository. The rare name goes through argv, where no delimiter exists
+    # to be confused, and the common case keeps its single batched call.
+    batched = [n for n in names if "\n" not in n]
+    individually = [n for n in names if "\n" in n]
+    if batched:
+        # One batched call: the file count is unbounded, and a process per
+        # file would make the probe's cost scale with someone else's mess.
+        hashed = _git_output_with_input(
+            ["hash-object", "--stdin-paths"], path, "\n".join(batched) + "\n")
+        if hashed is None:
+            return None
+        parts.append(hashed)
+    for name in individually:
+        hashed = _git_output(["hash-object", "--", name], path)
+        if hashed is None:
+            return None
+        # The name is digested alongside its content: two such files swapping
+        # contents would otherwise produce the same unordered set of hashes.
+        parts.append(f"{name}\0{hashed}")
+    return "\0".join(parts)
+
+
+def workspace_fingerprint(cwd: Path) -> str | None:
+    """Digest of everything in this repository a session could have changed.
+
+    ``None`` means the question could not be answered, which is deliberately
+    distinct from "nothing changed".
+
+    Scope is the whole repository, not ``cwd``. Work here happens on branches
+    in linked worktrees under ``.worktrees/``, so a session can commit an
+    entire feature without the primary checkout's HEAD or ``git status``
+    moving at all. Fingerprinting only the current directory would therefore
+    report a productive session as idle and eventually stop a loop that was
+    working perfectly. Every local ref and every worktree's uncommitted state
+    is included instead.
+
+    ``refs/remotes`` is included for the same reason: a session that commits,
+    pushes, then deletes its local branch and worktree leaves local state
+    exactly as it found it, and only the remote-tracking ref still records
+    that the work happened.
+
+    A detached HEAD is covered by each worktree's ``# branch.oid`` line
+    rather than by the refs, because a commit made while detached advances no
+    ref at all.
+    """
+    refs = _git_output(
+        ["for-each-ref", "--format=%(objectname) %(refname)",
+         "refs/heads", "refs/tags", "refs/stash", "refs/remotes"], cwd)
+    if refs is None:
+        return None
+    worktrees = _worktree_paths(cwd)
+    if worktrees is None:
+        return None
+
+    digest = hashlib.sha256()
+    digest.update(refs.encode("utf-8", "replace"))
+    for path in worktrees:
+        present = dir_present(path)
+        if present is False:
+            # git still lists a worktree whose directory has been removed. It
+            # cannot be holding changes, so it is recorded as absent rather
+            # than making the whole fingerprint unknown.
+            digest.update(f"\0{path}\0<absent>".encode("utf-8", "replace"))
+            continue
+        if present is None:
+            return None
+        # ``--branch`` in the v2 format is what makes a detached HEAD
+        # visible. A commit on a detached checkout advances no ref, so
+        # ``for-each-ref`` above cannot see it and the tree is clean
+        # afterwards — the whole repository would fingerprint identically
+        # across a session that committed real work, and the breaker would
+        # stop a loop that was being productive. ``# branch.oid`` carries the
+        # commit itself. v2 is used rather than a second ``rev-parse`` probe
+        # because it costs no extra process and, unlike ``rev-parse HEAD``,
+        # it still exits 0 in a repository with no commits yet (reporting
+        # ``(initial)``) rather than failing and reading as "unknown".
+        status = _git_output(
+            ["status", "--porcelain=v2", "--branch",
+             "--untracked-files=all"], path)
+        if status is None:
+            # The worktree we cannot read is exactly the one that might hold
+            # the change, so no verdict is available for the repository.
+            return None
+        content = _uncommitted_content(path)
+        if content is None:
+            return None
+        digest.update(f"\0{path}\0".encode("utf-8", "replace"))
+        digest.update(status.encode("utf-8", "replace"))
+        digest.update(content.encode("utf-8", "replace"))
+    return digest.hexdigest()
+
+
+def evaluate_progress(count: int | None, before: str | None,
+                      after: str | None) -> tuple[int | None, str]:
+    """Fold one finished session into the no-change counter.
+
+    Returns ``(count, verdict)`` where verdict is ``changed``, ``unchanged``
+    or ``unknown``. An unknown session leaves the counter exactly as it was:
+    it neither counts toward stopping the loop nor clears what came before.
+
+    Progress is judged before the counter is consulted, so a session that
+    demonstrably changed something resets the streak to zero even when the
+    previous count was unreadable. Reporting known progress as "unknown"
+    would leave a corrupt counter file corrupt forever, and a breaker that
+    can never be re-armed is one that has silently switched itself off.
+
+    An unreadable count is healed the same way when the session demonstrably
+    changed *nothing*, by restarting the streak at one. The argument is the
+    same one, and leaving it out was a real hole: a stuck agent is exactly
+    the case where no session ever writes the counter, so a file that went
+    corrupt would stay corrupt and the breaker would be off for the rest of
+    the run — precisely when it was needed. Restarting at one can only ever
+    undercount (the streak really is at least this session), so the error it
+    can make is letting the loop run longer, never stopping a healthy one.
+    """
+    if before is None or after is None:
+        return count, "unknown"
+    if before != after:
+        return 0, "changed"
+    if count is None:
+        return 1, "unchanged"
+    return count + 1, "unchanged"
 
 
 def show_run_summary(run_started: str) -> None:
@@ -2901,6 +3176,43 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     # Recorded so this supervisor can be replaced later without guessing how
     # it was started. Written every time, so it tracks the live invocation.
     _save_loop_args(instance, user_args)
+
+    # Progress circuit breaker. A fresh run starts a fresh count: --fresh
+    # means "forget the previous run", and inheriting its stalled counter
+    # would stop the new one after fewer sessions than it is owed.
+    workdir = Path.cwd()
+    if is_fresh:
+        # The count is reset in memory whether or not the file could be
+        # removed. Deleting it is disk hygiene; if that fails, reading the
+        # stale streak back would let a run started with --fresh stop early,
+        # which is exactly what --fresh promises will not happen.
+        remove_file(instance.nochange_file)
+        nochange = 0
+    else:
+        nochange = instance.read_nochange_count()
+    if adopt:
+        # This supervisor arrived part-way through a session it did not
+        # start, so the repository state that session began with is not
+        # knowable. Measuring its end against a baseline taken now would read
+        # work it had already finished as no work at all, and could stop a
+        # loop that had just been productive. The adopted session is
+        # unmeasurable by construction; the baseline re-arms from its end.
+        baseline = None
+    else:
+        baseline = workspace_fingerprint(workdir)
+    if nochange is None:
+        log(f"  Progress breaker: re-arms from the next measurable session "
+            f"— cannot read {instance.nochange_file}")
+    elif adopt:
+        log(f"  Progress breaker: re-arms after the adopted session "
+            f"(currently {nochange})")
+    elif baseline is None:
+        log("  Progress breaker: inactive — no readable git state in "
+            f"{workdir}")
+    else:
+        log(f"  Progress breaker: stops the loop after "
+            f"{MAX_NOCHANGE_SESSIONS} consecutive sessions that change "
+            f"nothing (currently {nochange})")
     try:
         try:
             while session_num <= MAX_SESSIONS:
@@ -3086,6 +3398,38 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     remove_file(instance.restart_marker)
                     stop_session_gracefully(instance)
                     instance.save_state(session_num, run_started)
+
+                    # The session is over and its writes have landed, so this
+                    # is the only honest moment to ask whether it changed
+                    # anything.
+                    current = workspace_fingerprint(workdir)
+                    nochange, verdict = evaluate_progress(
+                        nochange, baseline, current)
+                    if verdict == "unknown":
+                        log(f"Session #{session_num}: cannot tell whether "
+                            f"anything changed — progress breaker not advanced")
+                    elif verdict == "changed":
+                        instance.save_nochange_count(0)
+                    else:
+                        instance.save_nochange_count(nochange)
+                        log(f"Session #{session_num}: changed nothing in "
+                            f"{workdir} ({nochange}/{MAX_NOCHANGE_SESSIONS})")
+                        if nochange >= MAX_NOCHANGE_SESSIONS:
+                            log(f"Progress breaker tripped: {nochange} "
+                                f"consecutive sessions changed nothing. "
+                                f"Stopping instead of starting session "
+                                f"#{session_num + 1}.")
+                            log(f"  Resume with: operator --loop --name "
+                                f"{instance.display_name}")
+                            show_run_summary(run_started)
+                            instance.cleanup_files()
+                            return EXIT_NO_PROGRESS
+                    # A session whose end could not be measured keeps the old
+                    # baseline, so its work is still counted against the next
+                    # comparison rather than being lost between two unknowns.
+                    if current is not None:
+                        baseline = current
+
                     session_num += 1
                     log(f"Pausing before session #{session_num}...")
                     _sleep(RESTART_PAUSE_SECONDS)
