@@ -101,6 +101,21 @@ def test_an_unreadable_counter_cannot_be_advanced():
     assert op.evaluate_progress(0, "abc", "abc") == (1, "unchanged")
 
 
+def test_known_progress_heals_an_unreadable_counter():
+    """A session that demonstrably changed something clears the streak even
+    when the previous count could not be read.
+
+    Reporting known progress as `unknown` instead would leave a corrupt
+    counter file corrupt for the rest of the run: nothing would ever write to
+    it again, so the breaker could never re-arm, and it would be off with
+    nothing in the log to say so.
+    """
+    assert op.evaluate_progress(None, "abc", "xyz") == (0, "changed")
+    # Still unknown when the fingerprints agree, so the healing above is the
+    # verdict's doing rather than a blanket "None counts as zero".
+    assert op.evaluate_progress(None, "abc", "abc") == (None, "unknown")
+
+
 # ── the fingerprint ─────────────────────────────────────────────
 def test_a_quiet_repository_fingerprints_the_same_twice(tmp_path):
     repo = make_repo(tmp_path / "repo")
@@ -118,6 +133,94 @@ def test_a_commit_changes_the_fingerprint(tmp_path):
     after = op.workspace_fingerprint(repo)
     assert after is not None
     assert after != before
+
+
+def test_a_second_edit_to_the_same_tracked_file_changes_the_fingerprint(
+        tmp_path):
+    """`git status` names the path that changed, never what is in it.
+
+    An agent iterating on one uncommitted file emits the identical
+    ` M README.md` line every session, so a fingerprint built from the status
+    alone would call sustained work a stall and stop the loop in the middle
+    of it. This is the breaker's most expensive failure direction.
+    """
+    repo = make_repo(tmp_path / "repo")
+    (repo / "README.md").write_text("first draft\n", encoding="utf-8")
+    first = op.workspace_fingerprint(repo)
+    (repo / "README.md").write_text("second draft\n", encoding="utf-8")
+    second = op.workspace_fingerprint(repo)
+    assert first is not None and second is not None
+    assert second != first
+    # The status output really is identical across those two edits, which is
+    # what makes this a trap rather than a hypothetical.
+    assert _git(repo, "status", "--porcelain=v1").strip() == "M README.md"
+
+
+def test_a_second_edit_to_an_untracked_file_changes_the_fingerprint(tmp_path):
+    """The same trap one step earlier: a file drafted over several sessions
+    and not yet added stays `?? notes.md` no matter what is written into it.
+    """
+    repo = make_repo(tmp_path / "repo")
+    draft = repo / "notes.md"
+    draft.write_text("first\n", encoding="utf-8")
+    first = op.workspace_fingerprint(repo)
+    draft.write_text("second\n", encoding="utf-8")
+    second = op.workspace_fingerprint(repo)
+    assert first is not None and second is not None
+    assert second != first
+    assert _git(repo, "status", "--porcelain=v1").strip() == "?? notes.md"
+
+
+def test_an_ignored_file_does_not_change_the_fingerprint(tmp_path):
+    """The other direction, and the reason the breaker is not permanently
+    disarmed here: files the repository ignores are regenerated constantly
+    (`__pycache__`, build output). If they moved the fingerprint, every
+    session would look productive and the breaker would never trip.
+    """
+    repo = make_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text("junk/\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "ignore junk")
+    (repo / "junk").mkdir()
+    before = op.workspace_fingerprint(repo)
+    (repo / "junk" / "artifact.bin").write_text("regenerated\n",
+                                                encoding="utf-8")
+    assert before is not None
+    assert op.workspace_fingerprint(repo) == before
+
+
+def test_work_pushed_then_cleaned_up_locally_still_counts_as_a_change(
+        tmp_path):
+    """An agent that commits, pushes, and then deletes its local branch
+    leaves local state exactly as it found it.
+
+    Only the remote-tracking ref still records that anything happened, so a
+    fingerprint over `refs/heads` alone would call a finished, published
+    feature "changed nothing" -- and three of those in a row would stop the
+    loop for being too productive.
+    """
+    upstream = tmp_path / "upstream.git"
+    _git(tmp_path, "init", "-q", "--bare", str(upstream))
+    repo = make_repo(tmp_path / "repo")
+    _git(repo, "remote", "add", "origin", str(upstream))
+    home = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+
+    before = op.workspace_fingerprint(repo)
+    _git(repo, "checkout", "-q", "-b", "feat/pushed")
+    (repo / "feature.txt").write_text("done\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "a whole feature")
+    _git(repo, "push", "-q", "origin", "feat/pushed")
+    _git(repo, "checkout", "-q", home)
+    _git(repo, "branch", "-q", "-D", "feat/pushed")
+
+    after = op.workspace_fingerprint(repo)
+    assert before is not None and after is not None
+    assert after != before
+    # Local branches really did return to where they started, so refs/remotes
+    # is the only thing that can be carrying this verdict.
+    assert _git(repo, "for-each-ref", "--format=%(refname)",
+                "refs/heads").strip() == f"refs/heads/{home}"
 
 
 def test_an_uncommitted_edit_changes_the_fingerprint(tmp_path):
@@ -302,6 +405,22 @@ def test_cleanup_removes_the_counter():
     inst.save_nochange_count(3)
     inst.cleanup_files()
     assert inst.read_nochange_count() == 0
+
+
+def test_a_counter_that_cannot_be_written_does_not_kill_the_supervisor(
+        isolated_state, capsys, monkeypatch):
+    """Losing the count costs the breaker its memory across a supervisor
+    swap. Raising here would cost an unattended loop its supervisor, which is
+    a far worse trade -- `_save_loop_args` already makes exactly this choice.
+    """
+    inst = op.Instance("unwritable")
+    # Control: with a real state directory the write succeeds, so the False
+    # below is the missing directory's doing and not an inert method.
+    assert inst.save_nochange_count(2) is True
+
+    monkeypatch.setattr(op, "RESTART_DIR", isolated_state / "never-created")
+    assert inst.save_nochange_count(3) is False
+    assert "could not record the no-change count" in capsys.readouterr().err
 
 
 # ── the loop ────────────────────────────────────────────────────
@@ -490,3 +609,91 @@ def test_a_fresh_run_does_not_inherit_a_stalled_streak(
         "a fresh run is owed the full allowance, not the one session left "
         "over from the previous run")
 
+
+
+def test_a_fresh_run_starts_at_zero_even_if_the_counter_cannot_be_removed(
+        loop_in_repo, monkeypatch):
+    """`--fresh` promises the full allowance.
+
+    Deleting the counter file is disk hygiene, and deletion can fail -- a
+    lock, a permission, a tri-state probe that could not tell. If the count
+    were then read back from the file that is still there, a run started with
+    `--fresh` would spend almost all of its allowance before its first
+    session, which is precisely what `--fresh` says will not happen.
+    """
+    inst = op.Instance("stubborn")
+    inst.save_nochange_count(op.MAX_NOCHANGE_SESSIONS - 1)
+
+    real_remove = op.remove_file
+    monkeypatch.setattr(
+        op, "remove_file",
+        lambda path: None if path == inst.nochange_file else real_remove(path))
+
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_die(launched))
+
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == op.EXIT_NO_PROGRESS
+    assert len(launched) == op.MAX_NOCHANGE_SESSIONS, (
+        "the undeleted counter must not be read back into a fresh run")
+    # The file really did survive, so the test exercised the failure it
+    # claims to and not a successful deletion.
+    assert inst.nochange_file.exists()
+
+
+def test_an_adopted_session_is_not_measured_against_a_late_baseline(
+        loop_in_repo, monkeypatch):
+    """`operator restart-loop` replaces a supervisor part-way through a
+    session, and the replacement runs with `adopt=True`.
+
+    It cannot know what the repository looked like when that session started.
+    Taking the baseline at adoption time and comparing it to the session's
+    end reads every change the session had already made as no change at all,
+    so a loop that had just landed a feature could be stopped for idleness on
+    the very next tick. The adopted session is unmeasurable by construction.
+    """
+    inst = op.Instance("adopted")
+    inst.claim("test-token")
+    inst.save_nochange_count(op.MAX_NOCHANGE_SESSIONS - 1)
+    # The adopted session is already over: the supervisor arrives, takes it
+    # over, and immediately sees it exit.
+    inst.exit_file.write_text("0", encoding="utf-8")
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: True)
+    monkeypatch.setattr(op.MUX, "pane_dead", lambda session: False)
+
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_die(launched))
+
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False,
+                          adopt=True)
+
+    assert rc == op.EXIT_NO_PROGRESS
+    assert launched == [2], (
+        "the adopted session #1 must not spend the last of the streak; the "
+        "breaker re-arms from its end and trips on the next launched session")
+
+
+def test_a_launched_session_is_measured_where_an_adopted_one_is_not(
+        loop_in_repo, monkeypatch):
+    """The control for the test above.
+
+    Identical state, `adopt=False`: session #1 is launched by this supervisor
+    and is therefore measurable, so it spends the last of the streak and no
+    second session is ever started. Without this, the assertion above would
+    also pass against an implementation that had simply stopped counting.
+    """
+    inst = op.Instance("not-adopted")
+    inst.save_nochange_count(op.MAX_NOCHANGE_SESSIONS - 1)
+    # No live session to inherit: a supervisor that is not adopting launches
+    # into an empty slot, which is what makes this the fair comparison.
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
+    monkeypatch.setattr(op.MUX, "pane_dead", lambda session: False)
+
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_die(launched))
+
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert rc == op.EXIT_NO_PROGRESS
+    assert launched == [1]

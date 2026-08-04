@@ -671,10 +671,21 @@ class Instance:
             return None
         return value if value >= 0 else None
 
-    def save_nochange_count(self, count: int) -> None:
+    def save_nochange_count(self, count: int) -> bool:
+        """Persist the streak. ``False`` when it could not be written.
+
+        Losing this costs the breaker its memory across a supervisor swap,
+        never the running session, so — like ``_save_loop_args`` — it must not
+        take an unattended supervisor down with it.
+        """
         tmp = RESTART_DIR / f"{self.id}.nochange.tmp"
-        tmp.write_text(f"{count}\n", encoding="utf-8")
-        os.replace(tmp, self.nochange_file)
+        try:
+            tmp.write_text(f"{count}\n", encoding="utf-8")
+            os.replace(tmp, self.nochange_file)
+        except OSError as exc:
+            log(f"  Warning: could not record the no-change count: {exc}")
+            return False
+        return True
 
     def cleanup_files(self) -> None:
         for path in (self.restart_marker, self.managed_file, self.spec_file,
@@ -1340,6 +1351,27 @@ def _git_output(args: list[str], cwd: Path) -> str | None:
     return proc.stdout
 
 
+def _git_output_with_input(args: list[str], cwd: Path,
+                           stdin_text: str) -> str | None:
+    """``_git_output`` for a command that reads paths on stdin.
+
+    Same contract: every failure mode collapses to ``None``, meaning
+    "unknown", never "nothing changed".
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args], cwd=str(cwd), input=stdin_text,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=GIT_PROBE_TIMEOUT, **NO_WINDOW_KWARGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
 def _worktree_paths(cwd: Path) -> list[Path] | None:
     """Every checkout attached to this repository, primary first."""
     out = _git_output(["worktree", "list", "--porcelain"], cwd)
@@ -1352,6 +1384,53 @@ def _worktree_paths(cwd: Path) -> list[Path] | None:
         # list means the output was not what we think it was.
         return None
     return [Path(p) for p in paths]
+
+
+def _uncommitted_content(path: Path) -> str | None:
+    """The *content* of everything uncommitted in one worktree.
+
+    ``git status`` names the paths that changed and how, but not what is in
+    them: a file edited twice produces the identical ``" M app.py"`` line
+    both times. A loop iterating on the same uncommitted file would therefore
+    fingerprint identically session after session and be stopped for making
+    no progress, which is the most expensive way this breaker can be wrong.
+
+    ``git diff`` (worktree against index) and ``git diff --cached`` (index
+    against HEAD) together cover every tracked byte, and neither needs HEAD to
+    exist — in a repository with no commits yet ``--cached`` diffs against the
+    empty tree instead of failing, so no unborn-HEAD special case is needed.
+    Untracked files are in neither diff, so their contents are hashed
+    separately. ``--exclude-standard`` applies the ignore rules, which is what
+    keeps build output and ``__pycache__`` from churning the fingerprint on
+    every run and silently disarming the breaker. Entries ending in ``/`` are
+    skipped: git does not descend into a nested repository, so it reports one
+    collapsed directory entry that ``hash-object`` cannot read. A linked
+    worktree is the common case and loses nothing, because every worktree is
+    fingerprinted in its own right; anything else still registers through the
+    ``git status`` line that names it.
+
+    ``None`` means the question could not be answered.
+    """
+    parts = []
+    for args in (["diff"], ["diff", "--cached"]):
+        out = _git_output(args, path)
+        if out is None:
+            return None
+        parts.append(out)
+    untracked = _git_output(
+        ["ls-files", "--others", "--exclude-standard", "-z"], path)
+    if untracked is None:
+        return None
+    names = [n for n in untracked.split("\0") if n and not n.endswith("/")]
+    if names:
+        # One batched call: the file count is unbounded, and a process per
+        # file would make the probe's cost scale with someone else's mess.
+        hashed = _git_output_with_input(
+            ["hash-object", "--stdin-paths"], path, "\n".join(names) + "\n")
+        if hashed is None:
+            return None
+        parts.append(hashed)
+    return "\0".join(parts)
 
 
 def workspace_fingerprint(cwd: Path) -> str | None:
@@ -1367,10 +1446,15 @@ def workspace_fingerprint(cwd: Path) -> str | None:
     report a productive session as idle and eventually stop a loop that was
     working perfectly. Every local ref and every worktree's uncommitted state
     is included instead.
+
+    ``refs/remotes`` is included for the same reason: a session that commits,
+    pushes, then deletes its local branch and worktree leaves local state
+    exactly as it found it, and only the remote-tracking ref still records
+    that the work happened.
     """
     refs = _git_output(
         ["for-each-ref", "--format=%(objectname) %(refname)",
-         "refs/heads", "refs/tags", "refs/stash"], cwd)
+         "refs/heads", "refs/tags", "refs/stash", "refs/remotes"], cwd)
     if refs is None:
         return None
     worktrees = _worktree_paths(cwd)
@@ -1395,8 +1479,12 @@ def workspace_fingerprint(cwd: Path) -> str | None:
             # The worktree we cannot read is exactly the one that might hold
             # the change, so no verdict is available for the repository.
             return None
+        content = _uncommitted_content(path)
+        if content is None:
+            return None
         digest.update(f"\0{path}\0".encode("utf-8", "replace"))
         digest.update(status.encode("utf-8", "replace"))
+        digest.update(content.encode("utf-8", "replace"))
     return digest.hexdigest()
 
 
@@ -1407,11 +1495,19 @@ def evaluate_progress(count: int | None, before: str | None,
     Returns ``(count, verdict)`` where verdict is ``changed``, ``unchanged``
     or ``unknown``. An unknown session leaves the counter exactly as it was:
     it neither counts toward stopping the loop nor clears what came before.
+
+    Progress is judged before the counter is consulted, so a session that
+    demonstrably changed something resets the streak to zero even when the
+    previous count was unreadable. Reporting known progress as "unknown"
+    would leave a corrupt counter file corrupt forever, and a breaker that
+    can never be re-armed is one that has silently switched itself off.
     """
-    if count is None or before is None or after is None:
+    if before is None or after is None:
         return count, "unknown"
     if before != after:
         return 0, "changed"
+    if count is None:
+        return None, "unknown"
     return count + 1, "unchanged"
 
 
@@ -3045,15 +3141,33 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     # would stop the new one after fewer sessions than it is owed.
     workdir = Path.cwd()
     if is_fresh:
+        # The count is reset in memory whether or not the file could be
+        # removed. Deleting it is disk hygiene; if that fails, reading the
+        # stale streak back would let a run started with --fresh stop early,
+        # which is exactly what --fresh promises will not happen.
         remove_file(instance.nochange_file)
-    nochange = instance.read_nochange_count()
-    baseline = workspace_fingerprint(workdir)
-    if baseline is None:
-        log("  Progress breaker: inactive — no readable git state in "
-            f"{workdir}")
-    elif nochange is None:
+        nochange = 0
+    else:
+        nochange = instance.read_nochange_count()
+    if adopt:
+        # This supervisor arrived part-way through a session it did not
+        # start, so the repository state that session began with is not
+        # knowable. Measuring its end against a baseline taken now would read
+        # work it had already finished as no work at all, and could stop a
+        # loop that had just been productive. The adopted session is
+        # unmeasurable by construction; the baseline re-arms from its end.
+        baseline = None
+    else:
+        baseline = workspace_fingerprint(workdir)
+    if nochange is None:
         log(f"  Progress breaker: inactive — cannot read "
             f"{instance.nochange_file}")
+    elif adopt:
+        log(f"  Progress breaker: re-arms after the adopted session "
+            f"(currently {nochange})")
+    elif baseline is None:
+        log("  Progress breaker: inactive — no readable git state in "
+            f"{workdir}")
     else:
         log(f"  Progress breaker: stops the loop after "
             f"{MAX_NOCHANGE_SESSIONS} consecutive sessions that change "
