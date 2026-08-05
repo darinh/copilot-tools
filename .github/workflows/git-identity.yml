@@ -25,13 +25,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Load-bearing. Every job in ci.yml checks out at the default depth
-          # of 1; a history scan run there would examine the tip commit,
-          # certify the hundreds behind it, and report that in green forever.
-          # git_identity.py refuses a shallow clone with exit 2 rather than
-          # passing, so deleting this line turns the job red instead of
-          # silent -- but it is still the line that makes the job mean
-          # anything.
+          # Load-bearing. A history scan at the default depth of 1 would
+          # examine the tip commit, certify the hundreds behind it, and report
+          # that in green forever. git_identity.py refuses a shallow clone
+          # with exit 2 rather than passing, so deleting this line turns the
+          # job red instead of silent -- but it is still the line that makes
+          # the job mean anything.
+          #
+          # This used to add "every job in ci.yml checks out at the default
+          # depth of 1". That is no longer so: ci.yml's matrix job takes full
+          # history too, because backlog_tool resolves the `commit:` sha of
+          # every closed item and a shallow clone cannot tell a bogus sha from
+          # one it was never given. Depth is not what keeps this check in its
+          # own workflow -- the push trigger above is.
           fetch-depth: 0
 
       # actions/checkout fetches refs/heads/* and refs/tags/* even at depth 0.

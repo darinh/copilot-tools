@@ -19,7 +19,18 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
+      # Full history, not the default depth-1 clone. backlog_tool's R8 rule
+      # resolves the `commit:` sha of every closed item with `git cat-file`,
+      # and in a shallow clone no commit but the tip exists -- so the rule
+      # reported every correctly-closed item as naming a commit that "does not
+      # resolve to a commit in this repository". The check cannot tell "this
+      # sha is bogus" from "I was only given one commit to look at", and the
+      # shallow clone made the second reading permanent on CI while every
+      # local run passed. Fetching the history restores the guarantee; making
+      # the rule tolerate a shallow clone would have retired it.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
