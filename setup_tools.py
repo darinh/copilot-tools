@@ -1310,7 +1310,25 @@ def _reconcile_scratch(dest: Path) -> None:
 #: Files copied from ``templates/`` into ``~/.copilot``.
 TEMPLATE_ARTIFACTS = (
     ("mcp-config.json", "mcp-config.json", "MCP config"),
-    ("copilot-instructions.md", "copilot-instructions.md", "Copilot instructions"),
+)
+
+#: Artifacts setup used to deploy and no longer does, with the command that
+#: finishes retiring each one.
+#:
+#: ``copilot-instructions.md`` was installed at user scope, which meant every
+#: Copilot session on the machine — in every directory, project or not — was
+#: told to resolve a project root, read the catalog and offer to enroll the
+#: working directory. Its replacement is a per-repository ``AGENTS.md``, and
+#: the move is the operator's to make because it needs the user's answer about
+#: repositories that already have one.
+#:
+#: Setup only *reports* these. Deleting the old file here would be a removal
+#: separated from its replacement, and a machine interrupted in that window
+#: would have the conventions in no place at all. A duplicate is the failure
+#: mode this trades for.
+RETIRED_ARTIFACTS = (
+    ("templates/copilot-instructions.md", "copilot-instructions.md",
+     "Copilot instructions", "operator projects retire"),
 )
 
 
@@ -2081,6 +2099,9 @@ def report_status() -> int:
         for source, target, _func in pending:
             print(f"  {source} -> {target}")
 
+    print()
+    retired = report_retired_artifacts()
+
     tools = manifest.get("tools") or {}
     if tools:
         print("\nTool versions at last setup:")
@@ -2090,9 +2111,37 @@ def report_status() -> int:
     if install_manifest.needs_update(report):
         print("\nRun setup to bring these up to date.")
         return 1
-    if broken or inert:
+    if broken or inert or retired:
         return 1
     return 0
+
+
+def report_retired_artifacts() -> int:
+    """Say which no-longer-installed artifacts are still on this machine.
+
+    An artifact that setup has stopped deploying does not stop *existing*.
+    ``deployed_artifacts`` no longer names it, so ``--status`` would otherwise
+    fall silent about a file that is still being loaded into every session —
+    and the one machine that most needs telling is the machine that installed
+    it, which is every machine that ran an earlier setup.
+
+    Returns how many are still present, so a caller can decide whether that is
+    worth an exit code.
+    """
+    outstanding = 0
+    for _key, dest_name, label, command in RETIRED_ARTIFACTS:
+        dest = COPILOT_DIR / dest_name
+        # ``is not False``: a file that cannot be examined is still there as
+        # far as anything reading it is concerned, and reporting it gone
+        # because a stat failed would hide exactly what this is for.
+        if install_manifest.path_present(dest) is False:
+            continue
+        outstanding += 1
+        warn(f"{label} at {dest} is no longer installed by setup and is still "
+             f"there. It is read by every Copilot session on this machine, "
+             f"including directories that are not projects.")
+        print(f"    Run `{command}` to move it into each project's AGENTS.md.")
+    return outstanding
 
 
 def apply_upgrades(manifest: dict, assume_yes: bool = False) -> None:
@@ -2212,9 +2261,10 @@ def main(argv: list[str] | None = None) -> int:
         warn(f"Could not write install manifest: {exc}")
 
     print("\n\u2550\u2550\u2550 Setup Complete \u2550\u2550\u2550\n")
+    report_retired_artifacts()
     print("Next steps:")
     print("  1. Run: operator help")
-    print("  2. Review ~/.copilot/copilot-instructions.md and customize")
+    print("  2. Review this project's AGENTS.md and customize")
     print("  3. Start a session: operator --agent=anvil:anvil --yolo")
     print("  4. Start an autonomous loop: operator --loop --name myproject")
     return 0

@@ -51,7 +51,10 @@ if _HERE not in sys.path:
 import operator_ingest                                       # noqa: E402
 import operator_mail                                         # noqa: E402
 import operator_trace                                        # noqa: E402
+import install_manifest                                      # noqa: E402
 import project_features                                      # noqa: E402
+import project_instructions                                  # noqa: E402
+from copilot_tools_version import __version__ as TOOLKIT_VERSION  # noqa: E402
 from install_manifest import (                                # noqa: E402
     dir_present,
     file_present,
@@ -3778,6 +3781,7 @@ USAGE
     operator reload NAME                                       Hot-reload launch spec
     operator list                                              Show running instances
     operator projects                                          Per-project feature configuration
+    operator projects retire [--yes]                           Move conventions into each project's AGENTS.md
     operator stop [NAME]                                       Stop instance(s) — loop + session
     operator stop-loop NAME                                    Stop only the background loop
     operator restart-loop NAME                                 Replace the loop supervisor (new code), keep session
@@ -4595,15 +4599,27 @@ def browse_project_configurations() -> int:
         for i, (label, summary, path) in enumerate(rows, 1):
             print(f"  {i:>2}) {label:<{width}}  {summary}")
             print(f"      {path}")
+        retire_index = len(projects) + 1
+        offer_retirement = user_instructions_present()
+        if offer_retirement:
+            print(f"\n  {retire_index:>2}) Retire {global_instructions_path()}")
+            print(f"      Give each project above its own "
+                  f"{project_instructions.AGENTS_NAME} instead. That file is "
+                  "read by")
+            print("      every session on this machine, project or not.")
         print()
+        upper = retire_index if offer_retirement else len(projects)
         choice = _prompt_line(
-            f"Choose a project [1-{len(projects)}] (blank to go back): ")
+            f"Choose a project [1-{upper}] (blank to go back): ")
         if not choice:
             return 0
         try:
             index = int(choice)
         except ValueError:
             print("Not a number.", file=sys.stderr)
+            continue
+        if offer_retirement and index == retire_index:
+            retire_user_instructions()
             continue
         if not 1 <= index <= len(projects):
             print("Out of range.", file=sys.stderr)
@@ -4706,6 +4722,176 @@ def _pick_feature_value(feature, current: str) -> "str | None":
     return feature.options[index - 1].value
 
 
+# ── retiring the user-scope instructions file ───────────────────
+def global_instructions_path() -> Path:
+    """The user-scope instructions file, loaded into every session anywhere."""
+    return HOME / ".copilot" / project_instructions.GLOBAL_NAME
+
+
+def instructions_archive_dir() -> Path:
+    return HOME / ".copilot" / project_instructions.ARCHIVE_DIRNAME
+
+
+def _repo_template_path() -> Path:
+    """The template shipped beside this module.
+
+    ``_HERE`` rather than a package resource: this toolkit is installed from a
+    checkout, editable or otherwise, and every other path in this file is
+    derived the same way.
+    """
+    return Path(_HERE) / "templates" / project_instructions.TEMPLATE_NAME
+
+
+def user_instructions_present() -> bool:
+    """Whether the retired user-scope file is still sitting there.
+
+    ``is not False`` rather than ``is True``: a file that cannot be *examined*
+    is still being loaded into every session, and reporting it absent because
+    a stat failed would hide the exact thing this is for.
+    """
+    return path_present(global_instructions_path()) is not False
+
+
+def _combine_prompt(project: dict, existing: str) -> bool:
+    """Ask before writing into a repository's own ``AGENTS.md``."""
+    path = Path(project["path"]) / project_instructions.AGENTS_NAME
+    lines = existing.strip().splitlines()
+    print(f"\n  {path} already exists ({len(existing)} bytes, "
+          f"{len(lines)} lines). First lines:")
+    for line in lines[:5]:
+        print(f"    | {line}")
+    if len(lines) > 5:
+        print("    | ...")
+    print("\n  Combining appends this project's conventions below what is "
+          "there. Nothing already in the file is changed or removed.")
+    answer = _prompt_line("  Combine? [y/N]: ").lower()
+    return answer in ("y", "yes")
+
+
+def _catalog_fingerprint():
+    """Enough of the catalog's state to notice it changed under us.
+
+    Bytes rather than mtime: a second write within the same filesystem
+    timestamp granularity is exactly the case a coarse stamp misses, and two
+    agents registering projects a moment apart is the scenario. Unreadable
+    reads back as the exception text, so "it went away" also counts as a
+    change rather than as "no projects".
+    """
+    path = project_catalog_path()
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"unreadable: {exc}"
+
+
+def retire_user_instructions(assume_yes: bool = False) -> int:
+    """Give every catalogued project an ``AGENTS.md``, then retire the global file.
+
+    The offer this screen exists to make. A user-scope instructions file is
+    read by every Copilot session on the machine, including ones in
+    directories that are not projects, so the conventions move to where the
+    consent is: the repositories that were actually registered.
+    """
+    global_path = global_instructions_path()
+    print("\n═══ Retire the user-scope instructions file ═══\n")
+    print(f"  {global_path}")
+    if not user_instructions_present():
+        print("\n  Already retired — nothing at that path.")
+    found = catalog_projects()
+    if found is CATALOG_UNREADABLE:
+        print(f"\nCannot read {project_catalog_path()}; nothing can be "
+              "written and nothing will be removed.", file=sys.stderr)
+        return 1
+    projects, problems = found
+    if problems:
+        for problem in problems:
+            print(f"    ! {problem}")
+        print(f"\n  Those rows name projects that cannot be given an "
+              f"{project_instructions.AGENTS_NAME}, so {global_path} stays.",
+              file=sys.stderr)
+        print("  A row that will not parse is not a row naming no project. "
+              "Removing the file while one of them is unreadable would take "
+              "the conventions away from a project that never got them.",
+              file=sys.stderr)
+        return 1
+    if not projects:
+        print(f"\n  No projects registered in {project_catalog_path()}. "
+              "Removing the file now would take the conventions off this "
+              "machine entirely, so it stays.")
+        return 1
+
+    manifest = install_manifest.load(OPERATOR_HOME)
+    try:
+        source, origin = project_instructions.resolve_source(
+            _repo_template_path(), global_path, manifest)
+    except project_instructions.InstructionsError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 1
+    print(f"\n  Conventions taken from {origin}")
+    print(f"  Each project gets an {project_instructions.AGENTS_NAME} with "
+          "only the sections its own features turned on.\n")
+    for project in projects:
+        print(f"    {project['label']}  {project['path']}")
+    if not assume_yes:
+        if _prompt_line(f"\n  Write {project_instructions.AGENTS_NAME} into "
+                        f"{len(projects)} repositories? [y/N]: "
+                        ).lower() not in ("y", "yes"):
+            print("  Nothing written.")
+            return 0
+    print()
+    snapshot = _catalog_fingerprint()
+
+    def recheck():
+        if _catalog_fingerprint() == snapshot:
+            return None
+        return (f"{project_catalog_path()} changed while this was running, so "
+                "the list of projects it was given may be out of date.")
+
+    result = project_instructions.retire(
+        projects,
+        source=source,
+        source_origin=origin,
+        global_path=global_path,
+        archive_dir=instructions_archive_dir(),
+        projects_root=projects_root(),
+        home=HOME,
+        version=TOOLKIT_VERSION,
+        decide=(lambda project, existing: True) if assume_yes else _combine_prompt,
+        log=print,
+        recheck=recheck,
+    )
+    return _report_retirement(result, global_path)
+
+
+def _report_retirement(result, global_path: Path) -> int:
+    print()
+    if result.user_agents:
+        print("  ! A user-scope AGENTS.md is also loaded into every session:")
+        for path in result.user_agents:
+            print(f"      {path}")
+        print("    It is not this toolkit's file and was not touched.")
+    if result.removed:
+        if result.archived:
+            print(f"  Retired {global_path}")
+            print(f"  A copy is kept at {result.archived} — nothing prunes "
+                  "that directory.")
+        else:
+            print(f"  {global_path} was already gone.")
+        return 0
+    for problem in result.problems:
+        print(f"  ! {problem}", file=sys.stderr)
+    blockers = result.blockers
+    if blockers:
+        print("\n  Blocked by:", file=sys.stderr)
+        for outcome in blockers:
+            print(f"    {outcome.label}: {outcome.state}"
+                  + (f" — {outcome.detail}" if outcome.detail else ""),
+                  file=sys.stderr)
+        print("\n  The conventions are now in two places rather than none. "
+              "Resolve the above and run this again.", file=sys.stderr)
+    return 1
+
+
 def show_menu() -> int:
     """Bare ``operator`` (no arguments): an interactive action picker.
 
@@ -4716,6 +4902,12 @@ def show_menu() -> int:
     while True:
         running = len(active_instances())
         print("\n═══ Copilot Operator ═══\n")
+        if user_instructions_present():
+            print(f"  ! {global_instructions_path()} is read by every Copilot")
+            print("    session on this machine, including directories that "
+                  "are not projects.")
+            print("    Retire it from the projects screen below to give each "
+                  f"repository its own {project_instructions.AGENTS_NAME}.\n")
         options: list[tuple[str, Callable[[], int] | None]] = [
             (f"Sessions — inspect, join or stop  ({running} running)",
              browse_instances),
@@ -5025,6 +5217,14 @@ def _dispatch_command(args: list[str]) -> int:
     if head == "menu":
         return show_menu()
     if head == "projects":
+        if len(args) > 1:
+            if args[1] != "retire":
+                print(f"Unknown subcommand: operator projects {args[1]}",
+                      file=sys.stderr)
+                print("Did you mean `operator projects retire`?",
+                      file=sys.stderr)
+                return 1
+            return retire_user_instructions(assume_yes="--yes" in args[2:])
         return browse_project_configurations()
     if head == "report":
         return report_metrics(args[1] if len(args) > 1 else "summary")

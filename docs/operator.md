@@ -510,6 +510,64 @@ A setting written by a newer version of the toolkit — a feature slug this buil
 has never heard of — is named on screen and carried through untouched by
 anything changed here.
 
+### Retiring the user-scope instructions file
+
+Setup used to copy `templates/copilot-instructions.md` to
+`~/.copilot/copilot-instructions.md`. It no longer does, and the file that is
+already there is retired from this screen — it appears as an extra entry below
+the project list, and `operator` says so on its main menu, for as long as it is
+still present:
+
+```
+operator projects retire          # interactive
+operator projects retire --yes    # combine with existing AGENTS.md files without asking
+```
+
+Why it had to go: a file at user scope is read by every Copilot session on the
+machine, in every directory, whether or not that directory is a project. Its
+"On Session Start — Project Lookup" section then tells the agent to resolve a
+project root, read the catalog and offer to enroll the directory — so opening a
+terminal anywhere started a conversation about the project system. There is no
+wording that fixes this; only moving the file does.
+
+Each registered project gets an `AGENTS.md` holding the sections its own
+features turned on, with the enrollment section replaced by the resolved facts
+— this project's id, its project directory, its `features.json`. A project file
+knows which project it is, so it has nothing to look up.
+
+The order is the contract:
+
+1. **Every** project is written first.
+2. The global file is copied to `~/.copilot/retired/`, named by timestamp and
+   content digest, and the copy is read back and digest-compared.
+3. Only then is the original removed.
+
+One project that cannot be written stops the removal, and so does one whose
+directory is not on this machine right now — an unplugged drive is a project
+that comes back, and removing the global file while it is away opens the gap on
+a delay. The resulting state is the conventions in two places, which costs a
+duplicate paragraph, rather than in none, which costs the machine its
+conventions. Nothing prunes `retired/`, for the same reason nothing prunes
+[`superseded/`](#superseded-handoffs).
+
+Three more things it will not do:
+
+- **Overwrite a repository's own `AGENTS.md`.** If one exists without a managed
+  block in it, you are shown the first lines and asked; a "no" leaves the file
+  alone and stops the removal. Consent appends below what is there.
+- **Ask again on a file it already wrote.** Regenerating replaces only the text
+  between the `copilot-tools managed conventions` markers and leaves everything
+  around it byte for byte, so this is safe to re-run.
+- **Touch a user-scope `AGENTS.md`.** If you keep one at `~/AGENTS.md` or
+  `~/.copilot/AGENTS.md` it is reported and left exactly as it is. It is not
+  this toolkit's file.
+
+Which wording ends up in the projects depends on the install manifest: normally
+the repository's current template, but a deployed copy the manifest says *you
+edited* wins, because generating from the pristine template would delete a
+year of your edits in the same operation that deletes the file holding them.
+The screen names which one it used.
+
 ### Auto-Continue
 
 Named instances automatically resume where they left off when restarted. Session numbering, run summary scope, and the active Copilot CLI session ID carry over between operator restarts.
