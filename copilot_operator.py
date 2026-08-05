@@ -146,8 +146,20 @@ RESERVED_WORDS = set(SUBCOMMANDS)
 #: makes them the one part of the typo guard that has to be enumerated by
 #: hand, and the list is deliberately short -- an alias is a guess about
 #: intent, and a wrong guess sends the reader somewhere that does not do what
-#: they asked. Only entries whose target does the job the other tool's word
-#: names belong here.
+#: they asked.
+#:
+#: Two rules for adding one, both learned from entries that were removed:
+#:
+#: - The target must *do the thing the other tool's word names*. ``cat`` and
+#:   ``tail`` were here pointing at ``logs``, which reports sizes and prunes
+#:   old files and cannot display a log at all. An alias that misses by that
+#:   much is worse than no suggestion, because it is confident.
+#: - The target must not be *more destructive than the word*. ``quit`` and
+#:   ``exit`` were here pointing at ``stop``, and bare ``operator stop`` kills
+#:   every managed instance on the machine without asking. Somebody typing
+#:   ``quit`` means "let me out of this one", and answering it with a command
+#:   that stops everybody else's agents too is the exact harm this guard was
+#:   built to prevent, arriving by the front door.
 SUBCOMMAND_ALIASES = {
     "ls": "list",          # every unix shell
     "ll": "list",
@@ -155,11 +167,7 @@ SUBCOMMAND_ALIASES = {
     "dir": "list",         # cmd.exe
     "sessions": "list",
     "status": "list",      # `list` is the "what is running" view
-    "tail": "logs",        # `tail -f` on the log
-    "cat": "logs",
-    "kill": "stop",
-    "quit": "stop",
-    "exit": "stop",
+    "kill": "stop",        # a synonym, not an escalation: both take a target
 }
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -5524,9 +5532,25 @@ def main(argv: list[str] | None = None) -> int:
     return rc
 
 
+#: The shortest word the prefix rule will act on.
+#:
+#: Two characters is not evidence of intent. ``in``, ``re``, ``he`` and ``me``
+#: are all prefixes of a subcommand and all ordinary first words of a sentence,
+#: so a prefix rule without a floor refuses ``operator in the parser, rename
+#: x`` -- a working invocation, taken away to guess at a typo nobody made.
+#: Three costs nothing here: the two-letter mistake this guard exists for,
+#: ``ls``, is not a prefix of ``list`` at all and is caught by the alias table.
+MIN_PREFIX_LENGTH = 3
+
+
 def _one_edit_apart(word: str, candidate: str) -> bool:
-    """True when one insertion, deletion, substitution or transposition of
-    adjacent characters turns ``word`` into ``candidate``.
+    """True when at most one insertion, deletion, substitution or transposition
+    of adjacent characters turns ``word`` into ``candidate``.
+
+    At *most* one, so an identical pair is also true. Nothing calls it that
+    way -- the dispatcher answers an exact subcommand long before this -- but
+    the name says "apart" and a future caller would be entitled to read that
+    as "and not equal", so it is written down rather than left to be found.
 
     Damerau-Levenshtein rather than plain Levenshtein because a transposition
     is one slip of the fingers and two ordinary edits, and transposition is
@@ -5538,8 +5562,7 @@ def _one_edit_apart(word: str, candidate: str) -> bool:
     if abs(len(word) - len(candidate)) > 1:
         return False
     previous: dict[tuple[int, int], int] = {}
-    rows = range(-1, len(word))
-    for i in rows:
+    for i in range(-1, len(word)):
         previous[(i, -1)] = i + 1
     for j in range(-1, len(candidate)):
         previous[(-1, j)] = j + 1
@@ -5563,17 +5586,25 @@ def _subcommand_suggestions(word: str) -> list[str]:
     prompt, and ``operator [copilot-args...]`` is documented -- so every word
     it claims wrongly is a working invocation taken away.
 
-    - **A strict prefix.** ``sto`` and ``lo`` are truncations of something
-      real. This can only fire when the word is *shorter* than the subcommand,
-      which is what keeps instance names safe: ``list-view`` and ``report-gen``
-      are longer than every subcommand they resemble, so no name that is
-      longer than the thing it looks like can ever be refused.
-    - **One edit away.** The classic single-slip model, and the reason a count
-      is right here where a similarity ratio was not.
+    - **A prefix, of at least MIN_PREFIX_LENGTH characters.** ``sto`` and
+      ``log`` are truncations of something real. A prefix is necessarily no
+      longer than what it prefixes, which is what keeps instance names safe:
+      ``list-view`` and ``report-gen`` are longer than every subcommand they
+      resemble, so no name longer than the thing it looks like can be refused
+      by this rule at all.
+    - **One edit away**, the classic single-slip model, and the reason a count
+      is right here where a similarity ratio was not. It cannot span a length
+      gap of two, so it protects longer names for the same reason.
     - **A word from another tool.** ``ls`` is not a typo of ``list``; it is
       correct spelling from a different program, and no distance measure will
       ever connect them. Those are enumerated in SUBCOMMAND_ALIASES rather
-      than guessed at.
+      than guessed at, and consulted only when the other two rules found
+      nothing.
+
+    Together those two length properties are the whole safety argument for
+    project names: **a word two or more characters longer than a subcommand
+    can never be refused because of it.** Almost every real instance name has
+    that shape.
 
     An earlier version scored ``difflib.SequenceMatcher`` ratios with a 0.6
     cutoff, and three reviewers independently rejected it: a ratio measures
@@ -5581,7 +5612,7 @@ def _subcommand_suggestions(word: str) -> list[str]:
     ``read`` (``reload``), ``hello`` (``help``), ``test`` (``ingest``) and --
     worst -- ``myproject``, the documented quick-join, against ``projects``.
     Ten of thirty ordinary one-word prompts were refused. These rules refuse
-    one, ``lint``, which really is one keystroke from ``list``.
+    two, ``lint`` and ``end``, each genuinely one keystroke from a subcommand.
 
     All matches are returned rather than one winner. ``sto`` truncates three
     different subcommands and ``difflib``'s own tie-break is alphabetical,
@@ -5593,7 +5624,7 @@ def _subcommand_suggestions(word: str) -> list[str]:
     if not word:
         return []
     matches = [candidate for candidate in SUBCOMMANDS
-               if (len(word) < len(candidate) and candidate.startswith(word))
+               if (len(word) >= MIN_PREFIX_LENGTH and candidate.startswith(word))
                or _one_edit_apart(word, candidate)]
     if not matches and word in SUBCOMMAND_ALIASES:
         matches = [SUBCOMMAND_ALIASES[word]]

@@ -1087,6 +1087,22 @@ def test_no_alias_is_itself_a_subcommand():
     assert not set(op.SUBCOMMAND_ALIASES) & set(op.SUBCOMMANDS)
 
 
+@pytest.mark.parametrize("word", ["quit", "exit", "cat", "tail"])
+def test_the_aliases_that_were_removed_stay_removed(word):
+    """A tripwire, and the reason is the whole point of it.
+
+    `quit` and `exit` pointed at `stop`, and bare `operator stop` kills every
+    managed instance on the machine without asking -- so the suggestion turned
+    "let me out of this one" into "stop everybody's agents", which is the harm
+    this guard exists to prevent, arriving as advice. `cat` and `tail` pointed
+    at `logs`, which reports sizes and prunes old files and cannot display a
+    log at all.
+
+    Both are the kind of entry that looks obviously right when you add it.
+    """
+    assert word not in op.SUBCOMMAND_ALIASES
+
+
 @pytest.mark.parametrize("word", [
     "copilot-tools", "book-translator", "prism", "my-instance",
     "write the tests", "",
@@ -1101,6 +1117,10 @@ def test_no_alias_is_itself_a_subcommand():
     "resume", "triage", "sort", "format", "release", "port", "state",
     "report-gen", "restore-db", "tabs-ui", "list-view", "send-it",
     "implement", "review", "explain", "summarize", "investigate",
+    # And these by the second, which had a prefix rule with no length floor.
+    # Each is an ordinary first word of a sentence and a prefix of a real
+    # subcommand: `operator in the parser, rename x` has to keep working.
+    "i", "in", "re", "he", "me", "se", "to", "st", "lo", "ta", "pr", "fo",
 ])
 def test_a_word_that_resembles_no_subcommand_is_left_alone(word):
     """`operator [copilot-args...]` is documented; a prompt may be any word.
@@ -1112,20 +1132,22 @@ def test_a_word_that_resembles_no_subcommand_is_left_alone(word):
 
 
 @pytest.mark.parametrize("name", [
-    "list-view", "report-gen", "restore-db", "tabs-ui", "send-it",
-    "logs-archive", "joinery", "helpdesk", "traceroute", "menu-bar",
+    # Exactly two characters longer than the subcommand each one resembles,
+    # which is the boundary the property actually turns on. An earlier version
+    # of this test used `list-view` and `report-gen` -- five and six characters
+    # longer -- so `_one_edit_apart` rejected them on the length bail alone and
+    # widening the edit threshold to two left the test green. The population
+    # was doing no work.
+    "list-v", "logsxy", "stopxy", "menuxy", "joinxy", "tabsxy", "sendxy",
+    "helpxy", "tracexy", "restorexy",
 ])
 def test_a_name_two_characters_longer_than_a_subcommand_is_never_refused(name):
     """The property that keeps project names out of the guard's way.
 
-    A prefix match needs the word to be *shorter* than the subcommand, and one
-    edit cannot span a length difference greater than one. So a name at least
-    two characters longer than everything it resembles is structurally safe,
-    which is the shape almost every real instance name has.
-
-    Two, not one: `menus` is a single insertion from `menu` and is refused,
-    which is the guard working. The boundary is asserted below rather than
-    left to be discovered.
+    A prefix is never longer than what it prefixes, and one edit cannot span a
+    length gap of two. So a name at least two characters longer than
+    everything it resembles is structurally safe, which is the shape almost
+    every real instance name has.
     """
     assert op._subcommand_suggestions(name) == []
 
@@ -1140,6 +1162,29 @@ def test_the_length_boundary_is_exactly_one_character():
     """
     assert op._subcommand_suggestions("menus") == ["menu"]
     assert op._subcommand_suggestions("menuss") == []
+
+
+def test_the_prefix_rule_has_a_length_floor():
+    """Two characters is not evidence, three is.
+
+    The boundary asserted from both sides so that raising or lowering
+    MIN_PREFIX_LENGTH cannot pass silently.
+    """
+    assert op._subcommand_suggestions("re") == []
+    assert op._subcommand_suggestions("rel") == ["reload"]
+    assert op.MIN_PREFIX_LENGTH == 3
+
+
+def test_an_exact_subcommand_suggests_only_itself_and_its_extensions():
+    """Unreachable from the dispatcher, which answers an exact subcommand
+    first -- pinned so that if it ever does become reachable, the behaviour is
+    a decision somebody made rather than one that fell out.
+
+    `stop` is its own zero-edit match and the prefix of two more.
+    """
+    assert op._subcommand_suggestions("list") == ["list"]
+    assert op._subcommand_suggestions("stop") == [
+        "stop", "stop-loop", "stop-session"]
 
 
 def test_a_typo_with_further_arguments_is_refused_too(monkeypatch, capsys):
