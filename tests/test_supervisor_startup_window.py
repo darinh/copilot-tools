@@ -1196,3 +1196,103 @@ def test_the_exact_boundary_still_obeys_the_allowance(monkeypatch):
     assert abs(widest - op.SUPERVISOR_STARTUP_ALLOWANCE) <= 0.1, (
         f"the widest window is {widest}s but every wait budgets "
         f"{op.SUPERVISOR_STARTUP_ALLOWANCE}s for it")
+
+
+def test_a_live_pid_past_the_ceiling_stops_being_believed(monkeypatch):
+    """The phantom: a supervisor hard-killed inside its startup window leaves
+    a record, and the operating system hands that pid to something unrelated.
+
+    Liveness is checked before age, so without a ceiling that record names a
+    live process forever and is never pruned. This is the assertion that the
+    belief ends."""
+    inst = op.Instance("phantom")
+    op._record_supervisor_starting(inst, 4242)
+    _dead_pids(monkeypatch, 4242)
+    _age_record(inst, op.SUPERVISOR_STARTUP_CEILING + 1)
+
+    assert op._supervisor_present(inst) is None, \
+        "a pid is not an identity; this one was reused long ago"
+    assert not inst.loop_startup_file.exists(), \
+        "and the record must be cleared, or the next reader asks the same " \
+        "unanswerable question"
+
+
+def test_a_live_pid_just_under_the_ceiling_is_still_believed(monkeypatch):
+    """The control for the test above. The ceiling must retire a phantom
+    without retiring the slow startup the liveness ground exists for -- a
+    test that only proved records expire would be satisfied by a ceiling of
+    zero, which is the grace-only behaviour this branch overrides."""
+    inst = op.Instance("slowbutreal")
+    op._record_supervisor_starting(inst, 4243)
+    _dead_pids(monkeypatch, 4243)
+    _age_record(inst, op.SUPERVISOR_STARTUP_CEILING - 5)
+
+    assert op._supervisor_present(inst) == 4243
+    assert inst.loop_startup_file.exists()
+
+
+def test_the_ceiling_leaves_room_for_a_startup_the_grace_cannot_cover():
+    """Sizing, pinned as a property rather than a number.
+
+    The liveness ground exists to outlast `SUPERVISOR_STARTUP_GRACE`; a
+    ceiling anywhere near it collapses the two grounds into one and silently
+    retires the slow startup. Nothing else in the suite objects to that,
+    because every other test sits comfortably inside both bounds."""
+    assert op.SUPERVISOR_STARTUP_CEILING > op.SUPERVISOR_STARTUP_ALLOWANCE * 5, (
+        f"a ceiling of {op.SUPERVISOR_STARTUP_CEILING}s is not meaningfully "
+        f"longer than the {op.SUPERVISOR_STARTUP_ALLOWANCE}s window it is "
+        f"supposed to sit beyond")
+
+
+def test_no_wait_budget_is_sized_off_the_ceiling(monkeypatch):
+    """The ceiling must not reach the wait budgets.
+
+    A record with a live process behind it cannot be waited out on principle,
+    so a caller that meets one should time out and say so. Routing the
+    ceiling into a budget instead would make `operator stop` block for ten
+    minutes on a phantom -- and every existing budget test would still pass,
+    because they all assert a *lower* bound on the wait."""
+    clock = _fast_clock(monkeypatch)
+    inst = op.Instance("nobudgetdrift")
+    _dead_pids(monkeypatch)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
+    op._record_supervisor_starting(inst, 7171)
+
+    started = clock.now
+    op._request_supervisor_stop(inst)
+    waited = clock.now - started
+
+    assert waited < op.SUPERVISOR_STARTUP_CEILING, (
+        f"stop waited {waited}s, which is the ceiling rather than the "
+        f"{op.SUPERVISOR_STARTUP_ALLOWANCE}s window a record can be believed for")
+
+
+def test_a_phantom_record_does_not_make_a_launch_silently_start_nothing(monkeypatch):
+    """The consequence, end to end, and the reason the ceiling is worth a
+    constant.
+
+    `start_loop_headless` reports success when it finds a supervisor already
+    present. Believing a phantom forever therefore turns a rare crash into a
+    permanent, silent refusal to run: every later launch returns 0 having
+    started nothing, and the user is told it worked."""
+    inst = op.Instance("silentnostart")
+    inst.claim("test-token")
+    op._save_loop_args(inst, ["--agent", "anvil:anvil"])
+    op._record_supervisor_starting(inst, 4244)
+    _dead_pids(monkeypatch, 4244)
+    _age_record(inst, op.SUPERVISOR_STARTUP_CEILING + 1)
+    spawned = {"n": 0}
+
+    def spawn(instance, copilot_args, is_fresh, adopt=False, cwd=None):
+        spawned["n"] += 1
+        instance.loop_pid_file.write_text("6161", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(op, "_spawn_background_loop", spawn)
+    # Consulted only after the spawn, so this cannot weaken the refusal path
+    # the test is about -- it just lets the launch finish reporting.
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: True)
+
+    assert op.start_loop_headless(inst, [], is_fresh=False) == 0
+    assert spawned["n"] == 1, \
+        "it reported success without starting a supervisor"

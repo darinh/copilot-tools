@@ -129,6 +129,28 @@ CLOCK_SKEW_TOLERANCE = 2.0
 # window cannot do anything but time out in exactly the case the window
 # exists for, and it strands the marker it laid down when it does.
 SUPERVISOR_STARTUP_ALLOWANCE = SUPERVISOR_STARTUP_GRACE + CLOCK_SKEW_TOLERANCE
+# The point past which a startup record is not believed even though the pid it
+# names is alive. That belief is otherwise unbounded, and a pid is not an
+# identity: a supervisor hard-killed inside its startup window -- the one exit
+# that runs neither its atexit hook nor its `finally` -- leaves a record behind,
+# and the operating system is free to hand that number to something unrelated.
+# From then on the record names a live process forever, is never pruned because
+# liveness is checked before age, and every later launch declines to start a
+# supervisor and *reports success*. A rare crash becomes a permanent, silent
+# refusal to run, recoverable only by deleting a file nobody knows exists.
+#
+# Ten minutes rather than something near the grace because this bound is not
+# for slowness -- the grace and a live pid already cover a startup taking its
+# time, which is the whole reason liveness is a ground for belief at all. It
+# exists so that a phantom expires at all, and a startup still unpublished ten
+# minutes in is not one this record should keep speaking for.
+#
+# Deliberately NOT added to any wait budget. A record with a live process
+# behind it cannot be waited out on principle, and a caller that runs into one
+# should time out and say so rather than block for ten minutes; the budgets are
+# sized for SUPERVISOR_STARTUP_ALLOWANCE, which covers every record whose
+# process is gone -- the only kind a wait can outlast.
+SUPERVISOR_STARTUP_CEILING = 600.0
 # Consecutive sessions that may change nothing before the loop gives up.
 MAX_NOCHANGE_SESSIONS = 3
 # Consecutive sessions that may end *unaccounted for* -- neither by a restart
@@ -2465,6 +2487,11 @@ def _starting_loop_pid(instance: Instance) -> int | None:
     cost of either is that stop and restart-loop wait, which is bounded and
     reversible, where the cost of concluding absence is a session destroyed
     or a second supervisor started.
+
+    Both grounds are bounded, and neither bound is the other's.
+    ``SUPERVISOR_STARTUP_CEILING`` is what stops a live pid being believed
+    forever, because a pid is not an identity and the one it names may have
+    been reused; see that constant for what an unbounded belief costs.
     """
     path = instance.loop_startup_file
     try:
@@ -2479,16 +2506,23 @@ def _starting_loop_pid(instance: Instance) -> int | None:
         pid = int(path.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         pid = 0
-    if pid > 0 and _pid_alive(pid):
-        return pid
-    if -CLOCK_SKEW_TOLERANCE <= age < SUPERVISOR_STARTUP_GRACE:
-        return pid
-    # Two ways to be out of that window, and they are the same statement: this
+    if -CLOCK_SKEW_TOLERANCE <= age:
+        # Two independent upper bounds, because the two grounds for belief are
+        # worth different amounts of time. A live process is evidence for as
+        # long as it lives, up to the ceiling that stops a reused pid speaking
+        # forever. An mtime alone is evidence only for the grace.
+        if pid > 0 and age < SUPERVISOR_STARTUP_CEILING and _pid_alive(pid):
+            return pid
+        if age < SUPERVISOR_STARTUP_GRACE:
+            return pid
+    # Three ways to be outside all of that, and they are the same statement: this
     # record's mtime is no longer evidence that a supervisor is on its way.
-    # Above the grace it is simply old -- one that was going to publish a pid
-    # would have by now. Below the skew tolerance it is dated further ahead
+    # Above the grace with nothing alive behind it, it is simply old -- one that
+    # was going to publish a pid would have by now. Above the ceiling, the pid
+    # is alive but the record is far too old to still be about that process.
+    # Below the skew tolerance it is dated further ahead
     # than any clock disagreement explains, and believing it would cost an
-    # unbounded refusal rather than a bounded one. See the two constants.
+    # unbounded refusal rather than a bounded one. See the three constants.
     #
     # The future side is inclusive because the tolerance is sized off a
     # filesystem's timestamp granularity, and a filesystem that rounds to 2 s
