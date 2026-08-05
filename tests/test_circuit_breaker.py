@@ -17,6 +17,13 @@ them:
 * The measurement covers the whole repository, not the current directory.
   Work here happens on a branch in a linked worktree, so a session can land a
   whole feature without the primary checkout's HEAD or `git status` moving.
+
+A third joins them: "changed nothing" is evidence of *idleness* only when the
+session ended the way the loop expects. A session killed from outside has
+usually not committed at the moment it dies, so charging it here retires the
+loops being killed fastest -- the ones whose failure has nothing to do with
+the agent. Those endings are counted separately, so the loop is still
+bounded and the reason it stopped is the true one.
 """
 from __future__ import annotations
 
@@ -69,15 +76,18 @@ def make_repo(path):
 
 # ── the decision function ───────────────────────────────────────
 def test_an_identical_fingerprint_advances_the_counter():
-    assert op.evaluate_progress(0, "abc", "abc") == (1, "unchanged")
-    assert op.evaluate_progress(2, "abc", "abc") == (3, "unchanged")
+    assert op.evaluate_progress(
+        0, "abc", "abc", ending_accounted_for=True) == (1, "unchanged")
+    assert op.evaluate_progress(
+        2, "abc", "abc", ending_accounted_for=True) == (3, "unchanged")
 
 
 def test_a_different_fingerprint_clears_the_counter():
     """One productive session must wipe out the whole streak, not decrement
     it: three no-change sessions either side of real work are not evidence
     that the loop has stalled."""
-    assert op.evaluate_progress(2, "abc", "xyz") == (0, "changed")
+    assert op.evaluate_progress(
+        2, "abc", "xyz", ending_accounted_for=True) == (0, "changed")
 
 
 @pytest.mark.parametrize("before,after", [
@@ -88,7 +98,8 @@ def test_a_different_fingerprint_clears_the_counter():
 def test_an_unmeasurable_session_leaves_the_counter_untouched(before, after):
     """The failure this guards against is a loop that stops because git was
     briefly unavailable. `unknown` is not `unchanged`."""
-    assert op.evaluate_progress(2, before, after) == (2, "unknown")
+    assert op.evaluate_progress(
+        2, before, after, ending_accounted_for=True) == (2, "unknown")
 
 
 def test_an_unreadable_counter_is_healed_by_a_measured_session():
@@ -104,20 +115,26 @@ def test_an_unreadable_counter_is_healed_by_a_measured_session():
     this session -- so the worst it can do is let the loop run a little
     longer, never stop a healthy one.
     """
-    assert op.evaluate_progress(None, "abc", "abc") == (1, "unchanged")
+    assert op.evaluate_progress(
+        None, "abc", "abc", ending_accounted_for=True) == (1, "unchanged")
     # A readable count still accumulates rather than being pinned to 1, so
     # the healing above is the None's doing and not a constant.
-    assert op.evaluate_progress(0, "abc", "abc") == (1, "unchanged")
-    assert op.evaluate_progress(4, "abc", "abc") == (5, "unchanged")
+    assert op.evaluate_progress(
+        0, "abc", "abc", ending_accounted_for=True) == (1, "unchanged")
+    assert op.evaluate_progress(
+        4, "abc", "abc", ending_accounted_for=True) == (5, "unchanged")
 
 
 def test_an_unreadable_counter_stays_unknown_when_nothing_could_be_measured():
     """Healing needs evidence. With no fingerprint to compare, the session
     established nothing, so an unreadable count stays unreadable rather than
     being invented as one."""
-    assert op.evaluate_progress(None, None, "abc") == (None, "unknown")
-    assert op.evaluate_progress(None, "abc", None) == (None, "unknown")
-    assert op.evaluate_progress(None, None, None) == (None, "unknown")
+    assert op.evaluate_progress(
+        None, None, "abc", ending_accounted_for=True) == (None, "unknown")
+    assert op.evaluate_progress(
+        None, "abc", None, ending_accounted_for=True) == (None, "unknown")
+    assert op.evaluate_progress(
+        None, None, None, ending_accounted_for=True) == (None, "unknown")
 
 
 def test_known_progress_heals_an_unreadable_counter():
@@ -129,10 +146,105 @@ def test_known_progress_heals_an_unreadable_counter():
     it again, so the breaker could never re-arm, and it would be off with
     nothing in the log to say so.
     """
-    assert op.evaluate_progress(None, "abc", "xyz") == (0, "changed")
+    assert op.evaluate_progress(
+        None, "abc", "xyz", ending_accounted_for=True) == (0, "changed")
     # Cleared to zero rather than merely decremented, and distinct from the
     # unchanged case above, so "changed" is really being told apart.
-    assert op.evaluate_progress(9, "abc", "xyz") == (0, "changed")
+    assert op.evaluate_progress(
+        9, "abc", "xyz", ending_accounted_for=True) == (0, "changed")
+
+
+# ── endings the supervisor cannot account for ───────────────────
+def test_an_unaccounted_ending_is_not_charged_as_idleness():
+    """The defect this fixes.
+
+    A session killed from outside has usually not committed at the moment it
+    dies, so its fingerprint is identical to an idle session's. Charging it
+    to the idleness streak retires the loops being killed *fastest*, which is
+    backwards: their failure has nothing to do with the agent.
+    """
+    assert op.evaluate_progress(
+        2, "abc", "abc", ending_accounted_for=False) == (2, "unaccounted")
+    # The control: the same fingerprints with an accounted ending do advance
+    # the streak, so the sparing above is the ending's doing and not a
+    # function that stopped counting.
+    assert op.evaluate_progress(
+        2, "abc", "abc", ending_accounted_for=True) == (3, "unchanged")
+
+
+def test_an_unaccounted_ending_does_not_clear_the_streak_either():
+    """Not chargeable evidence in *either* direction.
+
+    Reading a kill as progress would be the opposite failure: an agent that
+    genuinely had nothing left to do would have its streak wiped by every
+    session something else ended, and the breaker would never trip.
+    """
+    assert op.evaluate_progress(
+        2, "abc", "abc", ending_accounted_for=False) == (2, "unaccounted")
+    assert op.evaluate_progress(
+        0, "abc", "abc", ending_accounted_for=False) == (0, "unaccounted")
+
+
+def test_an_unaccounted_ending_does_not_heal_an_unreadable_counter():
+    """Healing needs evidence, and this session is not evidence.
+
+    A measured no-change session restarts a corrupt streak at one because the
+    streak really does include it. This one does not: it says nothing about
+    idleness, so inventing a length from it would enter a guess as an
+    observation.
+    """
+    assert op.evaluate_progress(
+        None, "abc", "abc", ending_accounted_for=False) == (None, "unaccounted")
+
+
+def test_work_outranks_an_unaccounted_ending():
+    """A session that committed before it was killed still made progress.
+
+    The fingerprint is positive evidence on its own; how the session ended
+    cannot subtract from it.
+    """
+    assert op.evaluate_progress(
+        2, "abc", "xyz", ending_accounted_for=False) == (0, "changed")
+
+
+def test_an_unmeasurable_session_is_unknown_however_it_ended():
+    """`unknown` is decided first: with no fingerprint to compare there is
+    nothing for the ending to qualify."""
+    assert op.evaluate_progress(
+        2, None, "abc", ending_accounted_for=False) == (2, "unknown")
+    assert op.evaluate_progress(
+        2, "abc", None, ending_accounted_for=False) == (2, "unknown")
+
+
+def test_the_unaccounted_streak_advances_only_on_unaccounted_endings():
+    assert op.evaluate_unaccounted(0, "unaccounted") == 1
+    assert op.evaluate_unaccounted(2, "unaccounted") == 3
+    # Every other verdict leaves it exactly as it was: an idle session and a
+    # session nobody could measure are both silent about kills.
+    assert op.evaluate_unaccounted(2, "unchanged") == 2
+    assert op.evaluate_unaccounted(2, "unknown") == 2
+
+
+def test_work_clears_the_unaccounted_streak():
+    """Whatever ended those sessions, work landed — the loop is producing.
+
+    Without this the streak would survive productive sessions and stop a loop
+    that was delivering, which is the same failure the no-change counter's
+    reset exists to prevent.
+    """
+    assert op.evaluate_unaccounted(3, "changed") == 0
+    assert op.evaluate_unaccounted(None, "changed") == 0
+
+
+def test_an_unreadable_unaccounted_streak_is_healed_by_an_unaccounted_ending():
+    """Same argument as the no-change counter's healing: if a corrupt file
+    stayed corrupt, the one bound on a loop whose sessions keep being killed
+    would be off for exactly the run that needed it."""
+    assert op.evaluate_unaccounted(None, "unaccounted") == 1
+    # ...and only that verdict heals it, so the None survives a session that
+    # established nothing about kills.
+    assert op.evaluate_unaccounted(None, "unchanged") is None
+    assert op.evaluate_unaccounted(None, "unknown") is None
 
 
 # ── the fingerprint ─────────────────────────────────────────────
@@ -499,6 +611,62 @@ def test_cleanup_removes_the_counter():
     assert inst.read_nochange_count() == 0
 
 
+def test_the_two_streaks_do_not_share_a_file():
+    """Two killed sessions and one idle one are not three of anything.
+
+    Summing them is the arithmetic that let a loop be retired for idleness it
+    never showed, so the counters must be genuinely separate on disk and not
+    two names for one number.
+    """
+    inst = op.Instance("counter-split")
+    inst.save_nochange_count(2)
+    assert inst.read_unaccounted_count() == 0, \
+        "the idleness streak must not be readable as an unaccounted one"
+    inst.save_unaccounted_count(3)
+    assert inst.read_nochange_count() == 2, \
+        "writing one streak must not disturb the other"
+    assert inst.nochange_file != inst.unaccounted_file
+
+
+def test_the_unaccounted_counter_round_trips_and_reads_tri_state():
+    inst = op.Instance("unaccounted-rt")
+    assert inst.read_unaccounted_count() == 0
+    inst.save_unaccounted_count(4)
+    assert inst.read_unaccounted_count() == 4
+    # Corrupt and negative both read as unknown rather than zero, for the
+    # same reason as the streak beside it: a breaker that reads its own bad
+    # state as "nothing recorded" is one that has switched itself off.
+    inst.unaccounted_file.write_text("not a number\n", encoding="utf-8")
+    assert inst.read_unaccounted_count() is None
+    inst.unaccounted_file.write_text("-1\n", encoding="utf-8")
+    assert inst.read_unaccounted_count() is None
+
+
+def test_an_unexaminable_unaccounted_counter_reads_as_unknown(monkeypatch):
+    inst = op.Instance("unaccounted-denied")
+    inst.save_unaccounted_count(2)
+    with denied(monkeypatch, inst.unaccounted_file):
+        assert inst.read_unaccounted_count() is None
+
+
+def test_cleanup_removes_the_unaccounted_counter():
+    inst = op.Instance("unaccounted-clean")
+    inst.save_unaccounted_count(3)
+    inst.cleanup_files()
+    assert inst.read_unaccounted_count() == 0
+
+
+def test_an_unaccounted_counter_that_cannot_be_written_is_survivable(
+        isolated_state, capsys, monkeypatch):
+    """Same trade as the no-change count: losing the streak costs the bound
+    its memory, raising costs an unattended loop its supervisor."""
+    inst = op.Instance("unaccounted-unwritable")
+    assert inst.save_unaccounted_count(2) is True
+    monkeypatch.setattr(op, "RESTART_DIR", isolated_state / "never-created")
+    assert inst.save_unaccounted_count(3) is False
+    assert "could not record the unaccounted count" in capsys.readouterr().err
+
+
 def test_a_counter_that_cannot_be_written_does_not_kill_the_supervisor(
         isolated_state, capsys, monkeypatch):
     """Losing the count costs the breaker its memory across a supervisor
@@ -534,12 +702,33 @@ def loop_in_repo(tmp_path, monkeypatch):
 
 
 def _sessions_that_die(sessions: list[int], on_start=None):
-    """A `start_session` double that records each launch and dies at once."""
+    """A `start_session` double that records each launch and dies at once.
+
+    The exit file is written because that is what the runner does when it
+    outlives copilot: somebody saw this session end. That makes it an
+    *accounted* ending, which is what the no-change breaker charges.
+    """
     def start(instance, args, session_num, remain_on_exit=False, preamble=""):
         sessions.append(session_num)
         if on_start is not None:
             on_start(session_num)
         instance.exit_file.write_text("0", encoding="utf-8")
+    return start
+
+
+def _sessions_that_vanish(sessions: list[int], on_start=None):
+    """A `start_session` double for a session killed wholesale.
+
+    No exit code is left behind, because the runner died with it -- the
+    signature of the external kills recorded in `backlog/0001`. The exit file
+    is cleared on every launch exactly as `start_session` clears it, so a
+    previous session's code cannot be read against this one.
+    """
+    def start(instance, args, session_num, remain_on_exit=False, preamble=""):
+        sessions.append(session_num)
+        if on_start is not None:
+            on_start(session_num)
+        op.remove_file(instance.exit_file)
     return start
 
 
@@ -821,3 +1010,116 @@ def test_a_launched_session_is_measured_where_an_adopted_one_is_not(
 
     assert rc == op.EXIT_NO_PROGRESS
     assert launched == [1]
+
+
+# ── endings the supervisor cannot account for, in the loop ──────
+def test_killed_sessions_do_not_spend_the_idleness_allowance(
+        loop_in_repo, monkeypatch, capsys):
+    """The defect in `backlog/0002`, at the level that produced it.
+
+    Sessions that vanish leave no exit code and ask for no restart. They also
+    have not committed yet, so the fingerprint does not move -- which used to
+    be charged to the idleness streak and would have retired this project's
+    loop at three. The loop is still bounded, by a separate and more patient
+    allowance, and it stops with the other diagnosis.
+    """
+    _age_past_healthy(monkeypatch)
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_vanish(launched))
+
+    inst = op.Instance("killed")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == op.EXIT_UNACCOUNTED
+    assert len(launched) == op.MAX_UNACCOUNTED_SESSIONS, (
+        "the idleness allowance of three must not be what ends this loop")
+    err = capsys.readouterr().err
+    assert "ended unaccounted for and changed nothing" in err
+    # The exit code alone would be satisfied by any path returning 4, and the
+    # wrong diagnosis is the whole bug: it must not claim idleness.
+    assert "Progress breaker tripped" not in err
+    # The crash counter really was being reset, so this stop cannot be
+    # credited to MAX_LAUNCH_FAILURES -- which is also five.
+    assert "not a crash loop, resetting the exit count" in err
+
+
+def test_a_session_that_exits_is_still_charged_as_idleness(
+        loop_in_repo, monkeypatch, capsys):
+    """The control for the test above, differing only in the exit code.
+
+    Same repository, same aging, same absence of a handoff -- but the runner
+    survived to record an exit, so somebody saw this session end and its
+    unchanged fingerprint is evidence about the agent. Without this, the test
+    above would also pass against an implementation that had simply stopped
+    charging anything.
+    """
+    _age_past_healthy(monkeypatch)
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_die(launched))
+
+    inst = op.Instance("self-exiting")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == op.EXIT_NO_PROGRESS
+    assert len(launched) == op.MAX_NOCHANGE_SESSIONS
+    assert "Progress breaker tripped" in capsys.readouterr().err
+
+
+def test_work_clears_the_unaccounted_streak_in_the_loop(
+        loop_in_repo, monkeypatch):
+    """A killed session that had already committed is not evidence of a loop
+    that cannot produce anything, and must restart the allowance."""
+    _age_past_healthy(monkeypatch)
+    launched: list[int] = []
+
+    def work_on_the_third(session_num):
+        if session_num == 3:
+            (loop_in_repo / f"session{session_num}.txt").write_text(
+                "work\n", encoding="utf-8")
+
+    monkeypatch.setattr(op, "start_session",
+                        _sessions_that_vanish(launched, work_on_the_third))
+
+    inst = op.Instance("killed-but-productive")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == op.EXIT_UNACCOUNTED
+    assert len(launched) == 3 + op.MAX_UNACCOUNTED_SESSIONS, (
+        "session 3 landed work, so the streak must restart there and the "
+        "loop is owed the full allowance again")
+
+
+def test_the_unaccounted_streak_survives_a_supervisor_swap(
+        loop_in_repo, monkeypatch):
+    """On disk for the same reason the other streak is: a bound that forgot
+    its count on every `operator restart-loop` would never be reached."""
+    _age_past_healthy(monkeypatch)
+    inst = op.Instance("swapped-unaccounted")
+    inst.save_unaccounted_count(op.MAX_UNACCOUNTED_SESSIONS - 1)
+
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_vanish(launched))
+
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert rc == op.EXIT_UNACCOUNTED
+    assert launched == [1], (
+        "the inherited streak should be one session short of the limit")
+
+
+def test_a_fresh_run_does_not_inherit_an_unaccounted_streak(
+        loop_in_repo, monkeypatch):
+    """`--fresh` forgets the previous run, this counter included."""
+    _age_past_healthy(monkeypatch)
+    inst = op.Instance("refreshed-unaccounted")
+    inst.save_unaccounted_count(op.MAX_UNACCOUNTED_SESSIONS - 1)
+
+    launched: list[int] = []
+    monkeypatch.setattr(op, "start_session", _sessions_that_vanish(launched))
+
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == op.EXIT_UNACCOUNTED
+    assert len(launched) == op.MAX_UNACCOUNTED_SESSIONS, (
+        "a fresh run is owed the full allowance, not the one session left "
+        "over from the previous run")

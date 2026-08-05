@@ -91,10 +91,31 @@ SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
 # Consecutive sessions that may change nothing before the loop gives up.
 MAX_NOCHANGE_SESSIONS = 3
+# Consecutive sessions that may end *unaccounted for* -- neither by a restart
+# request nor by an exit the runner saw -- and change nothing, before the loop
+# gives up.
+#
+# A separate allowance, and a more patient one, because it is answering a
+# different question. Changing nothing is evidence of idleness only when the
+# session ended the way the loop expects; a session that was killed at four
+# minutes has usually not committed yet, so folding it into the idleness
+# streak retires the loops being killed *fastest* -- exactly the ones whose
+# failure has nothing to do with the agent. It is still bounded: an
+# unattended loop that cannot keep a session alive long enough to produce
+# anything burns credits either way, and the healthy-uptime reset means
+# MAX_LAUNCH_FAILURES can never bound it. Five matches the tolerance
+# MAX_LAUNCH_FAILURES gives deaths, rather than the three idleness gets.
+MAX_UNACCOUNTED_SESSIONS = 5
 # Seconds any single git probe may take before its answer is "unknown".
 GIT_PROBE_TIMEOUT = 30
 # run_loop_mode's exit code when the progress circuit breaker stopped it.
 EXIT_NO_PROGRESS = 3
+# run_loop_mode's exit code when the loop was stopped by sessions that kept
+# ending unaccounted for. Distinct from EXIT_NO_PROGRESS because the two carry
+# opposite diagnoses -- "the agent has run out of work" versus "something is
+# killing the sessions" -- and a reader who cannot tell them apart will act on
+# the wrong one.
+EXIT_UNACCOUNTED = 4
 RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
                   "version", "forget", "logs", "tabs", "restore",
                   "stop-loop", "stop-session", "restart-loop", "menu",
@@ -531,6 +552,17 @@ class Instance:
         return RESTART_DIR / f"{self.id}.nochange"
 
     @property
+    def unaccounted_file(self) -> Path:
+        """Consecutive sessions that ended unaccounted for and changed nothing.
+
+        Kept apart from ``nochange_file`` rather than sharing its count: two
+        killed sessions and one idle one are not three of anything, and
+        summing them is what let a loop be retired for idleness it never
+        showed. On disk for the same reason as the streak beside it.
+        """
+        return RESTART_DIR / f"{self.id}.unaccounted"
+
+    @property
     def restart_lock_file(self) -> Path:
         """Held while a supervisor handoff is in progress.
 
@@ -660,13 +692,23 @@ class Instance:
         of stalling yet" is how a circuit breaker ends up permanently off
         without anyone noticing.
         """
-        present = path_present(self.nochange_file)
+        return self._read_streak(self.nochange_file)
+
+    def read_unaccounted_count(self) -> int | None:
+        """Consecutive unaccounted-for endings recorded so far.
+
+        Same tri-state as ``read_nochange_count`` and for the same reason.
+        """
+        return self._read_streak(self.unaccounted_file)
+
+    def _read_streak(self, path: Path) -> int | None:
+        present = path_present(path)
         if present is False:
             return 0
         if present is None:
             return None
         try:
-            value = int(self.nochange_file.read_text(encoding="utf-8").strip())
+            value = int(path.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             return None
         return value if value >= 0 else None
@@ -678,12 +720,20 @@ class Instance:
         never the running session, so — like ``_save_loop_args`` — it must not
         take an unattended supervisor down with it.
         """
-        tmp = RESTART_DIR / f"{self.id}.nochange.tmp"
+        return self._save_streak(self.nochange_file, count, "no-change")
+
+    def save_unaccounted_count(self, count: int) -> bool:
+        """Persist the unaccounted-ending streak. ``False`` when it could not
+        be written, on the same terms as ``save_nochange_count``."""
+        return self._save_streak(self.unaccounted_file, count, "unaccounted")
+
+    def _save_streak(self, path: Path, count: int, label: str) -> bool:
+        tmp = RESTART_DIR / f"{path.name}.tmp"
         try:
             tmp.write_text(f"{count}\n", encoding="utf-8")
-            os.replace(tmp, self.nochange_file)
+            os.replace(tmp, path)
         except OSError as exc:
-            log(f"  Warning: could not record the no-change count: {exc}")
+            log(f"  Warning: could not record the {label} count: {exc}")
             return False
         return True
 
@@ -692,7 +742,7 @@ class Instance:
                      self.pid_file, self.exit_file, self.session_file,
                      self.loop_pid_file, self.detach_marker, self.stop_marker,
                      self.loop_args_file, self.restart_lock_file,
-                     self.nochange_file):
+                     self.nochange_file, self.unaccounted_file):
             remove_file(path)
 
 
@@ -1521,12 +1571,14 @@ def workspace_fingerprint(cwd: Path) -> str | None:
 
 
 def evaluate_progress(count: int | None, before: str | None,
-                      after: str | None) -> tuple[int | None, str]:
+                      after: str | None, *,
+                      ending_accounted_for: bool) -> tuple[int | None, str]:
     """Fold one finished session into the no-change counter.
 
-    Returns ``(count, verdict)`` where verdict is ``changed``, ``unchanged``
-    or ``unknown``. An unknown session leaves the counter exactly as it was:
-    it neither counts toward stopping the loop nor clears what came before.
+    Returns ``(count, verdict)`` where verdict is ``changed``, ``unchanged``,
+    ``unaccounted`` or ``unknown``. An unknown session leaves the counter
+    exactly as it was: it neither counts toward stopping the loop nor clears
+    what came before.
 
     Progress is judged before the counter is consulted, so a session that
     demonstrably changed something resets the streak to zero even when the
@@ -1542,14 +1594,53 @@ def evaluate_progress(count: int | None, before: str | None,
     the run — precisely when it was needed. Restarting at one can only ever
     undercount (the streak really is at least this session), so the error it
     can make is letting the loop run longer, never stopping a healthy one.
+
+    ``ending_accounted_for`` is what keeps this counter about *idleness*.
+    Changing nothing is evidence that an agent had nothing to do only if the
+    session ended the way the loop expects — a handoff, or an exit the runner
+    saw. A session killed from outside has usually not committed at the point
+    it dies, so it is indistinguishable from an idle one by fingerprint
+    alone, and charging it here retires the loops being killed fastest. Such
+    a session is not evidence *either way*: it neither advances this streak
+    nor clears it, exactly like an unmeasurable one. It is counted separately
+    by ``evaluate_unaccounted``, so the loop stays bounded.
+
+    There is deliberately no default. The caller must decide, because the
+    silent version of this parameter is the bug it exists to fix.
     """
     if before is None or after is None:
         return count, "unknown"
     if before != after:
         return 0, "changed"
+    if not ending_accounted_for:
+        # Not healed to 1 here as an unreadable count would be for a genuine
+        # no-change session: there is nothing to heal *from*. This session
+        # says nothing about idleness, so inventing a streak length from it
+        # would be entering a guess as an observation.
+        return count, "unaccounted"
     if count is None:
         return 1, "unchanged"
     return count + 1, "unchanged"
+
+
+def evaluate_unaccounted(count: int | None, verdict: str) -> int | None:
+    """Fold the same session into the unaccounted-ending streak.
+
+    Takes ``evaluate_progress``'s verdict rather than re-deciding, so the two
+    counters cannot disagree about what the session was.
+
+    A session that changed something clears this streak as well: whatever
+    ended it, work landed, and the loop is worth continuing. Anything the
+    fingerprint could not settle leaves it alone, for the same reason the
+    other counter is left alone — "could not tell" is not "ended badly".
+    """
+    if verdict == "changed":
+        return 0
+    if verdict != "unaccounted":
+        return count
+    if count is None:
+        return 1
+    return count + 1
 
 
 def show_run_summary(run_started: str) -> None:
@@ -3271,8 +3362,11 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
         # which is exactly what --fresh promises will not happen.
         remove_file(instance.nochange_file)
         nochange = 0
+        remove_file(instance.unaccounted_file)
+        unaccounted = 0
     else:
         nochange = instance.read_nochange_count()
+        unaccounted = instance.read_unaccounted_count()
     if adopt:
         # This supervisor arrived part-way through a session it did not
         # start, so the repository state that session began with is not
@@ -3296,6 +3390,10 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
         log(f"  Progress breaker: stops the loop after "
             f"{MAX_NOCHANGE_SESSIONS} consecutive sessions that change "
             f"nothing (currently {nochange})")
+        log(f"  Unaccounted endings: stops the loop after "
+            f"{MAX_UNACCOUNTED_SESSIONS} consecutive sessions that change "
+            f"nothing and end without a handoff or an observed exit "
+            f"(currently {'unknown' if unaccounted is None else unaccounted})")
     try:
         try:
             while session_num <= MAX_SESSIONS:
@@ -3408,6 +3506,15 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                         raise KeyboardInterrupt
 
                 restart_requested = False
+                # How the session that is about to end finished, carried to the
+                # converged progress check below rather than re-probed there:
+                # by then `remove_file` has cleared the restart marker, so the
+                # question is no longer answerable from disk. "Accounted for"
+                # means a handoff asked for the restart, or the runner survived
+                # to write an exit code — either way something explains the
+                # ending. A session that simply vanished explains nothing, and
+                # a fingerprint that did not move says nothing about idleness.
+                ending_accounted_for = False
                 while True:
                     if shutdown["requested"]:
                         raise KeyboardInterrupt
@@ -3473,11 +3580,20 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                         if restart_probe is True:
                             log(f"Session #{session_num}: restart signal detected!")
                             crash_failures = 0
+                            ending_accounted_for = True
                             _record_session_exit(instance, session_num,
                                                  stop_state, detach_state,
                                                  restart_probe,
                                                  crash_failures, uptime=uptime)
                         else:
+                            # No restart was asked for, so the only thing that
+                            # can still account for this ending is an exit code:
+                            # the runner outlived copilot and wrote one down.
+                            # With neither, nobody saw the session end — the
+                            # signature of the whole pane being killed — and it
+                            # is not chargeable evidence of an idle agent.
+                            ending_accounted_for = (
+                                read_exit_code(instance) is not None)
                             if uptime is not None and uptime >= HEALTHY_SESSION_SECONDS:
                                 # Healthy run, then death: whatever killed it,
                                 # it is not the startup failure the limit is
@@ -3508,6 +3624,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     if marker_set(instance.restart_marker):
                         log(f"Session #{session_num}: restart signal detected!")
                         crash_failures = 0
+                        ending_accounted_for = True
                         # The handoff path arrives here, not above: `handoff`
                         # touches the marker while copilot is still up, so the
                         # supervisor sees the request before it sees the exit.
@@ -3550,12 +3667,39 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     # anything.
                     current = workspace_fingerprint(workdir)
                     nochange, verdict = evaluate_progress(
-                        nochange, baseline, current)
+                        nochange, baseline, current,
+                        ending_accounted_for=ending_accounted_for)
+                    unaccounted = evaluate_unaccounted(unaccounted, verdict)
                     if verdict == "unknown":
                         log(f"Session #{session_num}: cannot tell whether "
                             f"anything changed — progress breaker not advanced")
                     elif verdict == "changed":
                         instance.save_nochange_count(0)
+                        instance.save_unaccounted_count(0)
+                    elif verdict == "unaccounted":
+                        # Deliberately not charged to the idleness streak. A
+                        # session nobody saw end had usually not committed yet,
+                        # so its unchanged fingerprint is a fact about when it
+                        # died and not about what the agent was doing.
+                        instance.save_unaccounted_count(unaccounted)
+                        log(f"Session #{session_num}: changed nothing in "
+                            f"{workdir} and ended with no handoff and no "
+                            f"observed exit "
+                            f"({unaccounted}/{MAX_UNACCOUNTED_SESSIONS}) — not "
+                            f"counted as idleness")
+                        if unaccounted >= MAX_UNACCOUNTED_SESSIONS:
+                            log(f"Loop stopped: {unaccounted} consecutive "
+                                f"sessions ended unaccounted for and changed "
+                                f"nothing. That is not idleness — something is "
+                                f"ending these sessions. Stopping instead of "
+                                f"starting session #{session_num + 1}.")
+                            log(f"  What ended them: operator trace "
+                                f"--kind session_exit")
+                            log(f"  Resume with: operator --loop --name "
+                                f"{instance.display_name}")
+                            show_run_summary(run_started)
+                            instance.cleanup_files()
+                            return EXIT_UNACCOUNTED
                     else:
                         instance.save_nochange_count(nochange)
                         log(f"Session #{session_num}: changed nothing in "
@@ -4351,6 +4495,28 @@ def show_menu() -> int:
             return rc
 
 
+def read_exit_code(instance) -> int | None:
+    """The exit code the runner recorded for a session, or ``None``.
+
+    ``None`` covers three things that are worth keeping apart in principle
+    and are the same answer here: no file, an empty file, and a file that
+    could not be read. What every one of them means to a caller is that
+    *nobody observed copilot terminate*. That is the signature of a session
+    killed wholesale — the runner dies with it and never gets to write a code
+    — as opposed to one whose process ended under a runner that survived to
+    write it down.
+
+    Only call this once the session is gone. `start_session` clears the file
+    at launch, but a clearing that failed would let a previous session's code
+    be read against a live one.
+    """
+    try:
+        raw = instance.exit_file.read_text(encoding="utf-8").strip()
+        return int(raw) if raw else None
+    except (OSError, ValueError):
+        return None
+
+
 def _record_session_exit(instance, session_num: int,
                          stop_state, detach_state, restart_state,
                          consecutive: int, uptime: float | None = None,
@@ -4382,13 +4548,7 @@ def _record_session_exit(instance, session_num: int,
     session's code be recorded against this one.
     """
     try:
-        code: "int | None" = None
-        if session_gone:
-            try:
-                raw = instance.exit_file.read_text(encoding="utf-8").strip()
-                code = int(raw) if raw else None
-            except (OSError, ValueError):
-                code = None
+        code: "int | None" = read_exit_code(instance) if session_gone else None
         try:
             pid = instance.copilot_pid()
         except Exception:
