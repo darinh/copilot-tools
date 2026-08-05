@@ -76,6 +76,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from install_manifest import path_present
+from operator_console import enable_utf8_output
 from project_paths import (
     CATALOG_MISSING,
     CATALOG_NO_ENTRY,
@@ -1601,6 +1602,7 @@ def _cmd_scrum(args, root: Path) -> int:
 
 
 def main(argv=None) -> int:
+    enable_utf8_output()
     parser = argparse.ArgumentParser(
         prog="backlog",
         description="Read and validate the repository's tracked backlog.")
