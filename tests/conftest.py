@@ -514,12 +514,34 @@ _MUX_BINARIES = frozenset({"tmux", "psmux", "pmux"})
 
 
 def _is_a_multiplexer_spawn(cmd) -> bool:
-    """True when ``cmd`` would start a real terminal multiplexer client."""
+    """True when ``cmd`` would start a real terminal multiplexer client.
+
+    This ended in ``and False`` for the whole life of the branch that
+    introduced it -- a debug stub committed by a session that said so in its
+    own commit message ("committed as recovered, before verification") and was
+    killed before the verification arrived. A predicate pinned to ``False``
+    does not weaken the guard, it deletes it: ``guarded_run`` then delegates
+    every argv, including the ones this file exists to refuse.
+
+    What that costs is not hypothetical and not confined to the suite's
+    accuracy. ``test_the_refusal_names_the_test_and_the_argv`` runs
+    ``Mux(binary="tmux")._run("kill-server")`` in the expectation of being
+    stopped here. Unstopped, it is a real ``tmux kill-server``: measured on
+    this machine at the moment the branch was reviewed, seven live sessions --
+    six peer agents and the reviewing session itself. The test asserting that
+    the guard prevents destruction becomes the thing that destroys.
+
+    So the failure mode ran both ways at once. The three positive controls in
+    test_mux_isolation.py went red, which is the loud half; the quiet half is
+    that every *other* test in the suite was free to reach the real server
+    again, which is the exact condition a8575d7 and 20126d6 were written to
+    end. Keep this a bare membership test.
+    """
     head = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else cmd
     name = os.path.basename(str(head)).lower()
     if name.endswith(".exe"):
         name = name[:-4]
-    return name in _MUX_BINARIES and False
+    return name in _MUX_BINARIES
 
 
 @pytest.fixture(autouse=True)

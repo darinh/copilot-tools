@@ -14,6 +14,7 @@ machine-dependent answer.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -21,7 +22,7 @@ import pytest
 
 import copilot_operator as op
 import operator_mux
-from conftest import FakeMux
+from conftest import FakeMux, _MUX_BINARIES, _is_a_multiplexer_spawn
 from operator_mux import MuxSessionError
 
 
@@ -37,6 +38,56 @@ def no_subprocess(monkeypatch):
         raise AssertionError(f"a real process was spawned: {args[0]!r}")
 
     monkeypatch.setattr(operator_mux.subprocess, "run", poisoned)
+
+
+@pytest.fixture
+def only_git_subprocess(monkeypatch):
+    """Refuse every spawn except git, which is answered without spawning.
+
+    `no_subprocess` above poisons *all* spawning, and for the FakeMux tests
+    that is exactly right: they must reach no process at all. The supervisor
+    is a different case now. While this branch sat unmerged, `main` grew the
+    no-change progress breaker, which fingerprints the repository by running
+    read-only git probes from inside `run_loop_mode` -- so "the supervisor
+    spawns nothing" stopped being true by design rather than by regression.
+    The merge was textually clean and semantically broken, which is the shape
+    the backlog item warned about: zero divergence is perishable.
+
+    Blanket poisoning would now fail the test for a legitimate reason, and the
+    tempting repair -- delegating anything that is not a multiplexer -- is
+    worse than it looks. It would run the real git against the developer's own
+    checkout, so a unit test written to end this suite's dependence on machine
+    state would acquire a fresh one, and a slow one: a `status
+    --untracked-files=all` per worktree. Instead git is answered here with a
+    canned non-zero result and no process. `_git_output` maps that to `None`,
+    the documented "could not be answered" reading, so the breaker takes its
+    unknown path and the loop's behaviour under test is unchanged.
+
+    What the test actually claims survives intact: nothing reached a real
+    multiplexer. Anything that is neither git nor a multiplexer still raises,
+    so a future spawn cannot be added silently.
+    """
+    spawned: list[list[str]] = []
+
+    def guarded(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args")
+        parts = ([str(a) for a in argv] if isinstance(argv, (list, tuple))
+                 else [str(argv)])
+        spawned.append(parts)
+        program = os.path.basename(parts[0]).lower() if parts else ""
+        if program.endswith(".exe"):
+            program = program[:-4]
+        if program != "git":
+            raise AssertionError(
+                f"a real process was spawned: {parts!r}. Only git is "
+                "expected from the supervisor (the progress breaker's "
+                "read-only probes); a multiplexer spawn here is the flake "
+                "this file exists to prevent."
+            )
+        return subprocess.CompletedProcess(parts, 1, "", "")
+
+    monkeypatch.setattr(operator_mux.subprocess, "run", guarded)
+    return spawned
 
 
 # ── the guard is installed ──────────────────────────────────────
@@ -55,14 +106,20 @@ def test_the_double_starts_empty():
     assert op.MUX.has_session("relaunch-me") is False
 
 
-def test_the_supervisor_does_not_spawn_a_process(no_subprocess, tmp_path,
-                                                 monkeypatch):
+def test_the_supervisor_does_not_spawn_a_multiplexer(only_git_subprocess,
+                                                     tmp_path, monkeypatch):
     """The regression test for the flake itself.
 
     The loop crash-relaunches twice and then stops, exactly as
     test_unexpected_exit_without_marker_is_relaunched drives it. Before the
-    fix this made five `tmux has-session` calls; with spawning poisoned, any
-    one of them fails the test instead of silently depending on the machine.
+    fix this made five `tmux has-session` calls; with spawning intercepted,
+    any one of them fails the test instead of silently depending on the
+    machine.
+
+    Git is permitted because `main`'s progress breaker fingerprints the
+    repository from inside the loop -- see `only_git_subprocess`. The claim
+    asserted at the end is the one that matters and the one that was ever
+    true: no multiplexer was reached.
     """
     restart = tmp_path / "restart"
     restart.mkdir(parents=True)
@@ -92,6 +149,18 @@ def test_the_supervisor_does_not_spawn_a_process(no_subprocess, tmp_path,
 
     assert rc == 0
     assert attempts["n"] == 3
+
+    # The claim in the test's name, asserted rather than assumed. Anything
+    # that was not git already raised inside the fixture; this catches the
+    # remaining way to be wrong -- a multiplexer invoked *through* git -- and,
+    # more usefully, it keeps failing if someone relaxes the fixture later.
+    def _program(part: str) -> str:
+        name = os.path.basename(str(part)).lower()
+        return name[:-4] if name.endswith(".exe") else name
+
+    reached = [argv for argv in only_git_subprocess
+               if any(_program(part) in _MUX_BINARIES for part in argv)]
+    assert reached == [], f"the supervisor reached a multiplexer: {reached!r}"
 
 
 # ── the double is faithful ──────────────────────────────────────
@@ -172,6 +241,25 @@ def test_every_multiplexer_spelling_is_refused(binary):
     and a clean tree the same way."""
     with pytest.raises(AssertionError, match="real terminal multiplexer"):
         subprocess.run([binary, "-V"], capture_output=True)
+
+
+def test_the_spawn_predicate_depends_on_its_argument():
+    """The predicate must actually discriminate, not return a constant.
+
+    It shipped as ``return name in _MUX_BINARIES and False``: a debug stub
+    left in by a session that was killed before the verification its own
+    commit message promised. Pinned to ``False`` the guard is not weakened but
+    absent, and the three refusal tests above go red -- while every other test
+    in the suite quietly regains access to the real server, which is the half
+    nobody would have read from a failure list.
+
+    The end-to-end refusals above would catch it too. This names it directly,
+    because the two halves of a predicate that is wired to a constant are one
+    edit apart and the diagnosis should not require reading a traceback about
+    tmux.
+    """
+    assert _is_a_multiplexer_spawn(["tmux", "kill-server"]) is True
+    assert _is_a_multiplexer_spawn([sys.executable, "-c", "pass"]) is False
 
 
 def test_a_non_multiplexer_subprocess_is_delegated_untouched():
