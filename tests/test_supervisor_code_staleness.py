@@ -234,15 +234,53 @@ def test_the_fingerprint_excludes_source_outside_the_operator_directory():
         assert here in Path(entry["path"]).parents, entry["path"]
 
 
-def test_the_fingerprint_does_not_glob_the_directory(tmp_path, monkeypatch):
+def test_the_fingerprint_does_not_glob_the_directory():
     """A file that sits beside the operator but was never imported is not
     part of the code this process is running. Including it would fire the
-    notice every time an unrelated tool in the checkout was edited."""
+    notice every time an unrelated tool in the checkout was edited.
+
+    The module table is supplied rather than probed, so the negative is
+    asserted about a file that demonstrably *exists* and demonstrably was not
+    imported. An earlier version named a file that does not exist at all,
+    which no implementation can return -- so it passed against a globbing one
+    too, and a mutation proved it.
+    """
     here = Path(op.__file__).resolve().parent
-    never_imported = here / "definitely_not_imported_by_anything.py"
-    assert not never_imported.exists(), "test fixture name is not unique"
-    paths = [e["path"] for e in op.running_code_fingerprint()["files"]]
-    assert str(never_imported) not in paths
+    neighbours = sorted(here.glob("*.py"))
+    assert len(neighbours) >= 2, "expected several modules beside the operator"
+    imported, not_imported = neighbours[0], neighbours[1]
+
+    class OneModule:
+        __file__ = str(imported)
+
+    sources = op._loaded_operator_sources({"only": OneModule})
+
+    assert imported in sources
+    assert not_imported not in sources, (
+        f"{not_imported.name} was never imported but is in the fingerprint "
+        f"-- the implementation is enumerating the directory")
+
+
+def test_the_fingerprint_ignores_modules_from_elsewhere(tmp_path):
+    """Hashing every module the interpreter has loaded would make a
+    supervisor stale whenever anything on the machine changed."""
+    outsider = tmp_path / "outsider.py"
+    outsider.write_text("x = 1\n", encoding="utf-8")
+
+    class Outsider:
+        __file__ = str(outsider)
+
+    assert op._loaded_operator_sources({"out": Outsider}) == []
+
+
+def test_the_fingerprint_skips_modules_with_no_file():
+    """Builtin and namespace modules have no __file__; reaching for one
+    would raise inside the supervisor's startup path."""
+
+    class Builtin:
+        __file__ = None
+
+    assert op._loaded_operator_sources({"b": Builtin}) == []
 
 
 def test_the_digest_moves_when_source_changes_though_the_version_does_not(

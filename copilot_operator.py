@@ -2066,7 +2066,7 @@ def _digest_file(path: Path) -> "str | _FileAbsent | None":
         return None
 
 
-def _loaded_operator_sources() -> list[Path]:
+def _loaded_operator_sources(modules: "dict | None" = None) -> list[Path]:
     """The operator's own ``.py`` files that *this process* imported.
 
     Deliberately not a glob of the directory. The question a staleness check
@@ -2077,10 +2077,16 @@ def _loaded_operator_sources() -> list[Path]:
     development that fires constantly. A notice that always fires is one
     nobody reads, which would leave the instrument no better off than the
     silence it replaced.
+
+    ``modules`` exists so a test can supply the module table instead of
+    mutating the real ``sys.modules``. Asserting the negative any other way
+    means naming a file and hoping nothing imported it, and the first version
+    of that test named a file that does not exist -- which no implementation
+    can return, so it passed against a globbing one too.
     """
     here = Path(__file__).resolve().parent
     found: dict[str, Path] = {}
-    for module in list(sys.modules.values()):
+    for module in list((sys.modules if modules is None else modules).values()):
         origin = getattr(module, "__file__", None)
         if not origin:
             continue
