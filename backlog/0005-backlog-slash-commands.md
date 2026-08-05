@@ -1,8 +1,10 @@
 ---
 id: 5
 title: Add /operator-backlog-* slash commands so requests become work items instead of interrupts
-status: open
+status: closed
 opened: 2026-08-05
+closed: 2026-08-05
+commit: 8a5bb8c0ab1557bf1da1c25a6fbc07bb570e2c3a
 spec: none
 ---
 
