@@ -5,16 +5,18 @@ Status is tracked in SQL during execution; this file is the reconciled record.
 ## Phase A — spec
 
 - [x] A1 Write `specs/004-operator-session/{spec,plan,tasks}.md`
-- [ ] A2 File the harness-agnostic rename as a `proposed` backlog item (D2)
+- [x] A2 File the harness-agnostic rename as a `proposed` backlog item (D2)
 
 ## Phase B — handoff keyed by instance (FR-1)
 
-- [ ] B1 Re-key the handoff path to `projects/{guid}/handoff/{instance}.md`
-- [ ] B2 Delete the `superseded/` archive, the lock, the author stamps and the
-      warning banners now unreachable
-- [ ] B3 Migrate existing `next-session.md` and `superseded/*` into per-instance
+- [x] B1 Re-key the handoff path to `projects/{guid}/handoff/{instance}.md`
+- [x] B2 Delete the `superseded/` archive, the lock and the warning banners now
+      unreachable. The author stamp is **kept**: the migration routes on it, and
+      a file copied out of its directory keeps its bytes but loses its name.
+      What went was the rule telling agents how to interpret it.
+- [x] B3 Migrate existing `next-session.md` and `superseded/*` into per-instance
       files — move, never delete; unknown provenance parks under a reserved name
-- [ ] B4 Update `handoff.sh` (bash 3.2 clean), `backlog_tool.py`,
+- [x] B4 Update `handoff.sh` (bash 3.2 clean), `backlog_tool.py`,
       `project_features.py` and every test pinning the old layout
 
 ## Phase C — liveness (FR-3, FR-4)
