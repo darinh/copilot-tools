@@ -584,6 +584,27 @@ def test_sixteen_characters_of_anything_is_not_a_stamp(tmp_path):
     assert stray.read_bytes() == b"nothing like the source"
 
 
+def test_a_name_with_no_room_for_a_stamp_is_not_an_archive(tmp_path):
+    """Both ends can match at once when there is nothing between them.
+
+    ``f-0967115f2813.md`` starts with the stem and ends with the digest and
+    suffix, sharing characters between the two. There is no stamp in it, so
+    it is not an archive -- and reading it back would refuse a preserve it
+    has nothing to do with.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+    digest = hashlib.sha256(b"same").hexdigest()[:12]
+    stray = archive / f"f-{digest}.md"
+    stray.write_bytes(b"nothing like the source")
+    landed = pi.preserve(source, archive)
+    assert landed != stray
+    assert landed.read_bytes() == b"same"
+    assert stray.read_bytes() == b"nothing like the source"
+
+
 def test_an_unrelated_file_ending_the_same_way_is_not_an_archive(tmp_path):
     """The middle of the name has to be stamp-shaped to count.
 

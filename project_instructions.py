@@ -517,11 +517,12 @@ def existing_archive(archive_dir, path, digest: str) -> "Path | None":
     for name in names:
         if not (name.startswith(head) and name.endswith(tail)):
             continue
+        # ``endswith`` above guarantees the name is at least as long as the
+        # tail, so this is never negative. When head and tail overlap -- a
+        # name carrying both ends and no stamp between them -- start runs past
+        # stop and the slice is empty, which the pattern refuses like any
+        # other wrong shape.
         middle_end = len(name) - len(tail)
-        if middle_end < len(head):
-            # head and tail overlap, so the two matches above are reading the
-            # same characters twice and there is no middle at all.
-            continue
         if not _STAMP.fullmatch(name[len(head):middle_end]):
             continue
         candidate = archive_dir / name
