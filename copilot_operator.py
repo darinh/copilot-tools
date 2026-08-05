@@ -1898,7 +1898,7 @@ def project_catalog_path() -> Path:
 def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
     """Resolve the handoff (``next-session.md``) path for a project directory.
 
-    Looks the directory up in ``~/.copilot/projects/catalog.csv`` (the same
+    Looks the directory up in ``~/.operator/projects/catalog.csv`` (the same
     catalog ``handoff``/``handoff_tool.py`` use) and returns the path the
     handoff file *would* live at, regardless of whether it currently exists.
     Returns None if the directory has no catalog entry at all, and
