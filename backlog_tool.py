@@ -811,8 +811,14 @@ def create_item(directory, **kwargs) -> Path:
     return path
 
 
-def _dominant_newline(raw: bytes) -> str:
-    return "\r\n" if b"\r\n" in raw else "\n"
+#: One line *with* whatever ended it, or the last line if nothing did.
+#:
+#: Deliberately not ``str.splitlines``, which splits on every Unicode line
+#: boundary -- form feed, vertical tab, NEL, U+2028, U+2029 -- so rejoining
+#: its output replaces each of those with an ordinary newline. In prose that
+#: is silent corruption of somebody's evidence, performed by a function whose
+#: entire claim is that it changed one line.
+_LINE = re.compile(r"[^\n]*\n|[^\n]+\Z")
 
 
 def approve_item(directory, item_id: int) -> Path:
@@ -823,9 +829,11 @@ def approve_item(directory, item_id: int) -> Path:
     an item that is already approved or already terminal, because both would
     be silent no-ops that read as an approval having happened.
 
-    The file's existing line endings are preserved. A rewrite that flipped
-    them would render as a whole-file diff, and a one-line decision that shows
-    up as a hundred-line change is a decision nobody can review.
+    Every other byte of the file survives: the rest of each line, its ending,
+    the trailing blank lines, and any exotic separator inside the prose. The
+    rewrite is assembled from the original pieces rather than re-rendered, so
+    a one-line decision is a one-line diff -- and a one-line decision that
+    shows up as a hundred-line change is a decision nobody reviews.
     """
     directory = Path(directory)
     match = [p for p in item_paths(directory)
@@ -843,8 +851,7 @@ def approve_item(directory, item_id: int) -> Path:
             f"{path.name} is {item.status!r}, not {PROPOSED_STATUS!r}; only a "
             "proposed item can be approved")
 
-    newline = _dominant_newline(raw)
-    lines = raw.decode("utf-8").splitlines()
+    lines = _LINE.findall(raw.decode("utf-8"))
     out, replaced, in_front = [], 0, False
     for index, line in enumerate(lines):
         if line.strip() == _DELIMITER:
@@ -855,7 +862,8 @@ def approve_item(directory, item_id: int) -> Path:
             out.append(line)
             continue
         if in_front and line.startswith("status:"):
-            out.append(f"status: {OPEN_STATUS}")
+            ending = line[len(line.rstrip("\r\n")):]
+            out.append(f"status: {OPEN_STATUS}{ending}")
             replaced += 1
             continue
         out.append(line)
@@ -863,8 +871,9 @@ def approve_item(directory, item_id: int) -> Path:
         raise BacklogFormatError(
             f"{path.name}: expected exactly one 'status:' line in the front "
             f"matter, found {replaced}")
-    with open(path, "w", encoding="utf-8", newline=newline) as fh:
-        fh.write(newline.join(out) + newline)
+    # Bytes, not text: an encoding-aware write would translate newlines on the
+    # way out and undo the preservation above.
+    path.write_bytes("".join(out).encode("utf-8"))
     return path
 
 
@@ -959,6 +968,18 @@ def read_watermark(path) -> "dict | None":
     if not isinstance(data, dict):
         raise WatermarkError(
             f"The watermark {path} holds {type(data).__name__}, not an object")
+    # Field types, not just the container. A JSON document is not a schema:
+    # ``{"commit": 123}`` is a perfectly good object, and the report would
+    # carry it as far as ``since[:12]`` before dying with a TypeError -- a
+    # traceback where an actionable refusal belongs.
+    for field in ("commit", "checked_at"):
+        value = data.get(field, "")
+        if not isinstance(value, str):
+            raise WatermarkError(
+                f"The watermark {path} has {field!r} as "
+                f"{type(value).__name__}, not a string. Delete it to start a "
+                "fresh check-in history, knowing that the next report will "
+                "cover everything.")
     return data
 
 
@@ -980,16 +1001,22 @@ def write_watermark(path, commit: "str | None", *, when=None) -> dict:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".scrum-",
                                    suffix=".json")
+        placed = False
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(text)
             os.replace(tmp, path)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+            placed = True
+        finally:
+            # ``finally`` rather than ``except OSError``: a Ctrl-C landing
+            # between the write and the replace is not an OSError, and it
+            # would leave a .scrum-*.json behind in the project directory
+            # with nothing that ever cleans it up.
+            if not placed:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
     except OSError as exc:
         raise WatermarkError(
             f"Cannot write the watermark {path}: {exc}. The next check-in "
@@ -1033,7 +1060,12 @@ class ScrumReport:
     first_run: bool = False
     since_resolves: bool = True
     commits: tuple = ()
+    #: False when the commit list could not be obtained. Distinct from an
+    #: empty ``commits``: "none" is an answer and "unknown" is a failure, and
+    #: rendering them identically is how a broken report reads as a quiet week.
+    commits_known: bool = True
     item_changes: tuple = ()
+    changes_known: bool = True
     counts: tuple = ()
     ready: tuple = ()
     awaiting: tuple = ()
@@ -1065,16 +1097,29 @@ def scrum_report(repo_root=None, watermark: "dict | None" = None, *,
 
     commits: list = []
     item_changes: list = []
-    if since_resolves and head:
-        rc, out = _git(["log", "--no-merges", "--format=%h %s",
-                        f"{since}..{head}"], root)
+    commits_known = changes_known = True
+    # A first run has no boundary to measure from and says so in prose; every
+    # other case lists commits, including the one where the recorded boundary
+    # has gone. Skipping the section there would render an unresolvable
+    # watermark as a quiet week, which is precisely what the note above
+    # promises it is not doing -- and a promise the report then breaks is
+    # worse than no note, because the reader has been told to trust it.
+    if head and not first_run:
+        span = f"{since}..{head}" if since_resolves else head
+        rc, out = _git(["log", "--no-merges", "--format=%h %s", span], root)
         if rc != 0:
+            commits_known = False
             notes.append("could not list commits since the last check-in")
         else:
             commits = [line for line in out.splitlines() if line.strip()]
-        rc, out = _git(["diff", "--name-status", f"{since}..{head}", "--",
-                        BACKLOG_DIRNAME], root)
+        if since_resolves:
+            changed = ["diff", "--name-status", span, "--", BACKLOG_DIRNAME]
+        else:
+            changed = ["log", "--no-merges", "--name-status", "--format=",
+                       span, "--", BACKLOG_DIRNAME]
+        rc, out = _git(changed, root)
         if rc != 0:
+            changes_known = False
             notes.append("could not list backlog changes since the last "
                          "check-in")
         else:
@@ -1098,6 +1143,7 @@ def scrum_report(repo_root=None, watermark: "dict | None" = None, *,
     return ScrumReport(
         head=head, since=since, since_when=since_when, first_run=first_run,
         since_resolves=since_resolves, commits=tuple(commits),
+        commits_known=commits_known, changes_known=changes_known,
         item_changes=tuple(item_changes), counts=counts, ready=ready,
         awaiting=awaiting, problems=tuple(problems), notes=tuple(notes),
     )
@@ -1118,14 +1164,25 @@ def format_scrum(report: ScrumReport) -> str:
         sections.append("Since the previous check-in, which recorded no "
                         "commit to measure from.")
 
-    if report.commits:
+    if not report.commits_known:
+        # Not "none". The list could not be obtained, and saying "none" here
+        # would report the failure as a quiet period -- which is the one thing
+        # a check-in must never do, because both look like good news.
+        sections.append("Commits: could not be listed (see the caveats "
+                        "below); this is not the same as none.")
+    elif report.commits:
         sections.append("\n".join(
             [f"Commits ({len(report.commits)}):"]
             + [f"  {line}" for line in report.commits]))
-    elif not report.first_run and report.since_resolves:
+    elif not report.first_run:
+        # Said out loud rather than omitted. A missing section reads as a
+        # rendering slip; "none" is an answer the reader can act on.
         sections.append("Commits: none.")
 
-    if report.item_changes:
+    if not report.changes_known:
+        sections.append("Backlog files touched: could not be listed (see the "
+                        "caveats below); this is not the same as none.")
+    elif report.item_changes:
         sections.append("\n".join(
             ["Backlog files touched:"]
             + [f"  {code} {name}" for code, name in report.item_changes]))
@@ -1464,7 +1521,7 @@ def _cmd_new(args, root: Path) -> int:
     try:
         path = create_item(
             root / BACKLOG_DIRNAME, title=args.title, evidence=evidence,
-            status=args.status, spec=args.spec, blocks=args.blocks,
+            status=PROPOSED_STATUS, spec=args.spec, blocks=args.blocks,
             why=args.why or "", notes=args.notes or "", slug=args.slug)
     except BacklogFormatError as exc:
         print(f"refusing to file this item: {exc}", file=sys.stderr)
@@ -1548,7 +1605,8 @@ def main(argv=None) -> int:
                          help="say why each other item is not in the queue")
     p_ready.set_defaults(func=_cmd_ready)
 
-    p_new = sub.add_parser("new", help="file a new item")
+    p_new = sub.add_parser(
+        "new", help=f"file a new item, always as {PROPOSED_STATUS}")
     p_new.add_argument("--title", required=True)
     p_new.add_argument("--evidence", default=None,
                        help="what was observed, when, and how to reproduce it")
@@ -1556,10 +1614,11 @@ def main(argv=None) -> int:
                        help="read the evidence section from this file")
     p_new.add_argument("--why", default=None, help="the 'Why it matters' body")
     p_new.add_argument("--notes", default=None, help="the 'Notes' body")
-    p_new.add_argument("--status", choices=ACTIVE_STATUSES,
-                       default=PROPOSED_STATUS,
-                       help=f"default {PROPOSED_STATUS}: filing is not "
-                            "approving")
+    # There is deliberately no --status. Filing is not approving, and a flag
+    # that let this command write 'open' would be the tool publishing the
+    # bypass in its own --help: an agent needs no cunning to find a documented
+    # option. Approval is `backlog approve`, which is one act, by one person,
+    # and shows up as one line in a diff.
     p_new.add_argument("--spec", default=NO_SPEC)
     p_new.add_argument("--blocks", type=int, default=None,
                        help="the approved item this one is blocking")

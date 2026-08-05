@@ -227,15 +227,53 @@ def test_a_blocking_item_is_filed_with_its_reference(repo):
 
 def test_approval_changes_exactly_one_line(repo):
     """A one-line decision that renders as a whole-file diff is a decision
-    nobody reviews."""
+    nobody reviews.
+
+    Compared as bytes. An earlier draft compared ``splitlines()`` of each
+    side, which is the same lossy call the implementation was making -- so
+    every separator the rewrite destroyed was destroyed in the expectation
+    too, and the control agreed with the bug.
+    """
     path = file_one(repo)
-    before = path.read_text(encoding="utf-8").splitlines()
+    before = path.read_bytes()
     backlog_tool.approve_item(backlog_dir(repo), 1)
-    after = path.read_text(encoding="utf-8").splitlines()
-    differing = [(a, b) for a, b in zip(before, after) if a != b]
-    assert len(before) == len(after)
-    assert differing == [(f"status: {PROPOSED_STATUS}",
-                          f"status: {OPEN_STATUS}")], differing
+    after = path.read_bytes()
+    expected = before.replace(f"status: {PROPOSED_STATUS}".encode("utf-8"),
+                              f"status: {OPEN_STATUS}".encode("utf-8"), 1)
+    assert after == expected
+    assert after != before
+
+
+@pytest.mark.parametrize("separator", ["\f", "\v", "\x85", "\u2028", "\u2029"])
+def test_approval_preserves_separators_python_calls_line_boundaries(repo,
+                                                                    separator):
+    """``str.splitlines`` splits on all of these; rejoining turns each into an
+    ordinary newline.
+
+    That is silent corruption of somebody's evidence, performed by the one
+    function whose entire claim is that it changed a single line -- and it
+    would never show up as an error, only as prose that quietly reflowed.
+    """
+    path = file_one(repo, evidence=f"Observed{separator}mid-sentence, 2026.")
+    before = path.read_bytes()
+    assert separator.encode("utf-8") in before
+    backlog_tool.approve_item(backlog_dir(repo), 1)
+    assert separator.encode("utf-8") in path.read_bytes()
+
+
+def test_approval_preserves_trailing_blank_lines(repo):
+    """``splitlines`` drops them, and rejoining cannot put them back."""
+    path = file_one(repo)
+    path.write_bytes(path.read_bytes() + b"\n\n")
+    backlog_tool.approve_item(backlog_dir(repo), 1)
+    assert path.read_bytes().endswith(b"\n\n\n")
+
+
+def test_approval_preserves_a_missing_final_newline(repo):
+    path = file_one(repo)
+    path.write_bytes(path.read_bytes().rstrip(b"\n"))
+    backlog_tool.approve_item(backlog_dir(repo), 1)
+    assert not path.read_bytes().endswith(b"\n")
 
 
 def test_approval_makes_the_item_workable(repo):
@@ -322,7 +360,11 @@ def test_the_watermark_lives_in_the_per_project_directory(repo, home):
     catalogue(home, repo)
     path = backlog_tool.watermark_path(repo)
     assert path.parent == home / ".copilot" / "projects" / "test-guid"
-    assert path.name == backlog_tool.WATERMARK_NAME
+    # The literal, not the module's own constant. Asserting
+    # ``path.name == backlog_tool.WATERMARK_NAME`` compares the code's answer
+    # against the code's input, and holds for any name at all -- including a
+    # rename that would orphan every watermark already on disk.
+    assert path.name == "backlog-scrum.json"
 
 
 def test_every_worktree_of_a_project_shares_one_watermark(repo, home, tmp_path):
@@ -378,6 +420,23 @@ def test_a_watermark_holding_the_wrong_shape_refuses(tmp_path):
     path.write_text('["a list"]', encoding="utf-8")
     with pytest.raises(WatermarkError):
         backlog_tool.read_watermark(path)
+
+
+@pytest.mark.parametrize("field", ["commit", "checked_at"])
+def test_a_watermark_field_of_the_wrong_type_refuses(tmp_path, field):
+    """A JSON object is not a schema.
+
+    ``{"commit": 123}`` parses, passes an ``isinstance(dict)`` check, and dies
+    later at ``since[:12]`` with a TypeError -- a traceback in place of the
+    actionable refusal every other watermark failure gets.
+    """
+    path = tmp_path / "backlog-scrum.json"
+    payload = {"commit": "a" * 40, "checked_at": "2026-08-05T00:00:00Z"}
+    payload[field] = 123
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(WatermarkError) as exc:
+        backlog_tool.read_watermark(path)
+    assert field in str(exc.value)
 
 
 def test_a_watermark_that_cannot_be_read_refuses(tmp_path):
@@ -458,14 +517,38 @@ def test_a_watermark_commit_that_no_longer_exists_is_reported_not_ignored(repo):
     Reporting nothing would be the dangerous answer: it is what a quiet week
     looks like. This repository has rewritten its own history once already, so
     the case is live rather than hypothetical.
+
+    The caveat is checked *and so is the content*. An earlier draft asserted
+    only that the note appeared, and the note says the report covers
+    everything -- so the one thing the assertion did not look at was the one
+    thing the note promised, and the section was in fact being skipped.
     """
-    file_one(repo)
-    commit_all(repo, "file an item")
+    file_one(repo, title="Filed before the boundary vanished")
+    commit_all(repo, "first")
+    file_one(repo, title="Filed after")
+    commit_all(repo, "second")
     report = backlog_tool.scrum_report(repo, {"commit": "0" * 40,
                                               "checked_at": "2026-08-05T00:00:00Z"})
     assert not report.since_resolves
     assert any("does not resolve" in note for note in report.notes)
-    assert "does not resolve" in backlog_tool.format_scrum(report)
+    subjects = [line.split(" ", 1)[1] for line in report.commits]
+    assert subjects == ["second", "first", "seed"], subjects
+    assert sorted(name for _, name in report.item_changes) == [
+        "0001-filed-before-the-boundary-vanished.md", "0002-filed-after.md"]
+    text = backlog_tool.format_scrum(report)
+    assert "does not resolve" in text
+    assert "second" in text and "first" in text
+
+
+def test_a_check_in_with_no_commits_says_none_rather_than_omitting_the_section(
+        repo):
+    """"Commits: none." and a missing commits section read differently: one is
+    an answer, the other is a rendering slip the reader has to guess about."""
+    file_one(repo)
+    head = commit_all(repo, "file an item")
+    report = backlog_tool.scrum_report(repo, {"commit": head,
+                                              "checked_at": "2026-08-05T00:00:00Z"})
+    assert "Commits: none." in backlog_tool.format_scrum(report)
 
 
 def test_a_checkout_git_cannot_answer_for_is_a_caveat_not_a_quiet_week(tmp_path):
@@ -495,7 +578,8 @@ def test_a_git_command_that_fails_mid_report_becomes_a_caveat(repo, monkeypatch)
 
     ``rev-parse`` works, so the report looks healthy, and then ``log`` fails.
     Rendering that as "no commits" is the same lie as a quiet week, so each
-    failing step has to leave a note behind.
+    failing step has to leave a note behind *and* the rendered text must not
+    claim a number it does not have.
     """
     file_one(repo)
     head = commit_all(repo, "file an item")
@@ -510,10 +594,16 @@ def test_a_git_command_that_fails_mid_report_becomes_a_caveat(repo, monkeypatch)
     report = backlog_tool.scrum_report(
         repo, {"commit": head, "checked_at": "2026-08-05T00:00:00Z"})
     assert report.commits == ()
+    assert not report.commits_known and not report.changes_known
     assert any("could not list commits" in note for note in report.notes)
     assert any("could not list backlog changes" in note
                for note in report.notes)
-    assert "Caveats" in backlog_tool.format_scrum(report)
+    text = backlog_tool.format_scrum(report)
+    assert "Caveats" in text
+    assert "Commits: none." not in text, (
+        "a failed listing rendered as an empty one; 'unknown' and 'none' read "
+        "identically and only one of them is true")
+    assert "could not be listed" in text
 
 
 def test_the_report_separates_what_is_ready_from_what_is_waiting(repo):
@@ -555,6 +645,31 @@ def test_the_new_command_files_an_item(repo, capsys):
     assert rc == 0
     assert "0001-from-the-command-line.md" in out
     assert backlog_tool.check(repo) == []
+
+
+def test_the_new_command_offers_no_way_to_file_an_approved_item(repo, capsys):
+    """The bypass a reviewer found: ``backlog new --status open``.
+
+    An agent needs no cunning to find a documented option, so the command must
+    not carry one. It is still possible to write the file by hand -- the gate
+    is a speed bump with an audit trail, not a sandbox -- but there is a
+    difference between a boundary somebody stepped over and one the tool
+    published in its own ``--help``.
+    """
+    with pytest.raises(SystemExit) as exc:
+        run(repo, "new", "--title", "Self-approved", "--evidence", "Observed.",
+            "--status", OPEN_STATUS)
+    assert exc.value.code != 0
+    assert "--status" in capsys.readouterr().err
+    assert backlog_tool.item_paths(backlog_dir(repo)) == []
+
+
+def test_every_item_the_new_command_files_awaits_approval(repo):
+    """The positive control for the refusal above: whatever the caller passes,
+    what lands is ``proposed``."""
+    assert run(repo, "new", "--title", "Filed", "--evidence", "Observed.") == 0
+    item = backlog_tool.parse_item(backlog_tool.item_paths(backlog_dir(repo))[0])
+    assert item.status == PROPOSED_STATUS
 
 
 def test_the_new_command_refuses_an_item_with_no_evidence(repo, capsys):
