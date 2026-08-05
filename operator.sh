@@ -1235,7 +1235,185 @@ run_loop_mode() {
 }
 
 # ── Main ────────────────────────────────────────────────────────
-RESERVED_WORDS="stop list report ingest help join reload"
+
+# Every word `main`'s `case` below answers itself.
+#
+# One list, read by both `is_reserved_word` and the typo guard, because the
+# Python operator learned what two copies cost: its hand-maintained second
+# copy had already drifted -- `send` and `inbox` were dispatched and missing
+# from the set that decides what is not an instance name. Nothing broke, which
+# is what let the omission sit there.
+# `tests/test_operator_sh_typo_guard.py` checks this against the `case` arms
+# so a subcommand added to one and not the other fails rather than drifts.
+#
+# Deliberately only what *this script* implements, not what the Python
+# operator does. `send`, `inbox` and `restart-loop` have no arm here, so
+# suggesting one of them would answer a typing mistake by naming a word that
+# operator.sh also handles by starting a session -- the very behaviour this
+# guard exists to stop, arriving via the fix for it.
+SUBCOMMANDS="stop list report ingest help join reload"
+RESERVED_WORDS="$SUBCOMMANDS"
+
+#: Words that mean a subcommand here but are spelled for a different tool.
+#
+# Not typos, and no edit distance reaches them: somebody typing `ls` has
+# spelled what they meant correctly, in the wrong language. That makes this
+# the one part of the guard that must be enumerated by hand, and it is kept
+# short -- an alias is a guess about intent, and a wrong guess sends the
+# reader somewhere that does not do what they asked.
+#
+# Two rules for adding one, both learned from entries the Python operator
+# removed after review:
+#
+# - The target must *do the thing the other tool's word names*. `cat` and
+#   `tail` pointed at `logs`, which reports sizes and prunes old files and
+#   cannot display a log at all. An alias that misses by that much is worse
+#   than no suggestion, because it is confident.
+# - The target must not be *more destructive than the word*. `quit` and `exit`
+#   pointed at `stop`, and bare `operator stop` stops every managed instance.
+#   Somebody typing `quit` means "let me out of this one".
+#
+# Two parallel indexed arrays rather than one associative array, for the bash
+# 3.2 reason documented on `in_list`: `local -A` is a syntax error on the bash
+# macOS ships. Index i of one lines up with index i of the other.
+SUBCOMMAND_ALIAS_WORDS=(ls ll ps dir sessions status kill)
+SUBCOMMAND_ALIAS_TARGETS=(list list list list list list stop)
+
+#: Shortest prefix that may stand in for a subcommand.
+#
+# Two would refuse `ls`, `re` and `in` -- `operator [copilot-args...]` is
+# documented, so each of those is a working invocation taken away to guess at
+# a typo nobody made. Three costs nothing: the two-letter mistake this guard
+# exists for, `ls`, is not a prefix of `list` at all and is caught by the
+# alias table above.
+MIN_PREFIX_LENGTH=3
+
+# True when at most one insertion, deletion, substitution or transposition of
+# adjacent characters turns $1 into $2 -- Damerau-Levenshtein, threshold 1.
+#
+# Damerau rather than plain Levenshtein because a transposition is one slip of
+# the fingers and two ordinary edits: `jion`, `sedn` and `verison` are each one
+# flipped pair from a real word and would otherwise need a threshold of two,
+# which is wide enough to swallow real words (`test` is two edits from `list`).
+#
+# The matrix is one flat indexed array addressed as d[i * width + j]. bash 3.2
+# has no associative arrays and no two-dimensional ones at any version, and the
+# operands here are single subcommands, so the allocation is trivially small.
+one_edit_apart() {
+    local word="$1" candidate="$2"
+    local n=${#word} m=${#candidate}
+    local gap=$(( n > m ? n - m : m - n ))
+    # One edit changes the length by at most one, so this is not merely a
+    # shortcut: it is what stops a long instance name being refused because of
+    # a short subcommand.
+    if [ "$gap" -gt 1 ]; then
+        return 1
+    fi
+    local width=$(( m + 1 ))
+    local -a d=()
+    local i j cost candidate_prev
+    for (( i = 0; i <= n; i++ )); do
+        d[$(( i * width ))]=$i
+    done
+    for (( j = 0; j <= m; j++ )); do
+        d[$j]=$j
+    done
+    for (( i = 1; i <= n; i++ )); do
+        for (( j = 1; j <= m; j++ )); do
+            cost=1
+            if [ "${word:i-1:1}" = "${candidate:j-1:1}" ]; then
+                cost=0
+            fi
+            # Deletion, insertion, substitution. Assignments rather than
+            # `(( ... ))` statements throughout: an arithmetic command whose
+            # value is 0 returns 1, which under `set -e` would end the run the
+            # first time two prefixes matched exactly.
+            d[$(( i * width + j ))]=$(( d[(i - 1) * width + j] + 1 ))
+            if [ "$(( d[i * width + j - 1] + 1 ))" -lt "${d[$(( i * width + j ))]}" ]; then
+                d[$(( i * width + j ))]=$(( d[i * width + j - 1] + 1 ))
+            fi
+            if [ "$(( d[(i - 1) * width + j - 1] + cost ))" -lt "${d[$(( i * width + j ))]}" ]; then
+                d[$(( i * width + j ))]=$(( d[(i - 1) * width + j - 1] + cost ))
+            fi
+            # Transposition of the adjacent pair ending at i, j.
+            if [ "$i" -gt 1 ] && [ "$j" -gt 1 ]; then
+                candidate_prev="${candidate:j-2:1}"
+                if [ "${word:i-1:1}" = "$candidate_prev" ] \
+                   && [ "${word:i-2:1}" = "${candidate:j-1:1}" ] \
+                   && [ "$(( d[(i - 2) * width + j - 2] + cost ))" -lt "${d[$(( i * width + j ))]}" ]; then
+                    d[$(( i * width + j ))]=$(( d[(i - 2) * width + j - 2] + cost ))
+                fi
+            fi
+        done
+    done
+    [ "${d[$(( n * width + m ))]}" -le 1 ]
+}
+
+# The subcommands $1 is plausibly a mistyping of, one per line, in declared
+# order. Prints nothing when it resembles none of them.
+#
+# Three rules, and the narrowness of all three is the point. This predicate
+# decides whether a word is refused instead of being handed to copilot as a
+# prompt, and `operator [copilot-args...]` is documented -- so every word it
+# claims wrongly is a working invocation taken away.
+#
+# - A prefix of at least MIN_PREFIX_LENGTH characters. `sto` and `rep` are
+#   truncations of something real. A prefix is never longer than what it
+#   prefixes, which is what keeps instance names safe.
+# - One edit away, the classic single-slip model, which cannot span a length
+#   gap of two and so protects longer names for the same reason.
+# - A word from another tool, consulted only when the first two found nothing.
+#
+# Together those two length properties are the whole safety argument for
+# project names: *a word two or more characters longer than every subcommand
+# can never be refused*. Almost every real instance name has that shape.
+#
+# The Python operator's first attempt scored `difflib` similarity ratios at a
+# 0.6 cutoff and three reviewers rejected it independently: a ratio counts
+# shared characters in any order, so it refused `refactor`, `read`, `hello`,
+# `test` and -- worst -- `myproject`, the documented quick-join. Ten of thirty
+# ordinary one-word prompts. These rules refuse two, `lint` and `end`, each
+# genuinely one keystroke from a subcommand and both recoverable via the
+# escape hatch the message names.
+#
+# Every match is printed rather than one winner. `sto` truncates nothing else
+# here today, but a tie-break by taste is how `ls` would come to be answered
+# with `logs`, and there is no honest way to choose between equally good
+# answers.
+subcommand_suggestions() {
+    local word
+    word="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    if [ -z "$word" ]; then
+        return 0
+    fi
+    local -a matches=()
+    local candidate
+    for candidate in $SUBCOMMANDS; do
+        # `"$word"*` -- the variable is quoted so a name containing `*` or `?`
+        # is compared literally rather than used as a pattern against the
+        # subcommand it is being tested against.
+        if [ "${#word}" -ge "$MIN_PREFIX_LENGTH" ] && [[ "$candidate" == "$word"* ]]; then
+            matches+=("$candidate")
+        elif one_edit_apart "$word" "$candidate"; then
+            matches+=("$candidate")
+        fi
+    done
+    if [ "${#matches[@]}" -eq 0 ]; then
+        local i=0
+        for candidate in ${SUBCOMMAND_ALIAS_WORDS[@]+"${SUBCOMMAND_ALIAS_WORDS[@]}"}; do
+            if [ "$candidate" = "$word" ]; then
+                matches+=("${SUBCOMMAND_ALIAS_TARGETS[$i]}")
+                break
+            fi
+            i=$(( i + 1 ))
+        done
+    fi
+    # `printf '%s\n'` with no operands still prints one empty line, which the
+    # caller would read back as a suggestion of "".
+    if [ "${#matches[@]}" -gt 0 ]; then
+        printf '%s\n' ${matches[@]+"${matches[@]}"}
+    fi
+}
 
 join_instance() {
     local target="${1:-}"
@@ -1347,6 +1525,54 @@ main() {
             set_tab_title "terminal - $1"
             set_tab_progress 1
             exec tmux attach -t "$1"
+        fi
+    fi
+
+    # Everything above has answered, so the first argument is not a subcommand
+    # and does not name a running instance. The rest of main() would read it as
+    # a copilot argument and start a session named after the current directory
+    # -- so `operator ls` does not report that `ls` is spelled `list`, it
+    # offers to restart whatever is running here, and where nothing is running
+    # it starts a real session with `ls` as its prompt.
+    #
+    # An unknown subcommand is a typing mistake, and the answer to a typing
+    # mistake is a message rather than a state change. Only a first argument
+    # close to a real subcommand is refused: `operator [copilot-args...]` is
+    # documented, so an unrecognisable word is still passed through as a
+    # prompt.
+    #
+    # Ahead of the tmux/sqlite3/python3 checks below on purpose. A typo is
+    # answerable without any of them, and reporting a missing dependency to
+    # somebody who typed `operator ls` names neither the thing they got wrong
+    # nor the thing they wanted.
+    #
+    # Not gated on `$# -eq 1`, unlike the shortcut above: `operator ls -la` is
+    # the same mistake as `operator ls`.
+    #
+    # `is_reserved_word` is re-checked rather than assumed. Every arm of the
+    # `case` above happens to exit today -- `stop` exits inside
+    # `stop_operator`, the rest exit at the arm -- so a real subcommand cannot
+    # reach here. That is a fact about those seven handlers, not a property of
+    # the dispatch, and the failure it would produce if one ever returned is
+    # this guard refusing the exact command it had just run, with a "did you
+    # mean" naming the word the user typed correctly.
+    local first_arg="${1:-}"
+    if [[ -n "$first_arg" && "$first_arg" != -* ]] && ! is_reserved_word "$first_arg"; then
+        local suggestions
+        # Word-split on purpose. Every subcommand is a single word of lowercase
+        # letters, so there is nothing here to split wrongly or to glob.
+        suggestions="$(subcommand_suggestions "$first_arg")"
+        if [[ -n "$suggestions" ]]; then
+            local names="" suggestion
+            for suggestion in $suggestions; do
+                [[ -n "$names" ]] && names="$names or "
+                names="$names\`operator $suggestion\`"
+            done
+            echo "Unknown subcommand: operator $first_arg" >&2
+            echo "Did you mean $names?" >&2
+            echo "(To pass it to copilot instead, name the instance:" \
+                 "\`operator --name NAME $first_arg\`.)" >&2
+            exit 1
         fi
     fi
 
