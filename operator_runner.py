@@ -52,6 +52,8 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+from operator_console import enable_utf8_output               # noqa: E402
+
 SESSION_ID_TIMEOUT = 20
 LOG_PIN_TIMEOUT = 30
 TREE_SETTLE_SECONDS = 1.5
@@ -535,6 +537,7 @@ def run(spec_path: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    enable_utf8_output()
     parser = argparse.ArgumentParser(
         prog="operator-runner",
         description="In-pane supervisor for a Copilot session (internal).",

@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import install_manifest
+from operator_console import enable_utf8_output
 from project_paths import resolved_str
 
 BUSY_TIMEOUT = 15.0
@@ -859,6 +860,7 @@ def ingest_all(log_dir, db_path, force: bool = False) -> "list[str] | None":
 
 
 def main(argv: list[str] | None = None) -> int:
+    enable_utf8_output()
     parser = argparse.ArgumentParser(prog="operator-ingest")
     parser.add_argument("logfile")
     parser.add_argument("db_path")
