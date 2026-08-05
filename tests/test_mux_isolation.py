@@ -379,7 +379,14 @@ def test_subprocess_is_still_reachable_outside_the_poison_fixture():
     """Control: the poison above is a fixture, not a permanent change. Without
     it a spawn works, so the tests that pass are passing on the fake rather
     than on a globally broken subprocess module."""
-    assert subprocess.run is operator_mux.subprocess.run
+    # An identity check here -- `subprocess.run is operator_mux.subprocess.run`
+    # -- would assert nothing: they are two names for one module attribute, so
+    # it holds however broken the state is, including with the poison still
+    # installed. What distinguishes this moment is which of the two layers is
+    # active, so assert that instead: conftest's guard still refuses a
+    # multiplexer, while the per-test poison that refused *everything* is gone.
+    with pytest.raises(AssertionError, match="real terminal multiplexer"):
+        subprocess.run(["tmux", "-V"], capture_output=True)
     proc = subprocess.run([sys.executable, "-c", "print('ok')"],
                           capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
