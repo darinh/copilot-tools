@@ -462,6 +462,60 @@ def archive_name(path, digest: str, when: datetime) -> str:
     return f"{stem}-{when.strftime('%Y%m%dT%H%M%SZ')}-{digest[:12]}{suffix}"
 
 
+#: Length of the ``%Y%m%dT%H%M%SZ`` stamp ``archive_name`` puts in the middle.
+_STAMP_WIDTH = 16
+
+
+def existing_archive(archive_dir, path, digest: str) -> "Path | None":
+    """The archive already holding these bytes, whatever second it was made in.
+
+    Reuse has to be keyed on the digest alone, because the name also carries a
+    timestamp and the timestamp is only accurate to the second. Two preserves
+    of identical bytes that straddle a second boundary produce two different
+    names for one set of bytes, so matching on the whole name files the same
+    content twice and reports each as new. That is what it did: CI caught it on
+    one leg of eight, as a same-content pair a second apart.
+
+    Matching is on the two ends of the name rather than a glob, because a stem
+    is caller-controlled and ``[`` in one would make ``Path.glob`` read it as a
+    character class and quietly match the wrong things. The middle is required
+    to be stamp-shaped so an unrelated file that happens to end the same way
+    cannot be mistaken for an archive.
+
+    Returns None when nothing matches. Raises when a candidate is found and
+    cannot be confirmed to hold the right bytes, because the only caller of
+    ``preserve`` unlinks the original next: an archive taken on trust is
+    exactly as good as no archive, and worse, because it reads as success.
+    """
+    archive_dir = Path(archive_dir)
+    stem = Path(path).stem or "file"
+    suffix = Path(path).suffix or ".md"
+    head = f"{stem}-"
+    tail = f"-{digest[:12]}{suffix}"
+    try:
+        names = sorted(entry.name for entry in archive_dir.iterdir())
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise InstructionsError(
+            f"Cannot list {archive_dir} to look for an existing copy, so "
+            f"this copy cannot be verified ({exc}). Nothing was removed."
+        ) from exc
+    for name in names:
+        if not (name.startswith(head) and name.endswith(tail)):
+            continue
+        if len(name) - len(head) - len(tail) != _STAMP_WIDTH:
+            continue
+        candidate = archive_dir / name
+        if file_digest(candidate) != digest:
+            raise InstructionsError(
+                f"The archive at {candidate} does not hold the bytes its "
+                "name claims, so it cannot stand in for a fresh copy. "
+                "Nothing was removed.")
+        return candidate
+    return None
+
+
 def preserve(path, archive_dir, *, when: "datetime | None" = None) -> Path:
     """Copy ``path`` into ``archive_dir`` and prove the copy arrived.
 
@@ -482,16 +536,18 @@ def preserve(path, archive_dir, *, when: "datetime | None" = None) -> Path:
         raise InstructionsError(f"Cannot read {path} to preserve it: {exc}") from exc
     digest = hashlib.sha256(original).hexdigest()
     stamp = when or datetime.now(timezone.utc)
+    already = existing_archive(archive_dir, path, digest)
+    if already is not None:
+        # These bytes are already kept, and re-writing could only damage a
+        # copy that has just been read back and confirmed correct.
+        return already
+    # No presence check on the name below. Anything sitting at it would carry
+    # this stem, this digest and a stamp-shaped middle, so the scan above
+    # would have found it and either returned it or refused; reaching here
+    # means the name is free. A racing writer can only be writing these same
+    # bytes, since the digest is what picks the name, so the atomic replace
+    # below is safe against one either way.
     target = archive_dir / archive_name(path, digest, stamp)
-    already = path_present(target)
-    if already is None:
-        raise InstructionsError(
-            f"Something is at {target} and could not be examined, so this "
-            "copy cannot be verified. Nothing was removed.")
-    if already:
-        # Same name means same bytes: the digest is in it. Nothing to do, and
-        # rewriting would only risk damaging a copy that is already correct.
-        return target
     try:
         archive_dir.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(archive_dir), prefix=".retiring-")
