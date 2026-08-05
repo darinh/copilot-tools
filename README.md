@@ -339,6 +339,7 @@ copilot-tools/
 ├── operator_trace.py              # Who invoked the operator, and how it ended
 ├── operator_console.py            # UTF-8 console output
 ├── project_paths.py               # Project identity: catalog and per-project dirs
+├── project_features.py            # The feature vocabulary, and each project's choices
 ├── handoff_tool.py                # Session handoff
 ├── backlog_tool.py                # Backlog parser, validator, and HTML view
 ├── setup_tools.py                 # Cross-platform environment setup

@@ -121,6 +121,19 @@ def reported(root: Path, needle: str, **kwargs) -> bool:
 # The real directory
 # ---------------------------------------------------------------------------
 
+def _stand_down_reason(backend: str, source: str) -> "str | None":
+    """Why ``backlog/`` should not be demanded of this project, or ``None``.
+
+    A pure function of the two facts, so it can be exercised for every backend
+    without arranging a machine to be in that state -- and so the decision
+    lives in one place that a control can score.
+    """
+    if backend == project_features.BACKLOG_FOLDER:
+        return None
+    return (f"this project's tracked-backlog backend is {backend!r} "
+            f"(from {source}), so backlog/ is not where its open work lives")
+
+
 def _require_folder_backend() -> None:
     """Stand aside for a project that keeps its open work somewhere else.
 
@@ -134,14 +147,55 @@ def _require_folder_backend() -> None:
     :func:`project_features.tracked_backlog_backend` answers ``folder`` for
     every uncertainty, including no catalog at all, which is what CI has. So
     this can only step aside because a person configured it to, never because
-    a file was missing, and it says so out loud when it does: a guard that
-    disappears silently is worse than one that was never written.
+    a file was missing.
+
+    That is not sufficient on its own, and a mutation proved it: inverting the
+    comparison in :func:`_stand_down_reason` turns all three assertions into
+    skips, and a suite reporting ``59 passed, 4 skipped`` reads exactly like a
+    suite reporting ``62 passed, 1 skipped``. A guard that can be switched off
+    without going red is not a guard, so
+    :func:`test_the_enforcement_is_switched_on_in_this_repository` asserts this
+    gate lets *this* repository through, and fails loudly when it does not.
     """
-    backend, source = project_features.tracked_backlog_backend(REPO)
-    if backend != project_features.BACKLOG_FOLDER:
-        pytest.skip(
-            f"this project's tracked-backlog backend is {backend!r} "
-            f"(from {source}), so backlog/ is not where its open work lives")
+    reason = _stand_down_reason(*project_features.tracked_backlog_backend(REPO))
+    if reason:
+        pytest.skip(reason)
+
+
+def test_the_enforcement_is_switched_on_in_this_repository():
+    """The premise the three assertions below rest on.
+
+    ``pytest.skip`` raises, and a skip raised inside a test body skips that
+    test rather than failing it -- so the outcome is caught and asserted on
+    instead. Anything that makes the gate stand down here, an inverted
+    comparison or a configuration nobody meant to leave behind, arrives as a
+    red test naming the reason rather than as three skips in a count nobody
+    reads.
+    """
+    outcome = []
+    try:
+        _require_folder_backend()
+    except BaseException as exc:          # noqa: BLE001 - Skipped is one of these
+        outcome.append(exc)
+    assert not outcome, (
+        f"the backlog enforcement below has stood down: {outcome[0]}")
+
+
+@pytest.mark.parametrize("backend", ["github-issues", "none"])
+def test_another_backend_stands_the_enforcement_down(backend):
+    """Positive control: the gate must be able to open."""
+    assert _stand_down_reason(backend, "a source") is not None
+
+
+def test_the_folder_backend_keeps_the_enforcement_on():
+    """Negative control: the gate must not open for everything."""
+    assert _stand_down_reason(project_features.BACKLOG_FOLDER, "a source") is None
+
+
+def test_the_stand_down_reason_names_the_backend_and_where_it_came_from():
+    """A guard that disappears silently is worse than one never written."""
+    reason = _stand_down_reason("github-issues", "/some/features.json")
+    assert "github-issues" in reason and "/some/features.json" in reason
 
 
 def test_the_repositorys_own_backlog_conforms():
