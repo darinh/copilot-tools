@@ -764,25 +764,23 @@ def test_stop_loop_outlasts_the_grace_and_leaves_no_marker(monkeypatch):
     assert clock.now - started >= op.SUPERVISOR_STARTUP_GRACE
     assert not inst.detach_marker.exists(), (
         "left a trap for the next supervisor")
-    assert rc == 0
+    # Not a timeout: it got its answer inside the budget. Non-zero because
+    # nothing consumed the request -- see the test below.
+    assert rc == 1
 
 
 def test_stop_loop_reports_a_supervisor_that_never_came_up(monkeypatch):
     """Same end state, different truth. Nothing consumed the request, so
     saying "supervisor stopped" would be a claim about an event that never
-    happened."""
+    happened -- and reporting success would too."""
     inst = op.Instance("neverup")
     op._record_supervisor_starting(inst, 5353)
     _dead_pids(monkeypatch)
     _fast_clock(monkeypatch)
-    said: list = []
-    monkeypatch.setattr(
-        "builtins.print",
-        lambda *a, **k: said.append(" ".join(str(x) for x in a)))
 
-    op.stop_loop_only("neverup")
+    rc = op.stop_loop_only("neverup")
 
-    assert any("never came up" in s for s in said), said
+    assert rc == 1
 
 
 def test_stop_loop_reports_a_real_stop_normally(monkeypatch):
@@ -813,7 +811,6 @@ def test_stop_loop_reports_a_real_stop_normally(monkeypatch):
 
     assert rc == 0
     assert any("session left running" in s for s in said), said
-    assert not any("never came up" in s for s in said), said
 
 
 def test_restart_loop_budget_covers_a_shim_pid(monkeypatch):
@@ -878,3 +875,138 @@ def test_stop_session_still_says_nothing_will_when_nothing_will(monkeypatch):
     op.stop_session_only("wontrelaunch")
 
     assert any("will not restart automatically" in s for s in said), said
+
+
+# ── the window and the budgets must not drift apart ─────────────
+#
+# They already have, twice. The failure is quiet in both directions: a wait
+# shorter than the window cannot do anything but time out in exactly the case
+# the window exists for, and nothing in the run says which of the two numbers
+# was wrong. These tests measure the window rather than restate it, so the
+# constant and the reader have to agree before the budgets are asked to.
+
+
+def _believed_for(instance: op.Instance, clock: _Clock) -> float:
+    """How long, from now, this instance's record stays believed."""
+    started = clock.now
+    while op._supervisor_present(instance) is not None:
+        clock.sleep(0.1)
+        if clock.now - started > 3600:
+            pytest.fail("record never aged out")
+    return clock.now - started
+
+
+@pytest.mark.parametrize("ahead", [0.0, 0.5, 1.0, 5.0, 29.0, 3600.0])
+def test_no_record_is_believed_for_longer_than_the_allowance(monkeypatch, ahead):
+    """`SUPERVISOR_STARTUP_ALLOWANCE` is a claim about the reader, not a
+    definition: *no* record, however dated, is believed for longer than this
+    from now.
+
+    The symmetric `-GRACE < age < GRACE` window failed this at `ahead=29`,
+    where a record stayed believed for 59s while every wait budgeted 30 --
+    reproduced by a reviewer as a 50s timeout with the marker stranded.
+    """
+    inst = op.Instance(f"window{ahead}".replace(".", ""))
+    op._record_supervisor_starting(inst, 6001)
+    _age_record(inst, -ahead)
+    _dead_pids(monkeypatch)
+    clock = _fast_clock(monkeypatch)
+
+    assert _believed_for(inst, clock) <= op.SUPERVISOR_STARTUP_ALLOWANCE + 0.1
+
+
+def test_the_allowance_is_not_slack(monkeypatch):
+    """The other side of the bound, so it cannot be satisfied by making the
+    allowance absurdly large. A record written right now must still be
+    believed for essentially the whole grace."""
+    inst = op.Instance("windowfloor")
+    op._record_supervisor_starting(inst, 6002)
+    _dead_pids(monkeypatch)
+    clock = _fast_clock(monkeypatch)
+
+    assert _believed_for(inst, clock) >= op.SUPERVISOR_STARTUP_GRACE
+
+
+def _worst_case_record(instance: op.Instance, pid: int) -> None:
+    """A record at the most-future mtime that is still believed.
+
+    Not `now`: the whole point is that the wait has to cover the skew
+    tolerance *as well as* the grace, and a record written at `now` only
+    exercises the grace.
+    """
+    op._record_supervisor_starting(instance, pid)
+    _age_record(instance, -(op.CLOCK_SKEW_TOLERANCE - 0.5))
+
+
+def test_stop_outlasts_the_worst_case_record(monkeypatch):
+    inst = op.Instance("worststop")
+    _worst_case_record(inst, 6101)
+    _dead_pids(monkeypatch)
+    clock = _fast_clock(monkeypatch)
+    started = clock.now
+
+    op._request_supervisor_stop(inst, timeout=1.0)
+
+    assert clock.now - started > op.SUPERVISOR_STARTUP_GRACE, (
+        "a grace-sized budget cannot cover a record dated ahead of the clock")
+    assert op._supervisor_present(inst) is None, (
+        "gave up while the record it was waiting on was still believed")
+    assert not inst.stop_marker.exists(), "left a trap for the next supervisor"
+
+
+def test_stop_loop_outlasts_the_worst_case_record(monkeypatch, capsys):
+    inst = op.Instance("worststoploop")
+    _worst_case_record(inst, 6102)
+    _dead_pids(monkeypatch)
+    _fast_clock(monkeypatch)
+
+    rc = op.stop_loop_only("worststoploop")
+
+    # Both endings clean the marker and return 1, so the marker is no
+    # discriminator here; the message is. "did not stop within" means the
+    # budget expired, which is the bug.
+    assert "did not stop within" not in capsys.readouterr().err
+    assert rc == 1
+    assert op._supervisor_present(inst) is None
+    assert not inst.detach_marker.exists()
+
+
+def test_restart_loop_outlasts_the_worst_case_record(monkeypatch, capsys):
+    inst = op.Instance("worstrestart")
+    _worst_case_record(inst, 6103)
+    _dead_pids(monkeypatch)
+    _fast_clock(monkeypatch)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: True)
+
+    op._do_restart_loop(inst, ["--agent", "t:a"], os.getcwd())
+
+    assert "did not stop within" not in capsys.readouterr().err
+    assert op._supervisor_present(inst) is None
+
+
+# ── how a supervisor is described ───────────────────────────────
+
+
+def test_a_dead_shim_pid_is_not_described_as_running(monkeypatch):
+    """`f'pid {pid}' if pid else 'still starting'` calls a dead launcher
+    shim's pid the supervisor in charge -- the one case the whole startup
+    record exists to cover, described as the one case it is not."""
+    inst = op.Instance("shimwhere")
+    op._record_supervisor_starting(inst, 5555)
+    _dead_pids(monkeypatch)
+
+    where = op._supervisor_where(inst, op._supervisor_present(inst))
+
+    assert "still starting" in where
+    assert where != "pid 5555"
+
+
+def test_a_published_supervisor_is_described_by_its_pid(monkeypatch):
+    """The control: the ordinary case must not be dressed up as a startup."""
+    inst = op.Instance("publishedwhere")
+    inst.loop_pid_file.write_text("5556", encoding="utf-8")
+    _dead_pids(monkeypatch, 5556)
+
+    where = op._supervisor_where(inst, op._supervisor_present(inst))
+
+    assert where == "pid 5556"

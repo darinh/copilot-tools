@@ -1406,19 +1406,27 @@ def test_stop_loop_only_touches_detach_marker_and_waits(monkeypatch):
     inst.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
 
     calls = {"n": 0}
+    state = {"consumed": False}
 
     def fake_running_pid(instance):
         calls["n"] += 1
-        # Simulate the supervisor exiting after being asked to detach.
-        if calls["n"] >= 2:
+        if state["consumed"]:
+            return None
+        # Simulate the supervisor consuming the request and then exiting --
+        # in that order, which is the order a real one does it in.
+        if calls["n"] >= 3 and instance.detach_marker.exists():
+            op.remove_file(instance.detach_marker)
+            state["consumed"] = True
             return None
         return os.getpid()
 
     monkeypatch.setattr(op, "_running_loop_pid", fake_running_pid)
     monkeypatch.setattr(op.time, "sleep", lambda s: None)
     rc = op.stop_loop_only("has-loop")
+    # rc is the discriminator: 0 only when the marker was gone by the time the
+    # supervisor was, i.e. unlinked by the supervisor itself and not by us.
     assert rc == 0
-    assert inst.detach_marker.exists()  # unlinked by the supervisor itself, not us
+    assert not inst.detach_marker.exists()
     assert calls["n"] >= 2
 
 
