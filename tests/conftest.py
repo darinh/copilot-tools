@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import ntpath
 import os
 import pathlib
 import sys
@@ -537,20 +538,30 @@ def _is_a_multiplexer_spawn(cmd) -> bool:
     again, which is the exact condition a8575d7 and 20126d6 were written to
     end. Keep this a bare membership test.
 
-    The name is extracted with both separators spelled out rather than with
-    ``os.path.basename`` alone, because ``os.path`` is the *running* platform's
-    path syntax and this guard is asked about argv that name the other one.
-    On POSIX, ``os.path.basename(r"C:\\tools\\tmux.exe")`` is the whole string --
+    The name is extracted with ``ntpath.basename`` rather than
+    ``os.path.basename``, because ``os.path`` is the *running* platform's path
+    syntax and this guard is asked about argv that name the other one. On
+    POSIX, ``os.path.basename(r"C:\\tools\\tmux.exe")`` is the whole string --
     backslash is an ordinary filename character there -- so the membership test
-    saw ``c:\\tools\\tmux`` and the guard delegated a tmux invocation it exists to
-    refuse. That is how the parametrised case for a full Windows path passed on
-    the Windows legs and spawned on the four POSIX ones, which no amount of
-    local Windows testing could show. Treating ``\\`` as a separator everywhere
-    can only ever make the guard refuse *more*, and over-refusing inside the
-    test suite costs a loud error, while under-refusing costs a real server.
+    saw ``c:\\tools\\tmux`` and the guard delegated a tmux invocation it exists
+    to refuse. That is how the parametrised case for a full Windows path passed
+    on the Windows legs and spawned on the four POSIX ones, which no amount of
+    local Windows testing could show.
+
+    ``ntpath`` is the right tool rather than splitting on both separators by
+    hand, and the difference is not cosmetic: the hand-rolled version read
+    ``C:tmux.exe`` -- a drive-*relative* path, which Windows accepts and
+    resolves against the current directory on that drive -- as the name
+    ``c:tmux``, missed, and delegated. That spelling is one ``os.path.basename``
+    already handled, so the hand-rolled fix would have closed the POSIX hole by
+    opening a Windows one. ``ntpath`` is pure syntax with no filesystem or
+    platform dependence, and it understands drive prefixes, UNC paths and both
+    separators, so it is the union of the two syntaxes rather than a guess at
+    it. Over-refusing inside the test suite costs a loud error; under-refusing
+    costs a real server.
     """
     head = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else cmd
-    name = str(head).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    name = ntpath.basename(str(head)).lower()
     if name.endswith(".exe"):
         name = name[:-4]
     return name in _MUX_BINARIES
