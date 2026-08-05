@@ -1,8 +1,10 @@
 ---
 id: 9
 title: operator.sh silently starts a session for subcommands only the Python CLI implements
-status: proposed
+status: closed
 opened: 2026-08-05
+closed: 2026-08-05
+commit: 75b7731
 spec: none
 ---
 
@@ -70,3 +72,76 @@ elsewhere.
 
 Whether `operator.sh` should reach parity at all is the product decision
 underneath this, and it should be made deliberately rather than by accretion.
+
+## Delivered
+
+Landed in `75b7731` on `fix/operator-sh-python-only`.
+
+The cheap correct half, as the notes above proposed: a word the Python
+operator dispatches and this script does not is now refused by name rather
+than answered with a session. `PYTHON_ONLY_SUBCOMMANDS` holds the thirteen --
+`version menu projects stop-loop restart-loop stop-session forget send inbox
+logs trace tabs restore` -- and a branch in `main()` prints where the
+subcommand lives and exits 1 without touching any state. `operator help` grew
+an `ELSEWHERE` section listing the same words, printed from the same variable
+through an unquoted heredoc, because finding out by being refused means you
+already ran it.
+
+The message names three things, and the third is the one that is easy to
+forget: what was refused, where it lives, and how to get past the refusal.
+`operator --name NAME trace` is still how somebody whose Copilot prompt really
+is the word `trace` says so -- the same escape hatch backlog 8's guard offers,
+for the same reason. The entry point is named as a runnable command line only
+when `${SCRIPT_DIR}/copilot_operator.py` is actually there; `operator.sh` is
+installed on its own often enough that quoting a path to a file that does not
+exist would send the reader somewhere worse than the bare filename does.
+
+**Refusing rather than forwarding.** `exec python3 copilot_operator.py "$@"`
+would have reached parity for free and was rejected: it makes this script a
+proxy for the other one, which is exactly the product decision this item says
+should be made deliberately, and it fails confusingly wherever the Python file
+is absent or its dependencies are not installed. A refusal turns a silent
+wrong action into a recoverable one and commits to nothing.
+
+**Placement.** The branch sits inside backlog 8's guard, ahead of the distance
+rules and ahead of the tmux/sqlite3/python3 checks -- `operator inbox` on a box
+without tmux must say where `inbox` lives rather than "Error: tmux is
+required", since `main` exits at that check and it would be the last thing the
+reader saw. It sits *after* the positional join shortcut, so an instance
+genuinely named `trace` is still attachable: refusing there would take away an
+invocation that works today, which is the failure mode this repository keeps
+paying for. Matching is exact rather than by distance, because a word the other
+program implements is a fact rather than a guess. No word is in both
+populations today, so the order is a statement of precedence and
+`test_the_two_refusals_cannot_both_claim_a_word` is what keeps it one.
+
+**The list is derived, not transcribed.** A hand-maintained copy of a set that
+lives in another file is precisely the arrangement that let
+`copilot_operator.py`'s own `RESERVED_WORDS` drift until it was missing `send`
+and `inbox` -- and here a missing word is not a silent inconsistency, it is
+this defect back again for that word. So
+`test_the_python_only_list_is_what_the_two_dispatches_differ_by` computes
+`python SUBCOMMANDS - shell SUBCOMMANDS` and requires equality: a subcommand
+added to the Python operator is red here until it is either implemented in the
+shell or refused by it.
+
+That derivation leans on `SUBCOMMANDS` being what the Python dispatcher
+actually answers, and only half of that was pinned. `test_every_subcommand_is_dispatched`
+read the tuple and asked whether each word was answered; nothing asked the
+reverse, so a word dispatched and left out of the tuple passed silently -- and
+would now be a word the shell does not refuse, invisible on both sides.
+`test_every_dispatched_head_is_listed` closes it, with a control that runs the
+extractor over planted text containing the bug, because a regex that matched
+nothing would have reported the whole file clean.
+
+Verified: 8 hand-written mutations of the new branch, 0 survivors, each killed
+by a distinct test -- branch deleted, a word dropped from the list, a word
+invented, the path branch made unconditional, the help heredoc quoted, the
+guard gated on `$# -eq 1`, the escape hatch dropped, and `exit 1` turned into
+`exit 0`. Three of those were first written with ambiguous anchors and were
+never applied at all; reported as skips rather than as kills, which is the only
+reason they were noticed. Also `bash -n`, the bash 3.2 conformance scan, and a
+real run of the shipped script against an isolated `COPILOT_OPERATOR_HOME`:
+`inbox`, `send`, `trace` and `projects` each refused with exit 1, `list` still
+lists. Three adversarial reviewers (gpt-5.3-codex, gemini-3.1-pro,
+claude-opus-4.6) found nothing.
