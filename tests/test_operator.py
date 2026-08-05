@@ -981,6 +981,288 @@ def test_reserved_words_are_not_instance_names():
         assert word in op.RESERVED_WORDS
 
 
+def test_every_dispatched_subcommand_is_a_reserved_word():
+    """The two lists were hand-maintained copies, and one had already drifted.
+
+    `send` and `inbox` are dispatched and were missing from RESERVED_WORDS.
+    Nothing broke, because both are matched before the positional shortcut is
+    reached -- so the drift was invisible, which is what makes it worth a
+    test rather than a re-read.
+    """
+    assert op.RESERVED_WORDS == set(op.SUBCOMMANDS)
+    for word in ("send", "inbox", "trace", "projects", "restart-loop"):
+        assert word in op.SUBCOMMANDS
+
+
+def test_every_subcommand_is_dispatched():
+    """A name in the tuple that nothing answers to would be a dead end.
+
+    HELP is deliberately not asserted against: `menu` is what a bare
+    `operator` opens and `version` is normally spelled `--version`, so
+    neither has a USAGE line, and requiring one would be inventing a rule
+    rather than recording the existing surface.
+    """
+    source = Path(op.__file__).read_text(encoding="utf-8")
+    for word in op.SUBCOMMANDS:
+        # Both spellings the dispatcher actually uses, and nothing looser:
+        # matching a bare quoted word would be satisfied by SUBCOMMANDS
+        # itself and could never fail.
+        dispatched = (f'head == "{word}"' in source
+                      or f'head in ("{word}"' in source)
+        assert dispatched, f"{word} is listed but nothing dispatches it"
+
+
+def test_that_dispatch_check_can_actually_fail():
+    """The control for the scan above: a made-up name must not look served."""
+    source = Path(op.__file__).read_text(encoding="utf-8")
+    assert 'head == "nonesuch"' not in source
+    assert 'head in ("nonesuch"' not in source
+
+
+def test_a_mistyped_subcommand_is_refused_instead_of_starting_a_session(
+        monkeypatch, capsys):
+    """`operator ls` used to fall through and offer to restart the session.
+
+    The head is not a subcommand and names no running instance, so
+    run_dispatch read it as a copilot argument and started (or offered to
+    restart) a session named after the current directory. A typo is a typo,
+    and the answer to one is a message.
+    """
+    monkeypatch.setattr(op, "migrate_legacy_state", lambda: None)
+    monkeypatch.setattr(op.MUX, "available", lambda: True)
+    monkeypatch.setattr(op.MUX, "has_session", lambda name: False)
+    monkeypatch.setattr(op, "run_dispatch",
+                        lambda args: pytest.fail(f"a typo reached run_dispatch: {args}"))
+
+    assert op._dispatch_command(["ls"]) == 1
+    err = capsys.readouterr().err
+    assert "Unknown subcommand: operator ls" in err
+    assert "operator list" in err
+
+
+@pytest.mark.parametrize("typo,expected", [
+    ("ls", "list"),
+    ("lst", "list"),
+    ("stopp", "stop"),
+    ("repot", "report"),
+    ("joim", "join"),
+    ("inbxo", "inbox"),
+    ("hepl", "help"),
+    ("LIST", "list"),
+    ("sto", "stop"),
+    ("log", "logs"),
+    ("verison", "version"),
+    ("sedn", "send"),
+    ("status", "list"),
+    ("kill", "stop"),
+])
+def test_the_suggestion_names_the_subcommand_that_was_meant(typo, expected):
+    assert expected in op._subcommand_suggestions(typo)
+
+
+def test_a_tie_is_reported_rather_than_broken_arbitrarily():
+    """`sto` truncates three subcommands and none of them is the answer.
+
+    difflib's own tie-break is alphabetical, which is how the first version of
+    this answered `logs` to `ls` -- the exact mistake it was written for. All
+    the candidates are offered instead of one invented winner.
+    """
+    assert op._subcommand_suggestions("sto") == [
+        "stop", "stop-loop", "stop-session"]
+
+
+def test_every_alias_names_a_real_subcommand():
+    """An alias pointing at nothing would advise a command that does not exist.
+
+    The aliases are the hand-written part of the guard, so they are the part
+    that can rot when a subcommand is renamed.
+    """
+    for alias, target in op.SUBCOMMAND_ALIASES.items():
+        assert target in op.SUBCOMMANDS, f"{alias} -> {target}"
+
+
+def test_no_alias_is_itself_a_subcommand():
+    """An alias for a real subcommand is dead code: the dispatcher matches the
+    word first and the suggestion is never reached."""
+    assert not set(op.SUBCOMMAND_ALIASES) & set(op.SUBCOMMANDS)
+
+
+@pytest.mark.parametrize("word", ["quit", "exit", "cat", "tail"])
+def test_the_aliases_that_were_removed_stay_removed(word):
+    """A tripwire, and the reason is the whole point of it.
+
+    `quit` and `exit` pointed at `stop`, and bare `operator stop` kills every
+    managed instance on the machine without asking -- so the suggestion turned
+    "let me out of this one" into "stop everybody's agents", which is the harm
+    this guard exists to prevent, arriving as advice. `cat` and `tail` pointed
+    at `logs`, which reports sizes and prunes old files and cannot display a
+    log at all.
+
+    Both are the kind of entry that looks obviously right when you add it.
+    """
+    assert word not in op.SUBCOMMAND_ALIASES
+
+
+@pytest.mark.parametrize("word", [
+    "copilot-tools", "book-translator", "prism", "my-instance",
+    "write the tests", "",
+    # Every one of these was refused by the first version of this guard, which
+    # scored difflib ratios against a 0.6 cutoff. Three reviewers found them
+    # independently, so they are pinned as the regression set.
+    "refactor",     # -> restore, 0.67
+    "read",         # -> reload, 0.80
+    "hello",        # -> help, 0.67
+    "test",         # -> ingest, 0.60
+    "myproject",    # -> projects, 0.82: the documented quick-join
+    "resume", "triage", "sort", "format", "release", "port", "state",
+    "report-gen", "restore-db", "tabs-ui", "list-view", "send-it",
+    "implement", "review", "explain", "summarize", "investigate",
+    # And these by the second, which had a prefix rule with no length floor.
+    # Each is an ordinary first word of a sentence and a prefix of a real
+    # subcommand: `operator in the parser, rename x` has to keep working.
+    "i", "in", "re", "he", "me", "se", "to", "st", "lo", "ta", "pr", "fo",
+])
+def test_a_word_that_resembles_no_subcommand_is_left_alone(word):
+    """`operator [copilot-args...]` is documented; a prompt may be any word.
+
+    These are the shapes that must keep working: instance names, and a
+    prompt handed straight to copilot.
+    """
+    assert op._subcommand_suggestions(word) == []
+
+
+@pytest.mark.parametrize("name", [
+    # Exactly two characters longer than the subcommand each one resembles,
+    # which is the boundary the property actually turns on. An earlier version
+    # of this test used `list-view` and `report-gen` -- five and six characters
+    # longer -- so `_one_edit_apart` rejected them on the length bail alone and
+    # widening the edit threshold to two left the test green. The population
+    # was doing no work.
+    "list-v", "logsxy", "stopxy", "menuxy", "joinxy", "tabsxy", "sendxy",
+    "helpxy", "tracexy", "restorexy",
+])
+def test_a_name_two_characters_longer_than_a_subcommand_is_never_refused(name):
+    """The property that keeps project names out of the guard's way.
+
+    A prefix is never longer than what it prefixes, and one edit cannot span a
+    length gap of two. So a name at least two characters longer than
+    everything it resembles is structurally safe, which is the shape almost
+    every real instance name has.
+    """
+    assert op._subcommand_suggestions(name) == []
+
+
+def test_the_length_boundary_is_exactly_one_character():
+    """The control for the property above -- it must not hold vacuously.
+
+    If the guard stopped firing altogether, every name in that list would pass
+    and the test would still be green. `menus` is one edit from `menu` and has
+    to be caught, which is what proves the population above was chosen rather
+    than the predicate being dead.
+    """
+    assert op._subcommand_suggestions("menus") == ["menu"]
+    assert op._subcommand_suggestions("menuss") == []
+
+
+def test_the_prefix_rule_has_a_length_floor():
+    """Two characters is not evidence, three is.
+
+    The boundary asserted from both sides so that raising or lowering
+    MIN_PREFIX_LENGTH cannot pass silently.
+    """
+    assert op._subcommand_suggestions("re") == []
+    assert op._subcommand_suggestions("rel") == ["reload"]
+    assert op.MIN_PREFIX_LENGTH == 3
+
+
+def test_an_exact_subcommand_suggests_only_itself_and_its_extensions():
+    """Unreachable from the dispatcher, which answers an exact subcommand
+    first -- pinned so that if it ever does become reachable, the behaviour is
+    a decision somebody made rather than one that fell out.
+
+    `stop` is its own zero-edit match and the prefix of two more.
+    """
+    assert op._subcommand_suggestions("list") == ["list"]
+    assert op._subcommand_suggestions("stop") == [
+        "stop", "stop-loop", "stop-session"]
+
+
+def test_a_typo_with_further_arguments_is_refused_too(monkeypatch, capsys):
+    """`operator stopp NAME` is the more dangerous shape, not a lesser one.
+
+    The single-token form was what got reported, but a typo carrying an
+    argument reaches run_dispatch the same way and starts a session with both
+    words handed to copilot.
+    """
+    monkeypatch.setattr(op, "migrate_legacy_state", lambda: None)
+    monkeypatch.setattr(op.MUX, "available", lambda: True)
+    monkeypatch.setattr(op.MUX, "has_session", lambda name: False)
+    monkeypatch.setattr(op, "run_dispatch",
+                        lambda args: pytest.fail("a typo reached run_dispatch"))
+
+    assert op._dispatch_command(["stopp", "copilot-tools"]) == 1
+    assert "operator stop" in capsys.readouterr().err
+
+
+def test_a_running_instance_is_still_joined_even_if_it_looks_like_a_typo(
+        monkeypatch):
+    """The refusal must not have swallowed the join shortcut.
+
+    An instance really named `lst` is attached to, because the shortcut runs
+    first and returns; the suggestion is only reached when nothing is there.
+    """
+    attached = []
+    monkeypatch.setattr(op, "migrate_legacy_state", lambda: None)
+    monkeypatch.setattr(op.MUX, "available", lambda: True)
+    monkeypatch.setattr(op.MUX, "has_session", lambda name: True)
+    monkeypatch.setattr(op.MUX, "attach", lambda name: attached.append(name))
+    monkeypatch.setattr(op, "set_tab_title", lambda title: None)
+    monkeypatch.setattr(op, "set_tab_progress", lambda state: None)
+    monkeypatch.setattr(op, "_running_loop_pid", lambda instance: None)
+    monkeypatch.setattr(op, "run_dispatch",
+                        lambda args: pytest.fail("the join shortcut was lost"))
+
+    assert op._dispatch_command(["lst"]) == 0
+    assert attached
+
+
+@pytest.mark.parametrize("argv", [
+    ["refactor", "the", "parser"],
+    ["read", "AGENTS.md", "and", "summarise", "it"],
+    ["myproject"],
+    ["test"],
+    ["hello"],
+])
+def test_an_ordinary_prompt_still_reaches_run_dispatch(monkeypatch, argv):
+    """The refusal is narrow: anything unlike a subcommand passes through.
+
+    The argv is *split*, as a shell hands it over. The first version of this
+    test passed `["refactor the parser"]` as a single token -- a shape the
+    command line cannot produce -- and the 19-character head resembled no
+    subcommand, so the test passed while the real invocation was refused. It
+    was the argument shape, not the assertion, that hid the regression.
+    """
+    seen = []
+    monkeypatch.setattr(op, "migrate_legacy_state", lambda: None)
+    monkeypatch.setattr(op.MUX, "available", lambda: True)
+    monkeypatch.setattr(op.MUX, "has_session", lambda name: False)
+    monkeypatch.setattr(op, "run_dispatch", lambda args: seen.append(args) or 0)
+
+    assert op._dispatch_command(list(argv)) == 0
+    assert seen == [list(argv)]
+
+
+def test_a_flag_is_never_read_as_a_mistyped_subcommand(monkeypatch):
+    """`--loop` and friends belong to run_dispatch and must reach it."""
+    seen = []
+    monkeypatch.setattr(op, "migrate_legacy_state", lambda: None)
+    monkeypatch.setattr(op.MUX, "available", lambda: True)
+    monkeypatch.setattr(op, "run_dispatch", lambda args: seen.append(args) or 0)
+
+    assert op._dispatch_command(["--loop", "--name", "x"]) == 0
+    assert seen == [["--loop", "--name", "x"]]
+
+
 def test_stop_unknown_instance_reports_error(monkeypatch, capsys):
     monkeypatch.setattr(op.MUX, "available", lambda: False)
     assert op.stop_operator("ghost") == 1

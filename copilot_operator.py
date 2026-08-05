@@ -121,10 +121,54 @@ EXIT_NO_PROGRESS = 3
 # killing the sessions" -- and a reader who cannot tell them apart will act on
 # the wrong one.
 EXIT_UNACCOUNTED = 4
-RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
-                  "version", "forget", "logs", "tabs", "restore",
-                  "stop-loop", "stop-session", "restart-loop", "menu",
-                  "trace", "projects"}
+
+# Every word `_dispatch_command` answers to itself, rather than reading as an
+# instance name or handing on to copilot. This tuple is the single source of
+# truth: `RESERVED_WORDS` is derived from it and the did-you-mean suggestion
+# is measured against it.
+#
+# It is one list because the hand-maintained second copy had already drifted:
+# `send` and `inbox` are dispatched here and were missing from the set that
+# decides what is not an instance name. Nothing broke, because both are
+# matched before the shortcut is reached -- which is exactly the kind of
+# silence that lets the next omission be a real one.
+SUBCOMMANDS = ("help", "version", "list", "menu", "projects", "report",
+               "ingest", "stop", "stop-loop", "restart-loop", "stop-session",
+               "join", "reload", "forget", "send", "inbox", "logs", "trace",
+               "tabs", "restore")
+
+RESERVED_WORDS = set(SUBCOMMANDS)
+
+#: Words that mean a subcommand here but are spelled for a different tool.
+#:
+#: These are not typos and no edit distance reaches them: somebody typing
+#: ``ls`` has spelled what they meant correctly, in the wrong language. That
+#: makes them the one part of the typo guard that has to be enumerated by
+#: hand, and the list is deliberately short -- an alias is a guess about
+#: intent, and a wrong guess sends the reader somewhere that does not do what
+#: they asked.
+#:
+#: Two rules for adding one, both learned from entries that were removed:
+#:
+#: - The target must *do the thing the other tool's word names*. ``cat`` and
+#:   ``tail`` were here pointing at ``logs``, which reports sizes and prunes
+#:   old files and cannot display a log at all. An alias that misses by that
+#:   much is worse than no suggestion, because it is confident.
+#: - The target must not be *more destructive than the word*. ``quit`` and
+#:   ``exit`` were here pointing at ``stop``, and bare ``operator stop`` kills
+#:   every managed instance on the machine without asking. Somebody typing
+#:   ``quit`` means "let me out of this one", and answering it with a command
+#:   that stops everybody else's agents too is the exact harm this guard was
+#:   built to prevent, arriving by the front door.
+SUBCOMMAND_ALIASES = {
+    "ls": "list",          # every unix shell
+    "ll": "list",
+    "ps": "list",          # what is running
+    "dir": "list",         # cmd.exe
+    "sessions": "list",
+    "status": "list",      # `list` is the "what is running" view
+    "kill": "stop",        # a synonym, not an escalation: both take a target
+}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
@@ -5488,6 +5532,105 @@ def main(argv: list[str] | None = None) -> int:
     return rc
 
 
+#: The shortest word the prefix rule will act on.
+#:
+#: Two characters is not evidence of intent. ``in``, ``re``, ``he`` and ``me``
+#: are all prefixes of a subcommand and all ordinary first words of a sentence,
+#: so a prefix rule without a floor refuses ``operator in the parser, rename
+#: x`` -- a working invocation, taken away to guess at a typo nobody made.
+#: Three costs nothing here: the two-letter mistake this guard exists for,
+#: ``ls``, is not a prefix of ``list`` at all and is caught by the alias table.
+MIN_PREFIX_LENGTH = 3
+
+
+def _one_edit_apart(word: str, candidate: str) -> bool:
+    """True when at most one insertion, deletion, substitution or transposition
+    of adjacent characters turns ``word`` into ``candidate``.
+
+    At *most* one, so an identical pair is also true. Nothing calls it that
+    way -- the dispatcher answers an exact subcommand long before this -- but
+    the name says "apart" and a future caller would be entitled to read that
+    as "and not equal", so it is written down rather than left to be found.
+
+    Damerau-Levenshtein rather than plain Levenshtein because a transposition
+    is one slip of the fingers and two ordinary edits, and transposition is
+    the single most common typing mistake there is: ``jion``, ``sedn`` and
+    ``verison`` are all one flipped pair from a real subcommand and would
+    otherwise need a threshold of two, which is wide enough to swallow real
+    words (``test`` is two edits from ``list``).
+    """
+    if abs(len(word) - len(candidate)) > 1:
+        return False
+    previous: dict[tuple[int, int], int] = {}
+    for i in range(-1, len(word)):
+        previous[(i, -1)] = i + 1
+    for j in range(-1, len(candidate)):
+        previous[(-1, j)] = j + 1
+    for i, a in enumerate(word):
+        for j, b in enumerate(candidate):
+            cost = 0 if a == b else 1
+            best = min(previous[(i - 1, j)] + 1,
+                       previous[(i, j - 1)] + 1,
+                       previous[(i - 1, j - 1)] + cost)
+            if i and j and a == candidate[j - 1] and word[i - 1] == b:
+                best = min(best, previous[(i - 2, j - 2)] + cost)
+            previous[(i, j)] = best
+    return previous[(len(word) - 1, len(candidate) - 1)] <= 1
+
+
+def _subcommand_suggestions(word: str) -> list[str]:
+    """The subcommands ``word`` is plausibly a mistyping of, in declared order.
+
+    Three rules, and the narrowness of all three is the point. This predicate
+    decides whether a word is refused instead of being handed to copilot as a
+    prompt, and ``operator [copilot-args...]`` is documented -- so every word
+    it claims wrongly is a working invocation taken away.
+
+    - **A prefix, of at least MIN_PREFIX_LENGTH characters.** ``sto`` and
+      ``log`` are truncations of something real. A prefix is necessarily no
+      longer than what it prefixes, which is what keeps instance names safe:
+      ``list-view`` and ``report-gen`` are longer than every subcommand they
+      resemble, so no name longer than the thing it looks like can be refused
+      by this rule at all.
+    - **One edit away**, the classic single-slip model, and the reason a count
+      is right here where a similarity ratio was not. It cannot span a length
+      gap of two, so it protects longer names for the same reason.
+    - **A word from another tool.** ``ls`` is not a typo of ``list``; it is
+      correct spelling from a different program, and no distance measure will
+      ever connect them. Those are enumerated in SUBCOMMAND_ALIASES rather
+      than guessed at, and consulted only when the other two rules found
+      nothing.
+
+    Together those two length properties are the whole safety argument for
+    project names: **a word two or more characters longer than a subcommand
+    can never be refused because of it.** Almost every real instance name has
+    that shape.
+
+    An earlier version scored ``difflib.SequenceMatcher`` ratios with a 0.6
+    cutoff, and three reviewers independently rejected it: a ratio measures
+    shared characters in any order, so it refused ``refactor`` (``restore``),
+    ``read`` (``reload``), ``hello`` (``help``), ``test`` (``ingest``) and --
+    worst -- ``myproject``, the documented quick-join, against ``projects``.
+    Ten of thirty ordinary one-word prompts were refused. These rules refuse
+    two, ``lint`` and ``end``, each genuinely one keystroke from a subcommand.
+
+    All matches are returned rather than one winner. ``sto`` truncates three
+    different subcommands and ``difflib``'s own tie-break is alphabetical,
+    which would have answered ``logs`` to ``ls`` -- the exact mistake this was
+    written for. There is no limit because there is no honest way to choose
+    which of a set of equally good answers to hide.
+    """
+    word = word.lower()
+    if not word:
+        return []
+    matches = [candidate for candidate in SUBCOMMANDS
+               if (len(word) >= MIN_PREFIX_LENGTH and candidate.startswith(word))
+               or _one_edit_apart(word, candidate)]
+    if not matches and word in SUBCOMMAND_ALIASES:
+        matches = [SUBCOMMAND_ALIASES[word]]
+    return matches
+
+
 def _dispatch_command(args: list[str]) -> int:
     migrate_legacy_state()
 
@@ -5553,6 +5696,29 @@ def _dispatch_command(args: list[str]) -> int:
             set_tab_progress(TAB_LOOPING if _running_loop_pid(candidate) else TAB_STEADY)
             MUX.attach(candidate.session)
             return 0
+
+    # Everything above has returned, so `head` is not a subcommand and does
+    # not name a running instance. `run_dispatch` would read it as a copilot
+    # argument and start a session named after the current directory -- so
+    # `operator ls` does not report that `ls` is spelled `list`, it offers to
+    # restart whatever is running here, and against a name that is *not*
+    # running it starts a real session with no prompt at all.
+    #
+    # An unknown subcommand is a typing mistake, and the answer to a typing
+    # mistake is a message rather than a state change. Only a head that is
+    # close to a real subcommand is refused: `operator [copilot-args...]` is
+    # documented, so an unrecognisable word is still passed through as a
+    # prompt. This mirrors the refusal `operator projects <typo>` already
+    # gives one level down.
+    if not head.startswith("-"):
+        suggestions = _subcommand_suggestions(head)
+        if suggestions:
+            names = " or ".join(f"`operator {name}`" for name in suggestions)
+            print(f"Unknown subcommand: operator {head}", file=sys.stderr)
+            print(f"Did you mean {names}?", file=sys.stderr)
+            print(f"(To pass it to copilot instead, name the instance: "
+                  f"`operator --name NAME {head}`.)", file=sys.stderr)
+            return 1
 
     return run_dispatch(args)
 
