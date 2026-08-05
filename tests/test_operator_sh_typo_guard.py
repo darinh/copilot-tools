@@ -208,6 +208,34 @@ def test_a_mistyped_subcommand_is_refused_rather_than_run(word, expected, tmp_pa
 
 
 @bash
+@pytest.mark.parametrize("argv, expected", [
+    (["ls", "-la"], "list"),
+    (["jion", "payments-api"], "join"),
+    (["hepl", "me"], "help"),
+    (["reprot", "costs"], "report"),
+])
+def test_a_mistyped_subcommand_is_refused_whatever_follows_it(argv, expected, tmp_path):
+    """`operator ls -la` is the same mistake as `operator ls`.
+
+    The positional join shortcut above this guard *is* gated on a single
+    argument, because `operator foo bar` cannot be a request to attach to
+    `foo`. Copying that gate down into the guard is the obvious-looking
+    simplification and it is wrong: `operator reprot costs` is a typed
+    subcommand with its own argument, and gating would hand the whole line to
+    copilot as a prompt.
+
+    This started as a claim in a comment with no test under it, and a mutation
+    that added `$# -eq 1` to the guard's condition survived the entire rest of
+    this file.
+    """
+    proc = _dispatch(argv, tmp_path)
+    assert _launched(proc) is None, (
+        f"operator.sh {argv} started a session: {proc.stdout!r}")
+    assert proc.returncode == 1
+    assert f"`operator {expected}`" in proc.stderr, proc.stderr
+
+
+@bash
 def test_the_refusal_precedes_the_dependency_checks(tmp_path):
     """`operator ls` on a box without tmux still says `ls` is spelled `list`.
 
@@ -556,6 +584,14 @@ def test_no_alias_is_reachable_by_the_distance_rules():
     reads as intent, and it hides a real question: if `stauts` is meant to
     reach `list`, the alias table cannot do it, because aliases are matched
     exactly and `status` is not a subcommand here.
+
+    This also carries the argument for a mutant that survives deliberately.
+    Making `subcommand_suggestions` consult the alias table unconditionally --
+    dropping the `${#matches[@]} -eq 0` gate -- changes no answer, because the
+    only word that could gain a duplicate suggestion is one matched by *both*
+    a distance rule and the table, and this test is the statement that no such
+    word exists. The gate is an optimisation and a statement of intent rather
+    than a behaviour, and it is only equivalent for as long as this passes.
     """
     redundant = {word: _python_reference(word) for word in aliases()
                  if [c for c in subcommands()
