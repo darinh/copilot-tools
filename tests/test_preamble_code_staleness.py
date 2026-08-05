@@ -350,3 +350,58 @@ def test_a_failed_check_degrades_to_unknown_rather_than_current():
         assert op._launch_code_state() == op.CODE_UNKNOWN
     finally:
         op.own_code_state = original
+
+
+# ── why `operator reload` is not this ───────────────────────────
+#
+# `reload` re-generates an instance's launch spec from a fresh process, so it
+# is a reasonable guess at the remedy for a stale supervisor. It is not, for
+# three separate reasons, and the first two are established below rather than
+# argued. The third is structural: `reload` is a *remedy*, and applying it
+# requires already knowing the supervisor is behind -- which is precisely what
+# nobody knew for 355 launches. Detection is not the same as cure, and the
+# cure here remains `restart-loop`.
+
+
+def test_reload_cannot_write_the_clause_that_was_wrong(tmp_path):
+    """`reload_instance` builds its preamble with no crash-recovery argument,
+    so a reloaded spec never contains that claim at all. It cannot correct a
+    sentence it is structurally incapable of writing."""
+    inst = op.Instance("reloaded-claim")
+    op.write_launch_spec(
+        inst, ["copilot", "--agent", "a:b", "-i", "old"], tmp_path, 1)
+
+    assert op.reload_instance("reloaded-claim") == 0
+
+    written = json.loads(inst.spec_file.read_text(encoding="utf-8"))["argv"][-1]
+    assert "blanket human approval" in written, "control: reload did write a preamble"
+    assert "handoff file could not be found" not in written
+
+
+def test_a_loop_launch_overwrites_the_spec_that_reload_wrote(tmp_path, monkeypatch):
+    """In loop mode `reload`'s work does not survive to be read.
+
+    The supervisor builds its own preamble per launch and `start_session`
+    rewrites the spec from it, so the next launch replaces whatever `reload`
+    put there -- with text built by the same stale code. `reload` serves the
+    non-loop path, where the spec is what the runner actually reads.
+    """
+    inst = op.Instance("reloaded-spec")
+    op.write_launch_spec(
+        inst, ["copilot", "--agent", "a:b", "-i", "old"], tmp_path, 1)
+    assert op.reload_instance("reloaded-spec") == 0
+    reloaded = json.loads(inst.spec_file.read_text(encoding="utf-8"))["argv"][-1]
+    assert "blanket human approval" in reloaded, "control: reload did write a preamble"
+
+    monkeypatch.setattr(op, "copilot_executable", lambda: "copilot")
+    monkeypatch.setattr(op.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(op.Instance, "copilot_pid", lambda self: 4321)
+    monkeypatch.chdir(tmp_path)
+
+    op.start_session(inst, ["--agent", "a:b"], 2, remain_on_exit=True,
+                     preamble="built by the supervisor that is running")
+
+    argv = json.loads(inst.spec_file.read_text(encoding="utf-8"))["argv"]
+    assert "built by the supervisor that is running" in argv
+    assert reloaded not in argv, \
+        "the launch spec reload wrote was replaced, not read"
