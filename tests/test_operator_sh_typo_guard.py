@@ -35,6 +35,17 @@ produced tests that passed while testing nothing:
   +6 characters long, which the length bail rejects instantly -- so widening
   the edit threshold left the whole population green. The inputs here are
   exactly +2.
+
+Backlog item 9 added a second refusal to the same branch and is tested here
+too. `send`, `inbox`, `restart-loop` and ten more are spelled *correctly*, for
+the other program that answers the word `operator`, so no edit distance
+reaches them and the guard above cannot help: they fell through to the launch
+path exactly as `ls` did, and `operator inbox copilot-tools` started a copilot
+session named `inbox`. `test_the_python_only_list_is_what_the_two_dispatches_differ_by`
+is the load-bearing one there, for the same reason the parity test is
+load-bearing here -- the list in the shell is a hand-transcribed copy of a set
+that lives in `copilot_operator.py`, so it is derived and compared rather than
+read for plausibility.
 """
 
 from __future__ import annotations
@@ -65,13 +76,21 @@ _LAUNCHED = 7
 #: nothing, and the guard silently could not fire. The probe was measuring its
 #: own stub. A test built on that helper would have passed against an
 #: `operator.sh` with the guard deleted.
-_REAL = ("main", "subcommand_suggestions", "one_edit_apart", "is_reserved_word")
+_REAL = ("main", "subcommand_suggestions", "one_edit_apart", "is_reserved_word",
+         # `in_list` is what the backlog-9 refusal asks whether a word is
+         # Python-only. Left to `_shell_helper_names()`'s blanket stub it
+         # returns 0 for everything, so *every* first argument would be
+         # refused as Python-only and the tests below would pass against a
+         # script with no such list at all -- the same "measuring its own
+         # stub" failure documented above, one function along.
+         "in_list")
 
 #: Constants the real functions read. Extracted from the shipped script rather
 #: than restated, so a test cannot go on passing against a value the script no
 #: longer holds.
 _CONSTANTS = ("SUBCOMMANDS", "RESERVED_WORDS", "MIN_PREFIX_LENGTH",
-              "SUBCOMMAND_ALIAS_WORDS", "SUBCOMMAND_ALIAS_TARGETS")
+              "SUBCOMMAND_ALIAS_WORDS", "SUBCOMMAND_ALIAS_TARGETS",
+              "PYTHON_ONLY_SUBCOMMANDS")
 
 
 def _script_text() -> str:
@@ -119,6 +138,18 @@ def min_prefix_length() -> int:
     return int(match.group(1))
 
 
+def python_only_subcommands() -> tuple[str, ...]:
+    """The words `operator.sh` refuses by naming the Python operator."""
+    match = re.match(r'^PYTHON_ONLY_SUBCOMMANDS="([^"]*)"$',
+                     _assignment("PYTHON_ONLY_SUBCOMMANDS"))
+    assert match, ("PYTHON_ONLY_SUBCOMMANDS is no longer a plain "
+                   "double-quoted word list on one line")
+    words = tuple(match.group(1).split())
+    assert words, ("PYTHON_ONLY_SUBCOMMANDS is empty, so every refusal test "
+                   "below is vacuous")
+    return words
+
+
 def _probe_script() -> str:
     """A runnable `operator.sh` reduced to its dispatch and its typo guard."""
     stubs = "\n".join(f"{name}() {{ return 0; }}"
@@ -131,6 +162,11 @@ def _probe_script() -> str:
         # unguarded empty-array expansion into the abort this repo cares about.
         "set -euo pipefail\n"
         "IS_FRESH=false\nSTATE_FILE=state\n"
+        # The refusal added for backlog 9 names `${SCRIPT_DIR}/copilot_operator.py`
+        # when that file is there. Pointing SCRIPT_DIR at the probe's own
+        # directory lets a test choose which of the two messages it gets by
+        # creating the file or not, and keeps the whole probe inside tmp_path.
+        'SCRIPT_DIR="$PWD"\n'
         f"{constants}\n{stubs}\n"
         # `command -v` finds a shell function, so main's dependency checks pass
         # on a machine with none of these installed. `tmux` returns 1 so that
@@ -275,6 +311,113 @@ def test_the_refusal_precedes_the_dependency_checks(tmp_path):
     assert "is required but not found" in control.stderr, (
         "the dependency checks were not actually reached, so the ordering "
         f"assertion above was vacuous: {control.stderr!r}")
+
+
+# ── Backlog 9: words spelled for the other program ──────────────
+
+@bash
+@pytest.mark.parametrize("word", python_only_subcommands())
+def test_a_python_only_subcommand_is_refused_rather_than_run(word, tmp_path):
+    """The defect backlog 9 describes, one word at a time.
+
+    Every one of these reached the launch path: no `case` arm matched, no tmux
+    session was named, and the typo guard cannot help because the word is
+    spelled *correctly* -- for the other program. `operator send` started a
+    copilot session called `send`.
+
+    Parametrised over the list read out of the script rather than over a
+    hand-written copy, so a word added to `PYTHON_ONLY_SUBCOMMANDS` without a
+    working refusal is a red test rather than an untested entry.
+    """
+    (tmp_path / "copilot_operator.py").write_text("", encoding="utf-8")
+    proc = _dispatch([word], tmp_path)
+    assert _launched(proc) is None, (
+        f"operator.sh started a session for {word!r}, which is the defect: "
+        f"{proc.stdout!r}")
+    assert proc.returncode == 1, proc.stderr
+    assert f"`{word}`" in proc.stderr, (
+        f"the refusal does not name the word that was refused: {proc.stderr!r}")
+    assert "copilot_operator.py" in proc.stderr, (
+        "the refusal does not name the entry point that does implement it, "
+        f"which is the whole point of refusing instead of launching: {proc.stderr!r}")
+    # Same escape hatch the typo guard offers, for the same reason: somebody
+    # whose prompt really is the word `trace` needs to be told how to say so in
+    # the message that refused them.
+    assert f"`operator --name NAME {word}`" in proc.stderr, (
+        f"the refusal does not name the way past it: {proc.stderr!r}")
+
+
+@bash
+def test_the_reported_case_reads_a_mailbox_or_says_where_to(tmp_path):
+    """`operator inbox copilot-tools` -- the invocation this repo's own
+    conventions tell every agent to run at the start of work.
+
+    On POSIX it started a copilot session named `inbox` and handed
+    `copilot-tools` to it as a prompt: not an error, not a mailbox, and a
+    mailbox left unread looks exactly like an empty one. Two arguments, so the
+    single-argument join shortcut never applied and nothing above the guard
+    could have caught it.
+    """
+    (tmp_path / "copilot_operator.py").write_text("", encoding="utf-8")
+    proc = _dispatch(["inbox", "copilot-tools"], tmp_path)
+    assert _launched(proc) is None, (
+        f"operator.sh started a session for `inbox`: {proc.stdout!r}")
+    assert proc.returncode == 1
+    assert "copilot_operator.py" in proc.stderr, proc.stderr
+
+
+@bash
+def test_the_refusal_names_a_path_only_when_the_file_is_there(tmp_path):
+    """A command line quoting a path that does not exist is worse than none.
+
+    `operator.sh` is installed on its own often enough that the sibling
+    `copilot_operator.py` cannot be assumed, and "Run: python3
+    /somewhere/copilot_operator.py" sends the reader to a file that is not
+    there. Both branches are asserted, because a message that named the path
+    unconditionally would pass the presence test alone.
+    """
+    (tmp_path / "copilot_operator.py").write_text("", encoding="utf-8")
+    present = _dispatch(["send", "peer", "hello"], tmp_path)
+    assert "Run: python3" in present.stderr, present.stderr
+    # The directory component, not the whole path. Under Git bash `$PWD` is an
+    # MSYS path (`/tmp/pytest-of-.../x`) for a directory pytest names in
+    # Windows syntax (`C:\Users\...\Temp\pytest-of-...\x`), so comparing the
+    # two spellings fails on a difference that is not about the message. The
+    # claim being tested is "a directory was named, not just the file", and
+    # tmp_path's own leaf name carries that on either platform.
+    assert f"{tmp_path.name}/copilot_operator.py" in present.stderr, (
+        f"the refusal did not name the sibling script that is right there: "
+        f"{present.stderr!r}")
+
+    (tmp_path / "copilot_operator.py").unlink()
+    absent = _dispatch(["send", "peer", "hello"], tmp_path)
+    assert absent.returncode == 1, absent.stderr
+    assert "Run: python3" not in absent.stderr, (
+        "the refusal offered a command line for a file that is not there: "
+        f"{absent.stderr!r}")
+    assert "copilot_operator.py" in absent.stderr, (
+        f"the refusal named no entry point at all: {absent.stderr!r}")
+
+
+@bash
+def test_the_python_only_refusal_precedes_the_dependency_checks(tmp_path):
+    """Same ordering argument as the typo guard, and the same blinding.
+
+    `operator inbox` on a box without tmux must say where `inbox` lives, not
+    "Error: tmux is required" -- main exits at the dependency check, so that
+    would be the last thing the reader saw.
+    """
+    blinded = _probe_script().replace(
+        "tmux() { return 1; }\n",
+        "tmux() { return 1; }\ncommand() { return 1; }\n")
+    assert "command() { return 1; }" in blinded, "the injection missed"
+    (tmp_path / "blind.sh").write_text(blinded, encoding="utf-8", newline="\n")
+    proc = subprocess.run([_bash_executable(), "blind.sh", "inbox"], cwd=tmp_path,
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=120)
+    assert "copilot_operator.py" in proc.stderr, (
+        f"the dependency check answered first: {proc.stderr!r}")
+    assert "is required but not found" not in proc.stderr, proc.stderr
 
 
 # ── What must keep working ──────────────────────────────────────
@@ -575,6 +718,85 @@ def test_every_alias_points_at_a_subcommand_this_script_implements():
                if target not in subcommands()}
     assert not unknown, (
         f"these aliases name words operator.sh does not implement: {unknown}")
+
+
+def test_the_python_only_list_is_what_the_two_dispatches_differ_by():
+    """The one list in this file that is *derived* rather than compared.
+
+    `PYTHON_ONLY_SUBCOMMANDS` is a hand-transcribed copy of a set that lives in
+    another file, which is precisely the arrangement that let
+    `copilot_operator.py`'s own `RESERVED_WORDS` drift until it was missing
+    `send` and `inbox`. Nothing broke there, which is what let the omission
+    sit; here, a missing word is the original defect back again -- a
+    correctly-spelled subcommand that starts a copilot session named after
+    itself.
+
+    So the shell's list is not read for plausibility, it is computed: every
+    word the Python operator dispatches and this script does not, no more and
+    no less. Adding a subcommand to `copilot_operator.py` fails here until it
+    is either implemented in the shell or refused by it.
+    """
+    expected = set(op.SUBCOMMANDS) - set(subcommands())
+    assert expected, (
+        "the two dispatches now implement the same words, so this test and "
+        "the refusal it guards have nothing to say -- if that is deliberate, "
+        "PYTHON_ONLY_SUBCOMMANDS and its branch in main() should go")
+    actual = python_only_subcommands()
+    assert len(set(actual)) == len(actual), f"duplicate words: {actual}"
+    assert set(actual) == expected, (
+        "operator.sh's PYTHON_ONLY_SUBCOMMANDS and the Python operator's "
+        "dispatch have drifted:\n"
+        f"  dispatched by copilot_operator.py, not listed or implemented here: "
+        f"{sorted(expected - set(actual))}\n"
+        f"  listed here, dispatched by neither: {sorted(set(actual) - expected)}")
+
+
+def test_the_help_text_says_where_the_other_subcommands_live():
+    """`operator help` must name them too, or the refusal is the only way to
+    find out -- and finding out by being refused means you already ran it.
+
+    Executed rather than pattern-matched. The list reaches the help text
+    through an *unquoted* heredoc, which is one apostrophe away from being
+    printed as the literal `${PYTHON_ONLY_SUBCOMMANDS}`, and a static check
+    for the variable name would read that as a pass.
+    """
+    script = (
+        "set -euo pipefail\n"
+        + _assignment("PYTHON_ONLY_SUBCOMMANDS") + "\n"
+        + f"show_help() {{\n{_shell_function('show_help')}}}\nshow_help\n")
+    proc = subprocess.run([_bash_executable(), "-c", script],
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert "${PYTHON_ONLY_SUBCOMMANDS}" not in proc.stdout, (
+        "the help text prints the variable name instead of its value, so the "
+        "heredoc that carries it has been quoted")
+    missing = [w for w in python_only_subcommands() if w not in proc.stdout]
+    assert not missing, (
+        f"`operator help` does not mention {missing}, which this script "
+        "refuses without implementing")
+
+
+def test_the_two_refusals_cannot_both_claim_a_word():
+    """`main` checks the Python-only list first; today nothing needs it to.
+
+    Two refusals sit in one branch and answer differently -- one names
+    `copilot_operator.py`, the other suggests a nearer spelling -- so a word
+    both could claim would get whichever ran first. The order is a statement
+    of precedence rather than a behaviour anything depends on, and this is the
+    statement: no word is in both populations. A future subcommand that broke
+    it (`stop-loop` is already one edit from nothing, but `repost` would not
+    be) should fail here and be thought about, rather than silently getting the
+    answer that happens to be written above the other.
+    """
+    both = sorted(set(python_only_subcommands()) & set(subcommands()))
+    assert not both, (
+        f"these words are both implemented here and refused as Python-only: {both}")
+    reachable = {word: _python_reference(word) for word in python_only_subcommands()
+                 if _python_reference(word)}
+    assert not reachable, (
+        "the typo guard also claims these Python-only words, so which refusal "
+        f"answers is decided by the order of two branches: {reachable}")
 
 
 def test_no_alias_is_reachable_by_the_distance_rules():

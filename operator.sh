@@ -852,6 +852,19 @@ FILES
 DEPENDENCIES
     tmux, sqlite3, python3, copilot
 HELP
+    # Unquoted heredoc, so the word list is the same string the refusal in
+    # main() consults. Written out rather than restated: a help text that
+    # named these by hand is a second copy, and the whole reason the refusal
+    # exists is that a word can be a real subcommand somewhere and silently
+    # not one here.
+    cat << HELP
+ELSEWHERE
+    These are subcommands of the Python operator (copilot_operator.py), not
+    of this script. Asking for one here reports where it lives rather than
+    starting a session:
+
+        ${PYTHON_ONLY_SUBCOMMANDS}
+HELP
 }
 
 stop_operator() {
@@ -1254,6 +1267,35 @@ run_loop_mode() {
 SUBCOMMANDS="stop list report ingest help join reload"
 RESERVED_WORDS="$SUBCOMMANDS"
 
+#: Words the Python operator dispatches and this script does not.
+#
+# Backlog 9. These are not typos and the guard above cannot reach them: they
+# are spelled correctly, for the *other* program that answers the word
+# `operator`. Without an arm here they matched no `case`, named no running
+# session, and reached the launch path -- so `operator inbox copilot-tools`
+# on Linux or macOS started a copilot session named `inbox` and passed
+# `copilot-tools` to it as a prompt. It did not read a mailbox and it did not
+# report an error, which is the failure direction that costs the most: this
+# repository's own conventions tell every agent to run `operator inbox` at the
+# start of work, so the mailbox stays unread while looking exactly like an
+# empty one.
+#
+# Refusing rather than forwarding. `exec python3 copilot_operator.py "$@"`
+# would reach parity for free and is deliberately not done: it makes this
+# script a proxy for the other one, which is the product decision backlog 9
+# says should be made deliberately rather than by accretion, and it fails
+# confusingly wherever `copilot_operator.py` is absent or its dependencies are
+# not installed. A refusal that names the entry point turns a silent wrong
+# action into a recoverable one and commits to nothing.
+#
+# Hand-transcribed from `copilot_operator.py`'s SUBCOMMANDS, which is exactly
+# the arrangement that let that file's own second copy drift -- so
+# `tests/test_operator_sh_typo_guard.py` derives this set as
+# `python SUBCOMMANDS - shell SUBCOMMANDS` and fails when the two disagree. A
+# subcommand added to the Python operator is then a red test here rather than
+# a word that silently starts a session again.
+PYTHON_ONLY_SUBCOMMANDS="version menu projects stop-loop restart-loop stop-session forget send inbox logs trace tabs restore"
+
 #: Words that mean a subcommand here but are spelled for a different tool.
 #
 # Not typos, and no edit distance reaches them: somebody typing `ls` has
@@ -1537,9 +1579,10 @@ main() {
     #
     # An unknown subcommand is a typing mistake, and the answer to a typing
     # mistake is a message rather than a state change. Only a first argument
-    # close to a real subcommand is refused: `operator [copilot-args...]` is
-    # documented, so an unrecognisable word is still passed through as a
-    # prompt.
+    # close to a real subcommand -- or spelled correctly for the Python
+    # operator, which is backlog 9 and the first branch below -- is refused:
+    # `operator [copilot-args...]` is documented, so an unrecognisable word is
+    # still passed through as a prompt.
     #
     # Ahead of the tmux/sqlite3/python3 checks below on purpose. A typo is
     # answerable without any of them, and reporting a missing dependency to
@@ -1558,6 +1601,32 @@ main() {
     # mean" naming the word the user typed correctly.
     local first_arg="${1:-}"
     if [[ -n "$first_arg" && "$first_arg" != -* ]] && ! is_reserved_word "$first_arg"; then
+        # Backlog 9. Checked before the "did you mean" rules, and by exact
+        # match rather than by distance: a word this script does not implement
+        # but the Python operator does is not a guess, it is a fact, and an
+        # answer that names the entry point beats one that suggests the
+        # nearest word spelled differently. No word is in both lists today --
+        # `test_the_two_refusals_cannot_both_claim_a_word` is what keeps that
+        # true -- so the order is a statement of precedence rather than a
+        # behaviour anything currently depends on.
+        if in_list "$first_arg" $PYTHON_ONLY_SUBCOMMANDS; then
+            echo "operator.sh does not implement \`$first_arg\`;" \
+                 "the Python operator does." >&2
+            # Named only when it is actually there. operator.sh is often
+            # installed on its own, and a command line quoting a path that
+            # does not exist is worse than one that names the file to go and
+            # find.
+            if [[ -f "${SCRIPT_DIR:-}/copilot_operator.py" ]]; then
+                echo "Run: python3 \"${SCRIPT_DIR}/copilot_operator.py\"" \
+                     "$first_arg [arguments...]" >&2
+            else
+                echo "Run it with the Python operator (\`copilot_operator.py\`)" \
+                     "instead of this script." >&2
+            fi
+            echo "(To pass it to copilot instead, name the instance:" \
+                 "\`operator --name NAME $first_arg\`.)" >&2
+            exit 1
+        fi
         local suggestions
         # Word-split on purpose. Every subcommand is a single word of lowercase
         # letters, so there is nothing here to split wrongly or to glob.
