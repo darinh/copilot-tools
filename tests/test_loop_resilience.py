@@ -452,6 +452,78 @@ def test_a_restart_request_seen_after_the_session_is_gone_is_traced(
         "not be counted toward the give-up limit")
 
 
+def test_an_unreadable_restart_probe_is_traced_as_unknown(
+        monkeypatch, tmp_path):
+    """"Not there" and "could not look" must not be the same record.
+
+    `marker_set` answers False for both, which is correct for the branch --
+    one more poll is cheap -- but the old call wrote that same False into the
+    trace, so a probe that failed was filed as a definite absence. That is the
+    first defect in this file wearing different clothes: a reader cannot
+    recover the difference afterwards, and the whole point of the record is to
+    be read later by somebody who was not there.
+    """
+    import json
+
+    import operator_trace
+
+    inst = op.Instance("unreadable-restart")
+    real_present = op.path_present
+    monkeypatch.setattr(
+        op, "path_present",
+        lambda p: None if Path(p) == inst.restart_marker else real_present(p))
+
+    def script(n, instance):
+        instance.exit_file.write_text("0", encoding="utf-8")
+        if n > 1:
+            instance.stop_marker.touch()
+
+    _loop_with_handoff(monkeypatch, tmp_path / "next-session.md", script)
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    exits = [json.loads(x) for x in
+             operator_trace.trace_path(op.OPERATOR_HOME)
+             .read_text(encoding="utf-8").splitlines()
+             if json.loads(x).get("event") == "session_exit"]
+
+    assert exits, "the ending must still be recorded"
+    assert exits[0]["markers"]["restart"] is None, (
+        "an unreadable probe must be recorded as 'nobody could tell', not as "
+        "the absence the branch had to assume to keep polling")
+    assert exits[0]["markers"]["stop"] is False, (
+        "the readable probes must still record their real answer -- without "
+        "this the assertion above would also pass if every marker went null")
+
+
+def test_a_continued_run_without_a_resume_id_still_has_a_predecessor(
+        monkeypatch, tmp_path):
+    """A missing resume id does not mean there was no previous session.
+
+    The verdict is gated on there having been a predecessor to ask about, and
+    that was read off `resume_id` -- which is only written when the previous
+    session reported an id that parses as a UUID. A run five sessions deep
+    whose id went missing would be treated as a first launch, and the crash
+    note it exists to give would be skipped exactly once, on the relaunch most
+    likely to be following something that went wrong.
+    """
+    handoff = tmp_path / "next-session.md"  # absent: the predecessor left none
+
+    def script(n, instance):
+        instance.exit_file.write_text("0", encoding="utf-8")
+        instance.stop_marker.touch()
+
+    seen = _loop_with_handoff(monkeypatch, handoff, script)
+
+    inst = op.Instance("no-resume-id")
+    inst.save_state(5, "2026-07-27T10:00:00Z")  # no session id recorded
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert seen, "the loop must have launched"
+    assert "crash" in seen[0].lower(), (
+        "session #6 had a predecessor; `test_fresh_run_has_no_crash_note` is "
+        "the control that this note is not simply always present")
+
+
 
 
 def test_unexpected_exit_without_marker_is_relaunched(monkeypatch):

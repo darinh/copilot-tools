@@ -3180,9 +3180,16 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     # a moment, so it is re-asked before every launch rather than answered once
     # here. See `crash_recovery_verdict`. What is fixed for the whole run is
     # only whether there *was* a predecessor to ask about: at loop start that
-    # is exactly "we are continuing an earlier run" (a resume id), and every
-    # session this supervisor watches end adds one thereafter.
-    had_predecessor = bool(resume_id)
+    # is exactly "we are continuing an earlier run", and every session this
+    # supervisor watches end adds one thereafter.
+    #
+    # Continuation is read off the session number, not off `resume_id`. A
+    # resume id is written only when the previous session reported one and it
+    # parses as a UUID, so keying on it would call a run with five sessions
+    # behind it a first launch the moment that id went missing -- and the
+    # question here is whether a predecessor *existed*, not whether we can
+    # resume into it.
+    had_predecessor = bool(resume_id) or start_session_num > 1
 
     if adopt:
         # Refuse to "adopt" anything we do not own or that is not there: the
@@ -3456,11 +3463,19 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                         unknown_markers = 0
                         uptime = (None if session_started_at is None
                                   else time.time() - session_started_at)
-                        if marker_set(instance.restart_marker):
+                        # Probed as a tri-state and recorded as one. `marker_set`
+                        # answers False for "not there" and for "could not
+                        # look", which is the right call for the *branch* -- one
+                        # more poll is cheap -- but writing that False into the
+                        # trace would enter a guess as an observation, and the
+                        # postmortem reading it has no way to tell them apart.
+                        restart_probe = marker_state(instance.restart_marker)
+                        if restart_probe is True:
                             log(f"Session #{session_num}: restart signal detected!")
                             crash_failures = 0
                             _record_session_exit(instance, session_num,
-                                                 stop_state, detach_state, True,
+                                                 stop_state, detach_state,
+                                                 restart_probe,
                                                  crash_failures, uptime=uptime)
                         else:
                             if uptime is not None and uptime >= HEALTHY_SESSION_SECONDS:
@@ -3474,7 +3489,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                                 crash_failures = 0
                             crash_failures += 1
                             _record_session_exit(instance, session_num,
-                                                 stop_state, detach_state, False,
+                                                 stop_state, detach_state,
+                                                 restart_probe,
                                                  crash_failures, uptime=uptime)
                             ran_for = ("" if uptime is None
                                        else f" after {int(uptime)}s")
@@ -3499,6 +3515,16 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                         # `session_exit` in the trace carried `restart=False`
                         # -- not because no session ever ended by handoff, but
                         # because the ones that did were never written down.
+                        #
+                        # Recorded here rather than after the session is
+                        # actually torn down, deliberately. If
+                        # `stop_session_gracefully` and the kill behind it both
+                        # fail, the supervisor dies -- and a record written
+                        # after that point is the one that would never exist.
+                        # A trace saying "a restart was requested" when the
+                        # teardown then failed is recoverable by whoever reads
+                        # it next; silence about the last thing that happened
+                        # before the supervisor died is not.
                         _record_session_exit(
                             instance, session_num,
                             marker_state(instance.stop_marker),
@@ -4339,10 +4365,15 @@ def _record_session_exit(instance, session_num: int,
 
     ``restart_state`` is passed in rather than probed here. It used to be
     re-read off disk, and the only call site was the branch that had *already*
-    established the restart marker was absent -- so the field could not take
-    any value but ``False``, over 979 recorded exits. A field that cannot vary
+    established the restart marker was absent -- so the field could not carry
+    ``True`` in any record, over 979 recorded exits. A field that cannot vary
     records nothing, and this one was read as proof that no session had ever
     ended by handoff when all it showed was where the call sat.
+
+    It takes the caller's tri-state probe, not a ``bool``. ``marker_set``
+    collapses "not there" and "could not look" into one answer, which is the
+    right trade for deciding a branch and the wrong one for a record somebody
+    will later read as an observation.
 
     ``session_gone`` is False on the one path that fires while copilot is still
     up (a restart requested mid-session, which is what `handoff` does). No exit

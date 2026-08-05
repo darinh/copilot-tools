@@ -74,10 +74,18 @@ reporting the thing they were read as ruling out.
    `_record_session_exit` was called from exactly one place:
    the `else` of `if marker_set(instance.restart_marker)`. It only ran once
    the restart marker had already been established absent, so `restart` could
-   not take any other value in any record, ever. Sessions that *did* end by
+   not carry `True` in any record, ever. Sessions that *did* end by
    handoff took the other branch and were **not recorded at all** — the
    population excluded the cases being counted, and an excluded case does not
    look like a missing row.
+
+   The `False` was not even reliably a `False`. `marker_set` answers the same
+   way for "the marker is not there" and "the probe could not look", and the
+   unreadable-marker guard on that path checked only the stop and detach
+   probes — so an unreadable restart probe was written down as definite
+   absence. Both are fixed here: the branch now records the tri-state
+   `marker_state` result, so a `False` in a record dated 2026-08-05 or later
+   means the marker was observed absent, and `null` means nobody could tell.
 
 2. *"`handoff` appears 0 times in the entire trace."* `handoff_tool.py` does
    not import `operator_trace` and never has. The trace records `operator`
@@ -86,8 +94,12 @@ reporting the thing they were read as ruling out.
 
 3. *"No `next-session.md` exists for this project."* True at that instant and
    consistent with the opposite conclusion: the protocol has the *reader*
-   delete it at session start, so an absent handoff is the normal steady
-   state between a session starting and the next one ending.
+   delete it at session start — a convention agents follow rather than
+   something any code here enforces — so an absent handoff is the normal
+   steady state between a session starting and the next one ending. This is
+   the weakest of the three refutations: it establishes that the observation
+   cannot distinguish the two cases, not that the handoff was there. The
+   positive counter-evidence below is what settles it.
 
 Positive counter-evidence, measured 2026-08-05T02:20Z:
 `~/.copilot/projects/{guid}/next-session.md` was written at 02:16:00Z with a
