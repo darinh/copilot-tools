@@ -215,6 +215,9 @@ operator inbox backend
 
 # Usage reports
 operator report costs
+
+# Per-project feature configuration (which conventions a project opted into)
+operator projects
 ```
 
 Named loop instances persist the active Copilot CLI session ID, so restarting the same loop after a WSL crash or Windows reboot automatically resumes the prior CLI session.

@@ -23,6 +23,7 @@ import atexit
 import hashlib
 import json
 import os
+import ntpath
 import platform
 import re
 import shlex
@@ -50,6 +51,7 @@ if _HERE not in sys.path:
 import operator_ingest                                       # noqa: E402
 import operator_mail                                         # noqa: E402
 import operator_trace                                        # noqa: E402
+import project_features                                      # noqa: E402
 from install_manifest import (                                # noqa: E402
     dir_present,
     file_present,
@@ -119,7 +121,7 @@ EXIT_UNACCOUNTED = 4
 RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
                   "version", "forget", "logs", "tabs", "restore",
                   "stop-loop", "stop-session", "restart-loop", "menu",
-                  "trace"}
+                  "trace", "projects"}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
@@ -3775,6 +3777,7 @@ USAGE
     operator join [NAME]                                       Join (explicit form)
     operator reload NAME                                       Hot-reload launch spec
     operator list                                              Show running instances
+    operator projects                                          Per-project feature configuration
     operator stop [NAME]                                       Stop instance(s) — loop + session
     operator stop-loop NAME                                    Stop only the background loop
     operator restart-loop NAME                                 Replace the loop supervisor (new code), keep session
@@ -4462,6 +4465,247 @@ def browse_instances() -> int:
     return show_instance_detail(instance)
 
 
+# ── project configurations ──────────────────────────────────────
+def catalog_projects(catalog=None):
+    """Every project the catalog registers, plus the rows that would not read.
+
+    Returns ``(projects, problems)``, or :data:`CATALOG_UNREADABLE` when the
+    file itself could not be opened. Those are three answers and not two: an
+    absent catalog means nothing is registered yet and the right thing to say
+    is "run setup"; an unreadable one establishes nothing at all, and printing
+    an empty project list for it would report every project on the machine as
+    unregistered on the strength of one permission error.
+
+    ``problems`` carries the rows that were skipped, for the same reason. A
+    line that will not parse, or one whose second column is not a usable
+    project id, is a row that was *not compared* -- it is not evidence that the
+    project it names is absent, and silently dropping it would let a user look
+    at this screen, not see their project, and conclude it was never set up.
+    """
+    catalog = Path(catalog) if catalog is not None else project_catalog_path()
+    if file_present(catalog) is False:
+        return [], []
+    projects: list[dict] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+    try:
+        with open(catalog, "r", encoding="utf-8", errors="replace",
+                  newline="") as fh:
+            for number, row in enumerate(catalog_rows(fh), 1):
+                if row is None:
+                    problems.append(f"line {number}: could not be parsed as CSV")
+                    continue
+                if not row or not any(cell.strip() for cell in row):
+                    continue
+                if len(row) < 2:
+                    problems.append(f"line {number}: no project id column")
+                    continue
+                path = row[0].strip().strip('"')
+                guid = row[1].strip().strip('"')
+                if not path:
+                    problems.append(f"line {number}: no project path")
+                    continue
+                if not guid_is_usable(guid):
+                    problems.append(
+                        f"line {number}: {path} has an unusable project id "
+                        f"{guid!r}")
+                    continue
+                if guid in seen:
+                    problems.append(
+                        f"line {number}: {path} repeats project id {guid}")
+                    continue
+                seen.add(guid)
+                projects.append({"path": path, "guid": guid,
+                                 "label": _project_label(path)})
+    except OSError:
+        return CATALOG_UNREADABLE
+    return projects, problems
+
+
+def _project_label(path: str) -> str:
+    """The last component of a catalog path, for a compact listing.
+
+    ``ntpath`` rather than ``os.path``. The catalog stores each path in the
+    native form of the platform that *created* the entry, so a Linux machine
+    reading a catalog synced from Windows meets ``C:\\Users\\dev\\repos\\app``
+    -- and ``posixpath.basename`` returns that whole string, because a
+    backslash is an ordinary filename character there. ``ntpath`` is pure
+    syntax with no platform dependence and understands drive prefixes, UNC
+    paths and both separators, so it is the union of the two rather than a
+    guess at which one this row came from.
+    """
+    trimmed = path.rstrip("/\\")
+    return ntpath.basename(trimmed) or path
+
+
+def _feature_config(project: dict):
+    """``(document, values, problem)`` for one project.
+
+    ``problem`` is a message when the configuration exists and could not be
+    read, and in that case ``document`` is None and ``values`` is None -- not
+    the defaults. Resolving an unreadable file to the defaults would render a
+    complete, confident screen about a project whose real choices nobody
+    managed to look at, and then write those invented defaults back over the
+    file the moment the user touched anything.
+    """
+    path = project_features.config_path(project["guid"])
+    try:
+        document = project_features.read_config(path)
+    except project_features.FeatureConfigError as exc:
+        return None, None, str(exc)
+    return document, project_features.resolved_values(document), None
+
+
+def browse_project_configurations() -> int:
+    """List catalogued projects, pick one, then change its features."""
+    while True:
+        found = catalog_projects()
+        if found is CATALOG_UNREADABLE:
+            print(f"\nCannot read the project catalog "
+                  f"{project_catalog_path()}.", file=sys.stderr)
+            print("  Nothing can be listed until it opens; this is not the "
+                  "same as no projects being registered.", file=sys.stderr)
+            return 1
+        projects, problems = found
+        print("\n═══ Project Configurations ═══\n")
+        if problems:
+            print(f"  {project_catalog_path()}:")
+            for problem in problems:
+                print(f"    ! {problem}")
+            print("  Those rows were skipped, so any project they name is "
+                  "missing from this list.\n")
+        if not projects:
+            print(f"  No projects registered in {project_catalog_path()}.")
+            print("  A project is registered the first time an agent sets it "
+                  "up in that directory.")
+            return 0
+
+        rows = []
+        for project in projects:
+            _, values, problem = _feature_config(project)
+            if problem is not None:
+                summary = "unreadable configuration"
+            else:
+                enabled = project_features.enabled_slugs(values)
+                summary = (f"{len(enabled)} of "
+                           f"{len(project_features.FEATURES)} enabled")
+            rows.append((project["label"], summary, project["path"]))
+
+        width = max(len(row[0]) for row in rows)
+        for i, (label, summary, path) in enumerate(rows, 1):
+            print(f"  {i:>2}) {label:<{width}}  {summary}")
+            print(f"      {path}")
+        print()
+        choice = _prompt_line(
+            f"Choose a project [1-{len(projects)}] (blank to go back): ")
+        if not choice:
+            return 0
+        try:
+            index = int(choice)
+        except ValueError:
+            print("Not a number.", file=sys.stderr)
+            continue
+        if not 1 <= index <= len(projects):
+            print("Out of range.", file=sys.stderr)
+            continue
+        show_project_config(projects[index - 1])
+
+
+def show_project_config(project: dict) -> int:
+    """The feature list for one project. Each change is written immediately.
+
+    Written on each change rather than on the way out, because the way out
+    includes Ctrl-C and a closed terminal, and a screen that shows a feature
+    as off while the file still says on is worse than no screen at all.
+    """
+    path = project_features.config_path(project["guid"])
+    while True:
+        document, values, problem = _feature_config(project)
+        print(f"\n═══ {project['label']} ═══\n")
+        print(f"  {project['path']}")
+        if problem is not None:
+            print(f"\n  ! {problem}", file=sys.stderr)
+            print("  Refusing to show or change features that could not be "
+                  "read.", file=sys.stderr)
+            return 1
+        print(f"  {path}"
+              f"{'' if document is not None else '  (not written yet — showing defaults)'}")
+        unknown = project_features.unknown_entries(document)
+        if unknown:
+            print(f"\n  ! Settings this build has no feature for: "
+                  f"{', '.join(unknown)}")
+            print("    They are left untouched by anything changed here.")
+
+        features = project_features.FEATURES
+        width = max(len(f.name) for f in features)
+        print()
+        for i, feature in enumerate(features, 1):
+            shown = project_features.describe_value(feature.slug,
+                                                    values[feature.slug])
+            print(f"  {i:>2}) {feature.name:<{width}}  {shown}")
+        print(f"  {len(features) + 1:>2}) Back")
+        print()
+        choice = _prompt_line(
+            f"Choose a feature [1-{len(features) + 1}] (blank to go back): ")
+        if not choice:
+            return 0
+        try:
+            index = int(choice)
+        except ValueError:
+            print("Not a number.", file=sys.stderr)
+            continue
+        if index == len(features) + 1:
+            return 0
+        if not 1 <= index <= len(features):
+            print("Out of range.", file=sys.stderr)
+            continue
+
+        feature = features[index - 1]
+        chosen = _pick_feature_value(feature, values[feature.slug])
+        if chosen is None or chosen == values[feature.slug]:
+            continue
+        try:
+            project_features.write_config(path, {feature.slug: chosen},
+                                          document=document)
+        except project_features.FeatureConfigError as exc:
+            print(f"Not saved: {exc}", file=sys.stderr)
+            continue
+        print(f"  {feature.name} → "
+              f"{project_features.describe_value(feature.slug, chosen)}")
+
+
+def _pick_feature_value(feature, current: str) -> "str | None":
+    """The value the user wants for ``feature``, or None to leave it alone.
+
+    A two-valued feature is toggled rather than submenued -- asking someone to
+    pick "on" from a list of {on, off} is a menu that exists to be dismissed.
+    Anything with more options gets the list, which is what makes a choice of
+    one backend expressible at all: ``tracked-backlog`` is not a boolean, and
+    a screen built only from toggles could not offer it.
+    """
+    if feature.is_flag:
+        return project_features.OFF if current == project_features.ON \
+            else project_features.ON
+    print(f"\n  {feature.name}: {feature.description}\n")
+    for i, option in enumerate(feature.options, 1):
+        marker = "*" if option.value == current else " "
+        print(f"  {i:>2}){marker} {option.value:<14} {option.label}")
+    print()
+    choice = _prompt_line(
+        f"Choose [1-{len(feature.options)}] (blank to leave unchanged): ")
+    if not choice:
+        return None
+    try:
+        index = int(choice)
+    except ValueError:
+        print("Not a number.", file=sys.stderr)
+        return None
+    if not 1 <= index <= len(feature.options):
+        print("Out of range.", file=sys.stderr)
+        return None
+    return feature.options[index - 1].value
+
+
 def show_menu() -> int:
     """Bare ``operator`` (no arguments): an interactive action picker.
 
@@ -4475,6 +4719,8 @@ def show_menu() -> int:
         options: list[tuple[str, Callable[[], int] | None]] = [
             (f"Sessions — inspect, join or stop  ({running} running)",
              browse_instances),
+            ("Project configurations — features per project",
+             browse_project_configurations),
             ("Restore tabs (pick which)", lambda: restore_tabs([])),
             ("Restore all tracked tabs", lambda: restore_tabs(["--all"])),
             ("View usage report", lambda: report_metrics("summary")),
@@ -4778,6 +5024,8 @@ def _dispatch_command(args: list[str]) -> int:
         return list_instances()
     if head == "menu":
         return show_menu()
+    if head == "projects":
+        return browse_project_configurations()
     if head == "report":
         return report_metrics(args[1] if len(args) > 1 else "summary")
     if head == "ingest":

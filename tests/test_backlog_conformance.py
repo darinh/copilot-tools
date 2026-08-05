@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 import backlog_tool
+import project_features
 from backlog_tool import (
     ACTIVE_STATUSES,
     APPROVED_STATUSES,
@@ -120,8 +121,32 @@ def reported(root: Path, needle: str, **kwargs) -> bool:
 # The real directory
 # ---------------------------------------------------------------------------
 
+def _require_folder_backend() -> None:
+    """Stand aside for a project that keeps its open work somewhere else.
+
+    ``tracked-backlog`` is a choice of one backend, not a toggle: a project may
+    keep open work in ``backlog/``, in GitHub Issues, or nowhere. The three
+    assertions below demand a conforming ``backlog/`` directory, and demanding
+    one of a project that deliberately chose GitHub Issues would be this
+    repository's rules enforced on somebody who declined them.
+
+    The predicate is deliberately one-sided --
+    :func:`project_features.tracked_backlog_backend` answers ``folder`` for
+    every uncertainty, including no catalog at all, which is what CI has. So
+    this can only step aside because a person configured it to, never because
+    a file was missing, and it says so out loud when it does: a guard that
+    disappears silently is worse than one that was never written.
+    """
+    backend, source = project_features.tracked_backlog_backend(REPO)
+    if backend != project_features.BACKLOG_FOLDER:
+        pytest.skip(
+            f"this project's tracked-backlog backend is {backend!r} "
+            f"(from {source}), so backlog/ is not where its open work lives")
+
+
 def test_the_repositorys_own_backlog_conforms():
     """The assertion this module exists for. Everything else is a control."""
+    _require_folder_backend()
     found = backlog_tool.check(REPO)
     assert found == [], "backlog/ violates its own rules:\n" + "\n".join(found)
 
@@ -133,6 +158,7 @@ def test_the_repository_actually_has_a_backlog_to_check():
     satisfies all of them. Without this, deleting ``backlog/`` would turn the
     test above green rather than red.
     """
+    _require_folder_backend()
     items = backlog_tool.item_paths(REPO / BACKLOG_DIRNAME)
     assert items, f"no items under {REPO / BACKLOG_DIRNAME}"
 
@@ -143,6 +169,7 @@ def test_every_item_in_the_repository_names_a_spec_or_says_there_is_none():
     ``check`` enforces this too; asserting it here as well means the mapping
     cannot be quietly abandoned by relaxing one rule in the checker.
     """
+    _require_folder_backend()
     items, parse_problems = backlog_tool.load(REPO / BACKLOG_DIRNAME)
     assert not parse_problems, parse_problems
     for item in items:
