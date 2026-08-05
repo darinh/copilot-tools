@@ -171,10 +171,22 @@ def test_the_boot_probe_short_circuits_the_expensive_ones() -> None:
         "a conclusive reboot must not cost a multiplexer call")
 
 
-def test_the_mux_probe_short_circuits_the_pid_probe() -> None:
-    probes = FakeProbes(boot="uuid:same", session=False, running=True)
+def test_the_pid_probe_short_circuits_the_mux_probe() -> None:
+    """A syscall is asked before a subprocess spawn. Both can only conclude
+    DEAD, so the order cannot change a verdict -- only what establishing a
+    dead owner costs, on every claim of every sweep."""
+    probes = FakeProbes(boot="uuid:same", session=True, running=False)
     ol.assess(make_claim(), probes=probes, now=NOW)
-    assert probes.asked == ["boot", "mux"]
+    assert probes.asked == ["boot", "pid"]
+
+
+def test_the_mux_probe_is_still_asked_when_the_pid_is_inconclusive() -> None:
+    """Cheapest first is an ordering, not a filter: a pid that cannot be
+    judged must not swallow the question the mux session can answer."""
+    probes = FakeProbes(boot="uuid:same", session=False, running=None)
+    verdict = ol.assess(make_claim(), probes=probes, now=NOW)
+    assert probes.asked == ["boot", "pid", "mux"]
+    assert verdict.verdict == ol.DEAD
 
 
 def test_the_start_token_is_only_asked_for_when_the_pid_is_there() -> None:
@@ -342,7 +354,39 @@ def test_a_numeric_string_pid_is_accepted() -> None:
 
 
 def test_an_absurd_pid_is_absent() -> None:
-    assert ol.process_present(4_000_000_000) in (False, None)
+    """In range, so it is a question the OS can answer -- and it answers no."""
+    assert ol.process_present(0x7FFFFFFE) is False
+
+
+@pytest.mark.parametrize("pid", [
+    1 << 32,
+    (1 << 32) + 4,
+    1 << 64,
+    str((1 << 32) + 4),
+    10 ** 30,
+])
+def test_a_pid_too_wide_for_the_platform_is_refused(pid) -> None:
+    """A pid is 32 bits on both platforms and ``ctypes`` truncates rather than
+    complains: ``OpenProcess`` handed ``(1 << 32) + os.getpid()`` opens *this*
+    process and reports it running. Truncating is the float-pid bug at a
+    different width -- a confident answer about a different process."""
+    assert ol._coerce_pid(pid) is None
+    assert ol.process_present(pid) is None
+    assert ol.process_start_token(pid) is None
+
+
+def test_the_widest_representable_pid_is_still_a_question() -> None:
+    """The refusal is a range check, not a cap that swallows real pids."""
+    assert ol._coerce_pid(ol._PID_MAX) == ol._PID_MAX
+    assert ol._coerce_pid(ol._PID_MAX + 1) is None
+
+
+def test_our_own_pid_is_not_reachable_by_wrapping() -> None:
+    """The concrete alias the range check exists to stop, on this machine."""
+    mine = os.getpid()
+    assert ol.process_present(mine) is True
+    assert ol.process_present((1 << 32) + mine) is None
+    assert ol.process_start_token((1 << 32) + mine) is None
 
 
 def test_the_real_probes_judge_our_own_process_live() -> None:

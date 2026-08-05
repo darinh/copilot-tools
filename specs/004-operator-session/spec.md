@@ -88,10 +88,12 @@ Cascade, cheapest first. The first three are conclusive; the fourth is not.
 
 1. `boot_id` differs from current → **DEAD**. The unplanned-reboot case, and it
    needs no timeout: nothing from the previous boot is running.
-2. Mux session absent → **DEAD**. Direct and exact, because every agent runs
+2. PID absent, or present with a different start time → **DEAD**. The
+   start-time comparison is what makes this safe after PID reuse. Asked before
+   the mux session because it is a syscall where that is a subprocess spawn;
+   both can only conclude DEAD, so the order changes cost, never a verdict.
+3. Mux session absent → **DEAD**. Direct and exact, because every agent runs
    inside one.
-3. PID absent, or present with a different start time → **DEAD**. The
-   start-time comparison is what makes this safe after PID reuse.
 4. Heartbeat older than `staleAfter` with 1–3 inconclusive → **STALE**. Report;
    never auto-steal. This combination means something unusual — a hung process,
    a clock problem — and guessing is how two agents end up in one tree.

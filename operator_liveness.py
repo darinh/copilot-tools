@@ -84,6 +84,10 @@ _ERROR_ACCESS_DENIED = 5
 #: The weakest access right that answers "does this pid exist, and when did it
 #: start", so the probe succeeds for processes we may not open fully.
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+#: The widest pid either platform can represent: a ``DWORD`` on Windows, an
+#: ``int32`` ``pid_t`` on POSIX. Anything larger is not a big pid, it is a
+#: number that ``ctypes`` will quietly truncate into somebody else's pid.
+_PID_MAX = 0xFFFFFFFF if platform.system() == "Windows" else 0x7FFFFFFF
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -318,7 +322,7 @@ def _posix_process_present(pid: int) -> "bool | None":
         # Someone else's process, but a process. Same reasoning as the Windows
         # access-denied branch: refused is not absent.
         return True
-    except OSError:
+    except (OSError, OverflowError):
         return None
     return True
 
@@ -382,6 +386,12 @@ def _coerce_pid(pid) -> "int | None":
     tidiness: on POSIX they are signal-group selectors, and ``os.kill(0, 0)``
     probes *our own* process group -- an answer about something nobody asked
     that would always come back True.
+
+    Values above :data:`_PID_MAX` are refused for the third time for the same
+    reason. A pid is a 32-bit ``DWORD`` on Windows and a 32-bit ``pid_t`` on
+    POSIX, and ``ctypes`` truncates rather than complains: ``OpenProcess``
+    handed ``(1 << 32) + os.getpid()`` opens *this* process and reports it
+    running. Refusing is the only answer that is not about some other process.
     """
     if pid is None or isinstance(pid, bool):
         return None
@@ -394,7 +404,9 @@ def _coerce_pid(pid) -> "int | None":
         value = int(text)
     else:
         return None
-    return value if value > 0 else None
+    if value <= 0 or value > _PID_MAX:
+        return None
+    return value
 
 
 def process_present(pid: "int | None") -> "bool | None":
@@ -518,13 +530,13 @@ def assess(claim, *, probes=None, now=None,
         return Liveness(DEAD, "boot id differs: the machine has rebooted since "
                               "this claim was taken", signals)
 
-    session = getattr(claim, "mux_session", None)
-    if session:
-        present = probes.session_present(session)
-        signals["mux"] = present
-        if present is False:
-            return Liveness(DEAD, f"mux session {session!r} is gone", signals)
-
+    # The pid probe is asked before the mux probe because it is cheaper by
+    # three orders of magnitude -- a syscall against a subprocess spawn -- and
+    # cost is the only thing that separates them here. Both can only conclude
+    # DEAD, and neither can conclude LIVE, so asking either one first cannot
+    # change a verdict: a live mux session does not stop the pid question
+    # being asked, and vice versa. What it changes is what a dead agent costs
+    # to establish, which is paid on every sweep of every claim.
     pid = getattr(claim, "pid", None)
     if pid:
         running = probes.process_present(pid)
@@ -539,6 +551,13 @@ def assess(claim, *, probes=None, now=None,
                 return Liveness(
                     DEAD, f"pid {pid} was reused: it started at {token}, the "
                           f"claim recorded {recorded}", signals)
+
+    session = getattr(claim, "mux_session", None)
+    if session:
+        present = probes.session_present(session)
+        signals["mux"] = present
+        if present is False:
+            return Liveness(DEAD, f"mux session {session!r} is gone", signals)
 
     age = heartbeat_age(claim, now=now)
     signals["heartbeat_age"] = age
