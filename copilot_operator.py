@@ -2481,7 +2481,7 @@ def _starting_loop_pid(instance: Instance) -> int | None:
         pid = 0
     if pid > 0 and _pid_alive(pid):
         return pid
-    if -CLOCK_SKEW_TOLERANCE < age < SUPERVISOR_STARTUP_GRACE:
+    if -CLOCK_SKEW_TOLERANCE <= age < SUPERVISOR_STARTUP_GRACE:
         return pid
     # Two ways to be out of that window, and they are the same statement: this
     # record's mtime is no longer evidence that a supervisor is on its way.
@@ -2489,12 +2489,21 @@ def _starting_loop_pid(instance: Instance) -> int | None:
     # would have by now. Below the skew tolerance it is dated further ahead
     # than any clock disagreement explains, and believing it would cost an
     # unbounded refusal rather than a bounded one. See the two constants.
+    #
+    # The future side is inclusive because the tolerance is sized off a
+    # filesystem's timestamp granularity, and a filesystem that rounds to 2 s
+    # produces an age of *exactly* -2.0 rather than approximately it. A strict
+    # bound there would prune every record this instance ever writes, on that
+    # filesystem, every time -- reopening the window for the one class of user
+    # who cannot see it happening. Costs nothing: the invariant is
+    # `believed for <= SUPERVISOR_STARTUP_ALLOWANCE`, and -2.0 is exactly the
+    # case that reaches it.
     remove_file(path)
     return None
 
 
-def _supervisor_present(instance: Instance) -> int | None:
-    """Is *any* supervisor for this instance running, including a starting one?
+def _supervisor_status(instance: Instance) -> tuple[int | None, bool]:
+    """``(pid, still_starting)`` for this instance, from one pass.
 
     ``_running_loop_pid`` answers a narrower question — has a supervisor
     finished starting — and every caller that acts destructively on the
@@ -2504,52 +2513,52 @@ def _supervisor_present(instance: Instance) -> int | None:
     relaunched underneath the user, and ``operator restart-loop`` start a
     second supervisor over the first.
 
+    Both halves come from one pass because they are read from the same two
+    files and every caller uses them together. Asking separately means a
+    supervisor that publishes its pid, or exits, between the two reads is
+    described by one and sized for by the other: a published supervisor that
+    exits mid-question gets reported as "still starting" and handed a
+    startup-sized budget it has no use for.
+
+    ``still_starting`` is only meaningful when ``pid is not None``; with no
+    supervisor at all there is nothing for it to describe.
+
     Callers that are *confirming a supervisor came up* must keep using
-    ``_running_loop_pid``: this function is satisfied by the record its own
-    spawn wrote, so it would report success before anything had started.
+    ``_running_loop_pid``: this is satisfied by the record its own spawn
+    wrote, so it would report success before anything had started.
     """
     pid = _running_loop_pid(instance)
     if pid is not None:
-        return pid
-    return _starting_loop_pid(instance)
+        return pid, False
+    return _starting_loop_pid(instance), True
 
 
-def _supervisor_still_starting(instance: Instance) -> bool:
-    """True when the only evidence of a supervisor is its startup record.
+def _supervisor_present(instance: Instance) -> int | None:
+    """Is *any* supervisor for this instance running, including a starting one?
 
-    Every caller that waits for a supervisor to *go* needs this to size its
-    budget. A supervisor that has not finished starting cannot look at a
-    marker yet, and an orphaned record — a spawn whose child died before
-    claiming it — is only resolved by ageing out of the window, which from
-    any given moment is up to ``SUPERVISOR_STARTUP_ALLOWANCE`` away. A wait
-    shorter than that is guaranteed to time out in exactly the case the
-    grace exists for.
-
-    Not derivable from the pid the caller already holds. The record can name
-    a live pid, a dead launcher shim's pid, or ``0`` for "present, pid
-    unknown", and ``not pid`` catches only the last of those — so the
-    Windows shim case, the whole reason the mtime grace exists, would be the
-    one that silently kept the short budget.
+    The half of ``_supervisor_status`` that most callers need on its own.
     """
-    return _running_loop_pid(instance) is None
+    return _supervisor_status(instance)[0]
 
 
-def _supervisor_where(instance: Instance, pid: int | None) -> str:
+def _supervisor_where(pid: int | None, still_starting: bool) -> str:
     """How to describe a supervisor whose pid may not mean what it says.
 
-    The pid from ``_supervisor_present`` is only a *running* supervisor's pid
+    The pid from ``_supervisor_status`` is only a *running* supervisor's pid
     when it came from the pid file. From a startup record it can be a live
     pid, ``0`` for "not yet knowable", or a launcher shim's pid that is
-    already dead — and the last of those is truthy, so `f'pid {pid}' if pid`
-    reports a dead process as the one in charge. Which supervisor a message
-    names is not worth a second stat by itself; being wrong about whether one
-    is *running* is, because that is the sentence the reader acts on.
+    already dead — and the last of those is truthy, so
+    ``f'pid {pid}' if pid`` reports a dead process as the one in charge,
+    for exactly the case the startup record exists to cover.
+
+    Takes both halves rather than re-reading, so what it says cannot
+    contradict what its caller decided.
     """
-    if _supervisor_still_starting(instance):
-        if not pid:
-            return "still starting; pid not yet known"
-        return f"still starting; spawned as pid {pid}"
-    return f"pid {pid}"
+    if not still_starting:
+        return f"pid {pid}"
+    if not pid:
+        return "still starting; pid not yet known"
+    return f"still starting; spawned as pid {pid}"
 
 
 def is_copilot_running(instance: Instance) -> bool:
@@ -2759,17 +2768,17 @@ def _request_supervisor_stop(instance: Instance, timeout: float = 20.0) -> None:
     the marker, or it is gone because we removed it.
     """
     instance.stop_marker.touch()
-    pid = _supervisor_present(instance)
+    pid, starting = _supervisor_status(instance)
     if pid is None:
         remove_file(instance.stop_marker)
         return
     log(f"  Stop signal sent to loop supervisor for '{instance.display_name}' "
-        f"({_supervisor_where(instance, pid)})")
+        f"({_supervisor_where(pid, starting)})")
     # A supervisor that has not published yet cannot look at the marker, so a
     # wait shorter than the whole window a record can be believed for is
     # guaranteed to expire before an orphaned one is even eligible to be
     # pruned.
-    if _supervisor_still_starting(instance):
+    if starting:
         timeout += SUPERVISOR_STARTUP_ALLOWANCE
     deadline = time.time() + timeout
     while time.time() < deadline and _supervisor_present(instance) is not None:
@@ -2847,18 +2856,17 @@ def stop_loop_only(target: str | None) -> int:
         print("Usage: operator stop-loop NAME", file=sys.stderr)
         return 1
     instance = Instance(target)
-    pid = _supervisor_present(instance)
+    pid, starting = _supervisor_status(instance)
     if pid is None:
         print(f"No background loop supervisor is running for '{target}'.", file=sys.stderr)
         return 1
     instance.detach_marker.touch()
     log(f"Detach requested for loop '{target}' "
-        f"({_supervisor_where(instance, pid)})")
+        f"({_supervisor_where(pid, starting)})")
     # Same budget reasoning as _do_restart_loop: a supervisor that has not
     # finished starting has to finish before it polls, and an orphaned
     # startup record is only resolved by ageing out of the whole window.
-    budget = 20.0 + (SUPERVISOR_STARTUP_ALLOWANCE
-                     if _supervisor_still_starting(instance) else 0.0)
+    budget = 20.0 + (SUPERVISOR_STARTUP_ALLOWANCE if starting else 0.0)
     deadline = time.time() + budget
     while time.time() < deadline:
         if _supervisor_present(instance) is None:
@@ -2970,10 +2978,10 @@ def _do_restart_loop(instance: Instance, user_args: list[str],
                      recorded_cwd: str) -> int:
     """The handoff itself. Runs holding the per-instance restart lock."""
     target = instance.display_name
-    pid = _supervisor_present(instance)
+    pid, starting = _supervisor_status(instance)
     if pid is not None:
         instance.detach_marker.touch()
-        where = _supervisor_where(instance, pid)
+        where = _supervisor_where(pid, starting)
         log(f"Restart requested for loop '{target}' ({where})")
         # Budget derived from how long the supervisor can take to look at the
         # marker, so tuning the poll interval cannot silently break this. A
@@ -2981,8 +2989,7 @@ def _do_restart_loop(instance: Instance, user_args: list[str],
         # all, so the whole window a startup record can be believed for is
         # part of the wait too.
         budget = (SESSION_ID_WAIT + POLL_INTERVAL * 2 + 15
-                  + (SUPERVISOR_STARTUP_ALLOWANCE
-                     if _supervisor_still_starting(instance) else 0))
+                  + (SUPERVISOR_STARTUP_ALLOWANCE if starting else 0))
         deadline = time.time() + budget
         while time.time() < deadline:
             if _supervisor_present(instance) is None:
@@ -3088,10 +3095,10 @@ def stop_session_only(target: str | None) -> int:
     # from the pid file alone told the user their session would stay down and
     # then relaunched it seconds later. `is not None`, not truthiness: 0 is a
     # supervisor whose pid is not knowable yet, not the absence of one.
-    pid = _supervisor_present(instance)
+    pid, starting = _supervisor_status(instance)
     if pid is not None:
         print(f"Session '{instance.display_name}' stopped; loop supervisor "
-              f"({_supervisor_where(instance, pid)}) will relaunch it shortly.")
+              f"({_supervisor_where(pid, starting)}) will relaunch it shortly.")
     else:
         print(f"Session '{instance.display_name}' stopped. "
               f"No loop supervisor is running, so it will not restart automatically.")
@@ -4800,9 +4807,9 @@ def start_and_attach_loop(instance: Instance, copilot_args: list[str],
     the invoking terminal, and there is only ever one tab involved, not one
     for the loop's logs and a second for the session.
     """
-    existing_pid = _supervisor_present(instance)
+    existing_pid, starting = _supervisor_status(instance)
     if existing_pid is not None:
-        where = _supervisor_where(instance, existing_pid)
+        where = _supervisor_where(existing_pid, starting)
         log(f"Loop supervisor already running for '{instance.display_name}' "
             f"({where}) — attaching")
         print(f"Loop already running for '{instance.display_name}' — attaching...")
@@ -4841,9 +4848,9 @@ def start_loop_headless(instance: Instance, copilot_args: list[str],
     the process is spawned: a caller that never attaches would otherwise have
     no way to learn that the launch failed.
     """
-    existing_pid = _supervisor_present(instance)
+    existing_pid, starting = _supervisor_status(instance)
     if existing_pid is not None:
-        where = _supervisor_where(instance, existing_pid)
+        where = _supervisor_where(existing_pid, starting)
         log(f"Loop supervisor already running for '{instance.display_name}' "
             f"({where}) — nothing to start")
         print(f"Loop already running for '{instance.display_name}' ({where}).")

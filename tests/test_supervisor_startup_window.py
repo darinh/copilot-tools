@@ -21,6 +21,7 @@ the startup record is written by the spawn itself.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import time
@@ -706,12 +707,13 @@ def test_still_starting_is_not_decided_from_the_pid(monkeypatch):
     op._record_supervisor_starting(inst, 6060)  # a shim pid, and dead
     _dead_pids(monkeypatch)
 
-    assert op._supervisor_present(inst) == 6060, "precondition: a truthy pid"
-    assert op._supervisor_still_starting(inst) is True
+    pid, starting = op._supervisor_status(inst)
+    assert pid == 6060, "precondition: a truthy pid"
+    assert starting is True
 
     inst.loop_pid_file.write_text("6060", encoding="utf-8")
     _dead_pids(monkeypatch, 6060)
-    assert op._supervisor_still_starting(inst) is False
+    assert op._supervisor_status(inst) == (6060, False)
 
 
 def test_stop_outlasts_the_grace_for_an_orphaned_record(monkeypatch):
@@ -897,7 +899,7 @@ def _believed_for(instance: op.Instance, clock: _Clock) -> float:
     return clock.now - started
 
 
-@pytest.mark.parametrize("ahead", [0.0, 0.5, 1.0, 5.0, 29.0, 3600.0])
+@pytest.mark.parametrize("ahead", [0.0, 0.5, 1.0, 1.9, 2.0, 5.0, 29.0, 3600.0])
 def test_no_record_is_believed_for_longer_than_the_allowance(monkeypatch, ahead):
     """`SUPERVISOR_STARTUP_ALLOWANCE` is a claim about the reader, not a
     definition: *no* record, however dated, is believed for longer than this
@@ -906,6 +908,14 @@ def test_no_record_is_believed_for_longer_than_the_allowance(monkeypatch, ahead)
     The symmetric `-GRACE < age < GRACE` window failed this at `ahead=29`,
     where a record stayed believed for 59s while every wait budgeted 30 --
     reproduced by a reviewer as a 50s timeout with the marker stranded.
+
+    The parameters past 2.0 exercise the prune, not the ceiling: those are
+    dated further ahead than the tolerance and are dropped on sight. The
+    ones that press on the ceiling are 1.9 and 2.0, and 2.0 is the tightest
+    input there is -- exactly the tolerance, believed, for exactly the
+    allowance. A filesystem with 2s timestamp granularity produces that
+    exact value rather than an approximation of it, which is why the bound
+    is inclusive there and why this case is a parameter and not a comment.
     """
     inst = op.Instance(f"window{ahead}".replace(".", ""))
     op._record_supervisor_starting(inst, 6001)
@@ -914,6 +924,25 @@ def test_no_record_is_believed_for_longer_than_the_allowance(monkeypatch, ahead)
     clock = _fast_clock(monkeypatch)
 
     assert _believed_for(inst, clock) <= op.SUPERVISOR_STARTUP_ALLOWANCE + 0.1
+
+
+@pytest.mark.parametrize("ahead", [0.0, 1.9, 2.0])
+def test_a_record_within_the_tolerance_survives_to_the_grace(monkeypatch, ahead):
+    """The floor for every input the tolerance is meant to cover.
+
+    Without this the ceiling test above is satisfied by a reader that prunes
+    everything instantly, and `CLOCK_SKEW_TOLERANCE` could be narrowed to
+    nothing without a single test objecting -- which is the original
+    intermittent-failure bug, since a record written microseconds ago
+    routinely reads as microseconds in the future.
+    """
+    inst = op.Instance(f"floor{ahead}".replace(".", ""))
+    op._record_supervisor_starting(inst, 6003)
+    _age_record(inst, -ahead)
+    _dead_pids(monkeypatch)
+    clock = _fast_clock(monkeypatch)
+
+    assert _believed_for(inst, clock) >= op.SUPERVISOR_STARTUP_GRACE
 
 
 def test_the_allowance_is_not_slack(monkeypatch):
@@ -996,7 +1025,7 @@ def test_a_dead_shim_pid_is_not_described_as_running(monkeypatch):
     op._record_supervisor_starting(inst, 5555)
     _dead_pids(monkeypatch)
 
-    where = op._supervisor_where(inst, op._supervisor_present(inst))
+    where = op._supervisor_where(*op._supervisor_status(inst))
 
     assert "still starting" in where
     assert where != "pid 5555"
@@ -1008,9 +1037,39 @@ def test_a_published_supervisor_is_described_by_its_pid(monkeypatch):
     inst.loop_pid_file.write_text("5556", encoding="utf-8")
     _dead_pids(monkeypatch, 5556)
 
-    where = op._supervisor_where(inst, op._supervisor_present(inst))
+    where = op._supervisor_where(*op._supervisor_status(inst))
 
     assert where == "pid 5556"
+
+
+def test_the_pid_and_how_it_is_described_come_from_one_read(monkeypatch):
+    """The two halves must not be able to disagree.
+
+    They were two separate reads, and a supervisor that published its pid or
+    exited between them got described by one and sized for by the other: a
+    published supervisor caught mid-exit was reported "still starting" and
+    handed a 32s budget it had no use for. One pass, so there is no between.
+    """
+    inst = op.Instance("onepass")
+    inst.loop_pid_file.write_text("5557", encoding="utf-8")
+    _dead_pids(monkeypatch, 5557)
+    reads = {"n": 0}
+    real = op._running_loop_pid
+
+    def counting(instance):
+        reads["n"] += 1
+        # The supervisor exits the instant it has been observed once.
+        out = real(instance)
+        op.remove_file(instance.loop_pid_file)
+        return out
+
+    monkeypatch.setattr(op, "_running_loop_pid", counting)
+
+    pid, starting = op._supervisor_status(inst)
+
+    assert (pid, starting) == (5557, False), (
+        "described as starting a supervisor that had published its pid")
+    assert reads["n"] == 1, "read the pid file twice to answer one question"
 
 
 def _timeout_budget(err: str) -> float:
@@ -1061,3 +1120,60 @@ def test_restart_loop_gives_a_starting_supervisor_the_whole_window(
         lambda inst: op._do_restart_loop(inst, ["--agent", "t:a"], os.getcwd()),
         "increstart")
     assert increment >= op.SUPERVISOR_STARTUP_ALLOWANCE
+
+
+def test_a_record_exactly_the_tolerance_ahead_is_believed(monkeypatch):
+    """The boundary is inclusive, and this is the only way to test it.
+
+    A filesystem whose timestamps have 2s granularity -- FAT32, exFAT, some
+    SMB shares -- produces an age of *exactly* -2.0, not approximately it, so
+    a strict `-CLOCK_SKEW_TOLERANCE < age` prunes every record this instance
+    ever writes, every time, on those filesystems only. That is the original
+    105ms window reopened for the one class of user least able to see it.
+
+    Dating the file `+tolerance` and reading it back cannot express that: the
+    write-to-check interval makes the age -2.0 plus a hair, which a strict
+    bound accepts, so the test would pass either way. Moving the *clock*
+    instead makes the subtraction exact -- 2.0 is a power of two and the
+    epoch has spacing well below it, so `(m - 2.0) - m` is exactly -2.0 -- and
+    the premise is asserted rather than assumed.
+    """
+    inst = op.Instance("exactboundary")
+    op._record_supervisor_starting(inst, 6004)
+    _dead_pids(monkeypatch)
+    clock = _fast_clock(monkeypatch)
+    mtime = inst.loop_startup_file.stat().st_mtime
+    clock.now = mtime - op.CLOCK_SKEW_TOLERANCE
+    assert clock.time() - mtime == -op.CLOCK_SKEW_TOLERANCE, (
+        "premise: the age under test is exactly the tolerance, not near it")
+
+    assert op._starting_loop_pid(inst) == 6004
+    assert inst.loop_startup_file.exists()
+
+
+def test_a_record_past_the_tolerance_is_still_pruned(monkeypatch):
+    """The control for the inclusive bound: one ulp further ahead and it
+    goes. Without this, inclusivity could be widened to anything."""
+    inst = op.Instance("pastboundary")
+    op._record_supervisor_starting(inst, 6005)
+    _dead_pids(monkeypatch)
+    clock = _fast_clock(monkeypatch)
+    mtime = inst.loop_startup_file.stat().st_mtime
+    clock.now = math.nextafter(mtime - op.CLOCK_SKEW_TOLERANCE, -math.inf)
+    assert clock.time() - mtime < -op.CLOCK_SKEW_TOLERANCE, "premise"
+
+    assert op._starting_loop_pid(inst) is None
+    assert not inst.loop_startup_file.exists()
+
+
+def test_the_exact_boundary_still_obeys_the_allowance(monkeypatch):
+    """And the tightest input there is does not escape the ceiling: believed
+    from -tolerance to +grace is the allowance, exactly, which is what makes
+    the allowance the right number for every wait to add."""
+    inst = op.Instance("boundaryceiling")
+    op._record_supervisor_starting(inst, 6006)
+    _dead_pids(monkeypatch)
+    clock = _fast_clock(monkeypatch)
+    clock.now = inst.loop_startup_file.stat().st_mtime - op.CLOCK_SKEW_TOLERANCE
+
+    assert _believed_for(inst, clock) <= op.SUPERVISOR_STARTUP_ALLOWANCE + 0.1
