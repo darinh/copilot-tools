@@ -36,9 +36,9 @@ $repoRoot = (git worktree list --porcelain | Select-Object -First 1) -replace '^
 ```
 
 Use that path — never the worktree path — for anything that identifies the *project* rather than the
-checkout: the `catalog.csv` lookup, the per-project directory, the handoff file, `.specify/`
-initialization. A worktree is a second directory for the same project, not a second project. Cataloging
-one mints a duplicate GUID and silently splits the project's state in two.
+checkout: the per-project directory, the handoff file, `.specify/` initialization. A worktree is a
+second directory for the same project, not a second project. Treating one as its own project mints a
+duplicate id and silently splits the project's state in two.
 
 ### Working in one
 
