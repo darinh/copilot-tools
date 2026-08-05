@@ -2642,16 +2642,37 @@ def send_message(args: list[str]) -> int:
             print(f"Live delivery failed ({exc}) — queueing instead.",
                   file=sys.stderr)
         else:
-            operator_mail.record_delivered(OPERATOR_HOME, msg)
+            try:
+                operator_mail.record_delivered(OPERATOR_HOME, msg)
+            except operator_mail.MailError as exc:
+                # The message is already on the recipient's screen. This
+                # record only feeds `inbox --history`, and failing the send
+                # over it would invite a resend of a message they have read.
+                print(f"Delivered, but not recorded in history ({exc}).",
+                      file=sys.stderr)
             log(f"Message delivered live: {sender} -> {target.display_name}")
             print(f"Delivered to '{target.display_name}' (session is live).")
             return 0
 
-    operator_mail.queue(OPERATOR_HOME, msg)
+    try:
+        operator_mail.queue(OPERATOR_HOME, msg)
+    except operator_mail.MailError as exc:
+        # Nothing was stored, so this has to be a failure the sender can see.
+        # The fault is at the far end -- their mailbox, not ours -- so say
+        # whose it is rather than leaving a traceback to be read as our bug.
+        print(f"Could not queue for '{target.display_name}': {exc}",
+              file=sys.stderr)
+        return 1
     log(f"Message queued: {sender} -> {target.display_name}")
     print(f"Queued for '{target.display_name}' — it will be delivered at the "
           f"start of its next session.")
-    print(f"  Pending: {operator_mail.pending_count(OPERATOR_HOME, target.id)}")
+    try:
+        print(f"  Pending: {operator_mail.pending_count(OPERATOR_HOME, target.id)}")
+    except operator_mail.MailError as exc:
+        # The message is already queued; this line is a courtesy. Reporting
+        # "Pending: 0" would be false and reporting failure would be worse --
+        # the caller would resend a message that is already sitting there.
+        print(f"  Pending: unknown ({exc})")
     return 0
 
 
@@ -2954,12 +2975,39 @@ def show_inbox(args: list[str]) -> int:
                            "working in this directory — the folder and the "
                            "mailbox belong to different agents.")
 
-    if want_history:
-        msgs = operator_mail.history(OPERATOR_HOME, instance.id)
-    elif peek:
-        msgs = operator_mail.pending(OPERATOR_HOME, instance.id)
-    else:
-        msgs = operator_mail.consume(OPERATOR_HOME, instance.id)
+    try:
+        if want_history:
+            msgs = operator_mail.history(OPERATOR_HOME, instance.id)
+        elif peek:
+            msgs = operator_mail.pending(OPERATOR_HOME, instance.id)
+        else:
+            msgs = operator_mail.consume(OPERATOR_HOME, instance.id)
+    except operator_mail.MailError as exc:
+        # The mailbox is there but could not be read. Printing "No messages."
+        # here would be the worst available answer: it is what a healthy empty
+        # inbox prints, so an agent that has mail waiting would be told, in the
+        # ordinary words, that nobody wrote to it -- and would stop looking.
+        print(f"operator inbox: could not read mail for "
+              f"'{instance.display_name}'.", file=sys.stderr)
+        print(f"  {exc}", file=sys.stderr)
+        print("  This is not the same as an empty inbox: messages may be "
+              "waiting and unreadable.", file=sys.stderr)
+        # `consume` archives one message at a time, so a fault part way
+        # through the batch leaves the earlier ones already read. Claiming
+        # "nothing has been marked read" on that path was this module's own
+        # defect reached through its error handler: a sentence asserting an
+        # outcome nobody checked, and the messages it was wrong about had
+        # been archived unread and shown to nobody. Ask, then say.
+        if exc.consumed:
+            print(f"  {len(exc.consumed)} message(s) HAD already been marked "
+                  "read before the failure. They are printed below, because "
+                  "this is the only time they will ever be offered.",
+                  file=sys.stderr)
+            print(operator_mail.render_for_terminal(exc.consumed))
+        else:
+            print("  Nothing has been marked read, so anything there survives "
+                  "for the next attempt.", file=sys.stderr)
+        return 1
 
     if as_json:
         print(json.dumps(msgs, indent=2))
@@ -3244,7 +3292,19 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     # arrives during session #3 must still reach session #4.
                     # Read now, archive only once the session is really up.
                     launch_preamble = preamble
-                    waiting = operator_mail.pending(OPERATOR_HOME, instance.id)
+                    try:
+                        waiting = operator_mail.pending(OPERATOR_HOME, instance.id)
+                    except operator_mail.MailError as exc:
+                        # An unreadable mailbox must not kill an unattended
+                        # loop, so this session goes ahead without a mail
+                        # preamble -- but it goes ahead having said so. The
+                        # messages are neither read nor archived, so they are
+                        # offered again at the next launch: a jam that is
+                        # announced every session, rather than a delivery that
+                        # silently never happens.
+                        log(f"  Could not read queued mail ({exc})")
+                        log("  Continuing without it; nothing was marked read")
+                        waiting = []
                     if waiting:
                         senders = ", ".join(operator_mail.sender_names(waiting))
                         log(f"  Delivering {len(waiting)} queued message(s) from {senders}")
@@ -3276,8 +3336,16 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                         continue
                     launch_failures = 0
                     if waiting:
-                        operator_mail.archive(OPERATOR_HOME, instance.id,
-                                              [m["id"] for m in waiting])
+                        try:
+                            operator_mail.archive(OPERATOR_HOME, instance.id,
+                                                  [m["id"] for m in waiting])
+                        except operator_mail.MailError as exc:
+                            # The mail was delivered into the session; only the
+                            # bookkeeping failed. Left pending, it is delivered
+                            # again next launch -- a duplicate the agent can
+                            # see, which is the better failure of the two.
+                            log(f"  Delivered mail could not be marked read ({exc})")
+                            log("  It will be offered again at the next launch")
                     resume_id_used = ""
                     last_launched = session_num
                     session_started_at = time.time()

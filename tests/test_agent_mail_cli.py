@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 from pathlib import Path
 
 import pytest
@@ -328,6 +329,101 @@ def test_inbox_history_shows_already_read_messages(idle_recipient, capsys):
 def test_inbox_is_empty_not_an_error_for_a_quiet_instance(idle_recipient, capsys):
     assert op.show_inbox(["beta"]) == 0
     assert "No messages." in capsys.readouterr().out
+
+
+def test_inbox_that_cannot_be_read_does_not_report_no_messages(idle_recipient,
+                                                                capsys,
+                                                                monkeypatch):
+    """The whole failure, at the seam where a human or an agent reads it.
+
+    The test directly above is the control and the two must not agree: a quiet
+    mailbox prints "No messages." and exits 0, and until this was fixed a
+    mailbox that could not be opened printed the same words and the same code
+    while holding mail. `Path.glob` swallows `PermissionError` and stops
+    yielding, so every layer above it saw an ordinary empty sequence.
+
+    That is the one lie this command cannot tell. An agent reads its inbox
+    once at the start of a session and believes the answer -- so a peer that
+    is blocked on a reply stays blocked, and nothing anywhere reports a fault.
+    """
+    op.send_message(["--from", "alpha", "--to", "beta", "please reply"])
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+    inbox = operator_mail.inbox_dir(op.OPERATOR_HOME, "beta")
+    real_scandir = os.scandir
+    denying = {"on": True}
+
+    def denied_scandir(path=".", *args, **kwargs):
+        if denying["on"] and Path(path) == inbox:
+            raise PermissionError(13, "Permission denied")
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(operator_mail.os, "scandir", denied_scandir)
+    capsys.readouterr()
+
+    assert op.show_inbox(["beta"]) == 1
+    captured = capsys.readouterr()
+    assert "No messages." not in captured.out + captured.err
+    assert "could not read mail" in captured.err
+
+    # Nothing was consumed on the way past, so the message is still there.
+    # The denial is lifted with a flag rather than `monkeypatch.undo()`, which
+    # would also revert the autouse fixture's OPERATOR_HOME and quietly assert
+    # against the real mailbox instead of this test's.
+    denying["on"] = False
+    assert operator_mail.pending_count(op.OPERATOR_HOME, "beta") == 1
+    assert [m["text"] for m in operator_mail.pending(op.OPERATOR_HOME, "beta")] \
+        == ["please reply"]
+
+
+def test_send_still_reports_success_when_the_pending_count_cannot_be_read(
+        idle_recipient, capsys, monkeypatch):
+    """The message is already queued by then; the count is a courtesy.
+
+    Letting the refusal escape would turn a delivered message into a reported
+    failure, and the caller's repair for that is to send it again.
+    """
+    inbox = operator_mail.inbox_dir(op.OPERATOR_HOME, "beta")
+    real_scandir = os.scandir
+    denying = {"on": True}
+
+    def denied_scandir(path=".", *args, **kwargs):
+        if denying["on"] and Path(path) == inbox:
+            raise PermissionError(13, "Permission denied")
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(operator_mail.os, "scandir", denied_scandir)
+    assert op.send_message(["--from", "alpha", "--to", "beta", "queued anyway"]) == 0
+    out = capsys.readouterr().out
+    assert "Pending: unknown" in out
+    assert "Pending: 0" not in out
+
+    denying["on"] = False
+    assert [m["text"] for m in operator_mail.pending(op.OPERATOR_HOME, "beta")] \
+        == ["queued anyway"]
+
+
+def test_send_reports_a_failure_when_the_recipients_mailbox_is_not_a_directory(
+        idle_recipient, capsys):
+    """The fault is at the far end, so the sender must be told whose it is.
+
+    `_write`'s `mkdir(exist_ok=True)` forgives a directory but not a plain
+    file, so this used to end in a raw `FileExistsError` traceback naming a
+    path the sender has no reason to recognise -- and which reads like a bug
+    in `operator send` rather than a broken mailbox belonging to somebody
+    else. Nothing is stored, so unlike the pending-count case this has to be
+    a non-zero exit: a success here would lose the message silently.
+    """
+    inbox = operator_mail.inbox_dir(op.OPERATOR_HOME, "beta")
+    if inbox.exists():
+        shutil.rmtree(inbox)
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox.write_text("not a directory", encoding="utf-8")
+
+    assert op.send_message(["--from", "alpha", "--to", "beta", "undeliverable"]) == 1
+    captured = capsys.readouterr()
+    assert "Could not queue for" in captured.err
+    assert "Queued for" not in captured.out
+    assert "Traceback" not in captured.err
 
 
 @pytest.mark.parametrize("bad", ["--peak", "--unraed", "--help-me", "-x"])
@@ -1150,3 +1246,43 @@ def test_mail_is_only_archived_after_the_session_starts(idle_recipient):
     assert operator_mail.pending_count(op.OPERATOR_HOME, inst.id) == 1
     operator_mail.archive(op.OPERATOR_HOME, inst.id, [m["id"] for m in waiting])
     assert operator_mail.pending_count(op.OPERATOR_HOME, inst.id) == 0
+
+
+def test_inbox_prints_the_mail_it_already_marked_read_when_consume_fails(
+    isolated_state, monkeypatch, capsys
+):
+    """A partial `consume` must not lose the messages it already archived.
+
+    `consume` archives one message at a time, so a fault mid-batch leaves the
+    earlier ones read. The handler used to print "Nothing has been marked
+    read" on that path -- a sentence asserting an outcome nobody had checked
+    -- and those messages were then archived, unread, permanently. They are
+    printed here because it is the only time they will ever be offered.
+    """
+    tmp = isolated_state
+    for text in ("first message", "second message"):
+        operator_mail.queue(tmp, operator_mail.new_message(
+            "alpha", "beta", "beta", text))
+
+    real_write_json = operator_mail._write_json
+    calls: list[dict] = []
+
+    def fail_on_the_second(path, msg):
+        calls.append(msg)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return real_write_json(path, msg)
+
+    monkeypatch.setattr(operator_mail, "_write_json", fail_on_the_second)
+    rc = op.show_inbox(["beta"])
+    out = capsys.readouterr()
+    combined = out.out + out.err
+
+    assert rc == 1, "a failed read is not a success"
+    assert "Nothing has been marked read" not in combined, (
+        "that claim is false here: a message was archived before the failure")
+    assert "HAD already been marked read" in combined
+    # The message itself, not merely a count of it.
+    consumed_text = calls[0]["text"]
+    assert consumed_text in combined, (
+        f"{consumed_text!r} was marked read and never shown to anybody")
