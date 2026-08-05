@@ -669,3 +669,72 @@ def test_an_empty_catalog_removes_nothing(catalog, monkeypatch, home):
                         lambda *a, **k: pytest.fail("retired with no projects"))
     assert copilot_operator.retire_user_instructions(assume_yes=True) == 1
     assert copilot_operator.user_instructions_present() is True
+
+
+def test_a_catalog_that_changes_mid_run_stops_the_removal(catalog, monkeypatch,
+                                                          home, tmp_path):
+    """The list of projects is a snapshot, and this machine has other agents.
+
+    A project registered after the snapshot is never written to. Removing the
+    global file anyway is precisely the gap the whole feature exists to
+    prevent, so the last thing before anything is removed is a re-read.
+    """
+    _plant_global(home)
+    repo = tmp_path / "one"
+    repo.mkdir()
+    catalog.write_text(f'"{repo}",{GUID}\n', encoding="utf-8")
+    monkeypatch.setattr(project_instructions, "resolve_source",
+                        lambda *a, **k: ("# Conventions\n\n## A\n\nbody\n",
+                                         "the repository template"))
+
+    real_retire = project_instructions.retire
+
+    def racing_retire(projects, **kwargs):
+        outer = kwargs.pop("recheck")
+
+        def recheck():
+            catalog.write_text(
+                f'"{repo}",{GUID}\n"/a/two",{OTHER_GUID}\n', encoding="utf-8")
+            return outer()
+
+        return real_retire(projects, recheck=recheck, **kwargs)
+
+    monkeypatch.setattr(project_instructions, "retire", racing_retire)
+    assert copilot_operator.retire_user_instructions(assume_yes=True) == 1
+    assert copilot_operator.user_instructions_present() is True
+    assert (repo / project_instructions.AGENTS_NAME).is_file()  # probe-ok: test
+
+
+def test_an_unchanged_catalog_is_not_mistaken_for_a_race(catalog, monkeypatch,
+                                                         home, tmp_path):
+    """The control: the re-read must not block the ordinary case."""
+    _plant_global(home)
+    repo = tmp_path / "one"
+    repo.mkdir()
+    catalog.write_text(f'"{repo}",{GUID}\n', encoding="utf-8")
+    monkeypatch.setattr(project_instructions, "resolve_source",
+                        lambda *a, **k: ("# Conventions\n\n## A\n\nbody\n",
+                                         "the repository template"))
+    assert copilot_operator.retire_user_instructions(assume_yes=True) == 0
+    assert copilot_operator.user_instructions_present() is False
+    assert (repo / project_instructions.AGENTS_NAME).is_file()  # probe-ok: test
+
+
+def test_the_fingerprint_notices_a_same_length_edit(catalog, home):
+    """Bytes, not mtime or size.
+
+    Two agents registering a moment apart is the case a coarse timestamp
+    misses, and a replaced guid is the case a size check misses.
+    """
+    catalog.write_text(f'"/a/one",{GUID}\n', encoding="utf-8")
+    before = copilot_operator._catalog_fingerprint()
+    catalog.write_text(f'"/a/one",{OTHER_GUID}\n', encoding="utf-8")
+    assert len(OTHER_GUID) == len(GUID), "the edit must not change the size"
+    assert copilot_operator._catalog_fingerprint() != before
+
+
+def test_a_catalog_that_vanishes_counts_as_a_change(catalog, home):
+    catalog.write_text(f'"/a/one",{GUID}\n', encoding="utf-8")
+    before = copilot_operator._catalog_fingerprint()
+    catalog.unlink()
+    assert copilot_operator._catalog_fingerprint() != before

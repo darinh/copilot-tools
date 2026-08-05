@@ -4768,6 +4768,22 @@ def _combine_prompt(project: dict, existing: str) -> bool:
     return answer in ("y", "yes")
 
 
+def _catalog_fingerprint():
+    """Enough of the catalog's state to notice it changed under us.
+
+    Bytes rather than mtime: a second write within the same filesystem
+    timestamp granularity is exactly the case a coarse stamp misses, and two
+    agents registering projects a moment apart is the scenario. Unreadable
+    reads back as the exception text, so "it went away" also counts as a
+    change rather than as "no projects".
+    """
+    path = project_catalog_path()
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"unreadable: {exc}"
+
+
 def retire_user_instructions(assume_yes: bool = False) -> int:
     """Give every catalogued project an ``AGENTS.md``, then retire the global file.
 
@@ -4823,6 +4839,14 @@ def retire_user_instructions(assume_yes: bool = False) -> int:
             print("  Nothing written.")
             return 0
     print()
+    snapshot = _catalog_fingerprint()
+
+    def recheck():
+        if _catalog_fingerprint() == snapshot:
+            return None
+        return (f"{project_catalog_path()} changed while this was running, so "
+                "the list of projects it was given may be out of date.")
+
     result = project_instructions.retire(
         projects,
         source=source,
@@ -4834,6 +4858,7 @@ def retire_user_instructions(assume_yes: bool = False) -> int:
         version=TOOLKIT_VERSION,
         decide=(lambda project, existing: True) if assume_yes else _combine_prompt,
         log=print,
+        recheck=recheck,
     )
     return _report_retirement(result, global_path)
 

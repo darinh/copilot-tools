@@ -712,6 +712,7 @@ def retire(projects, *, source: str, source_origin: str, global_path,
            archive_dir, projects_root, home, version: str,
            decide=lambda project, existing: False,
            log=lambda message: None,
+           recheck=lambda: None,
            allow_missing: bool = False) -> RetirementResult:
     """Give every project its ``AGENTS.md``, then retire the user-scope file.
 
@@ -725,6 +726,13 @@ def retire(projects, *, source: str, source_origin: str, global_path,
     ``AGENTS.md`` without a managed block in it, and never for anything else,
     so a non-interactive caller that answers "no" is refusing to write into
     other people's files rather than refusing the whole operation.
+
+    ``recheck`` is asked, just before anything is removed, whether the list it
+    was given still describes reality. ``projects`` is a snapshot, and other
+    agents register projects on this machine while this runs -- a row added
+    after the snapshot would never be written to, and removing the global file
+    anyway is the gap this whole function exists to prevent. Returning a
+    message aborts; returning ``None`` proceeds.
     """
     result = RetirementResult(source_origin=source_origin)
     result.user_agents = user_scope_agents_files(home)
@@ -752,6 +760,14 @@ def retire(projects, *, source: str, source_origin: str, global_path,
             f"No project received an {AGENTS_NAME}, so {global_path} was left "
             "in place. Removing it now would take the conventions off this "
             "machine entirely.")
+        return result
+
+    changed = recheck()
+    if changed:
+        result.problems.append(
+            f"{changed} {global_path} was left in place; every project that "
+            f"was listed has its {AGENTS_NAME}, so running this again costs "
+            "nothing.")
         return result
 
     global_path = Path(global_path)
