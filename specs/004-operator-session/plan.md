@@ -51,6 +51,14 @@ and the correct output is a report, not a steal.
 `operator_mux.py` already knows how to ask whether a mux session exists; reuse
 it rather than adding a second spelling of the same question.
 
+Delivered as `work_claims.py` (the claim table and its check-and-write, one
+`BEGIN IMMEDIATE` transaction) and `operator_liveness.py` (boot identity,
+process presence and start token, and `assess()`). The mux question is asked
+through a new `Mux.session_present()` beside `has_session()` rather than a
+second implementation: `has_session()` answers two-valued, which is right for
+the create path — trying again costs nothing — and wrong here, where a failed
+call read as "absent" reports a live agent dead.
+
 ## Phase D — session lifecycle
 
 `session end` must be atomic across three effects (handoff, claim release,

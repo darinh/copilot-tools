@@ -47,6 +47,7 @@ py-modules = [
     "install_manifest",
     "operator_console",
     "operator_ingest",
+    "operator_liveness",
     "operator_mail",
     "operator_trace",
     "operator_mux",
@@ -56,6 +57,7 @@ py-modules = [
     "project_instructions",
     "project_paths",
     "setup_tools",
+    "work_claims",
     "worktree_guard_backend",
 ]
 

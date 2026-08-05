@@ -14,6 +14,8 @@ messaging, and spec-driven workflow conventions.
 | [`copilot_operator.py`](docs/operator.md) | Cross-platform Copilot CLI wrapper with metrics capture, autonomous loop mode, and multi-instance support |
 | [`operator_runner.py`](docs/operator.md#architecture) | In-pane session supervisor: correct process attribution and metrics after detach |
 | [`operator_mux.py`](docs/operator.md#platform-support) | Session-backend abstraction (tmux / psmux) |
+| [`work_claims.py`](work_claims.py) | One work item, one owner: the claim store behind `operator work` |
+| [`operator_liveness.py`](operator_liveness.py) | Whether a claim's owner is provably gone: LIVE / DEAD / STALE |
 | [`operator_ingest.py`](operator_ingest.py) | Pure-Python log parser for copilot process logs |
 | [`handoff_tool.py`](docs/operator.md) | Atomic session handoff for agents |
 | [`backlog_tool.py`](backlog/README.md) | Reads and enforces the tracked `backlog/`; ships the `backlog` command |
@@ -363,11 +365,13 @@ copilot-tools/
 ├── operator_ingest.py             # Pure-Python log parser
 ├── operator_mail.py               # Agent-to-agent mail, live and queued delivery
 ├── operator_trace.py              # Who invoked the operator, and how it ended
+├── operator_liveness.py           # Is a claim's owner still there? LIVE / DEAD / STALE
 ├── operator_console.py            # UTF-8 console output
 ├── project_paths.py               # Project identity: catalog and per-project dirs
 ├── project_features.py            # The feature vocabulary, and each project's choices
 ├── project_instructions.py        # Renders each project's AGENTS.md; retires the global file
 ├── handoff_tool.py                # Session handoff
+├── work_claims.py                 # One work item, one owner: the claim store
 ├── backlog_tool.py                # Backlog parser, validator, and HTML view
 ├── setup_tools.py                 # Cross-platform environment setup
 ├── install_manifest.py            # Records what setup deployed; upgrade strategies

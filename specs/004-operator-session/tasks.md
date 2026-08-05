@@ -21,11 +21,11 @@ Status is tracked in SQL during execution; this file is the reconciled record.
 
 ## Phase C — liveness (FR-3, FR-4)
 
-- [ ] C1 `work_claims` schema and store
-- [ ] C2 `boot_id` probe — Linux `/proc/sys/kernel/random/boot_id`, Windows
+- [x] C1 `work_claims` schema and store
+- [x] C2 `boot_id` probe — Linux `/proc/sys/kernel/random/boot_id`, Windows
       `LastBootUpTime`
-- [ ] C3 Mux-session and PID+start-time probes
-- [ ] C4 The four-step cascade returning LIVE / DEAD / STALE, never auto-stealing
+- [x] C3 Mux-session and PID+start-time probes
+- [x] C4 The four-step cascade returning LIVE / DEAD / STALE, never auto-stealing
       on STALE
 
 ## Phase D — session lifecycle (FR-2, FR-5)
