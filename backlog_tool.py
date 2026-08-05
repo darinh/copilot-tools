@@ -813,12 +813,17 @@ def create_item(directory, **kwargs) -> Path:
 
 #: One line *with* whatever ended it, or the last line if nothing did.
 #:
-#: Deliberately not ``str.splitlines``, which splits on every Unicode line
-#: boundary -- form feed, vertical tab, NEL, U+2028, U+2029 -- so rejoining
-#: its output replaces each of those with an ordinary newline. In prose that
-#: is silent corruption of somebody's evidence, performed by a function whose
-#: entire claim is that it changed one line.
-_LINE = re.compile(r"[^\n]*\n|[^\n]+\Z")
+#: All three real endings count -- ``\r\n``, ``\n`` and a lone ``\r`` -- so
+#: this splits exactly what :func:`parse_item` splits. Anything narrower makes
+#: a CR-only file parse fine and then fail to approve, with an error blaming a
+#: missing ``status:`` line that is plainly there.
+#:
+#: Deliberately not ``str.splitlines``, which additionally splits on every
+#: Unicode line boundary -- form feed, vertical tab, NEL, U+2028, U+2029 -- so
+#: rejoining its output replaces each of those with an ordinary newline. In
+#: prose that is silent corruption of somebody's evidence, performed by a
+#: function whose entire claim is that it changed one line.
+_LINE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
 
 
 def approve_item(directory, item_id: int) -> Path:
@@ -1082,8 +1087,13 @@ def scrum_report(repo_root=None, watermark: "dict | None" = None, *,
     rc, out = _git(["rev-parse", "HEAD"], root)
     head = out.strip() if rc == 0 else ""
     if not head:
-        notes.append("this checkout has no commits yet, so nothing is dated "
-                     "against a revision")
+        # Stated as the observation, not a diagnosis. A checkout with no
+        # commits and a checkout whose git could not be run answer this
+        # question identically, and picking one of them to report is how
+        # "I could not look" gets spent as "there was nothing there".
+        notes.append("HEAD could not be read, so nothing is dated against a "
+                     "revision; a checkout with no commits yet reads this "
+                     "way too")
 
     since = (watermark or {}).get("commit", "") or ""
     since_when = (watermark or {}).get("checked_at", "") or ""
@@ -1098,6 +1108,12 @@ def scrum_report(repo_root=None, watermark: "dict | None" = None, *,
     commits: list = []
     item_changes: list = []
     commits_known = changes_known = True
+    if not head and not first_run:
+        # HEAD could not be read, so nothing was listed and nothing is known.
+        # Leaving the flags true here renders "Commits: none." on a report
+        # whose git is broken -- the same conflation the flags were added to
+        # end, one branch further out.
+        commits_known = changes_known = False
     # A first run has no boundary to measure from and says so in prose; every
     # other case lists commits, including the one where the recorded boundary
     # has gone. Skipping the section there would render an unresolvable
@@ -1164,7 +1180,11 @@ def format_scrum(report: ScrumReport) -> str:
         sections.append("Since the previous check-in, which recorded no "
                         "commit to measure from.")
 
-    if not report.commits_known:
+    if report.first_run:
+        # The opening prose already says the history is left out; a first run
+        # has no boundary, so neither "none" nor "unknown" would be true.
+        pass
+    elif not report.commits_known:
         # Not "none". The list could not be obtained, and saying "none" here
         # would report the failure as a quiet period -- which is the one thing
         # a check-in must never do, because both look like good news.
@@ -1174,12 +1194,12 @@ def format_scrum(report: ScrumReport) -> str:
         sections.append("\n".join(
             [f"Commits ({len(report.commits)}):"]
             + [f"  {line}" for line in report.commits]))
-    elif not report.first_run:
+    else:
         # Said out loud rather than omitted. A missing section reads as a
         # rendering slip; "none" is an answer the reader can act on.
         sections.append("Commits: none.")
 
-    if not report.changes_known:
+    if not report.first_run and not report.changes_known:
         sections.append("Backlog files touched: could not be listed (see the "
                         "caveats below); this is not the same as none.")
     elif report.item_changes:

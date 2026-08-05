@@ -276,6 +276,24 @@ def test_approval_preserves_a_missing_final_newline(repo):
     assert not path.read_bytes().endswith(b"\n")
 
 
+def test_approval_handles_the_line_endings_the_parser_handles(repo):
+    """A CR-only file, which ``parse_item`` reads without complaint.
+
+    Splitting on fewer endings than the parser accepts makes an item that
+    lists, shows and validates cleanly refuse to approve -- with an error
+    blaming a missing ``status:`` line that is plainly in the file. The two
+    have to agree about what a line is.
+    """
+    path = file_one(repo)
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r"))
+    assert backlog_tool.parse_item(path).status == PROPOSED_STATUS
+    backlog_tool.approve_item(backlog_dir(repo), 1)
+    raw = path.read_bytes()
+    assert b"\n" not in raw, "a CR-only file came back with LF endings"
+    assert f"status: {OPEN_STATUS}".encode("utf-8") in raw
+    assert backlog_tool.parse_item(path).status == OPEN_STATUS
+
+
 def test_approval_makes_the_item_workable(repo):
     file_one(repo)
     assert backlog_tool.workable(backlog_tool.load(backlog_dir(repo))[0]) == []
@@ -473,6 +491,44 @@ def commit_all(root: Path, message: str) -> str:
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", message)
     return git(root, "rev-parse", "HEAD")
+
+
+def test_an_unreadable_head_is_unknown_not_none(repo, monkeypatch):
+    """The branch one step out from the one the flags were added for.
+
+    ``rev-parse`` failing means nothing was listed, so nothing is known -- but
+    the listing block is skipped rather than failing, so the flags stay true
+    unless something says otherwise, and the report renders "Commits: none."
+    over a broken git. Two reviewers read this branch and called it sound.
+    """
+    file_one(repo)
+    head = commit_all(repo, "file an item")
+    real = backlog_tool._git
+
+    def no_head(args, cwd):
+        if args and args[0] == "rev-parse":
+            return 128, ""
+        return real(args, cwd)
+
+    monkeypatch.setattr(backlog_tool, "_git", no_head)
+    report = backlog_tool.scrum_report(
+        repo, {"commit": head, "checked_at": "2026-08-05T00:00:00Z"})
+    assert report.head == ""
+    assert not report.commits_known and not report.changes_known
+    text = backlog_tool.format_scrum(report)
+    assert "Commits: none." not in text
+    assert "could not be listed" in text
+
+
+def test_a_first_check_in_claims_neither_none_nor_unknown(repo):
+    """A first run has no boundary, so both readings would be false; the
+    opening prose already says the history is left out."""
+    file_one(repo)
+    commit_all(repo, "file an item")
+    text = backlog_tool.format_scrum(backlog_tool.scrum_report(repo, None))
+    assert "Commits: none." not in text
+    assert "could not be listed" not in text
+    assert "First check-in" in text
 
 
 def test_a_first_check_in_says_so_and_reports_current_state(repo):
