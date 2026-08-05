@@ -5525,6 +5525,172 @@ def _catalog_fingerprint():
         return f"unreadable: {exc}"
 
 
+# ── telling git about the AGENTS.md files retirement writes ──────
+#: What happened to one repository's ``AGENTS.md`` once git was told about it.
+AGENTS_COMMITTED = "committed"
+AGENTS_STAGED = "staged"
+AGENTS_TRACKED = "already tracked"
+AGENTS_NO_REPO = "not a git repository"
+AGENTS_FAILED = "could not be staged"
+
+
+class AgentsTracking:
+    """One repository's ``AGENTS.md``, and what git was told about it.
+
+    A plain class rather than a ``@dataclass``, which is what this was until
+    `tests/test_entry_points.py` objected. That test executes this module
+    straight from its path, with no entry in ``sys.modules`` -- the way the
+    installed console script is loaded -- and ``@dataclass`` resolves its
+    field annotations through ``sys.modules[cls.__module__]``, which is
+    ``None`` there. It raises at import time, so the cost is not a broken
+    dataclass but a `operator` command that cannot start at all.
+    """
+    __slots__ = ("label", "root", "state", "detail")
+
+    def __init__(self, label: str, root: Path, state: str, detail: str = ""):
+        self.label = label
+        self.root = root
+        self.state = state
+        self.detail = detail
+
+    def __repr__(self) -> str:
+        return (f"AgentsTracking({self.label!r}, {self.root!r}, "
+                f"{self.state!r}, {self.detail!r})")
+
+
+
+def _git_write(args: list[str], cwd: Path) -> "tuple[bool, str]":
+    """Run a git command that changes state. ``(succeeded, why not)``.
+
+    Unlike :func:`_git_output` the failure text is kept rather than collapsed
+    into ``None``. Every caller here has to name the repository that refused
+    and say why: a write whose failure is indistinguishable from success
+    leaves somebody believing a file is staged when it is not, which is the
+    exact belief this feature exists to stop being wrong.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=GIT_PROBE_TIMEOUT, **NO_WINDOW_KWARGS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        text = (proc.stderr or proc.stdout).strip()
+        lines = text.splitlines()
+        return False, (lines[-1] if lines else f"git exited {proc.returncode}")
+    return True, ""
+
+
+def _commit_would_be_unsafe(root: Path) -> "str | None":
+    """Why a commit in ``root`` must not be attempted, or ``None``.
+
+    A commit is refused wherever it would land somewhere nobody is looking.
+    A detached HEAD takes the commit and leaves no branch pointing at it. An
+    interrupted merge, rebase, cherry-pick or revert has a half-built tree
+    whose next git command expects to *finish* that operation, not to find an
+    unrelated commit on top of it.
+
+    Staging stays correct in every one of these -- only the commit is
+    refused -- which is why this answers about the commit alone.
+    """
+    if _git_output(["symbolic-ref", "-q", "HEAD"], root) is None:
+        return "HEAD is detached"
+    for name, why in (
+            ("MERGE_HEAD", "a merge is in progress"),
+            ("CHERRY_PICK_HEAD", "a cherry-pick is in progress"),
+            ("REVERT_HEAD", "a revert is in progress"),
+            ("rebase-merge", "a rebase is in progress"),
+            ("rebase-apply", "a rebase is in progress")):
+        located = _git_output(["rev-parse", "--git-path", name], root)
+        if located is None:
+            return "the git directory could not be examined"
+        # `.exists()` answers False for a path that is there but unexaminable,
+        # and raises on a permission denial. Both wrong answers here say "no
+        # operation in progress" and let a commit land in a half-built tree,
+        # so an unexaminable git directory refuses the commit rather than
+        # assuming the best of it.
+        try:
+            interrupted = (root / located.strip()).exists()
+        except OSError as exc:
+            return f"the git directory could not be examined ({exc})"
+        if interrupted:
+            return why
+    return None
+
+
+def stage_agents_files(outcomes) -> "list[AgentsTracking]":
+    """Stage every ``AGENTS.md`` that was just written.
+
+    Writing the file and saying nothing to git leaves a repository's own
+    conventions in the one state that `git clean -fd` deletes, that never
+    reaches a clone, and that is indistinguishable from the scratch checkout
+    hygiene exists to sweep away. Staged, it survives all three and reads in
+    `git status` as something somebody meant to be there.
+
+    Staging is unconditional because it creates no commit and destroys
+    nothing; committing is the part that has to be asked about.
+    """
+    name = project_instructions.AGENTS_NAME
+    tracked: "list[AgentsTracking]" = []
+    for outcome in outcomes:
+        if outcome.agents_path is None:
+            continue
+        root = Path(outcome.path)
+        if _git_output(["rev-parse", "--git-dir"], root) is None:
+            tracked.append(AgentsTracking(outcome.label, root, AGENTS_NO_REPO))
+            continue
+        # Tracked-and-unmodified is the one case with nothing to do. It is
+        # asked as two questions because `git status` alone cannot tell it
+        # apart from a file some .gitignore has swallowed, which reports
+        # clean while being entirely absent from the repository.
+        is_tracked = _git_output(
+            ["ls-files", "--error-unmatch", "--", name], root) is not None
+        pending = _git_output(["status", "--porcelain", "--", name], root)
+        if is_tracked and pending is not None and not pending.strip():
+            tracked.append(AgentsTracking(outcome.label, root, AGENTS_TRACKED))
+            continue
+        ok, why = _git_write(["add", "--", name], root)
+        tracked.append(AgentsTracking(
+            outcome.label, root,
+            AGENTS_STAGED if ok else AGENTS_FAILED, "" if ok else why))
+    return tracked
+
+
+def commit_agents_files(tracked, origin: str) -> "list[AgentsTracking]":
+    """Commit the staged ``AGENTS.md`` files, one commit per repository.
+
+    ``git commit -- <path>`` rather than a bare ``git commit``, so a
+    repository carrying unrelated staged work contributes only this file.
+    Sweeping somebody's in-progress index into a commit they did not write is
+    the failure this feature must not become, and it is the reason a bare
+    commit is wrong here even though it is shorter.
+
+    Anything that was not staged is passed through untouched, so the returned
+    list still describes every repository.
+    """
+    name = project_instructions.AGENTS_NAME
+    message = (f"docs: add {name} project conventions\n\n"
+               f"Written by `operator projects retire` from {origin}.")
+    settled: "list[AgentsTracking]" = []
+    for entry in tracked:
+        if entry.state != AGENTS_STAGED:
+            settled.append(entry)
+            continue
+        unsafe = _commit_would_be_unsafe(entry.root)
+        if unsafe:
+            settled.append(AgentsTracking(entry.label, entry.root,
+                                          AGENTS_STAGED, f"not committed — {unsafe}"))
+            continue
+        ok, why = _git_write(["commit", "-m", message, "--", name], entry.root)
+        settled.append(AgentsTracking(
+            entry.label, entry.root,
+            AGENTS_COMMITTED if ok else AGENTS_STAGED,
+            "" if ok else f"not committed — {why}"))
+    return settled
+
+
 def retire_user_instructions(assume_yes: bool = False) -> int:
     """Give every catalogued project an ``AGENTS.md``, then retire the global file.
 
@@ -5601,11 +5767,32 @@ def retire_user_instructions(assume_yes: bool = False) -> int:
         log=print,
         recheck=recheck,
     )
-    return _report_retirement(result, global_path)
+    tracking = stage_agents_files(result.placed)
+    staged = [entry for entry in tracking if entry.state == AGENTS_STAGED]
+    # `--yes` answers "write into my repositories", which is not the same
+    # consent as "make commits in them". Unattended, the conservative half is
+    # taken: everything is staged and nothing is committed.
+    if staged and not assume_yes:
+        suffix = "y" if len(staged) == 1 else "ies"
+        if _prompt_line(
+                f"\n  Commit {project_instructions.AGENTS_NAME} in "
+                f"{len(staged)} repositor{suffix}? [y/N]: "
+                ).lower() in ("y", "yes"):
+            tracking = commit_agents_files(tracking, result.source_origin)
+    return _report_retirement(result, global_path, tracking)
 
 
-def _report_retirement(result, global_path: Path) -> int:
+def _report_retirement(result, global_path: Path, tracking=()) -> int:
     print()
+    if tracking:
+        print(f"  {project_instructions.AGENTS_NAME} in each repository:")
+        for entry in tracking:
+            print(f"    {entry.label}: {entry.state}"
+                  + (f" — {entry.detail}" if entry.detail else ""))
+        if any(entry.state == AGENTS_STAGED for entry in tracking):
+            print("    Staged, not committed — commit them or they are one "
+                  "`git clean -fd` from gone.")
+        print()
     if result.user_agents:
         print("  ! A user-scope AGENTS.md is also loaded into every session:")
         for path in result.user_agents:
