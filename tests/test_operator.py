@@ -1406,19 +1406,30 @@ def test_stop_loop_only_touches_detach_marker_and_waits(monkeypatch):
     inst.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
 
     calls = {"n": 0}
+    state = {"consumed": False}
 
     def fake_running_pid(instance):
         calls["n"] += 1
-        # Simulate the supervisor exiting after being asked to detach.
-        if calls["n"] >= 2:
-            return None
-        return os.getpid()
+        return None if state["consumed"] else os.getpid()
+
+    def fake_sleep(seconds):
+        # The supervisor acts *during* the wait, which is the only place a
+        # real one can: it consumes the request, then exits. Driving this off
+        # a count of _running_loop_pid calls instead would couple the test to
+        # how many times the function happens to stat, and a fake that fires
+        # before the wait even starts makes the whole thing pass by accident.
+        if inst.detach_marker.exists():
+            op.remove_file(inst.detach_marker)
+            state["consumed"] = True
 
     monkeypatch.setattr(op, "_running_loop_pid", fake_running_pid)
-    monkeypatch.setattr(op.time, "sleep", lambda s: None)
+    monkeypatch.setattr(op.time, "sleep", fake_sleep)
     rc = op.stop_loop_only("has-loop")
+    # rc is the discriminator: 0 only when the marker was gone by the time the
+    # supervisor was, i.e. unlinked by the supervisor itself and not by us.
     assert rc == 0
-    assert inst.detach_marker.exists()  # unlinked by the supervisor itself, not us
+    assert state["consumed"], "the wait never ran, so nothing was tested"
+    assert not inst.detach_marker.exists()
     assert calls["n"] >= 2
 
 
