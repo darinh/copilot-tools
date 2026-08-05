@@ -232,6 +232,16 @@ SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
 
 IS_WINDOWS = platform.system() == "Windows"
 
+# Verdicts of the supervisor-staleness check. Defined up here, away from the
+# machinery in `loop_code_state`, because `build_preamble` takes one as a
+# default argument and a default is evaluated when the `def` runs -- so the
+# name has to exist above the first function that mentions it, not merely
+# above the first that calls it.
+CODE_CURRENT = "current"
+CODE_STALE = "stale"
+CODE_UNKNOWN = "unknown"
+CODE_UNRECORDED = "unrecorded"
+
 # Extra Popen/run kwargs for helper subprocesses that must never show a window.
 #
 # On Windows, a process that has no console of its own (for example the
@@ -1960,7 +1970,8 @@ def crash_recovery_verdict(workdir: Path) -> bool:
     return False
 
 
-def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = False) -> str:
+def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = False,
+                   code_state: str = CODE_CURRENT) -> str:
     text = (
         "You are running under an automated operator wrapper that a human set up. "
         "Key facts: (1) You have blanket human approval for ALL decisions — tool calls, "
@@ -1977,14 +1988,76 @@ def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = F
         f"(5) Operator instance: {instance.display_name}. "
         "Now: check for your session handoff and get to work."
     )
+    clause = 5
     if crash_recovery:
+        clause += 1
         text += (
-            " (6) This session is being resumed because a handoff file could not be "
+            f" ({clause}) This session is being resumed because a handoff file could not be "
             "found for this project. Either a crash occurred or the previous session "
             "ended without the handoff being written. If you intended to end the "
             "session, please make sure you write a handoff first next time."
         )
+    notice = _code_state_notice(code_state, instance, crash_recovery)
+    if notice:
+        clause += 1
+        text += f" ({clause}) {notice}"
     return text
+
+
+def _code_state_notice(code_state: str, instance: Instance,
+                       crash_recovery: bool) -> str:
+    """The staleness caveat for the preamble, or ``""`` when there is none.
+
+    Why this belongs in the preamble at all, when `operator list` already
+    reports the same fact: they have different readers. `operator list` is
+    read by a human at a terminal who went looking. The preamble is read by
+    an agent that did not, and the preamble is where the misinformation
+    lands -- 355 launches across the fleet were told a handoff could not be
+    found, by supervisors running code from before the verdict was decided
+    per launch, and not one of them had any reason to go and check whether
+    its wrapper was current. Making staleness legible at the command line
+    did not make it legible to the party being lied to.
+
+    Scoped deliberately to *this preamble's own claims* rather than issued as
+    a general warning about the repository. The agent cannot act on "some
+    code is old"; it can act on "the sentence above about your predecessor
+    may have been written by code that no longer exists".
+
+    Silent when the code is current, which is the overwhelmingly common case
+    -- a caveat attached to every session is one that stops being read, and
+    this instrument exists because the previous one said nothing.
+    """
+    if code_state == CODE_CURRENT:
+        return ""
+    # Named so the agent can quote it back, and so the two verdicts are not
+    # reported in the same words: one is an observed difference, the other is
+    # an absence of evidence, and collapsing them would overstate the second.
+    claims = ("the claim above that a handoff could not be found"
+              if crash_recovery else "anything above that it decided per launch")
+    if code_state == CODE_STALE:
+        return (
+            "CAUTION — this operator wrapper is running OUT-OF-DATE code. The operator "
+            "source on disk has changed since the supervisor that launched you imported "
+            f"it, and a supervisor keeps its code for the whole run, so {claims} was "
+            "produced by a version that is no longer in the tree. Treat it as "
+            "unverified rather than false, and verify anything you would otherwise "
+            "have taken on this wrapper's word before acting on it — in particular, "
+            "check for a handoff file yourself rather than trusting a claim that none "
+            f"exists. `operator list` names the changed files; `operator restart-loop "
+            f"{instance.display_name}` picks up the current code, but that restarts "
+            "the supervisor you are running under, so raise it with the human rather "
+            "than doing it as a side effect of some other task."
+        )
+    return (
+        "CAUTION — this operator wrapper CANNOT SHOW that it is running current code. "
+        "The supervisor that launched you either recorded nothing about the operator "
+        "source it imported, or that record could not be compared against the tree "
+        f"now. This is an absence of evidence, not evidence of staleness: {claims} may "
+        "be perfectly correct. But it cannot be confirmed, so verify anything load-"
+        "bearing — in particular, check for a handoff file yourself rather than "
+        "trusting a claim that none exists. `operator list` reports the same state for "
+        "every instance on this machine."
+    )
 
 
 def write_launch_spec(instance: Instance, argv: list[str], cwd: Path,
@@ -2159,10 +2232,6 @@ class _FileAbsent:
 
 
 FILE_ABSENT = _FileAbsent()
-CODE_CURRENT = "current"
-CODE_STALE = "stale"
-CODE_UNKNOWN = "unknown"
-CODE_UNRECORDED = "unrecorded"
 
 _RUNNING_CODE: "dict | None" = None
 
@@ -2403,7 +2472,19 @@ def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
         # file belonging to one. A record we cannot read is the same answer as
         # a record that is not there.
         return CODE_UNKNOWN, []
-    files = payload.get("files")
+    return _compare_recorded_files(payload.get("files"))
+
+
+def _compare_recorded_files(files: object) -> "tuple[str, list[str]]":
+    """Compare recorded per-file digests against what is on disk now.
+
+    Shared by the two callers that ask the staleness question from opposite
+    ends: `loop_code_state` reads another process's record off disk, and
+    `own_code_state` hands over this process's own in-memory fingerprint.
+    They must not drift, because they are quoted side by side -- `operator
+    list` prints one and the session preamble carries the other, and two
+    verdicts that disagree about the same supervisor would discredit both.
+    """
     if not isinstance(files, list) or not files:
         return CODE_UNKNOWN, []
 
@@ -2435,6 +2516,59 @@ def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
     if undecided:
         return CODE_UNKNOWN, []
     return CODE_CURRENT, []
+
+
+def own_code_state() -> "tuple[str, list[str]]":
+    """Has the operator source moved on since *this* process imported it?
+
+    The same question `loop_code_state` answers about somebody else, asked
+    from inside the process that is actually running the code -- which is
+    strictly better evidence, and the reason this does not simply reuse the
+    record on disk. Three things stop being possible:
+
+    - The record could have failed to be written. `_save_loop_code` warns and
+      carries on, by design, so a supervisor can be running with a
+      `loop_code` file belonging to a *previous* supervisor of the same
+      instance. Compared against disk that stale record can read
+      ``current`` -- a confident all-clear sourced from a process that no
+      longer exists.
+    - The record could be unreadable, which costs a verdict this process
+      never needed to go to disk for.
+    - The record has no owner stamped into it that a reader is obliged to
+      check, so nothing distinguishes those two cases from a good one.
+
+    `running_code_fingerprint` is cached for the life of the process, so the
+    left-hand side here is what was really imported, not a re-read of disk.
+    That cache is what makes the comparison mean anything: recomputing both
+    sides would compare disk against disk and always say ``current``.
+
+    Never returns ``CODE_UNRECORDED``: an in-memory fingerprint always
+    exists, so "nobody wrote it down" is not one of the available answers.
+    """
+    return _compare_recorded_files(running_code_fingerprint().get("files"))
+
+
+def _launch_code_state() -> str:
+    """`own_code_state` for the per-launch preamble, which may not raise.
+
+    This runs inside an unattended supervisor's launch loop, where an
+    unhandled exception ends the run and takes every future session with it.
+    A staleness verdict is never worth that, so anything unexpected degrades
+    to ``CODE_UNKNOWN``.
+
+    Degrading to ``CODE_UNKNOWN`` rather than ``CODE_CURRENT`` is the whole
+    point: the failure directions are not symmetric. ``CODE_UNKNOWN`` prints
+    a caveat the agent may not need, which costs a few lines. ``CODE_CURRENT``
+    prints a clean bill of health nobody checked, which is exactly the silent
+    all-clear this instrument was built to stop -- and it would be
+    indistinguishable from the healthy case, so nothing downstream could ever
+    catch it.
+    """
+    try:
+        return own_code_state()[0]
+    except Exception as exc:  # pragma: no cover - defensive
+        log(f"  Warning: could not check whether this supervisor is current: {exc}")
+        return CODE_UNKNOWN
 
 
 def _running_loop_pid(instance: Instance) -> int | None:
@@ -4160,7 +4294,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     launch_preamble = build_preamble(
                         agent, instance,
                         crash_recovery=(had_predecessor
-                                        and crash_recovery_verdict(workdir)))
+                                        and crash_recovery_verdict(workdir)),
+                        code_state=_launch_code_state())
                     try:
                         waiting = operator_mail.pending(OPERATOR_HOME, instance.id)
                     except operator_mail.MailError as exc:
