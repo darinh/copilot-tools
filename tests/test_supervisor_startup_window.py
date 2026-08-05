@@ -22,6 +22,7 @@ the startup record is written by the spawn itself.
 from __future__ import annotations
 
 import os
+import re
 import time
 
 import pytest
@@ -1010,3 +1011,53 @@ def test_a_published_supervisor_is_described_by_its_pid(monkeypatch):
     where = op._supervisor_where(inst, op._supervisor_present(inst))
 
     assert where == "pid 5556"
+
+
+def _timeout_budget(err: str) -> float:
+    """The budget a wait announced when it gave up."""
+    m = re.search(r"did not stop within ([\d.]+)s", err)
+    assert m, f"no timeout message to read a budget from: {err!r}"
+    return float(m.group(1))
+
+
+def _budget_increment(monkeypatch, capsys, call, name: str) -> float:
+    """How much longer a wait gives itself for a supervisor that is starting.
+
+    Measured by making the wait time out twice -- once against a published
+    supervisor, once against a startup record -- and differencing the budgets
+    it announces. Differencing rather than reading the absolute number is the
+    point: the base budgets are already several times the window, so a wait
+    can use the wrong constant and still, by luck of its base, outlast every
+    record a test can construct. The increment is the thing that has to
+    match the window, and it is the thing that drifted.
+    """
+    budgets = {}
+    for tag, starting in (("pub", False), ("rec", True)):
+        inst = op.Instance(f"{name}{tag}")
+        if starting:
+            op._record_supervisor_starting(inst, 4242)
+        else:
+            inst.loop_pid_file.write_text("4242", encoding="utf-8")
+        _dead_pids(monkeypatch, 4242)  # never goes away -> always times out
+        _fast_clock(monkeypatch)
+        capsys.readouterr()
+        call(inst)
+        budgets[tag] = _timeout_budget(capsys.readouterr().err)
+    return budgets["rec"] - budgets["pub"]
+
+
+def test_stop_loop_gives_a_starting_supervisor_the_whole_window(
+        monkeypatch, capsys):
+    increment = _budget_increment(
+        monkeypatch, capsys,
+        lambda inst: op.stop_loop_only(inst.display_name), "incstoploop")
+    assert increment >= op.SUPERVISOR_STARTUP_ALLOWANCE
+
+
+def test_restart_loop_gives_a_starting_supervisor_the_whole_window(
+        monkeypatch, capsys):
+    increment = _budget_increment(
+        monkeypatch, capsys,
+        lambda inst: op._do_restart_loop(inst, ["--agent", "t:a"], os.getcwd()),
+        "increstart")
+    assert increment >= op.SUPERVISOR_STARTUP_ALLOWANCE
