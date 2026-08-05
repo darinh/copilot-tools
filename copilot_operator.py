@@ -20,6 +20,7 @@ never under ``~/.copilot``, which the Copilot CLI wholesale-deletes on startup.
 from __future__ import annotations
 
 import atexit
+import difflib
 import hashlib
 import json
 import os
@@ -121,10 +122,23 @@ EXIT_NO_PROGRESS = 3
 # killing the sessions" -- and a reader who cannot tell them apart will act on
 # the wrong one.
 EXIT_UNACCOUNTED = 4
-RESERVED_WORDS = {"stop", "list", "report", "ingest", "help", "join", "reload",
-                  "version", "forget", "logs", "tabs", "restore",
-                  "stop-loop", "stop-session", "restart-loop", "menu",
-                  "trace", "projects"}
+
+# Every word `_dispatch_command` answers to itself, rather than reading as an
+# instance name or handing on to copilot. This tuple is the single source of
+# truth: `RESERVED_WORDS` is derived from it and the did-you-mean suggestion
+# is measured against it.
+#
+# It is one list because the hand-maintained second copy had already drifted:
+# `send` and `inbox` are dispatched here and were missing from the set that
+# decides what is not an instance name. Nothing broke, because both are
+# matched before the shortcut is reached -- which is exactly the kind of
+# silence that lets the next omission be a real one.
+SUBCOMMANDS = ("help", "version", "list", "menu", "projects", "report",
+               "ingest", "stop", "stop-loop", "restart-loop", "stop-session",
+               "join", "reload", "forget", "send", "inbox", "logs", "trace",
+               "tabs", "restore")
+
+RESERVED_WORDS = set(SUBCOMMANDS)
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
@@ -5488,6 +5502,34 @@ def main(argv: list[str] | None = None) -> int:
     return rc
 
 
+def _subcommand_suggestions(word: str, limit: int = 3) -> list[str]:
+    """The subcommands ``word`` is plausibly a misspelling of, best first.
+
+    ``difflib`` ratios rather than a hand-rolled edit distance, because the
+    useful threshold here is a *ratio* and not a count: ``ls`` is two edits
+    from ``list`` and ``report`` is two from ``restore``, but only the first
+    is a plausible typo, and the ratio separates them (0.67 against 0.33).
+    The 0.6 cutoff is the lowest that still catches ``ls``.
+
+    All the ties are returned rather than one arbitrary winner. ``ls`` scores
+    identically against ``list`` and ``logs``, and ``difflib`` breaks that tie
+    alphabetically -- which would confidently answer ``logs`` to the exact
+    mistake this was written for. Two honest guesses beat one invented one.
+
+    Deliberately not exhaustive: a word that resembles nothing is left alone,
+    because ``operator [copilot-args...]`` is documented and a prompt is
+    allowed to be any word at all.
+    """
+    scored = []
+    for index, candidate in enumerate(SUBCOMMANDS):
+        ratio = difflib.SequenceMatcher(None, word.lower(), candidate).ratio()
+        if ratio >= 0.6:
+            # Declaration order breaks a ratio tie, so the answer does not
+            # depend on how the alphabet happens to fall.
+            scored.append((-ratio, index, candidate))
+    return [candidate for _, _, candidate in sorted(scored)[:limit]]
+
+
 def _dispatch_command(args: list[str]) -> int:
     migrate_legacy_state()
 
@@ -5553,6 +5595,29 @@ def _dispatch_command(args: list[str]) -> int:
             set_tab_progress(TAB_LOOPING if _running_loop_pid(candidate) else TAB_STEADY)
             MUX.attach(candidate.session)
             return 0
+
+    # Everything above has returned, so `head` is not a subcommand and does
+    # not name a running instance. `run_dispatch` would read it as a copilot
+    # argument and start a session named after the current directory -- so
+    # `operator ls` does not report that `ls` is spelled `list`, it offers to
+    # restart whatever is running here, and against a name that is *not*
+    # running it starts a real session with no prompt at all.
+    #
+    # An unknown subcommand is a typing mistake, and the answer to a typing
+    # mistake is a message rather than a state change. Only a head that is
+    # close to a real subcommand is refused: `operator [copilot-args...]` is
+    # documented, so an unrecognisable word is still passed through as a
+    # prompt. This mirrors the refusal `operator projects <typo>` already
+    # gives one level down.
+    if not head.startswith("-"):
+        suggestions = _subcommand_suggestions(head)
+        if suggestions:
+            names = " or ".join(f"`operator {name}`" for name in suggestions)
+            print(f"Unknown subcommand: operator {head}", file=sys.stderr)
+            print(f"Did you mean {names}?", file=sys.stderr)
+            print(f"(To pass it to copilot instead, name the instance: "
+                  f"`operator --name NAME {head}`.)", file=sys.stderr)
+            return 1
 
     return run_dispatch(args)
 
