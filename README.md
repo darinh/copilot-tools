@@ -20,6 +20,7 @@ messaging, and spec-driven workflow conventions.
 | [`operator.sh`](operator.sh), [`handoff.sh`](handoff.sh), [`operator-ingest.py`](operator-ingest.py) | Original bash implementation, retained on disk for rollback but no longer installed fresh by `setup.sh` |
 | [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | Roslyn-backed C# structural analysis |
 | [`skills/operator-agents`](skills/operator-agents/SKILL.md) | Starting parallel operator agents and messaging them |
+| [`skills/operator-backlog-*`](docs/skills.md) | Filing, refining and checking in on the tracked backlog |
 | [`operator_mail.py`](docs/operator.md#parallel-agents-and-messaging) | Message store behind `operator send` / `operator inbox` |
 | [`operator_trace.py`](operator_trace.py) | Records who invoked the operator and how each invocation ended, for attributing incidents |
 | [`install_manifest.py`](docs/versioning.md) | Records what setup deployed and its hash, so upgrades know what's safe to replace |
@@ -228,6 +229,9 @@ See [Operator Documentation](docs/operator.md) for full details.
 |-------|------|--------|
 | **code-intelligence** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
 | **operator-agents** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **operator-backlog-newitem** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **operator-backlog-refinement** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **operator-backlog-scrum** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
 | **Anvil** | Installable plugin | [`burkeholland/anvil`](https://github.com/burkeholland/anvil) |
 | **frontend-design** | Built-in CLI skill | Ships with Copilot CLI |
 | **find-skills** | Built-in CLI skill | Ships with Copilot CLI |
@@ -257,9 +261,18 @@ version control — one Markdown file per item, with YAML front matter.
 
 ```
 backlog list          # one line per item
+backlog ready         # what an agent may work right now
+backlog new --title "..." --evidence "..."   # file an item, awaiting approval
+backlog approve 3     # the owner's act: proposed -> open
+backlog scrum         # what changed since the last check-in
 backlog check         # validate every item; non-zero on failure
 backlog html --open   # a self-contained page, in a browser
 ```
+
+Three skills drive those commands in conversation:
+`/operator-backlog-newitem` files what surfaces mid-task,
+`/operator-backlog-refinement` walks the queue with you, and
+`/operator-backlog-scrum` reports what changed since you last looked.
 
 It exists because closed work is answerable from `git log` and open work was
 answerable from nothing: it lived in `next-session.md`, which is read-once and
@@ -267,13 +280,22 @@ deleted at session start, and was carried between sessions as one
 re-summarised sentence. That carry-forward is lossy by construction and
 nothing could detect the loss.
 
+An agent files items as `proposed`, never `open`: filing is not approving, and
+`backlog ready` lists only approved work, so the gate is enforced rather than
+merely documented. The one exception is narrow and checked — an item carrying
+`blocks: <id>` may be worked while the approved item it names is open, so a
+defect found mid-task has a legal path instead of a stall or a self-approval.
+
 Each item names a spec under `specs/`, or the literal `none`. **Closing an item
-means setting `status`, `closed` and `commit` in the same commit that does the
-work, and updating the linked spec in that commit too** — a close landing
-separately from its fix is a window in which the backlog is wrong.
+means setting `status`, `closed` and `commit` in the same change that does the
+work, and updating the linked spec there too** — a close landing separately
+from its fix is a window in which the backlog is wrong. In practice the close
+is the branch's last commit, naming the SHA of the one before it; filling in a
+SHA and then `git commit --amend` records an object the amend destroys.
 
 `tests/test_backlog_conformance.py` enforces the format, the spec mapping, and
-that every closing SHA actually resolves. See
+that every closing SHA actually resolves; `tests/test_backlog_workflow.py`
+covers filing, approval and the check-in. See
 [`backlog/README.md`](backlog/README.md) for the field reference.
 
 ## MCP Servers
@@ -334,8 +356,10 @@ copilot-tools/
 ├── skills/
 │   ├── code-intelligence/
 │   │   └── SKILL.md               # Roslyn routing
-│   └── operator-agents/
-│       └── SKILL.md               # Parallel operator agents and mail
+│   ├── operator-agents/
+│   │   └── SKILL.md               # Parallel operator agents and mail
+│   └── operator-backlog-*/
+│       └── SKILL.md               # Filing, refinement and the check-in
 ├── templates/
 │   ├── copilot-instructions.md    # Workflow conventions
 │   └── mcp-config.json            # MCP server config

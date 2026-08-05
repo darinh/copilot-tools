@@ -44,14 +44,20 @@ if _HERE not in sys.path:
 
 from install_manifest import (                                # noqa: E402
     dir_present,
-    file_present,
     path_present,
 )
 from operator_console import enable_utf8_output               # noqa: E402
 from operator_mux import Mux, MuxError, safe_instance_id      # noqa: E402
 from project_paths import (                                   # noqa: E402
-    catalog_rows,
-    guid_is_usable,
+    CATALOG_MISSING,
+    CATALOG_UNREADABLE,
+    CATALOG_UNUSABLE_ID,
+    catalog_guid,
+    # Re-exported, not used here: `copilot_operator` and the suite both reach
+    # for `handoff_tool.guid_is_usable`, and one test asserts the two names are
+    # the same object. Dropping it would move the definition, not remove it.
+    guid_is_usable,  # noqa: F401
+    normalized_key,
     primary_repo_root,
     project_dir,
     projects_root,
@@ -233,8 +239,12 @@ def die(msg: str) -> "NoReturn":  # type: ignore[valid-type]
 
 
 def normalize(path) -> str:
-    resolved = resolved_str(path)
-    return resolved.lower() if IS_WINDOWS else resolved
+    """This module's spelling of :func:`project_paths.normalized_key`.
+
+    The folding rule has one implementation; ``IS_WINDOWS`` is passed rather
+    than read there so that a test patching this module's flag still steers it.
+    """
+    return normalized_key(path, windows=IS_WINDOWS)
 
 
 def same_or_within(child: str, parent: str) -> bool:
@@ -666,36 +676,29 @@ def preserve_prior_handoff(handoff_file: Path) -> Path | None:
 
 
 def resolve_guid(project_root) -> str:
-    if file_present(CATALOG) is False:
-        # False, and only False. "Cannot tell" gets no branch of its own here
-        # because the open below already reports the real errno, and its
-        # message ("cannot read") is the true one; sending the operator off to
-        # create a catalog that is sitting right there behind a denied parent
-        # directory is the wrong instruction delivered confidently.
-        die(f"Catalog not found: {CATALOG}")
+    """The project id the catalog records for ``project_root``, or exit.
+
+    The lookup itself lives in :func:`project_paths.catalog_guid`, which
+    ``backlog_tool`` also uses. Only the phrasing is here: each failure gets
+    the instruction that fits it, and an instruction delivered for the wrong
+    situation is worse than none -- "catalog not found" against a catalog that
+    is merely unreadable sends the reader off to create a file that is already
+    sitting there.
+    """
+    found = catalog_guid(project_root, CATALOG)
+    if found.guid is not None:
+        return found.guid
     target = normalize(project_root)
-    try:
-        with open(CATALOG, "r", encoding="utf-8", errors="replace", newline="") as fh:
-            for row in catalog_rows(fh):
-                if row is None or len(row) < 2:
-                    continue
-                path, guid = row[0].strip().strip('"'), row[1].strip().strip('"')
-                if not path:
-                    continue
-                try:
-                    matched = normalize(path) == target
-                except OSError:
-                    continue
-                if matched:
-                    if not guid_is_usable(guid):
-                        die(f"Catalog entry for {target} has an unusable "
-                            f"project id: {guid!r}\n"
-                            f"The second column must be one plain directory "
-                            f"name, such as a GUID. Fix the line to read:\n"
-                            f"  \"{resolved_str(project_root)}\",<guid>")
-                    return guid
-    except OSError as exc:
-        die(f"Cannot read catalog {CATALOG}: {exc}")
+    if found.reason == CATALOG_MISSING:
+        die(f"Catalog not found: {CATALOG}")
+    if found.reason == CATALOG_UNREADABLE:
+        die(f"Cannot read catalog {CATALOG}: {found.detail}")
+    if found.reason == CATALOG_UNUSABLE_ID:
+        die(f"Catalog entry for {target} has an unusable "
+            f"project id: {found.detail!r}\n"
+            f"The second column must be one plain directory "
+            f"name, such as a GUID. Fix the line to read:\n"
+            f"  \"{resolved_str(project_root)}\",<guid>")
     die(f"No catalog entry for: {target}\n"
         f"Add it with a line such as:\n  \"{resolved_str(project_root)}\",<guid>")
 
