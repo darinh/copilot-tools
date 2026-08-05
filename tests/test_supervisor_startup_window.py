@@ -1244,27 +1244,27 @@ def test_the_ceiling_leaves_room_for_a_startup_the_grace_cannot_cover():
         f"supposed to sit beyond")
 
 
-def test_no_wait_budget_is_sized_off_the_ceiling(monkeypatch):
+def test_no_wait_budget_is_sized_off_the_ceiling(monkeypatch, capsys):
     """The ceiling must not reach the wait budgets.
 
     A record with a live process behind it cannot be waited out on principle,
-    so a caller that meets one should time out and say so. Routing the
-    ceiling into a budget instead would make `operator stop` block for ten
-    minutes on a phantom -- and every existing budget test would still pass,
-    because they all assert a *lower* bound on the wait."""
-    clock = _fast_clock(monkeypatch)
-    inst = op.Instance("nobudgetdrift")
-    _dead_pids(monkeypatch)
-    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
-    op._record_supervisor_starting(inst, 7171)
+    so a caller that meets one should time out and say so. Routing the ceiling
+    into a budget instead would make `operator stop` block for ten minutes on
+    a phantom.
 
-    started = clock.now
-    op._request_supervisor_stop(inst)
-    waited = clock.now - started
-
-    assert waited < op.SUPERVISOR_STARTUP_CEILING, (
-        f"stop waited {waited}s, which is the ceiling rather than the "
-        f"{op.SUPERVISOR_STARTUP_ALLOWANCE}s window a record can be believed for")
+    Asserted as equality against the allowance, because the two existing
+    increment tests assert a *lower* bound and a ten-minute increment
+    satisfies a lower bound of thirty-two seconds handsomely. An upper bound
+    is the only thing a substituted-upwards constant can fail."""
+    for name, call in (
+        ("ceilstoploop", lambda inst: op.stop_loop_only(inst.display_name)),
+        ("ceilrestart",
+         lambda inst: op._do_restart_loop(inst, ["--agent", "t:a"], os.getcwd())),
+    ):
+        increment = _budget_increment(monkeypatch, capsys, call, name)
+        assert abs(increment - op.SUPERVISOR_STARTUP_ALLOWANCE) <= 0.1, (
+            f"{name} gives a starting supervisor {increment}s on top, but a "
+            f"record can only be believed for {op.SUPERVISOR_STARTUP_ALLOWANCE}s")
 
 
 def test_a_phantom_record_does_not_make_a_launch_silently_start_nothing(monkeypatch):
