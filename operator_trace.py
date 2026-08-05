@@ -575,9 +575,43 @@ def record_exit(context: "dict | None", rc: int) -> None:
         return
 
 
+def record_supervisor_start(operator_home: Path, *, instance: str,
+                            session: int, code: "dict | None" = None) -> None:
+    """Record that a loop supervisor came up, and on what code. Never raises.
+
+    A supervisor imports the operator once and runs it for the whole run, so
+    every record it later writes describes the code it started with, not the
+    code on disk when the record was read. Without this event the two are
+    indistinguishable: the fix that made ``session_exit`` report handoff
+    endings landed at 19:36 on 2026-08-04 and every supervisor had started at
+    13:28, so records written *after* the fix were still produced by
+    instruments without it, and nothing in them said so.
+
+    ``code`` is stamped rather than the mere version string, because the
+    version only moves when deployed artifacts change -- that very fix bumped
+    nothing, so a version field would have reported the stale supervisor and
+    the fixed one as identical.
+    """
+    try:
+        payload = {
+            "ts": _utcnow(),
+            "event": "supervisor_start",
+            "pid": os.getpid(),
+            "instance": str(instance),
+            "session": session,
+        }
+        if isinstance(code, dict):
+            payload["code"] = code.get("digest")
+            payload["toolkit_version"] = code.get("version")
+        _append(trace_path(Path(operator_home)), payload)
+    except Exception:
+        return
+
+
 def record_session_exit(operator_home: Path, *, instance: str, session: int,
                         pid: "int | None", markers: "dict",
-                        consecutive: int, limit: int) -> None:
+                        consecutive: int, limit: int,
+                        code: "str | None" = None) -> None:
     """Record that a supervised copilot session ended. Never raises.
 
     This is the event the trace was built for and the one an invocation log
@@ -604,6 +638,12 @@ def record_session_exit(operator_home: Path, *, instance: str, session: int,
     read -- as proving no session had ever ended by handoff. A population that
     excludes the cases you are trying to count cannot answer the question, and
     it does not look empty while failing to.
+
+    ``code`` fingerprints the operator source the *supervisor* is running, so
+    a later reader can scope a re-measurement to records from an instrument
+    that had a given fix. Scoping by date cannot do this: a supervisor keeps
+    the code it imported at startup, so records dated after a fix are still
+    written by supervisors without it.
     """
     try:
         _append(trace_path(Path(operator_home)), {
@@ -620,6 +660,7 @@ def record_session_exit(operator_home: Path, *, instance: str, session: int,
             "consecutive": consecutive,
             "limit": limit,
             "giving_up": consecutive >= limit,
+            "code": code,
         })
     except Exception:
         return

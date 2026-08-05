@@ -552,6 +552,19 @@ class Instance:
         return RESTART_DIR / f"{self.id}.loopargs.json"
 
     @property
+    def loop_code_file(self) -> Path:
+        """Which operator source the running supervisor actually loaded.
+
+        A supervisor is long-lived and imported its code once, at startup, so
+        a fix landing afterwards does not reach it (that is what
+        ``restart-loop`` is for). Nothing recorded *which* code it started
+        with, so neither a person nor the trace could tell a supervisor
+        running today's fix from one running last week's — and the records
+        both produce are byte-identical in shape.
+        """
+        return RESTART_DIR / f"{self.id}.loopcode.json"
+
+    @property
     def nochange_file(self) -> Path:
         """Consecutive sessions that left the project's git state untouched.
 
@@ -751,7 +764,8 @@ class Instance:
         for path in (self.restart_marker, self.managed_file, self.spec_file,
                      self.pid_file, self.exit_file, self.session_file,
                      self.loop_pid_file, self.detach_marker, self.stop_marker,
-                     self.loop_args_file, self.restart_lock_file,
+                     self.loop_args_file, self.loop_code_file,
+                     self.restart_lock_file,
                      self.nochange_file, self.unaccounted_file):
             remove_file(path)
 
@@ -2010,6 +2024,209 @@ def _load_loop_args(instance: Instance) -> tuple[list[str], str | None]:
     return args, cwd if isinstance(cwd, str) else None
 
 
+class _CodeUnknown:
+    """The running code could not be compared against what is on disk."""
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "CODE_UNKNOWN"
+
+
+class _FileAbsent:
+    """A definite answer: the recorded source file is no longer there."""
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "FILE_ABSENT"
+
+
+FILE_ABSENT = _FileAbsent()
+CODE_CURRENT = "current"
+CODE_STALE = "stale"
+CODE_UNKNOWN = "unknown"
+
+_RUNNING_CODE: "dict | None" = None
+
+
+def _digest_file(path: Path) -> "str | _FileAbsent | None":
+    """sha256 of a file's bytes; ``FILE_ABSENT`` if gone, ``None`` if unknown.
+
+    Three answers, not two. A digest that quietly became a constant when the
+    file could not be read would compare equal to itself forever and report
+    code it never saw as unchanged -- which is the failure this whole
+    fingerprint exists to make impossible, reproduced inside it.
+
+    Absence is separated from unreadability because they support opposite
+    conclusions: a module the supervisor loaded that is no longer on disk has
+    *definitely* changed, while one behind a denied read has not been
+    examined at all.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except FileNotFoundError:
+        return FILE_ABSENT
+    except (OSError, ValueError):
+        return None
+
+
+def _loaded_operator_sources() -> list[Path]:
+    """The operator's own ``.py`` files that *this process* imported.
+
+    Deliberately not a glob of the directory. The question a staleness check
+    has to answer is "has the code I am running changed", which is about the
+    files this process loaded -- not about every file that happens to sit
+    beside them. A glob would mark a supervisor stale because an unrelated
+    tool in the same checkout was edited, and in a repository under active
+    development that fires constantly. A notice that always fires is one
+    nobody reads, which would leave the instrument no better off than the
+    silence it replaced.
+    """
+    here = Path(__file__).resolve().parent
+    found: dict[str, Path] = {}
+    for module in list(sys.modules.values()):
+        origin = getattr(module, "__file__", None)
+        if not origin:
+            continue
+        try:
+            resolved = Path(origin).resolve()
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if resolved.suffix != ".py":
+            continue
+        try:
+            if here not in resolved.parents:
+                continue
+        except (OSError, ValueError):
+            continue
+        found[str(resolved)] = resolved
+    return [found[key] for key in sorted(found)]
+
+
+def _combined_digest(entries: "list[dict]") -> str:
+    """One short digest over a set of per-file digests.
+
+    Unreadable and absent files contribute their *state* rather than being
+    skipped, so two fingerprints cannot come out equal because a file
+    dropped out of both.
+    """
+    hasher = hashlib.sha256()
+    for entry in sorted(entries, key=lambda e: e.get("path") or ""):
+        hasher.update((entry.get("path") or "").encode("utf-8", "replace"))
+        hasher.update(b"\0")
+        hasher.update(str(entry.get("sha256")).encode("utf-8", "replace"))
+        hasher.update(b"\n")
+    return hasher.hexdigest()[:16]
+
+
+def running_code_fingerprint() -> dict:
+    """Digest of the operator source this process is running. Computed once.
+
+    The cache is the point, not an optimisation. This has to keep answering
+    for the code the process *loaded*; recomputing it later would hash
+    whatever is on disk by then and report a supervisor as running code it
+    has never executed -- stating the confusion the fingerprint exists to
+    end, in the fingerprint's own voice.
+
+    Honest about its own resolution: the bytes are read from disk moments
+    after import rather than captured by the import itself, so a file edited
+    inside that window is recorded as the newer bytes. That is a millisecond
+    at startup, and it is the direction that under-reports staleness rather
+    than inventing it.
+    """
+    global _RUNNING_CODE
+    if _RUNNING_CODE is None:
+        entries = []
+        for path in _loaded_operator_sources():
+            digest = _digest_file(path)
+            entries.append({
+                "path": str(path),
+                "sha256": None if digest is None
+                          else ("absent" if digest is FILE_ABSENT else digest),
+            })
+        _RUNNING_CODE = {
+            "version": TOOLKIT_VERSION,
+            "digest": _combined_digest(entries),
+            "files": entries,
+        }
+    return _RUNNING_CODE
+
+
+def _save_loop_code(instance: Instance) -> None:
+    """Record which operator source this supervisor started with.
+
+    Losing this costs a staleness verdict, never the running session, so it
+    warns and carries on for the same reason ``_save_loop_args`` does.
+    """
+    payload = dict(running_code_fingerprint())
+    payload["pid"] = os.getpid()
+    payload["recorded"] = utcnow()
+    tmp = instance.loop_code_file.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, instance.loop_code_file)
+    except OSError as exc:
+        log(f"  Warning: could not record the running operator code: {exc}")
+
+
+def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
+    """Is the supervisor running the code that is on disk now?
+
+    Returns ``(verdict, changed_paths)`` where verdict is ``CODE_CURRENT``,
+    ``CODE_STALE`` or ``CODE_UNKNOWN``.
+
+    A supervisor imported its code at startup and keeps it for the whole run,
+    so an operator fix is inert for every instance already running when it
+    landed. That was not a hypothetical: the fix that made ``session_exit``
+    record handoff endings landed at 19:36 on 2026-08-04, and every
+    supervisor on the machine had started at 13:28 -- so the trace kept
+    producing pre-fix records, dated after the fix, with nothing in them
+    saying so. Backlog 0001 tells its next reader to scope a re-measurement
+    to records "at or after 2026-08-05", and that instruction was already
+    false when it was written.
+
+    One observed difference is enough to say stale, even when other files
+    could not be read: staleness is established by a single changed file,
+    whereas *currency* is a claim about all of them and so cannot survive a
+    file nobody could examine.
+    """
+    try:
+        payload = json.loads(instance.loop_code_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # No record at all: either the supervisor predates this, or its state
+        # was lost. Both mean "cannot tell", which must not be reported as
+        # either running code being current or a supervisor being stale.
+        return CODE_UNKNOWN, []
+    files = payload.get("files")
+    if not isinstance(files, list) or not files:
+        return CODE_UNKNOWN, []
+
+    changed: list[str] = []
+    undecided = False
+    for entry in files:
+        if not isinstance(entry, dict):
+            undecided = True
+            continue
+        path, recorded = entry.get("path"), entry.get("sha256")
+        if not isinstance(path, str) or not path:
+            undecided = True
+            continue
+        if not isinstance(recorded, str):
+            # Nothing was known about this file when the supervisor started,
+            # so nothing can be concluded about it now.
+            undecided = True
+            continue
+        now = _digest_file(Path(path))
+        if now is None:
+            undecided = True
+            continue
+        current = "absent" if now is FILE_ABSENT else now
+        if current != recorded:
+            changed.append(path)
+
+    if changed:
+        return CODE_STALE, sorted(changed)
+    if undecided:
+        return CODE_UNKNOWN, []
+    return CODE_CURRENT, []
+
+
 def _running_loop_pid(instance: Instance) -> int | None:
     """PID of instance's background loop supervisor, if one is alive.
 
@@ -2173,10 +2390,25 @@ def list_instances() -> int:
     one."""
     print("═══ Running Operator Instances ═══\n")
     instances = active_instances()
-    for inst in instances:
-        print(f"  {_instance_summary(instance_snapshot(inst))}")
+    snaps = [instance_snapshot(inst) for inst in instances]
+    for snap in snaps:
+        print(f"  {_instance_summary(snap)}")
     if not instances:
         print("  (none)")
+    # Named individually rather than counted: the remedy is per-instance, and
+    # a bare count would leave the reader to work out which ones it meant.
+    stale = [s["name"] for s in snaps
+             if s["loop_pid"] and s.get("loop_code") == CODE_STALE]
+    if stale:
+        print("\nThese supervisors are running operator code that has since "
+              "changed on disk.")
+        print("A supervisor imports its code once and keeps it for the whole "
+              "run, so a fix that")
+        print("landed afterwards is not running in them, and the records they "
+              "write still describe")
+        print("the older code. Pick it up without stopping the session:")
+        for name in stale:
+            print(f"    operator restart-loop {name}")
     print("\nInspect: operator             (interactive: stats, join, stop)")
     print("Attach:  operator join <name>")
     print("Stop:    operator stop <name>")
@@ -3363,6 +3595,13 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     # Recorded so this supervisor can be replaced later without guessing how
     # it was started. Written every time, so it tracks the live invocation.
     _save_loop_args(instance, user_args)
+    # ...and which operator source it is actually running. A supervisor keeps
+    # the code it imported for the whole run, so this is the only place the
+    # answer is still knowable.
+    _save_loop_code(instance)
+    operator_trace.record_supervisor_start(
+        OPERATOR_HOME, instance=instance.display_name,
+        session=start_session_num, code=running_code_fingerprint())
 
     # Progress circuit breaker. A fresh run starts a fresh count: --fresh
     # means "forget the previous run", and inheriting its stalled counter
@@ -4257,6 +4496,7 @@ def instance_snapshot(instance: Instance) -> dict:
         # surface it: a same-named session we did not start is look-only.
         "owned": session_live and instance.owns_live_session(),
         "loop_pid": _running_loop_pid(instance),
+        "loop_code": loop_code_state(instance)[0],
         "session_num": session_num,
         "run_started": state.get("RUN_STARTED", "") or owner.get("claimed_at", ""),
         "copilot_session_id": (state.get("COPILOT_SESSION_ID", "")
@@ -4285,6 +4525,11 @@ def _instance_summary(snap: dict) -> str:
         parts.append(_shorten_home(snap["cwd"]))
     if snap["session_live"] and not snap["owned"]:
         parts.append("[unowned session]")
+    # Only ever said about a supervisor that is actually running: a stopped
+    # instance has no loaded code to be stale, and saying so anyway would
+    # attach the notice to every row it cannot act on.
+    if snap["loop_pid"] and snap.get("loop_code") == CODE_STALE:
+        parts.append("[supervisor running older code]")
     return "  ·  ".join(parts)
 
 
@@ -5029,6 +5274,7 @@ def _record_session_exit(instance, session_num: int,
                      "uptime_s": None if uptime is None else int(uptime)},
             consecutive=consecutive,
             limit=MAX_LAUNCH_FAILURES,
+            code=running_code_fingerprint().get("digest"),
         )
     except Exception:
         return
@@ -5089,13 +5335,19 @@ def show_trace(args: list[str]) -> int:
     if limit:
         session_exits = session_exits[-limit:]
 
+    supervisor_starts = [r for r in records
+                         if r.get("event") == "supervisor_start"]
+    if limit:
+        supervisor_starts = supervisor_starts[-limit:]
+
     if as_json:
         print(json.dumps(
-            {"invocations": invocations, "session_exits": session_exits},
+            {"invocations": invocations, "session_exits": session_exits,
+             "supervisor_starts": supervisor_starts},
             indent=2))
         return 0
 
-    if not invocations and not session_exits:
+    if not invocations and not session_exits and not supervisor_starts:
         # An empty *result* and an empty *trace* are different findings, and
         # printing one sentence for both would hide a filter that matched
         # nothing behind a file that recorded nothing.
@@ -5157,6 +5409,15 @@ def show_trace(args: list[str]) -> int:
             else:
                 verdict = f"rc={code}"
             gave_up = " GIVING UP" if rec.get("giving_up") else ""
+            # Which supervisor code wrote this record. Printed on every line
+            # because the alternative a reader falls back on is the date, and
+            # a date cannot see a supervisor that started before a fix and
+            # kept running -- which is how 979 records written by an
+            # instrument that could not vary were read as a finding about the
+            # world. "unrecorded" is its own answer: those are the records
+            # from before this was stamped, and they are exactly the ones no
+            # conclusion should rest on.
+            digest = rec.get("code") or "unrecorded"
             print(f"{rec.get('ts', '?'):20} {str(rec.get('instance', '?')):18} "
                   f"#{rec.get('session', '?'):<5} "
                   f"{rec.get('consecutive', '?')}/{rec.get('limit', '?')}"
@@ -5164,7 +5425,20 @@ def show_trace(args: list[str]) -> int:
             print(f"{'':20} └─ {verdict}; "
                   f"copilot pid={rec.get('session_pid')}, markers "
                   f"stop={markers.get('stop')} detach={markers.get('detach')} "
-                  f"restart={markers.get('restart')}")
+                  f"restart={markers.get('restart')}; code={digest}")
+
+    if supervisor_starts:
+        # The boundary every other record is read relative to. A supervisor
+        # keeps the code it imported for its whole run, so this line is where
+        # one instrument stops and the next begins -- without it the only
+        # available boundary is the clock, which does not know that a
+        # supervisor started before a fix is still running afterwards.
+        print(f"\n═══ Supervisor starts ({len(supervisor_starts)} shown) ═══\n")
+        for rec in supervisor_starts:
+            print(f"{rec.get('ts', '?'):20} {str(rec.get('instance', '?')):18} "
+                  f"from session #{rec.get('session', '?'):<5} "
+                  f"code={rec.get('code') or 'unrecorded'} "
+                  f"v{rec.get('toolkit_version') or '?'}")
 
     print(f"\nTrace file: {operator_trace.trace_path(OPERATOR_HOME)}")
     return 0
