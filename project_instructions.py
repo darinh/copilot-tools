@@ -42,6 +42,7 @@ import hashlib
 import ntpath
 import os
 import re
+import stat
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -462,8 +463,13 @@ def archive_name(path, digest: str, when: datetime) -> str:
     return f"{stem}-{when.strftime('%Y%m%dT%H%M%SZ')}-{digest[:12]}{suffix}"
 
 
-#: Length of the ``%Y%m%dT%H%M%SZ`` stamp ``archive_name`` puts in the middle.
-_STAMP_WIDTH = 16
+#: The shape ``archive_name`` puts between the stem and the digest. Matched
+#: rather than merely counted: sixteen characters of anything would let a file
+#: a user happened to drop in the directory be taken for an archive, and being
+#: taken for one means being read back and refused, which fails the preserve
+#: rather than ignoring the file. ``test_the_stamp_pattern_matches_what_archive_name_writes``
+#: keeps this and the strftime format above from drifting apart.
+_STAMP = re.compile(r"\d{8}T\d{6}Z")
 
 
 def existing_archive(archive_dir, path, digest: str) -> "Path | None":
@@ -486,6 +492,13 @@ def existing_archive(archive_dir, path, digest: str) -> "Path | None":
     cannot be confirmed to hold the right bytes, because the only caller of
     ``preserve`` unlinks the original next: an archive taken on trust is
     exactly as good as no archive, and worse, because it reads as success.
+
+    A candidate has to be a regular file and not a symlink. ``file_digest``
+    follows links, so a link in the archive directory reads back as whatever
+    it points at -- and a link pointing at the source file being retired would
+    digest as a perfect match, be returned as the preserved copy, and become a
+    dangling link the moment the caller unlinks the original. The bytes would
+    be gone and the run would report success.
     """
     archive_dir = Path(archive_dir)
     stem = Path(path).stem or "file"
@@ -504,9 +517,25 @@ def existing_archive(archive_dir, path, digest: str) -> "Path | None":
     for name in names:
         if not (name.startswith(head) and name.endswith(tail)):
             continue
-        if len(name) - len(head) - len(tail) != _STAMP_WIDTH:
+        middle_end = len(name) - len(tail)
+        if middle_end < len(head):
+            # head and tail overlap, so the two matches above are reading the
+            # same characters twice and there is no middle at all.
+            continue
+        if not _STAMP.fullmatch(name[len(head):middle_end]):
             continue
         candidate = archive_dir / name
+        try:
+            kind = os.lstat(candidate).st_mode
+        except OSError as exc:
+            raise InstructionsError(
+                f"Cannot examine {candidate}, so it cannot stand in for a "
+                f"fresh copy ({exc}). Nothing was removed.") from exc
+        if not stat.S_ISREG(kind):
+            raise InstructionsError(
+                f"{candidate} is named like an archive but is not a regular "
+                "file, so it cannot stand in for a fresh copy. Nothing was "
+                "removed.")
         if file_digest(candidate) != digest:
             raise InstructionsError(
                 f"The archive at {candidate} does not hold the bytes its "

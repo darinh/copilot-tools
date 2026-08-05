@@ -414,19 +414,21 @@ def test_two_files_with_identical_bytes_get_their_own_archives(tmp_path):
 def test_two_files_with_identical_bytes_and_different_suffixes_do_too(tmp_path):
     """The same argument for the other end of the name.
 
-    ``AGENTS.md`` and ``AGENTS.txt`` are one rename apart and hold the same
-    bytes more often than not.
+    The two suffixes are the same length deliberately, for the reason the
+    equal-length stems above are: with ``.md`` against ``.txt`` the stamp
+    check rejects the mismatch by itself, and the test passes without the
+    suffix ever being compared. Two reviewers found that independently.
     """
     archive = tmp_path / "retired"
     md = tmp_path / "AGENTS.md"
     md.write_bytes(b"identical")
-    txt = tmp_path / "AGENTS.txt"
-    txt.write_bytes(b"identical")
+    py = tmp_path / "AGENTS.py"
+    py.write_bytes(b"identical")
     kept_md = pi.preserve(md, archive)
-    kept_txt = pi.preserve(txt, archive)
-    assert kept_md != kept_txt
+    kept_py = pi.preserve(py, archive)
+    assert kept_md != kept_py
     assert kept_md.name.endswith(".md")
-    assert kept_txt.name.endswith(".txt")
+    assert kept_py.name.endswith(".py")
     assert len(list(archive.iterdir())) == 2
 
 
@@ -449,20 +451,137 @@ def test_an_archive_that_no_longer_holds_its_own_bytes_is_refused(tmp_path):
 def test_a_stem_with_glob_characters_matches_only_itself(tmp_path):
     """The scan is not a glob, and a caller-controlled stem is why.
 
-    ``Path.glob`` would read the ``[ab]`` here as a character class, so an
-    archive of ``a.md`` would be handed back as the preserved copy of
-    ``[ab].md`` -- different bytes, reported as kept.
+    ``Path.glob`` would read ``a?c`` as "any single character in the middle"
+    and hand back the archive of ``abc.md`` as the preserved copy of
+    ``a?c.md`` -- different bytes, reported as kept.
+
+    The metacharacter has to be ``?`` and the decoy stem has to be the same
+    length. ``[ab]`` -- the obvious choice, and the one this test used first
+    -- cannot show the difference at all: a character class matches exactly
+    one character, so any name a glob wrongly matched would have a
+    three-characters-shorter stem and the stamp check would reject it on its
+    own. That version passed against a glob implementation, and two reviewers
+    said so independently.
+
+    ``a?c.md`` is not a legal filename on Windows, so ``existing_archive`` is
+    called directly. Nothing here needs the source to exist on disk: only its
+    stem and suffix are read.
     """
     archive = tmp_path / "retired"
-    decoy = tmp_path / "a.md"
-    decoy.write_bytes(b"same")
+    decoy = tmp_path / "abc.md"
+    decoy.write_bytes(b"the decoy's bytes")
     kept_decoy = pi.preserve(decoy, archive)
-    tricky = tmp_path / "[ab].md"
-    tricky.write_bytes(b"same")
-    kept_tricky = pi.preserve(tricky, archive)
-    assert kept_tricky != kept_decoy
-    assert kept_tricky.name.startswith("[ab]-")
-    assert pi.preserve(tricky, archive) == kept_tricky
+    assert kept_decoy.name.startswith("abc-")
+    digest = hashlib.sha256(b"the decoy's bytes").hexdigest()
+    assert pi.existing_archive(archive, "a?c.md", digest) is None
+    assert pi.existing_archive(archive, "abc.md", digest) == kept_decoy
+
+
+def test_a_symlink_is_never_accepted_as_a_preserved_copy(tmp_path):
+    """The reviewers' finding, and the worst shape in this function.
+
+    ``file_digest`` follows links, so a link in the archive directory reads
+    back as whatever it points at. A link pointing at the source being
+    retired digests as a perfect match -- it *is* the source -- so it would be
+    returned as the preserved copy, and the caller unlinking the original
+    would turn it into a dangling link. The bytes would be gone and the run
+    would report success.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"the only copy")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+    digest = hashlib.sha256(b"the only copy").hexdigest()
+    link = archive / f"f-20260805T095751Z-{digest[:12]}.md"
+    try:
+        link.symlink_to(source)
+    except (OSError, NotImplementedError):
+        pytest.skip("this account cannot create symlinks")
+    with pytest.raises(InstructionsError):
+        pi.preserve(source, archive)
+    assert source.read_bytes() == b"the only copy"
+
+
+def test_a_directory_named_like_an_archive_is_refused(tmp_path):
+    """The other non-regular candidate, and the one that needs no privileges.
+
+    ``file_digest`` returns None for a directory, so this was already
+    refused -- but by a check that cannot tell "not a file" from "wrong
+    bytes", and the message said the bytes were wrong.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+    digest = hashlib.sha256(b"same").hexdigest()
+    (archive / f"f-20260805T095751Z-{digest[:12]}.md").mkdir()
+    with pytest.raises(InstructionsError) as caught:
+        pi.preserve(source, archive)
+    assert "not a regular file" in str(caught.value)
+
+
+def test_duplicates_already_on_disk_are_settled_on_deterministically(tmp_path):
+    """Directories retired before the fix already hold the duplicate pairs.
+
+    Reuse has to pick one, pick the same one every time, and not add a third.
+    Sorting the names is what makes the choice stable, and because the stamp
+    is fixed-width and zero-padded, sorted order is chronological: the
+    earliest copy wins, on every platform.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+    digest = hashlib.sha256(b"same").hexdigest()[:12]
+    for stamp in ("20260805T095752Z", "20260805T095751Z", "20260805T095753Z"):
+        (archive / f"f-{stamp}-{digest}.md").write_bytes(b"same")
+    picked = {pi.preserve(source, archive).name for _ in range(3)}
+    assert picked == {f"f-20260805T095751Z-{digest}.md"}
+    assert len(list(archive.iterdir())) == 3
+
+
+def test_the_stamp_pattern_matches_what_archive_name_writes():
+    """The two halves of the naming scheme, pinned against each other.
+
+    ``archive_name`` writes the stamp with ``strftime`` and
+    ``existing_archive`` recognises it with a regex. Nothing else makes them
+    agree, and if they stopped agreeing every archive would look unrecognised
+    and reuse would silently stop working -- which is the bug this whole
+    change is about, returned in a new spelling.
+    """
+    digest = "0" * 64
+    built = pi.archive_name("f.md", digest, datetime(
+        2026, 12, 31, 23, 59, 59, tzinfo=timezone.utc))
+    middle = built[len("f-"):-len(f"-{digest[:12]}.md")]
+    assert pi._STAMP.fullmatch(middle)
+    assert middle == "20261231T235959Z"
+
+
+def test_sixteen_characters_of_anything_is_not_a_stamp(tmp_path):
+    """Length alone is not the shape, and getting this wrong fails a preserve.
+
+    A file whose middle is sixteen arbitrary characters would be taken for an
+    archive, read back, and -- since it is not one -- refused. That refuses
+    the whole preserve, so a stray file in the archive directory would stop
+    the retire it was unrelated to. Sixteen was what the first version
+    checked; a reviewer pointed out that it is not the same question.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+    digest = hashlib.sha256(b"same").hexdigest()[:12]
+    reference = pi.archive_name("f.md", "0" * 64, datetime(
+        2026, 8, 5, 9, 57, 51, tzinfo=timezone.utc))
+    stamp_length = len(reference) - len("f-") - len("-000000000000.md")
+    middle = "notatimestamp!!!"
+    assert len(middle) == stamp_length
+    stray = archive / f"f-{middle}-{digest}.md"
+    stray.write_bytes(b"nothing like the source")
+    landed = pi.preserve(source, archive)
+    assert landed != stray
+    assert landed.read_bytes() == b"same"
+    assert stray.read_bytes() == b"nothing like the source"
 
 
 def test_an_unrelated_file_ending_the_same_way_is_not_an_archive(tmp_path):
