@@ -389,10 +389,11 @@ of starting a session:
 ═══ Copilot Operator ═══
 
   1) Sessions — inspect, join or stop  (2 running)
-  2) Restore tabs (pick which)
-  3) Restore all tracked tabs
-  4) View usage report
-  5) Exit
+  2) Project configurations — features per project
+  3) Restore tabs (pick which)
+  4) Restore all tracked tabs
+  5) View usage report
+  6) Exit
 ```
 
 The menu stays open until you choose Exit, so one action is not the end of the
@@ -442,6 +443,72 @@ offering actions against something already gone.
 
 `operator list` prints the same one-line summaries non-interactively, for
 scripts and for a quick glance.
+
+### Project configurations
+
+**Project configurations** — also reachable directly as `operator projects` —
+lists every project registered in `~/.copilot/projects/catalog.csv` and lets
+you change which conventions it opted into:
+
+```
+═══ Project Configurations ═══
+
+   1) my-project    7 of 7 enabled
+      ~/repos/my-project
+   2) scratch       5 of 7 enabled
+      ~/repos/scratch
+
+Choose a project [1-2] (blank to go back):
+```
+
+Picking one shows the features and their current values:
+
+```
+═══ my-project ═══
+
+  ~/repos/my-project
+  ~/.copilot/projects/{guid}/features.json
+
+   1) Session Handoff           on
+   2) Session History           on
+   3) Spec-Driven Development   on
+   4) Parallel Agents           on
+   5) Operator Agents           on
+   6) Branching Strategy        on
+   7) Tracked Backlog           `backlog/` in the repo, one file per item, enforced by tests
+   8) Back
+```
+
+Choosing an on/off feature toggles it. **Tracked Backlog is a choice, not a
+toggle** — it takes `folder`, `github-issues` or `none` — so picking it opens
+the list of backends. Every change is written to `features.json` immediately
+rather than on the way out, because the way out includes Ctrl-C.
+
+`project_features.py` is the single owner of what features exist and what
+values each may take, and `tests/test_project_features.py` pins
+`templates/copilot-instructions.md` against it in both directions. Do not keep
+a second list of features anywhere: a menu that enumerates features and a
+document that enumerates features will disagree, and the disagreement shows up
+as an option that silently toggles nothing.
+
+Three things this screen deliberately refuses to guess at:
+
+- A catalog that cannot be **opened** is not an empty list of projects.
+  Reporting "no projects registered" on the strength of a permission error
+  invites setting a project up again, which mints a duplicate GUID and splits
+  that project's state in two.
+- A row that cannot be **used** — unparseable, no project id, an id that is not
+  one plain directory name — is listed as a skipped row rather than dropped, so
+  a project missing from the list is never mistaken for one that was never set
+  up.
+- A `features.json` that cannot be **read** is refused rather than resolved to
+  the defaults. Showing defaults would be a complete, confident answer about a
+  project whose real choices nobody managed to look at, and the first toggle
+  would write those invented defaults over the file.
+
+A setting written by a newer version of the toolkit — a feature slug this build
+has never heard of — is named on screen and carried through untouched by
+anything changed here.
 
 ### Auto-Continue
 

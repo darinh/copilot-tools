@@ -1,8 +1,10 @@
 ---
 id: 6
 title: Add a Project Configurations screen to the operator menu for per-project feature toggles
-status: open
+status: closed
 opened: 2026-08-05
+closed: 2026-08-05
+commit: 3c531b9
 spec: none
 ---
 

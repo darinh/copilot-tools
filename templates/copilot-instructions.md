@@ -224,8 +224,25 @@ When setting up a new project, the user selects which conventions to enable:
 | **Session History** | SQL `session_log` table for audit trail | ON |
 | **Spec-Driven Development** | Spec as source of truth. Uses GitHub spec-kit. Location: `.specify/` and `specs/`. | ON |
 | **Parallel Agents** | SQL-coordinated parallel task execution via `todo_claims`. | ON |
+| **Operator Agents** | Peer Copilot sessions via `operator`, and mail between them | ON |
 | **Branching Strategy** | Feature branches in worktrees, merged to `main`, conventional commits | ON |
-| **Tracked Backlog** | `backlog/` in the repo, one file per item, enforced by tests | ON |
+| **Tracked Backlog** | Where open work is recorded | `backlog/` folder |
+
+**Tracked Backlog is a choice, not a toggle.** It takes one of `folder` (a
+`backlog/` directory in the repo, one file per item, enforced by tests),
+`github-issues`, or `none`. The other rows above are on/off.
+
+The selections are stored in `~/.copilot/projects/{guid}/features.json`, and
+`project_features.py` is the single owner of what features exist and what
+values each may take. Read or change them with:
+
+```
+operator projects
+```
+
+Do not maintain a second list of features anywhere. A menu that enumerates
+features and a document that enumerates features will disagree, and the
+disagreement shows up as an option that silently toggles nothing.
 
 ### What to write in a per-project file
 
@@ -237,7 +254,7 @@ or branching rules only creates something to drift. Name the enabled features an
 # {project} — project conventions
 
 Enabled features: session-handoff, session-history, spec-driven, parallel-agents,
-branching-strategy, tracked-backlog.   <!-- list only the ones actually enabled -->
+operator-agents, branching-strategy, tracked-backlog.   <!-- list only the ones actually enabled -->
 
 ## What this repo is
 One paragraph. What it does, and what makes changes here risky.
@@ -624,6 +641,8 @@ When reviewing completed work:
 ---
 
 ## Operator — Parallel Agents
+
+*Enabled by feature flag: `operator-agents`*
 
 `operator` runs a **full, first-party Copilot CLI** in its own terminal
 session. Starting one gives you a **peer agent, not a sub-agent**: a separate

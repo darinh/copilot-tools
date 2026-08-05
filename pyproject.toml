@@ -52,6 +52,7 @@ py-modules = [
     "operator_mux",
     "operator_runner",
     "handoff_tool",
+    "project_features",
     "project_paths",
     "setup_tools",
     "worktree_guard_backend",
