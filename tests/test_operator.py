@@ -1049,23 +1049,58 @@ def test_a_mistyped_subcommand_is_refused_instead_of_starting_a_session(
     ("inbxo", "inbox"),
     ("hepl", "help"),
     ("LIST", "list"),
+    ("sto", "stop"),
+    ("log", "logs"),
+    ("verison", "version"),
+    ("sedn", "send"),
+    ("status", "list"),
+    ("kill", "stop"),
 ])
 def test_the_suggestion_names_the_subcommand_that_was_meant(typo, expected):
     assert expected in op._subcommand_suggestions(typo)
 
 
 def test_a_tie_is_reported_rather_than_broken_arbitrarily():
-    """`ls` scores identically against `list` and `logs`.
+    """`sto` truncates three subcommands and none of them is the answer.
 
-    difflib's own tie-break is alphabetical and would answer `logs` to the
-    exact mistake this was written for, so both are offered.
+    difflib's own tie-break is alphabetical, which is how the first version of
+    this answered `logs` to `ls` -- the exact mistake it was written for. All
+    the candidates are offered instead of one invented winner.
     """
-    assert op._subcommand_suggestions("ls") == ["list", "logs"]
+    assert op._subcommand_suggestions("sto") == [
+        "stop", "stop-loop", "stop-session"]
+
+
+def test_every_alias_names_a_real_subcommand():
+    """An alias pointing at nothing would advise a command that does not exist.
+
+    The aliases are the hand-written part of the guard, so they are the part
+    that can rot when a subcommand is renamed.
+    """
+    for alias, target in op.SUBCOMMAND_ALIASES.items():
+        assert target in op.SUBCOMMANDS, f"{alias} -> {target}"
+
+
+def test_no_alias_is_itself_a_subcommand():
+    """An alias for a real subcommand is dead code: the dispatcher matches the
+    word first and the suggestion is never reached."""
+    assert not set(op.SUBCOMMAND_ALIASES) & set(op.SUBCOMMANDS)
 
 
 @pytest.mark.parametrize("word", [
     "copilot-tools", "book-translator", "prism", "my-instance",
     "write the tests", "",
+    # Every one of these was refused by the first version of this guard, which
+    # scored difflib ratios against a 0.6 cutoff. Three reviewers found them
+    # independently, so they are pinned as the regression set.
+    "refactor",     # -> restore, 0.67
+    "read",         # -> reload, 0.80
+    "hello",        # -> help, 0.67
+    "test",         # -> ingest, 0.60
+    "myproject",    # -> projects, 0.82: the documented quick-join
+    "resume", "triage", "sort", "format", "release", "port", "state",
+    "report-gen", "restore-db", "tabs-ui", "list-view", "send-it",
+    "implement", "review", "explain", "summarize", "investigate",
 ])
 def test_a_word_that_resembles_no_subcommand_is_left_alone(word):
     """`operator [copilot-args...]` is documented; a prompt may be any word.
@@ -1074,6 +1109,37 @@ def test_a_word_that_resembles_no_subcommand_is_left_alone(word):
     prompt handed straight to copilot.
     """
     assert op._subcommand_suggestions(word) == []
+
+
+@pytest.mark.parametrize("name", [
+    "list-view", "report-gen", "restore-db", "tabs-ui", "send-it",
+    "logs-archive", "joinery", "helpdesk", "traceroute", "menu-bar",
+])
+def test_a_name_two_characters_longer_than_a_subcommand_is_never_refused(name):
+    """The property that keeps project names out of the guard's way.
+
+    A prefix match needs the word to be *shorter* than the subcommand, and one
+    edit cannot span a length difference greater than one. So a name at least
+    two characters longer than everything it resembles is structurally safe,
+    which is the shape almost every real instance name has.
+
+    Two, not one: `menus` is a single insertion from `menu` and is refused,
+    which is the guard working. The boundary is asserted below rather than
+    left to be discovered.
+    """
+    assert op._subcommand_suggestions(name) == []
+
+
+def test_the_length_boundary_is_exactly_one_character():
+    """The control for the property above -- it must not hold vacuously.
+
+    If the guard stopped firing altogether, every name in that list would pass
+    and the test would still be green. `menus` is one edit from `menu` and has
+    to be caught, which is what proves the population above was chosen rather
+    than the predicate being dead.
+    """
+    assert op._subcommand_suggestions("menus") == ["menu"]
+    assert op._subcommand_suggestions("menuss") == []
 
 
 def test_a_typo_with_further_arguments_is_refused_too(monkeypatch, capsys):
@@ -1115,16 +1181,30 @@ def test_a_running_instance_is_still_joined_even_if_it_looks_like_a_typo(
     assert attached
 
 
-def test_an_ordinary_prompt_still_reaches_run_dispatch(monkeypatch):
-    """The refusal is narrow: anything unlike a subcommand passes through."""
+@pytest.mark.parametrize("argv", [
+    ["refactor", "the", "parser"],
+    ["read", "AGENTS.md", "and", "summarise", "it"],
+    ["myproject"],
+    ["test"],
+    ["hello"],
+])
+def test_an_ordinary_prompt_still_reaches_run_dispatch(monkeypatch, argv):
+    """The refusal is narrow: anything unlike a subcommand passes through.
+
+    The argv is *split*, as a shell hands it over. The first version of this
+    test passed `["refactor the parser"]` as a single token -- a shape the
+    command line cannot produce -- and the 19-character head resembled no
+    subcommand, so the test passed while the real invocation was refused. It
+    was the argument shape, not the assertion, that hid the regression.
+    """
     seen = []
     monkeypatch.setattr(op, "migrate_legacy_state", lambda: None)
     monkeypatch.setattr(op.MUX, "available", lambda: True)
     monkeypatch.setattr(op.MUX, "has_session", lambda name: False)
     monkeypatch.setattr(op, "run_dispatch", lambda args: seen.append(args) or 0)
 
-    assert op._dispatch_command(["refactor the parser"]) == 0
-    assert seen == [["refactor the parser"]]
+    assert op._dispatch_command(list(argv)) == 0
+    assert seen == [list(argv)]
 
 
 def test_a_flag_is_never_read_as_a_mistyped_subcommand(monkeypatch):

@@ -20,7 +20,6 @@ never under ``~/.copilot``, which the Copilot CLI wholesale-deletes on startup.
 from __future__ import annotations
 
 import atexit
-import difflib
 import hashlib
 import json
 import os
@@ -139,6 +138,29 @@ SUBCOMMANDS = ("help", "version", "list", "menu", "projects", "report",
                "tabs", "restore")
 
 RESERVED_WORDS = set(SUBCOMMANDS)
+
+#: Words that mean a subcommand here but are spelled for a different tool.
+#:
+#: These are not typos and no edit distance reaches them: somebody typing
+#: ``ls`` has spelled what they meant correctly, in the wrong language. That
+#: makes them the one part of the typo guard that has to be enumerated by
+#: hand, and the list is deliberately short -- an alias is a guess about
+#: intent, and a wrong guess sends the reader somewhere that does not do what
+#: they asked. Only entries whose target does the job the other tool's word
+#: names belong here.
+SUBCOMMAND_ALIASES = {
+    "ls": "list",          # every unix shell
+    "ll": "list",
+    "ps": "list",          # what is running
+    "dir": "list",         # cmd.exe
+    "sessions": "list",
+    "status": "list",      # `list` is the "what is running" view
+    "tail": "logs",        # `tail -f` on the log
+    "cat": "logs",
+    "kill": "stop",
+    "quit": "stop",
+    "exit": "stop",
+}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SESSION_ARG_RE = re.compile(r"^--(continue|resume|connect)(=.*)?$")
@@ -5502,32 +5524,80 @@ def main(argv: list[str] | None = None) -> int:
     return rc
 
 
-def _subcommand_suggestions(word: str, limit: int = 3) -> list[str]:
-    """The subcommands ``word`` is plausibly a misspelling of, best first.
+def _one_edit_apart(word: str, candidate: str) -> bool:
+    """True when one insertion, deletion, substitution or transposition of
+    adjacent characters turns ``word`` into ``candidate``.
 
-    ``difflib`` ratios rather than a hand-rolled edit distance, because the
-    useful threshold here is a *ratio* and not a count: ``ls`` is two edits
-    from ``list`` and ``report`` is two from ``restore``, but only the first
-    is a plausible typo, and the ratio separates them (0.67 against 0.33).
-    The 0.6 cutoff is the lowest that still catches ``ls``.
-
-    All the ties are returned rather than one arbitrary winner. ``ls`` scores
-    identically against ``list`` and ``logs``, and ``difflib`` breaks that tie
-    alphabetically -- which would confidently answer ``logs`` to the exact
-    mistake this was written for. Two honest guesses beat one invented one.
-
-    Deliberately not exhaustive: a word that resembles nothing is left alone,
-    because ``operator [copilot-args...]`` is documented and a prompt is
-    allowed to be any word at all.
+    Damerau-Levenshtein rather than plain Levenshtein because a transposition
+    is one slip of the fingers and two ordinary edits, and transposition is
+    the single most common typing mistake there is: ``jion``, ``sedn`` and
+    ``verison`` are all one flipped pair from a real subcommand and would
+    otherwise need a threshold of two, which is wide enough to swallow real
+    words (``test`` is two edits from ``list``).
     """
-    scored = []
-    for index, candidate in enumerate(SUBCOMMANDS):
-        ratio = difflib.SequenceMatcher(None, word.lower(), candidate).ratio()
-        if ratio >= 0.6:
-            # Declaration order breaks a ratio tie, so the answer does not
-            # depend on how the alphabet happens to fall.
-            scored.append((-ratio, index, candidate))
-    return [candidate for _, _, candidate in sorted(scored)[:limit]]
+    if abs(len(word) - len(candidate)) > 1:
+        return False
+    previous: dict[tuple[int, int], int] = {}
+    rows = range(-1, len(word))
+    for i in rows:
+        previous[(i, -1)] = i + 1
+    for j in range(-1, len(candidate)):
+        previous[(-1, j)] = j + 1
+    for i, a in enumerate(word):
+        for j, b in enumerate(candidate):
+            cost = 0 if a == b else 1
+            best = min(previous[(i - 1, j)] + 1,
+                       previous[(i, j - 1)] + 1,
+                       previous[(i - 1, j - 1)] + cost)
+            if i and j and a == candidate[j - 1] and word[i - 1] == b:
+                best = min(best, previous[(i - 2, j - 2)] + cost)
+            previous[(i, j)] = best
+    return previous[(len(word) - 1, len(candidate) - 1)] <= 1
+
+
+def _subcommand_suggestions(word: str) -> list[str]:
+    """The subcommands ``word`` is plausibly a mistyping of, in declared order.
+
+    Three rules, and the narrowness of all three is the point. This predicate
+    decides whether a word is refused instead of being handed to copilot as a
+    prompt, and ``operator [copilot-args...]`` is documented -- so every word
+    it claims wrongly is a working invocation taken away.
+
+    - **A strict prefix.** ``sto`` and ``lo`` are truncations of something
+      real. This can only fire when the word is *shorter* than the subcommand,
+      which is what keeps instance names safe: ``list-view`` and ``report-gen``
+      are longer than every subcommand they resemble, so no name that is
+      longer than the thing it looks like can ever be refused.
+    - **One edit away.** The classic single-slip model, and the reason a count
+      is right here where a similarity ratio was not.
+    - **A word from another tool.** ``ls`` is not a typo of ``list``; it is
+      correct spelling from a different program, and no distance measure will
+      ever connect them. Those are enumerated in SUBCOMMAND_ALIASES rather
+      than guessed at.
+
+    An earlier version scored ``difflib.SequenceMatcher`` ratios with a 0.6
+    cutoff, and three reviewers independently rejected it: a ratio measures
+    shared characters in any order, so it refused ``refactor`` (``restore``),
+    ``read`` (``reload``), ``hello`` (``help``), ``test`` (``ingest``) and --
+    worst -- ``myproject``, the documented quick-join, against ``projects``.
+    Ten of thirty ordinary one-word prompts were refused. These rules refuse
+    one, ``lint``, which really is one keystroke from ``list``.
+
+    All matches are returned rather than one winner. ``sto`` truncates three
+    different subcommands and ``difflib``'s own tie-break is alphabetical,
+    which would have answered ``logs`` to ``ls`` -- the exact mistake this was
+    written for. There is no limit because there is no honest way to choose
+    which of a set of equally good answers to hide.
+    """
+    word = word.lower()
+    if not word:
+        return []
+    matches = [candidate for candidate in SUBCOMMANDS
+               if (len(word) < len(candidate) and candidate.startswith(word))
+               or _one_edit_apart(word, candidate)]
+    if not matches and word in SUBCOMMAND_ALIASES:
+        matches = [SUBCOMMAND_ALIASES[word]]
+    return matches
 
 
 def _dispatch_command(args: list[str]) -> int:
