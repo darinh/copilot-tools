@@ -690,7 +690,7 @@ def test_a_clean_exit_is_reported_as_clean_not_as_a_crash(home, capsys):
         consecutive=5, limit=5)
     op.show_trace([])
     out = capsys.readouterr().out
-    assert "Supervised sessions found gone" in out
+    assert "Supervised session endings" in out
     assert "clean exit (rc=0)" in out
     assert "GIVING UP" in out
 

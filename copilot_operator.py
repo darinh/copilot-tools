@@ -1671,6 +1671,58 @@ def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
     return CATALOG_UNREADABLE if undecided else None
 
 
+def crash_recovery_verdict(workdir: Path) -> bool:
+    """Did the session before this launch end without leaving a handoff?
+
+    A missing handoff file means the previous session never reached `handoff`
+    — most likely a crash (operator itself dying, Windows rebooting, an
+    external kill mid-turn) rather than a clean stop. Telling the agent lets
+    it act accordingly.
+
+    **This is a claim about one moment and must be re-decided at every
+    launch.** It used to be decided once, before the supervisor's loop
+    started, and the answer was then baked into a preamble reused by every
+    session of the run. A run is long-lived — `copilot-tools` reached session
+    #223 on a run started 25 days earlier — so one verdict taken at loop start
+    was still being reported to sessions hundreds of handoffs later. It failed
+    in both directions: a loop that started with no handoff told every later
+    session its predecessor had crashed, contradicting the handoff sitting on
+    disk that the agent had just been told to read; and a loop that started
+    with one never reported a genuine mid-turn kill afterwards, which is
+    precisely the event this note exists to surface. Queued mail was moved to
+    per-launch delivery for the same reason and this was left behind.
+
+    An *unregistered* project is a different situation entirely: no catalog
+    entry means no handoff file could ever have been written there, so the
+    absence proves nothing and must not be reported to the agent as a crash.
+    """
+    handoff_file = project_handoff_file(workdir)
+    if handoff_file is CATALOG_UNREADABLE:
+        # The catalog would not open. That establishes nothing about whether
+        # this project is registered, so it must not be reported as either a
+        # missing handoff or an unregistered project.
+        log("  Could not read the project catalog — not reporting this as "
+            "crash recovery")
+        return False
+    if handoff_file is None:
+        log("  Project is not registered in the catalog — no handoff file "
+            "is expected here")
+        return False
+    # Probed once and held: asking twice invites the two answers to disagree,
+    # and the tri-state exists so the unknown case can be decided deliberately.
+    present = path_present(handoff_file)
+    if present is False:
+        log("  No handoff file found for this project — treating this as "
+            "crash recovery")
+        return True
+    if present is None:
+        # Telling the agent a handoff is missing is a claim about the last
+        # session. A probe that failed has not established anything.
+        log(f"  Could not examine {handoff_file} — not reporting this as "
+            f"crash recovery")
+    return False
+
+
 def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = False) -> str:
     text = (
         "You are running under an automated operator wrapper that a human set up. "
@@ -3124,37 +3176,20 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
         # Nothing is being launched, so there is nothing to resume into.
         resume_id = ""
 
-    # A resume id with no handoff file for this project means the previous
-    # session ended without ever calling `handoff` — most likely a crash
-    # (operator itself dying, Windows rebooting, etc.) rather than a clean
-    # stop. Tell the agent so it can act accordingly.
+    # Whether the *previous* session left a handoff behind is a question about
+    # a moment, so it is re-asked before every launch rather than answered once
+    # here. See `crash_recovery_verdict`. What is fixed for the whole run is
+    # only whether there *was* a predecessor to ask about: at loop start that
+    # is exactly "we are continuing an earlier run", and every session this
+    # supervisor watches end adds one thereafter.
     #
-    # An *unregistered* project is a different situation entirely: no catalog
-    # entry means no handoff file could ever have been written there, so the
-    # absence proves nothing and must not be reported to the agent as a crash.
-    crash_recovery = False
-    if resume_id:
-        handoff_file = project_handoff_file(Path.cwd())
-        if handoff_file is CATALOG_UNREADABLE:
-            # The catalog would not open. That establishes nothing about
-            # whether this project is registered, so it must not be reported
-            # as either a missing handoff or an unregistered project.
-            log("  Could not read the project catalog — not reporting this as "
-                "crash recovery")
-        elif handoff_file is None:
-            log("  Project is not registered in the catalog — no handoff file "
-                "is expected here")
-        elif path_present(handoff_file) is False:
-            crash_recovery = True
-            log("  No handoff file found for this project — treating this as "
-                "crash recovery")
-        elif path_present(handoff_file) is None:
-            # Telling the agent a handoff is missing is a claim about the last
-            # session. A probe that failed has not established anything.
-            log(f"  Could not examine {handoff_file} — not reporting this as "
-                f"crash recovery")
-
-    preamble = build_preamble(agent, instance, crash_recovery=crash_recovery)
+    # Continuation is read off the session number, not off `resume_id`. A
+    # resume id is written only when the previous session reported one and it
+    # parses as a UUID, so keying on it would call a run with five sessions
+    # behind it a first launch the moment that id went missing -- and the
+    # question here is whether a predecessor *existed*, not whether we can
+    # resume into it.
+    had_predecessor = bool(resume_id) or start_session_num > 1
 
     if adopt:
         # Refuse to "adopt" anything we do not own or that is not there: the
@@ -3288,10 +3323,13 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
 
                     # Messages that arrived while no session was running are
                     # handed over here, per launch rather than once: the base
-                    # preamble is built before the loop starts, so mail that
-                    # arrives during session #3 must still reach session #4.
+                    # preamble is built per launch too, so mail that arrives
+                    # during session #3 must still reach session #4.
                     # Read now, archive only once the session is really up.
-                    launch_preamble = preamble
+                    launch_preamble = build_preamble(
+                        agent, instance,
+                        crash_recovery=(had_predecessor
+                                        and crash_recovery_verdict(workdir)))
                     try:
                         waiting = operator_mail.pending(OPERATOR_HOME, instance.id)
                     except operator_mail.MailError as exc:
@@ -3423,12 +3461,23 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                                 return 1
                             continue
                         unknown_markers = 0
-                        if marker_set(instance.restart_marker):
+                        uptime = (None if session_started_at is None
+                                  else time.time() - session_started_at)
+                        # Probed as a tri-state and recorded as one. `marker_set`
+                        # answers False for "not there" and for "could not
+                        # look", which is the right call for the *branch* -- one
+                        # more poll is cheap -- but writing that False into the
+                        # trace would enter a guess as an observation, and the
+                        # postmortem reading it has no way to tell them apart.
+                        restart_probe = marker_state(instance.restart_marker)
+                        if restart_probe is True:
                             log(f"Session #{session_num}: restart signal detected!")
                             crash_failures = 0
+                            _record_session_exit(instance, session_num,
+                                                 stop_state, detach_state,
+                                                 restart_probe,
+                                                 crash_failures, uptime=uptime)
                         else:
-                            uptime = (None if session_started_at is None
-                                      else time.time() - session_started_at)
                             if uptime is not None and uptime >= HEALTHY_SESSION_SECONDS:
                                 # Healthy run, then death: whatever killed it,
                                 # it is not the startup failure the limit is
@@ -3441,6 +3490,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                             crash_failures += 1
                             _record_session_exit(instance, session_num,
                                                  stop_state, detach_state,
+                                                 restart_probe,
                                                  crash_failures, uptime=uptime)
                             ran_for = ("" if uptime is None
                                        else f" after {int(uptime)}s")
@@ -3458,10 +3508,38 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     if marker_set(instance.restart_marker):
                         log(f"Session #{session_num}: restart signal detected!")
                         crash_failures = 0
+                        # The handoff path arrives here, not above: `handoff`
+                        # touches the marker while copilot is still up, so the
+                        # supervisor sees the request before it sees the exit.
+                        # Recording only the branch above is why every
+                        # `session_exit` in the trace carried `restart=False`
+                        # -- not because no session ever ended by handoff, but
+                        # because the ones that did were never written down.
+                        #
+                        # Recorded here rather than after the session is
+                        # actually torn down, deliberately. If
+                        # `stop_session_gracefully` and the kill behind it both
+                        # fail, the supervisor dies -- and a record written
+                        # after that point is the one that would never exist.
+                        # A trace saying "a restart was requested" when the
+                        # teardown then failed is recoverable by whoever reads
+                        # it next; silence about the last thing that happened
+                        # before the supervisor died is not.
+                        _record_session_exit(
+                            instance, session_num,
+                            marker_state(instance.stop_marker),
+                            marker_state(instance.detach_marker), True,
+                            crash_failures,
+                            uptime=(None if session_started_at is None
+                                    else time.time() - session_started_at),
+                            session_gone=False)
                         restart_requested = True
                         break
 
                 if restart_requested:
+                    # Something has now ended under this supervisor's watch, so
+                    # from here on there is always a predecessor to ask about.
+                    had_predecessor = True
                     log("Restarting copilot...")
                     remove_file(instance.restart_marker)
                     stop_session_gracefully(instance)
@@ -3600,9 +3678,9 @@ MODES
         keeps going. Named instances auto-continue when restarted: session
         numbering, run summary scope, and the last Copilot CLI session id
         carry over, and that session is resumed once with --resume. Use
-        --fresh to reset. If a resumed session has no handoff file for the
-        project, the preamble notes that this looks like crash recovery
-        rather than a clean handoff.
+        --fresh to reset. Before every launch, if the previous session left
+        no handoff file for the project, the preamble notes that this looks
+        like crash recovery rather than a clean handoff.
 
 LOOP VS. SESSION
     Loop mode has two independent lifecycles: the background supervisor
@@ -4274,23 +4352,43 @@ def show_menu() -> int:
 
 
 def _record_session_exit(instance, session_num: int,
-                         stop_state, detach_state, consecutive: int,
-                         uptime: float | None = None) -> None:
-    """Trace a session found gone, with the evidence the decision was made on.
+                         stop_state, detach_state, restart_state,
+                         consecutive: int, uptime: float | None = None,
+                         session_gone: bool = True) -> None:
+    """Trace a session ending, with the evidence the decision was made on.
 
     The supervisor polls liveness rather than waiting on the child, so it has
     never had an exit *code* to log -- but the runner writes one to the exit
     file, and that is the difference between "copilot crashed" and "copilot
     shut down cleanly and nobody asked us to expect it". Reading it here costs
     one file read on a path that only runs when a session has already ended.
+
+    ``restart_state`` is passed in rather than probed here. It used to be
+    re-read off disk, and the only call site was the branch that had *already*
+    established the restart marker was absent -- so the field could not carry
+    ``True`` in any record, over 979 recorded exits. A field that cannot vary
+    records nothing, and this one was read as proof that no session had ever
+    ended by handoff when all it showed was where the call sat.
+
+    It takes the caller's tri-state probe, not a ``bool``. ``marker_set``
+    collapses "not there" and "could not look" into one answer, which is the
+    right trade for deciding a branch and the wrong one for a record somebody
+    will later read as an observation.
+
+    ``session_gone`` is False on the one path that fires while copilot is still
+    up (a restart requested mid-session, which is what `handoff` does). No exit
+    code can belong to a live process, so none is read: `start_session` clears
+    the exit file, but a clearing that failed would otherwise let a previous
+    session's code be recorded against this one.
     """
     try:
         code: "int | None" = None
-        try:
-            raw = instance.exit_file.read_text(encoding="utf-8").strip()
-            code = int(raw) if raw else None
-        except (OSError, ValueError):
-            code = None
+        if session_gone:
+            try:
+                raw = instance.exit_file.read_text(encoding="utf-8").strip()
+                code = int(raw) if raw else None
+            except (OSError, ValueError):
+                code = None
         try:
             pid = instance.copilot_pid()
         except Exception:
@@ -4301,7 +4399,7 @@ def _record_session_exit(instance, session_num: int,
             session=session_num,
             pid=pid,
             markers={"stop": stop_state, "detach": detach_state,
-                     "restart": marker_state(instance.restart_marker),
+                     "restart": restart_state,
                      "exit_code": code,
                      "uptime_s": None if uptime is None else int(uptime)},
             consecutive=consecutive,
@@ -4404,11 +4502,11 @@ def show_trace(args: list[str]) -> int:
 
     if session_exits:
         # Printed separately because they are a different kind of fact: not a
-        # command someone ran, but a supervised session found gone. These are
-        # the events a mass die-off consists of, and no operator command is
+        # command someone ran, but a supervised session ending. These are the
+        # events a mass die-off consists of, and no operator command is
         # invoked during one -- which is why an invocation log alone could not
         # explain the seven simultaneous deaths this trace was written after.
-        print(f"\n═══ Supervised sessions found gone "
+        print(f"\n═══ Supervised session endings "
               f"({len(session_exits)} shown) ═══\n")
         for rec in session_exits:
             markers = rec.get("markers") or {}
@@ -4416,7 +4514,18 @@ def show_trace(args: list[str]) -> int:
             # "Exited unexpectedly" only ever meant unexplained. A recorded
             # exit code of 0 is a clean shutdown nobody asked us to expect,
             # and reading it as a crash is how five of them end a loop.
-            if code is None:
+            #
+            # A set restart marker is the one explanation available here, so
+            # it is reported ahead of the code: `handoff` ends a session that
+            # way, and such a session has no exit code *by construction* --
+            # rendering it as "no exit code recorded" would give it the exact
+            # signature of the externally killed sessions it must be told
+            # apart from.
+            if markers.get("restart") is True:
+                verdict = "ended by restart request (handoff or operator restart)"
+                if code is not None:
+                    verdict += f", rc={code}"
+            elif code is None:
                 verdict = "no exit code recorded"
             elif code == 0:
                 verdict = "clean exit (rc=0), unexplained by any marker"

@@ -578,7 +578,7 @@ def record_exit(context: "dict | None", rc: int) -> None:
 def record_session_exit(operator_home: Path, *, instance: str, session: int,
                         pid: "int | None", markers: "dict",
                         consecutive: int, limit: int) -> None:
-    """Record that a supervised copilot session was found gone. Never raises.
+    """Record that a supervised copilot session ended. Never raises.
 
     This is the event the trace was built for and the one an invocation log
     cannot see. When seven loops died together on 2026-08-03 no operator
@@ -597,6 +597,13 @@ def record_session_exit(operator_home: Path, *, instance: str, session: int,
     in any one session. What is recorded here is therefore the observation and
     the marker states it was judged against, so a later reader can re-judge
     it. Nothing here decides what killed the session.
+
+    Endings that *were* explained are recorded too, and that is not a cosmetic
+    addition: for a long time only the unexplained branch called this, so
+    every record carried ``restart=False`` and the trace could be read -- was
+    read -- as proving no session had ever ended by handoff. A population that
+    excludes the cases you are trying to count cannot answer the question, and
+    it does not look empty while failing to.
     """
     try:
         _append(trace_path(Path(operator_home)), {
