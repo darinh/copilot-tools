@@ -88,3 +88,45 @@ a log at all -- and a property test whose inputs were five characters longer
 than the boundary it claimed to pin, so widening the edit threshold left it
 green. Each is fixed, and the predicate is now mutation-tested: five mutants,
 all killed, where two survived before.
+
+## Addendum, 2026-08-05 (later the same day): the POSIX half was never delivered
+
+The section above says "the fix landed" without saying *where*. It landed in
+`copilot_operator.py` only. `operator.sh` -- the program Linux, WSL and macOS
+users actually run -- kept the old fall-through for another day, and its
+hand-maintained `RESERVED_WORDS` kept the drift the Python side had just
+stopped having. `bash operator.sh ls` still started a session. Closing the item
+on one of two entry points is the same silence the item is about, one level up:
+nothing failed, so nothing said so.
+
+Ported in `e8ae2f3` (branch `fix/operator-sh-typo-guard`). The shell now
+carries the same three rules, the same `SUBCOMMANDS`-derived `RESERVED_WORDS`,
+and a Damerau-Levenshtein implementation over a flat indexed array, since bash
+3.2 has neither associative nor two-dimensional arrays. The refusal sits after
+the positional-join shortcut and *before* the tmux/sqlite3/python3 dependency
+checks, so a typo gets a suggestion rather than "tmux is required".
+
+The shell's `SUBCOMMANDS` is deliberately a strict subset of the Python one.
+`operator.sh` implements none of `send`, `inbox`, `restart-loop`, `trace`,
+`logs` or `tabs`, so naming them in a suggestion would advertise words that
+themselves fall through to a session -- the defect reappearing inside its own
+fix. A test pins the subset to what the `case` actually dispatches.
+
+Verification: 3222 passed, 10 skipped (baseline 3135/10), 36/36
+cross-platform, `bash -n` clean, and the real script run end to end under bash.
+The shell predicate was differentially tested against the Python one over 1998
+generated words -- every single-edit neighbour, prefix and alias -- with zero
+disagreements. Eleven mutants, ten killed; the survivor was real, not
+cosmetic: dropping the `$# -eq 1` gate changed nothing, because `operator ls
+-la` was claimed in a comment and tested nowhere. A test now covers it. Three
+adversarial reviews found nothing, and all three independently re-derived the
+one equivalent mutant left standing.
+
+Two traps worth recording, both of which produced confident wrong answers
+before they were caught. Python's `subprocess` with `encoding=` translates
+`\n` to `\r\n` on Windows, so a bash probe fed through it reads every word
+with a trailing carriage return; the first differential run reported 1967
+mismatches that did not exist. And this repository's own shell harness stubs
+*every* top-level function, which silently included the function under test --
+the first end-to-end probe reported no refusals at all from a guard that
+worked perfectly.
