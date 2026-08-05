@@ -642,6 +642,8 @@ def test_a_clean_catalog_is_not_treated_as_a_partial_read(catalog, monkeypatch,
         problems: list = []
         blockers: list = []
         user_agents: list = []
+        placed: list = []
+        source_origin = "the repository template"
 
     monkeypatch.setattr(project_instructions, "retire",
                         lambda *a, **k: seen.append(True) or _Result())
