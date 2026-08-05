@@ -1019,6 +1019,65 @@ def test_that_dispatch_check_can_actually_fail():
     assert 'head in ("nonesuch"' not in source
 
 
+def _dispatched_heads(source: str) -> set[str]:
+    """Every literal word the dispatcher compares `head` against."""
+    heads = set(re.findall(r'head == "([^"]+)"', source))
+    for group in re.findall(r'head in \(([^)]*)\)', source):
+        heads.update(re.findall(r'"([^"]+)"', group))
+    return heads
+
+
+def test_every_dispatched_head_is_listed():
+    """The other direction, and the one that had nothing looking at it.
+
+    `test_every_subcommand_is_dispatched` reads the tuple and asks whether
+    each word is answered. A word *answered* and missing from the tuple passes
+    that scan silently -- which is the shape the tuple's own history already
+    has, since `send` and `inbox` were dispatched while absent from
+    RESERVED_WORDS.
+
+    It stopped being a tidiness question when `operator.sh` grew a refusal for
+    the subcommands only this file implements. That list is derived as
+    `SUBCOMMANDS` minus the shell's own, so a word dispatched here but left
+    out of the tuple is a word the shell will not refuse -- and the shell
+    answers an unrecognised first argument by starting a Copilot session named
+    after it. The omission would be invisible on both sides and reintroduce
+    backlog 9 one word at a time.
+    """
+    heads = _dispatched_heads(Path(op.__file__).read_text(encoding="utf-8"))
+    assert heads, "the dispatch scan matched nothing, so this test is vacuous"
+    # `-h`, `--help`, `-?`, `--version` and `-V` are flag spellings of a
+    # subcommand rather than subcommands, and the guards that read SUBCOMMANDS
+    # never see a word beginning with a dash.
+    flags = {head for head in heads if head.startswith("-")}
+    assert flags, (
+        "no flag spellings were found, so the exclusion below is untested and "
+        "may now be hiding a real word")
+    unlisted = sorted(heads - flags - set(op.SUBCOMMANDS))
+    assert not unlisted, (
+        f"these words are dispatched but missing from SUBCOMMANDS: {unlisted}. "
+        "operator.sh derives its refusal list from that tuple, so each of them "
+        "is a word the shell answers by starting a session named after it")
+
+
+def test_that_the_reverse_dispatch_check_can_actually_fail():
+    """The control for the scan above, run over text that provably has the bug.
+
+    Without it, a regex that matched nothing would report every dispatched
+    head as listed -- the failure direction this whole pair exists to close,
+    arriving in the test that closes it.
+    """
+    planted = ('if head == "ghost":\n'
+               '    return 0\n'
+               'if head in ("phantom", "list"):\n'
+               '    return 0\n')
+    found = _dispatched_heads(planted)
+    assert found == {"ghost", "phantom", "list"}, found
+    assert sorted(found - set(op.SUBCOMMANDS)) == ["ghost", "phantom"], (
+        "the extractor cannot see an unlisted dispatched head, so the test "
+        "above passes no matter what copilot_operator.py dispatches")
+
+
 def test_a_mistyped_subcommand_is_refused_instead_of_starting_a_session(
         monkeypatch, capsys):
     """`operator ls` used to fall through and offer to restart the session.
