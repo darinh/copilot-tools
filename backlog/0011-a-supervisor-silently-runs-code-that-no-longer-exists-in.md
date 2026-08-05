@@ -80,3 +80,40 @@ The cheap discriminator for a human in the meantime: compare the instance's
 Diagnosed by the `discord-invite-manager` operator instance, which also
 declined to restart anything on its own initiative after finding it -- the
 right call, since a restart across eight projects was not its to make.
+
+## Correction, 2026-08-05
+
+**The remedy proposed in the Notes already exists.** 6d2385c, "a supervisor's
+records now say which code wrote them", landed earlier the same day: a
+supervisor stamps a digest of the operator source it actually imported into
+its state file and into its trace records, and `operator list` names any
+instance whose code cannot be shown to be current, together with the
+`restart-loop` command that fixes it. This item was filed without that being
+checked, from a diagnosis that was itself correct.
+
+What the fleet looked like at 09:10, immediately after the first supervisor
+restart on this machine since the feature landed:
+
+    book-translator  ...  [supervisor code unrecorded]
+    copilot-tools    ...
+    finances         ...  [supervisor code unrecorded]
+    scripts          ...  [supervisor code unrecorded]
+    snes-ghosts      ...  [supervisor code unrecorded]
+
+`copilot-tools` is unmarked because it had just been restarted; the other four
+predate the record entirely, which is why they read "unrecorded" rather than
+"stale". That is also the first time 6d2385c has been exercised in production
+-- until some supervisor restarted, every instance read UNKNOWN and the
+feature proved nothing.
+
+The residue this item still names, and the only part worth keeping open: the
+misinformation lands in the **session preamble**, and `operator list` is not
+where the agent reading that preamble looks. An agent told its predecessor
+crashed has no reason to go and check whether its supervisor is current, and
+355 launches did not. Making staleness legible to a human at the command line
+does not make it legible to the agent being lied to.
+
+So the open question is narrower than the title suggests: should a launch
+whose supervisor cannot show it is running current code say so *in the
+preamble*, next to the claims that code is responsible for? Everything else
+here is done.
