@@ -536,9 +536,21 @@ def _is_a_multiplexer_spawn(cmd) -> bool:
     that every *other* test in the suite was free to reach the real server
     again, which is the exact condition a8575d7 and 20126d6 were written to
     end. Keep this a bare membership test.
+
+    The name is extracted with both separators spelled out rather than with
+    ``os.path.basename`` alone, because ``os.path`` is the *running* platform's
+    path syntax and this guard is asked about argv that name the other one.
+    On POSIX, ``os.path.basename(r"C:\\tools\\tmux.exe")`` is the whole string --
+    backslash is an ordinary filename character there -- so the membership test
+    saw ``c:\\tools\\tmux`` and the guard delegated a tmux invocation it exists to
+    refuse. That is how the parametrised case for a full Windows path passed on
+    the Windows legs and spawned on the four POSIX ones, which no amount of
+    local Windows testing could show. Treating ``\\`` as a separator everywhere
+    can only ever make the guard refuse *more*, and over-refusing inside the
+    test suite costs a loud error, while under-refusing costs a real server.
     """
     head = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else cmd
-    name = os.path.basename(str(head)).lower()
+    name = str(head).replace("\\", "/").rsplit("/", 1)[-1].lower()
     if name.endswith(".exe"):
         name = name[:-4]
     return name in _MUX_BINARIES

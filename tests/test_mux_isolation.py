@@ -262,6 +262,31 @@ def test_the_spawn_predicate_depends_on_its_argument():
     assert _is_a_multiplexer_spawn([sys.executable, "-c", "pass"]) is False
 
 
+def test_the_predicate_reads_both_separators_on_every_platform():
+    """The program name must be extracted the same way whichever separator the
+    argv happens to use, on whichever platform is running.
+
+    ``os.path`` is the *running* platform's path syntax, and this guard is
+    asked about argv naming the other one. ``os.path.basename`` on POSIX
+    returns ``C:\\tools\\tmux.exe`` unchanged -- backslash is an ordinary
+    filename character there -- so the membership test saw ``c:\\tools\\tmux``,
+    missed, and the guard delegated a tmux invocation to the real binary.
+
+    Be honest about what this test can do: it cannot fail on Windows, where
+    ``basename`` already splits both separators and the bug is unreachable.
+    Only the four POSIX legs can falsify it. That is the whole lesson of the
+    defect -- a green local Windows suite was not evidence about the other
+    platforms, and the parametrised full-path case above passed here while
+    spawning a real tmux on every Linux and macOS runner.
+    """
+    for sep in ("/", "\\"):
+        assert _is_a_multiplexer_spawn([f"C:{sep}tools{sep}tmux.exe"]) is True
+        assert _is_a_multiplexer_spawn([f"{sep}usr{sep}bin{sep}tmux"]) is True
+        # Negative control on the same spelling: a separator-blind reading that
+        # answered True for everything would satisfy the two lines above.
+        assert _is_a_multiplexer_spawn([f"{sep}usr{sep}bin{sep}python"]) is False
+
+
 def test_a_non_multiplexer_subprocess_is_delegated_untouched():
     """Control. The guard must be a filter, not a blanket ban: the suite runs
     real Python child processes and several tests depend on it. If this ever

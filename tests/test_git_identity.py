@@ -851,20 +851,32 @@ def test_the_identity_scan_is_not_restricted_to_the_main_branch():
             "a push to any other branch publishes without being checked")
 
 
-def test_the_ci_matrix_jobs_are_the_reason_the_scan_is_separate():
+def test_the_ci_matrix_trigger_is_the_reason_the_scan_is_separate():
     """A premise assertion, so the rationale cannot quietly stop being true.
 
-    The workflow comments claim the ci.yml jobs are shallow. If that ever
-    stops being so, the argument for a separate full-depth workflow is worth
-    revisiting deliberately, rather than discovering the comment has been
-    wrong for months.
+    git-identity.yml's header gives the reason this check lives outside
+    ci.yml: ci.yml restricts its push trigger to `main`, and on a public
+    repository a push to *any* branch is publication, so a check hosted there
+    would not see most of what it exists to catch.
+
+    This assertion used to be about fetch depth -- ci.yml checked out at the
+    default depth of 1, and the comment beside git-identity.yml's `fetch-depth:
+    0` said so. That stopped being true when ci.yml's matrix job took full
+    history so backlog_tool could resolve the `commit:` sha of a closed item,
+    and this test fired on the change, which is exactly what a premise
+    assertion is for. Depth was never the load-bearing reason for a separate
+    workflow: the trigger is, and the refs/pull/* fetch asserted below is. So
+    the premise moves to the reason that still holds rather than being
+    deleted, which would leave the rationale unguarded.
     """
     ci = _workflows()["ci.yml"]
-    depths = {n: _checkout_fetch_depth(j)[1] for n, j in ci["jobs"].items()}
-    assert depths, "premise: ci.yml defines jobs"
-    assert all(d is None for d in depths.values()), (
-        f"a ci.yml job now sets fetch-depth: {depths}. Not a failure of the "
-        "scan -- revisit whether it still needs its own workflow.")
+    triggers = ci.get(True) or ci.get("on")
+    assert triggers is not None, "premise: ci.yml has a trigger block"
+    push = triggers.get("push") or {}
+    assert push.get("branches"), (
+        "ci.yml's push trigger no longer restricts branches. That is the "
+        "reason the identity scan lives in its own workflow -- not a failure "
+        "of the scan, but revisit whether it still needs one.")
 
 
 def test_the_scan_workflow_fetches_the_pull_request_refs():
