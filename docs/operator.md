@@ -269,6 +269,38 @@ that needed it.
   /home/you/.operator/restart/myproject.nochange
 ```
 
+**A session nobody saw end is not evidence of idleness.** Changing nothing is
+evidence that an agent had nothing to do only if the session ended the way the
+loop expects: a handoff, or an exit the runner survived to record. A session
+killed from outside — the whole pane going down, taking the runner with it, so
+no exit code is ever written — has usually not committed at the moment it
+dies, so its fingerprint is identical to an idle session's. Charging it to the
+streak retires the loops being killed *fastest*, which is backwards: their
+failure has nothing to do with the agent's behaviour.
+
+Such an ending is not chargeable evidence in either direction. It neither
+advances the no-change streak nor clears it, exactly like a session that could
+not be measured. It is counted separately instead, because "not idleness" is
+not "not a problem" — a loop that cannot keep a session alive long enough to
+produce anything is still burning credits, and the crash counter cannot bound
+it once the sessions live past `HEALTHY_SESSION_SECONDS`:
+
+```
+Session #5: changed nothing in /path/to/project and ended with no handoff and
+no observed exit (5/5) — not counted as idleness
+Loop stopped: 5 consecutive sessions ended unaccounted for and changed
+nothing. That is not idleness — something is ending these sessions.
+  What ended them: operator trace --kind session_exit
+```
+
+The supervisor exits **4** (`EXIT_UNACCOUNTED`) there, not 3. The two carry
+opposite diagnoses — "the agent has run out of work" against "something is
+killing the sessions" — and a reader who cannot tell them apart will act on
+the wrong one. The allowance is five rather than three, and the count lives in
+`~/.operator/restart/<id>.unaccounted`, deliberately not shared with the
+no-change count: two killed sessions and one idle one are not three of
+anything.
+
 **An adopted session is never judged.** `operator restart-loop` replaces the
 supervisor part-way through a session, and the replacement cannot know what
 the repository looked like when that session started. Measuring its end
@@ -787,6 +819,7 @@ logs.
 | `~/.operator/restart/<id>.session` | Copilot CLI session UUID |
 | `~/.operator/restart/<id>.exit` | Exit code, written after metrics capture |
 | `~/.operator/restart/<id>.nochange` | Consecutive sessions that changed nothing, for [the progress circuit breaker](#the-progress-circuit-breaker). On disk so a supervisor swap cannot reset it |
+| `~/.operator/restart/<id>.unaccounted` | Consecutive sessions that changed nothing *and* ended with no handoff and no observed exit. Counted apart from `.nochange` so a killed session is never read as an idle one |
 | `~/.operator/restart/<id>.launch.json` | Launch spec for the session |
 | `~/.operator/restart/<id>.runner.log` | Supervisor log for the instance |
 | `~/.operator/tabs.json` | Tracked terminal tabs, used by `operator restore` |
