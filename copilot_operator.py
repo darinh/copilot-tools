@@ -2084,6 +2084,7 @@ FILE_ABSENT = _FileAbsent()
 CODE_CURRENT = "current"
 CODE_STALE = "stale"
 CODE_UNKNOWN = "unknown"
+CODE_UNRECORDED = "unrecorded"
 
 _RUNNING_CODE: "dict | None" = None
 
@@ -2215,11 +2216,54 @@ def _save_loop_code(instance: Instance) -> None:
         log(f"  Warning: could not record the running operator code: {exc}")
 
 
+def _publish_supervisor_records(instance: Instance, user_args: list[str]) -> None:
+    """Write this supervisor's startup records, pid file last.
+
+    The order is the point, which is why these three writes live in one named
+    function instead of inline where they cannot be tested. Every reader of
+    the *code record* gates on the loop pid file first — `_instance_summary`
+    and `list_instances` both require `snap["loop_pid"]` before they will say
+    anything about `loop_code` — so among those readers the pid file is the
+    commit point: once it exists, the record describing that supervisor
+    already does.
+
+    Written the other way round -- which is how it was -- a concurrent
+    ``operator ls`` lands between the pid file and the code record and sees a
+    live supervisor that has recorded nothing, which is now a reportable
+    state. It would tell a perfectly healthy supervisor, running the newest
+    code there is, to restart. The window is short and the consequence is
+    only a printed line, but a notice that is sometimes wrong is the kind
+    that stops being read, and this one exists precisely because the previous
+    one said nothing.
+
+    The args record has a different reader: `restart_loop` gates on the live
+    session rather than on the pid file, and refuses when no args are
+    recorded. Writing args first shrinks that window too, so the reordering
+    is an improvement there rather than a trade.
+
+    What this ordering does **not** do is make a starting supervisor visible.
+    The pid file is written near the end of a startup that already takes
+    upwards of 105 ms, and until it exists `_running_loop_pid` reports that
+    nothing is running -- which `operator stop` and `operator restart-loop`
+    both act on. That window predates this function; moving the write later
+    costs a measured 1.9 ms of it. It is backlog item 0010, and it is not
+    fixable by ordering these three writes.
+    """
+    # Recorded so this supervisor can be replaced later without guessing how
+    # it was started. Written every time, so it tracks the live invocation.
+    _save_loop_args(instance, user_args)
+    # ...and which operator source it is actually running. A supervisor keeps
+    # the code it imported for the whole run, so this is the only place the
+    # answer is still knowable.
+    _save_loop_code(instance)
+    instance.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
+
 def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
     """Is the supervisor running the code that is on disk now?
 
     Returns ``(verdict, changed_paths)`` where verdict is ``CODE_CURRENT``,
-    ``CODE_STALE`` or ``CODE_UNKNOWN``.
+    ``CODE_STALE``, ``CODE_UNRECORDED`` or ``CODE_UNKNOWN``.
 
     A supervisor imported its code at startup and keeps it for the whole run,
     so an operator fix is inert for every instance already running when it
@@ -2235,13 +2279,36 @@ def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
     could not be read: staleness is established by a single changed file,
     whereas *currency* is a claim about all of them and so cannot survive a
     file nobody could examine.
+
+    A record that is *observed absent* is a fourth answer, not the third one.
+    The record is written by the same change that reads it, so a supervisor
+    that is running and has left none started before that change existed --
+    or could not write one, which ``_save_loop_code`` warns about and
+    survives. Either way its verdict is unavailable until it restarts, and
+    the remedy is the same as for a stale one. Collapsing that into "cannot
+    tell" is what made this instrument silent for the entire population it
+    was built for: measured 2026-08-05T11:35Z, every one of the six running
+    supervisors predated the record, so all six read ``unknown``, ``operator
+    ls`` said nothing, and the output was byte-identical to a machine on
+    which every supervisor was current.
     """
     try:
-        payload = json.loads(instance.loop_code_file.read_text(encoding="utf-8"))
+        raw = instance.loop_code_file.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        # Definite: nothing is there, and nothing can be under a path whose
+        # parent is a file. Distinguished from the denial below because they
+        # support different claims -- this one says the supervisor never
+        # recorded, that one says nobody could look.
+        return CODE_UNRECORDED, []
     except (OSError, ValueError):
-        # No record at all: either the supervisor predates this, or its state
-        # was lost. Both mean "cannot tell", which must not be reported as
-        # either running code being current or a supervisor being stale.
+        # Something is there and could not be read (a denial, a directory in
+        # its place, bytes that are not UTF-8). "Cannot tell" is the only
+        # honest answer, and it must not borrow the confidence of the branch
+        # above.
+        return CODE_UNKNOWN, []
+    try:
+        payload = json.loads(raw)
+    except ValueError:
         return CODE_UNKNOWN, []
     if not isinstance(payload, dict):
         # Valid JSON that is not an object -- `null`, `[]`, a bare string.
@@ -2466,6 +2533,22 @@ def list_instances() -> int:
               "write still describe")
         print("the older code. Pick it up without stopping the session:")
         for name in stale:
+            print(f"    operator restart-loop {name}")
+    # A separate group with the same remedy, because the reason differs and
+    # merging them would say something false about one of the two. Reported
+    # at all because silence here is indistinguishable from every supervisor
+    # being current -- which is how this check came to say nothing on a
+    # machine where no supervisor could be checked at all.
+    unrecorded = [s["name"] for s in snaps
+                  if s["loop_pid"] and s.get("loop_code") == CODE_UNRECORDED]
+    if unrecorded:
+        print("\nThese supervisors did not record which operator code they "
+              "loaded, so whether")
+        print("they are up to date cannot be determined. They started before "
+              "the record existed,")
+        print("or could not write one. The same restart fixes it and picks "
+              "up the current code:")
+        for name in unrecorded:
             print(f"    operator restart-loop {name}")
     print("\nInspect: operator             (interactive: stats, join, stop)")
     print("Attach:  operator join <name>")
@@ -3649,14 +3732,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     unknown_markers = 0
     resume_id_used = ""
     adopting = adopt
-    instance.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
-    # Recorded so this supervisor can be replaced later without guessing how
-    # it was started. Written every time, so it tracks the live invocation.
-    _save_loop_args(instance, user_args)
-    # ...and which operator source it is actually running. A supervisor keeps
-    # the code it imported for the whole run, so this is the only place the
-    # answer is still knowable.
-    _save_loop_code(instance)
+    _publish_supervisor_records(instance, user_args)
     operator_trace.record_supervisor_start(
         OPERATOR_HOME, instance=instance.display_name,
         session=start_session_num, code=running_code_fingerprint())
@@ -4588,6 +4664,12 @@ def _instance_summary(snap: dict) -> str:
     # attach the notice to every row it cannot act on.
     if snap["loop_pid"] and snap.get("loop_code") == CODE_STALE:
         parts.append("[supervisor running older code]")
+    elif snap["loop_pid"] and snap.get("loop_code") == CODE_UNRECORDED:
+        # Worded as the observation, not the conclusion. The supervisor did
+        # not record what it loaded, so what it is running is genuinely not
+        # known -- but that it cannot be checked is itself the finding, and
+        # the fix is the same restart.
+        parts.append("[supervisor code unrecorded]")
     return "  ·  ".join(parts)
 
 

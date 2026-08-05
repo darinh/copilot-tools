@@ -12,6 +12,7 @@ from __future__ import annotations
 import builtins
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,33 @@ def _unreadable(monkeypatch, target: Path):
         return real_open(file, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "open", guard)
+
+
+class _RaisingRecord:
+    """An instance whose code record raises a chosen error when *read*.
+
+    `loop_code_state` touches nothing else on an instance, so this is the
+    whole surface it needs -- and it lets the errno be chosen exactly, which
+    building the situation on disk cannot do portably.
+
+    The error comes out of `read_text`, not out of the attribute lookup, so
+    an implementation that resolved the path outside its `try` would still
+    fail these tests rather than pass them by accident.
+    """
+
+    class _Path:
+        def __init__(self, error: BaseException):
+            self._error = error
+
+        def read_text(self, *args, **kwargs):
+            raise self._error
+
+    def __init__(self, error: BaseException):
+        self.loop_code_file = self._Path(error)
+
+
+def _raising(error: BaseException):
+    return _RaisingRecord(error)
 
 
 # ── the three answers _digest_file has to keep apart ─────────────
@@ -110,11 +138,61 @@ def test_absent_and_unreadable_do_not_compare_equal(tmp_path, monkeypatch):
 
 
 # ── the verdict ─────────────────────────────────────────────────
-def test_no_record_at_all_is_unknown():
-    """A supervisor started before this existed has recorded nothing. That
-    must not read as either running current code or being stale."""
+def test_no_record_at_all_is_unrecorded_not_unknown():
+    """A supervisor that is running and has left no record started before the
+    record existed, or could not write one. That is an observation, not a
+    failure to look, and it must reach the operator -- collapsing it into
+    "cannot tell" is what silenced this check for every supervisor on the
+    machine. It still must not read as current or stale."""
     inst = op.Instance("norecord")
-    assert op.loop_code_state(inst) == (op.CODE_UNKNOWN, [])
+    assert op.loop_code_state(inst) == (op.CODE_UNRECORDED, [])
+
+
+def test_unrecorded_is_not_current_and_not_stale():
+    """The invariant the old `unknown` verdict protected, kept explicitly so
+    a later widening of `unrecorded` cannot quietly take it away."""
+    verdict = op.loop_code_state(op.Instance("norecord2"))[0]
+    assert verdict not in (op.CODE_CURRENT, op.CODE_STALE)
+
+
+def test_a_record_under_a_file_shaped_parent_is_unrecorded():
+    """`NotADirectoryError`, not `FileNotFoundError`: nothing can exist below
+    a path component that is a regular file, so this is as definite as
+    absence and must answer the same way. Raised through a stub rather than
+    built on disk because which errno Windows and POSIX produce for that
+    shape differs, and a test that only holds on some legs is the failure
+    mode this repository keeps paying for.
+    """
+    assert op.loop_code_state(_raising(NotADirectoryError(20, "Not a directory"))) \
+        == (op.CODE_UNRECORDED, [])
+
+
+def test_a_record_that_could_not_be_looked_at_is_unknown():
+    """The counterpart control: the same call site, a different errno, the
+    other answer. Without this the branch above would pass against an
+    implementation that returned `unrecorded` for every OSError."""
+    assert op.loop_code_state(_raising(PermissionError(13, "Denied")))[0] \
+        == op.CODE_UNKNOWN
+
+
+def test_an_unreadable_record_is_unknown_not_unrecorded(monkeypatch):
+    """The distinction the whole change rests on, through the real file this
+    time. A record behind a denied read exists; saying "unrecorded" about it
+    would claim the supervisor never wrote one, which is a different and
+    stronger statement."""
+    inst = op.Instance("denied")
+    inst.loop_code_file.write_text("{}", encoding="utf-8")
+    _unreadable(monkeypatch, inst.loop_code_file)
+    assert op.loop_code_state(inst)[0] == op.CODE_UNKNOWN
+
+
+def test_a_record_that_is_not_utf8_is_unknown():
+    """Bytes are there and could not be decoded -- `UnicodeDecodeError` is a
+    `ValueError`, so this would fall through to the JSON branch if the read
+    did not catch it, and the answer must still be "cannot tell"."""
+    inst = op.Instance("notutf8")
+    inst.loop_code_file.write_bytes(b"\xff\xfe\x00garbage")
+    assert op.loop_code_state(inst)[0] == op.CODE_UNKNOWN
 
 
 def test_an_unparseable_record_is_unknown():
@@ -445,6 +523,64 @@ def test_tracing_never_raises_on_a_bad_code_argument(tmp_path):
         tmp_path, instance="proj", session=1, code=None)
 
 
+# ── the startup window ──────────────────────────────────────────
+def test_the_code_record_exists_by_the_time_the_pid_file_does(monkeypatch):
+    """The invariant that keeps the notice honest during startup.
+
+    Every consumer treats the loop pid file as "a supervisor is running", so
+    if it appears first there is a window in which a healthy supervisor
+    running the newest code reads as having recorded nothing -- and
+    `operator ls` tells it to restart. Observed as a real ordering bug: the
+    pid file used to be written three lines before the record.
+    """
+    inst = op.Instance("ordering")
+    seen = {}
+    real_write = op.Path.write_text
+
+    def spy(self, *args, **kwargs):
+        if self == inst.loop_pid_file:
+            seen["code_present_at_pid_write"] = inst.loop_code_file.exists()
+            seen["args_present_at_pid_write"] = inst.loop_args_file.exists()
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(op.Path, "write_text", spy)
+    op._publish_supervisor_records(inst, ["--agent", "x"])
+
+    assert seen["code_present_at_pid_write"] is True
+    assert seen["args_present_at_pid_write"] is True
+
+
+def test_publishing_writes_all_three_records(monkeypatch):
+    """The companion to the ordering test above: it asserts the writes happen
+    at all.
+
+    The ordering test cannot be satisfied by an implementation that never
+    writes the pid file -- its spy would not fire and the assertion would
+    raise `KeyError` rather than pass -- so this is not a vacuity guard. It
+    is here because a `KeyError` names the dictionary, not the defect, and
+    the next person to see it should have a second failure that says which
+    file went missing.
+    """
+    inst = op.Instance("published")
+    op._publish_supervisor_records(inst, [])
+
+    assert inst.loop_pid_file.exists()
+    assert inst.loop_code_file.exists()
+    assert inst.loop_args_file.exists()
+    assert inst.loop_pid_file.read_text(encoding="utf-8").strip() == str(
+        os.getpid())
+
+
+def test_a_supervisor_that_just_published_reads_as_current():
+    """End to end through the real files: publish, then ask the question
+    `operator ls` asks. Anything other than `current` here means a freshly
+    started supervisor would be told to restart itself."""
+    inst = op.Instance("freshstart")
+    op._publish_supervisor_records(inst, [])
+
+    assert op.loop_code_state(inst) == (op.CODE_CURRENT, [])
+
+
 # ── what an operator sees ───────────────────────────────────────
 def _snap(**over):
     snap = {"name": "proj", "loop_pid": 123, "session_live": True,
@@ -463,10 +599,45 @@ def test_a_current_supervisor_is_not_called_out():
 
 
 def test_an_unknown_verdict_is_not_reported_as_stale():
-    """`unknown` is most often a supervisor that predates this feature.
-    Telling those users their code is stale would make the notice noise."""
+    """`unknown` means the record could not be read, not that the code is
+    behind. Telling those users their code is stale would make the notice
+    noise."""
     assert "older code" not in op._instance_summary(
         _snap(loop_code=op.CODE_UNKNOWN))
+
+
+def test_an_unrecorded_supervisor_is_called_out():
+    """The case this check exists for and could not report: measured
+    2026-08-05T11:35Z, all six running supervisors predated the record, so
+    every one read `unknown` and `operator ls` printed nothing at all.
+
+    Asserts the label rather than the bare verdict string. `CODE_UNRECORDED`
+    *is* the word "unrecorded", so a summary that merely dumped the raw
+    verdict into the row would satisfy the looser assertion without the
+    notice ever having been written.
+    """
+    summary = op._instance_summary(_snap(loop_code=op.CODE_UNRECORDED))
+    assert "[supervisor code unrecorded]" in summary
+
+
+def test_an_unrecorded_supervisor_is_not_called_stale():
+    """It is not known to be behind -- that is the entire point. The notice
+    must report the missing record, not invent a verdict from it."""
+    assert "older code" not in op._instance_summary(
+        _snap(loop_code=op.CODE_UNRECORDED))
+
+
+def test_a_current_supervisor_is_not_called_unrecorded():
+    """Negative control for the label above: a message that cannot be absent
+    carries no information when it appears."""
+    assert "unrecorded" not in op._instance_summary(_snap())
+
+
+def test_an_unrecorded_supervisor_that_is_not_running_is_not_called_out():
+    """No supervisor, no loaded code to be unaccounted for, and
+    `restart-loop` has nothing to restart."""
+    assert "unrecorded" not in op._instance_summary(
+        _snap(loop_pid=None, loop_code=op.CODE_UNRECORDED))
 
 
 def test_a_stopped_instance_is_not_called_out():
@@ -490,6 +661,65 @@ def test_the_listing_names_the_remedy_for_each_stale_instance(
 
     assert "operator restart-loop alpha" in out
     assert "operator restart-loop beta" not in out
+
+
+def test_the_listing_names_the_remedy_for_each_unrecorded_instance(
+        monkeypatch, capsys):
+    """The whole point of the change, at the level the operator actually
+    reads. Before it, this listing was byte-identical to the all-current
+    one."""
+    monkeypatch.setattr(op, "active_instances", lambda: [op.Instance("alpha"),
+                                                         op.Instance("beta")])
+    snaps = {"alpha": _snap(name="alpha", loop_code=op.CODE_UNRECORDED),
+             "beta": _snap(name="beta", loop_code=op.CODE_CURRENT)}
+    monkeypatch.setattr(op, "instance_snapshot",
+                        lambda inst: snaps[inst.display_name])
+
+    op.list_instances()
+    out = capsys.readouterr().out
+
+    assert "operator restart-loop alpha" in out
+    assert "operator restart-loop beta" not in out
+
+
+def test_an_unreadable_record_does_not_produce_the_notice(monkeypatch, capsys):
+    """`unknown` stays silent. The notice claims the supervisor left no
+    record; a record nobody could read is not that, and a remedy offered on a
+    guess is how a notice becomes noise."""
+    monkeypatch.setattr(op, "active_instances", lambda: [op.Instance("alpha")])
+    monkeypatch.setattr(op, "instance_snapshot",
+                        lambda inst: _snap(name="alpha",
+                                           loop_code=op.CODE_UNKNOWN))
+
+    op.list_instances()
+
+    assert "restart-loop" not in capsys.readouterr().out
+
+
+def test_stale_and_unrecorded_are_reported_as_separate_reasons(
+        monkeypatch, capsys):
+    """Both need the same restart for different reasons, and one sentence
+    covering both would say something false about one of them.
+
+    Asserts that each instance is listed under *its own* reason, not that one
+    group is printed before the other. Pinning the group order would fail on
+    a refactor that swapped two correct blocks, which is a fact about today's
+    print statements rather than about the behaviour.
+    """
+    monkeypatch.setattr(op, "active_instances",
+                        lambda: [op.Instance("alpha"), op.Instance("beta")])
+    snaps = {"alpha": _snap(name="alpha", loop_code=op.CODE_STALE),
+             "beta": _snap(name="beta", loop_code=op.CODE_UNRECORDED)}
+    monkeypatch.setattr(op, "instance_snapshot",
+                        lambda inst: snaps[inst.display_name])
+
+    op.list_instances()
+    out = capsys.readouterr().out
+
+    assert "changed on disk" in out
+    assert "did not record" in out
+    assert out.index("operator restart-loop alpha") > out.index("changed on disk")
+    assert out.index("operator restart-loop beta") > out.index("did not record")
 
 
 def test_the_listing_says_nothing_when_every_supervisor_is_current(
