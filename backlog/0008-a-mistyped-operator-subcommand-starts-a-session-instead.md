@@ -89,7 +89,7 @@ than the boundary it claimed to pin, so widening the edit threshold left it
 green. Each is fixed, and the predicate is now mutation-tested: five mutants,
 all killed, where two survived before.
 
-## Addendum, 2026-08-06: the POSIX half was never delivered
+## Addendum, 2026-08-05 (later the same day): the POSIX half was never delivered
 
 The section above says "the fix landed" without saying *where*. It landed in
 `copilot_operator.py` only. `operator.sh` -- the program Linux, WSL and macOS
