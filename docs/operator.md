@@ -447,7 +447,7 @@ scripts and for a quick glance.
 ### Project configurations
 
 **Project configurations** — also reachable directly as `operator projects` —
-lists every project registered in `~/.copilot/projects/catalog.csv` and lets
+lists every project registered in `~/.operator/projects/catalog.csv` and lets
 you change which conventions it opted into:
 
 ```
@@ -467,7 +467,7 @@ Picking one shows the features and their current values:
 ═══ my-project ═══
 
   ~/repos/my-project
-  ~/.copilot/projects/{guid}/features.json
+  ~/.operator/projects/{guid}/features.json
 
    1) Session Handoff           on
    2) Session History           on
@@ -538,7 +538,7 @@ knows which project it is, so it has nothing to look up.
 The order is the contract:
 
 1. **Every** project is written first.
-2. The global file is copied to `~/.copilot/retired/`, named by timestamp and
+2. The global file is copied to `~/.operator/retired/`, named by timestamp and
    content digest, and the copy is read back and digest-compared.
 3. Only then is the original removed.
 
@@ -589,7 +589,7 @@ Unnamed instances (no `--name`) are always ephemeral and don't persist state.
 
 Intentional operator handoffs still start a fresh Copilot CLI session and rely on the handoff file for context. The saved CLI session ID is only reused when the operator process itself is restarted.
 
-If a named loop resumes with a saved CLI session ID but finds **no handoff file** for the project (`~/.copilot/projects/{guid}/next-session.md`, resolved from `~/.copilot/projects/catalog.csv`), that almost always means the previous session ended without calling `handoff` — most likely a crash. The preamble gets an extra note in that case telling the agent this looks like crash recovery and, if it *did* mean to stop cleanly, to remember to write a handoff next time. Resuming after a clean `handoff`-triggered restart (or any run where the handoff file already exists) never adds this note.
+If a named loop resumes with a saved CLI session ID but finds **no handoff file** for the project (`~/.operator/projects/{guid}/next-session.md`, resolved from `~/.operator/projects/catalog.csv`), that almost always means the previous session ended without calling `handoff` — most likely a crash. The preamble gets an extra note in that case telling the agent this looks like crash recovery and, if it *did* mean to stop cleanly, to remember to write a handoff next time. Resuming after a clean `handoff`-triggered restart (or any run where the handoff file already exists) never adds this note.
 
 ### Superseded handoffs
 
@@ -602,7 +602,7 @@ a session that has already ended and cannot be asked to repeat itself.
 
 So neither is discarded. The old file is copied (not moved — the original stays
 put until the copy has succeeded) into
-`~/.copilot/projects/{guid}/superseded/`, under a timestamped name created with
+`~/.operator/projects/{guid}/superseded/`, under a timestamped name created with
 `O_EXCL` so no archive can land on another one. Only then is the new handoff
 published. Both survive.
 
@@ -663,7 +663,7 @@ the user's own disk. Clearing it is a decision for the person who owns the
 context, so if it has grown, read what is in there before deciding it is noise:
 
 ```bash
-ls -la ~/.copilot/projects/*/superseded/
+ls -la ~/.operator/projects/*/superseded/
 ```
 
 ### Multi-Instance
@@ -951,10 +951,10 @@ logs.
 | `~/.operator/messages/<id>/inbox/` | Undelivered messages for an instance |
 | `~/.operator/messages/<id>/archive/` | Messages already delivered, kept as an audit trail |
 | `~/.operator/backups/` | Historical backups of the operator script |
-| `~/.copilot/projects/catalog.csv` | Maps a project root to its `{guid}` |
-| `~/.copilot/projects/catalog.csv.pre-test-<timestamp>` | The catalog as it was before a test run overwrote it. Written by this repository's test suite, only when that happens, and [never removed automatically](#banked-catalog-copies) |
-| `~/.copilot/projects/{guid}/next-session.md` | Session handoff, written by `handoff`, deleted by the session that reads it |
-| `~/.copilot/projects/{guid}/superseded/` | Handoffs that were replaced before anyone read them. Timestamped, append-only, [never pruned](#superseded-handoffs) |
+| `~/.operator/projects/catalog.csv` | Maps a project root to its `{guid}` |
+| `~/.operator/projects/catalog.csv.pre-test-<timestamp>` | The catalog as it was before a test run overwrote it. Written by this repository's test suite, only when that happens, and [never removed automatically](#banked-catalog-copies) |
+| `~/.operator/projects/{guid}/next-session.md` | Session handoff, written by `handoff`, deleted by the session that reads it |
+| `~/.operator/projects/{guid}/superseded/` | Handoffs that were replaced before anyone read them. Timestamped, append-only, [never pruned](#superseded-handoffs) |
 | `~/.copilot/logs/process-*.log` | Copilot process logs (override with `COPILOT_LOG_DIR`) |
 
 > **Note**: Operator state used to live under `~/.copilot/`, but the copilot CLI itself wholesale-deletes `~/.copilot/restart/` on every startup (confirmed via fatrace). State was moved to `~/.operator/` to eliminate the collision. On first run the operator automatically migrates any legacy state from `~/.copilot/` into `~/.operator/`.

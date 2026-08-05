@@ -17,10 +17,10 @@ import handoff_tool as ho
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     home = tmp_path / "home"
-    (home / ".copilot" / "projects").mkdir(parents=True)
+    (home / ".operator" / "projects").mkdir(parents=True)
     restart = tmp_path / "operator" / "restart"
     restart.mkdir(parents=True)
-    catalog = home / ".copilot" / "projects" / "catalog.csv"
+    catalog = home / ".operator" / "projects" / "catalog.csv"
     monkeypatch.setattr(ho, "CATALOG", catalog)
     monkeypatch.setattr(ho, "state_dir", lambda: restart)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
@@ -302,7 +302,7 @@ def test_blank_id_never_writes_to_the_shared_projects_root(env, monkeypatch):
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    shared = env["home"] / ".copilot" / "projects" / "next-session.md"
+    shared = env["home"] / ".operator" / "projects" / "next-session.md"
     with pytest.raises(SystemExit):
         ho.main(["--instance", "proj", "--status", "s", "--next", "n",
                  "--project-root", str(env["project"])])
@@ -319,7 +319,7 @@ def test_handoff_is_never_written_directly_to_its_final_path(env, monkeypatch):
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-atomic\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    handoff = (env["home"] / ".copilot" / "projects" / "guid-atomic"
+    handoff = (env["home"] / ".operator" / "projects" / "guid-atomic"
                / "next-session.md")
     real_write_text = Path.write_text
 
@@ -675,7 +675,7 @@ def test_a_refusal_to_overwrite_still_banks_this_sessions_handoff(
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-17\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-17"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-17"
     project_dir.mkdir(parents=True)
     prior = project_dir / "next-session.md"
     prior.write_text("UNREADABLE PREDECESSOR", encoding="utf-8")
@@ -704,7 +704,7 @@ def test_a_refusal_that_cannot_bank_prints_the_handoff_instead(
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-18\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-18"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-18"
     project_dir.mkdir(parents=True)
     (project_dir / "next-session.md").write_text("PRIOR", encoding="utf-8")
 
@@ -818,7 +818,7 @@ def test_handoff_over_a_symlink_still_publishes(env, monkeypatch):
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-14\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-14"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-14"
     project_dir.mkdir(parents=True)
     elsewhere = env["home"] / "elsewhere"
     elsewhere.mkdir()
@@ -966,7 +966,7 @@ def test_handoff_banks_a_spare_copy_when_it_cannot_take_the_lock(
         f'"{env["project"].resolve()}",guid-15\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
     monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-15"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-15"
     project_dir.mkdir(parents=True)
     (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
 
@@ -994,7 +994,7 @@ def test_an_unserialised_publish_says_so_in_the_file_it_publishes(
         f'"{env["project"].resolve()}",guid-30\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
     monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-30"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-30"
     project_dir.mkdir(parents=True)
     (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
 
@@ -1024,7 +1024,7 @@ def test_the_banked_copy_says_it_may_never_have_been_published(
         f'"{env["project"].resolve()}",guid-31\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
     monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-31"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-31"
     project_dir.mkdir(parents=True)
     (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
 
@@ -1051,7 +1051,7 @@ def test_a_handoff_that_was_never_published_says_so_in_its_banked_copy(
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-32\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-32"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-32"
     project_dir.mkdir(parents=True)
     prior = project_dir / "next-session.md"
     prior.write_text("UNREADABLE PREDECESSOR", encoding="utf-8")
@@ -1086,7 +1086,7 @@ def test_an_uncontended_handoff_carries_no_notice(env, monkeypatch):
         "--project-root", str(env["project"]),
     ]) == 0
 
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-33"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-33"
     published = (project_dir / "next-session.md").read_text(encoding="utf-8")
     assert published == ho.render("ordinary", "", "n", "", "",
                                   instance="proj")
@@ -1123,7 +1123,7 @@ def test_a_preserved_predecessor_is_never_stamped(env, monkeypatch):
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-34\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-34"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-34"
     project_dir.mkdir(parents=True)
     original = "# Session Handoff\n\nthe predecessor's own words"
     (project_dir / "next-session.md").write_text(original, encoding="utf-8")
@@ -1153,7 +1153,7 @@ def test_the_published_notice_does_not_depend_on_the_spare_copy(
     def publish(guid, bank_works):
         env["catalog"].write_text(
             f'"{env["project"].resolve()}",{guid}\n', encoding="utf-8")
-        project_dir = env["home"] / ".copilot" / "projects" / guid
+        project_dir = env["home"] / ".operator" / "projects" / guid
         project_dir.mkdir(parents=True)
         (project_dir / "next-session.md.lock").write_text(
             "held", encoding="utf-8")
@@ -1199,7 +1199,7 @@ def test_the_banked_notice_does_not_claim_the_publish_happened(
         f'"{env["project"].resolve()}",guid-37\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
     monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-37"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-37"
     project_dir.mkdir(parents=True)
     (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
     prior = project_dir / "next-session.md"
@@ -1243,7 +1243,7 @@ def test_the_unserialised_notices_do_not_claim_a_peer_was_writing(
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-38\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-38"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-38"
     project_dir.mkdir(parents=True)
 
     real_open = ho.os.open
@@ -1278,7 +1278,7 @@ def test_a_failed_spare_copy_does_not_stop_the_handoff(env, monkeypatch):
         f'"{env["project"].resolve()}",guid-16\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
     monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-16"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-16"
     project_dir.mkdir(parents=True)
     (project_dir / "next-session.md.lock").write_text("held", encoding="utf-8")
 
@@ -1306,7 +1306,7 @@ def test_handoff_still_writes_when_the_lock_cannot_be_taken(env, monkeypatch):
         f'"{env["project"].resolve()}",guid-11\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
     monkeypatch.setattr(ho, "LOCK_WAIT_SECONDS", 0.05)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-11"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-11"
     project_dir.mkdir(parents=True)
     (project_dir / "next-session.md.lock").write_text("1", encoding="utf-8")
 
@@ -1326,7 +1326,7 @@ def test_handoff_leaves_no_lock_behind(env, monkeypatch):
         "--instance", "proj", "--status", "s", "--next", "n",
         "--project-root", str(env["project"]),
     ])
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-12"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-12"
     assert [p.name for p in project_dir.iterdir()] == ["next-session.md"]
 
 
@@ -1342,7 +1342,7 @@ def test_a_second_writer_cannot_enter_the_section_while_one_is_open(
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-13\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-13"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-13"
     project_dir.mkdir(parents=True)
     handoff = project_dir / "next-session.md"
     handoff.write_text("PREDECESSOR", encoding="utf-8")
@@ -1435,7 +1435,7 @@ def test_handoff_writes_file_and_marker(env, monkeypatch, capsys):
     ])
     assert rc == 0
 
-    handoff = env["home"] / ".copilot" / "projects" / "guid-1" / "next-session.md"
+    handoff = env["home"] / ".operator" / "projects" / "guid-1" / "next-session.md"
     body = handoff.read_text(encoding="utf-8")
     assert "finished the thing" in body
     assert "watch out for X" in body
@@ -1475,7 +1475,7 @@ def test_non_running_instance_warns_but_still_writes(env, monkeypatch, capsys):
         "--project-root", str(env["project"]),
     ]) == 0
     assert "Warning" in capsys.readouterr().err
-    handoff = env["home"] / ".copilot" / "projects" / "guid-3" / "next-session.md"
+    handoff = env["home"] / ".operator" / "projects" / "guid-3" / "next-session.md"
     assert handoff.exists()
 
 
@@ -1499,7 +1499,7 @@ def test_handoff_body_is_utf8(env, monkeypatch):
         "--next", "n",
         "--project-root", str(env["project"]),
     ])
-    handoff = env["home"] / ".copilot" / "projects" / "guid-5" / "next-session.md"
+    handoff = env["home"] / ".operator" / "projects" / "guid-5" / "next-session.md"
     assert "caf\u00e9" in handoff.read_text(encoding="utf-8")
 
 
@@ -1536,7 +1536,7 @@ def test_handoff_does_not_destroy_an_unread_predecessor(env, monkeypatch):
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-10\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-10"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-10"
     project_dir.mkdir(parents=True)
     handoff = project_dir / "next-session.md"
     handoff.write_text("# Session Handoff\n\nthe first agent's context",
@@ -1561,7 +1561,7 @@ def test_handoff_preserves_an_unread_predecessor(env, monkeypatch, capsys):
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-7\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-7"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-7"
     project_dir.mkdir(parents=True)
     handoff = project_dir / "next-session.md"
     handoff.write_text("# Session Handoff\n\nthe first agent's context",
@@ -1603,7 +1603,7 @@ def test_handoff_leaves_no_archive_when_nothing_was_waiting(env, monkeypatch):
         "--project-root", str(env["project"]),
     ]) == 0
 
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-8"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-8"
     assert [p.name for p in project_dir.iterdir()] == ["next-session.md"]
 
 
@@ -1626,7 +1626,7 @@ def test_no_handoff_is_lost_when_several_pile_up_unread(env, monkeypatch):
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-11\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-11"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-11"
     project_dir.mkdir(parents=True)
 
     contexts = [f"context of agent {n}" for n in range(4)]
@@ -1657,7 +1657,7 @@ def test_handoff_refuses_rather_than_destroying_what_it_cannot_preserve(
     env["catalog"].write_text(
         f'"{env["project"].resolve()}",guid-9\n', encoding="utf-8")
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-9"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-9"
     project_dir.mkdir(parents=True)
     handoff = project_dir / "next-session.md"
     handoff.write_text("PRECIOUS", encoding="utf-8")
@@ -1688,7 +1688,7 @@ def _publish(env, monkeypatch, guid, instance, status="s"):
         "--instance", instance, "--status", status, "--next", "n",
         "--project-root", str(env["project"]),
     ]) == 0
-    return env["home"] / ".copilot" / "projects" / guid
+    return env["home"] / ".operator" / "projects" / guid
 
 
 def test_the_published_handoff_names_the_instance_that_wrote_it(env, monkeypatch):
@@ -1800,7 +1800,7 @@ def test_the_stamp_reaches_a_banked_copy_too(env, monkeypatch, capsys):
         "--project-root", str(env["project"]),
     ]) == 0
 
-    project_dir = env["home"] / ".copilot" / "projects" / "guid-94"
+    project_dir = env["home"] / ".operator" / "projects" / "guid-94"
     banked = list((project_dir / ho.SUPERSEDED_DIRNAME).iterdir())
     assert len(banked) == 1
     assert ho.authoring_instance(

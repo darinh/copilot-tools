@@ -130,9 +130,9 @@ Both `--opt value` and `--opt=value` forms are accepted.
 
 ### Behavior
 
-1. Resolve the project GUID from `~/.copilot/projects/catalog.csv` by normalized path match.
+1. Resolve the project GUID from `~/.operator/projects/catalog.csv` by normalized path match.
    **Windows: compare case-insensitively** (FR-007).
-2. Write `~/.copilot/projects/{guid}/next-session.md` with sections `Status`, `In Progress` (optional),
+2. Write `~/.operator/projects/{guid}/next-session.md` with sections `Status`, `In Progress` (optional),
    `Next Steps`, `Context` (optional), `Prompt` (optional).
 3. Create the restart marker `~/.operator/restart/{instance}`.
 4. Print the handoff file path and the restart marker path.

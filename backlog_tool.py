@@ -4,7 +4,7 @@ Why this exists
 ---------------
 
 Open work in a Copilot-tools project survives only in
-``~/.copilot/projects/{guid}/next-session.md``, which is read-once and deleted
+``~/.operator/projects/{guid}/next-session.md``, which is read-once and deleted
 at session start. Closed work is answerable from ``git log``; open work was
 answerable from nothing durable at all. It lived in a live agent's context and
 was carried forward as one re-summarised sentence per session -- lossy by

@@ -161,11 +161,11 @@ nothing to recover at all.
 
 ## Project Configuration System
 
-Each project can have a persistent configuration stored outside the repo at `~/.copilot/projects/`.
+Each project can have a persistent configuration stored outside the repo at `~/.operator/projects/`.
 
 ### Catalog
 
-`~/.copilot/projects/catalog.csv` maps project root paths to GUIDs. Paths are stored in the **native
+`~/.operator/projects/catalog.csv` maps project root paths to GUIDs. Paths are stored in the **native
 form of the platform that created the entry**:
 
 ```csv
@@ -183,7 +183,7 @@ case-insensitively; on Linux and macOS compare case-sensitively.
 
 ### Per-Project Directory
 
-`~/.copilot/projects/{guid}/` contains:
+`~/.operator/projects/{guid}/` contains:
 - `copilot-instructions.md` — project-specific conventions and feature flags
 - `next-session.md` — session handoff file (ephemeral, read-once)
 - Any other project artifacts that should persist outside the repo
@@ -193,8 +193,8 @@ case-insensitively; on Linux and macOS compare case-sensitively.
 1. Determine the current project root. This is the **primary checkout** — if you are in a worktree,
    resolve it with `git worktree list --porcelain` as described under **Git Worktrees**, never with
    `git rev-parse --show-toplevel`. Fall back to the cwd only outside a git repo.
-2. Read `~/.copilot/projects/catalog.csv` and look for a matching path.
-3. **If found**: Read `~/.copilot/projects/{guid}/copilot-instructions.md` and follow its conventions. Check for `next-session.md` handoff.
+2. Read `~/.operator/projects/catalog.csv` and look for a matching path.
+3. **If found**: Read `~/.operator/projects/{guid}/copilot-instructions.md` and follow its conventions. Check for `next-session.md` handoff.
 4. **If not found**: Ask the user:
    - "This project isn't in the catalog yet. Would you like to set it up?"
    - Choices: "Enable all features" / "Select features" / "Skip for now"
@@ -232,7 +232,7 @@ When setting up a new project, the user selects which conventions to enable:
 `backlog/` directory in the repo, one file per item, enforced by tests),
 `github-issues`, or `none`. The other rows above are on/off.
 
-The selections are stored in `~/.copilot/projects/{guid}/features.json`, and
+The selections are stored in `~/.operator/projects/{guid}/features.json`, and
 `project_features.py` is the single owner of what features exist and what
 values each may take. Read or change them with:
 
@@ -279,13 +279,13 @@ better than an invented one — fill it in as the project teaches you.
 
 *Enabled by feature flag: `session-handoff`*
 
-Agents use `~/.copilot/projects/{guid}/next-session.md` for continuity across sessions.
+Agents use `~/.operator/projects/{guid}/next-session.md` for continuity across sessions.
 
 ### On Session Start
 When the user greets you (e.g., "hey", "hello", "hi"), **immediately**:
 
 1. **Check for unmerged work**: Run `git branch --no-merged main` (the ref matters — with no argument git compares against HEAD, which tells you nothing). If any feature branches have unmerged commits, tell the user: *"Found unmerged work on branch X (N commits). Want to continue that, merge it, or start fresh?"*
-2. **Read handoff**: Check if `~/.copilot/projects/{guid}/next-session.md` exists. If it does:
+2. **Read handoff**: Check if `~/.operator/projects/{guid}/next-session.md` exists. If it does:
    - Read it and use it as your starting context.
    - **Check who wrote it.** The file names its author: *"Written by operator
      instance: `name`"*. The mailbox is per-**project** but the restart signal
@@ -317,7 +317,7 @@ handoff --instance <operator-instance-name> --status "What was completed (commit
 The `handoff` command atomically writes the handoff file AND triggers the operator restart. **Never write the handoff file manually** — always use the command.
 
 If the `handoff` command is not available (e.g., not on PATH), fall back to writing
-`~/.copilot/projects/{guid}/next-session.md` manually and then creating the restart marker file using
+`~/.operator/projects/{guid}/next-session.md` manually and then creating the restart marker file using
 the form for your platform:
 
 **PowerShell (Windows)**
@@ -354,7 +354,7 @@ touch ~/.operator/restart/{instance-name}
 
 `handoff` does not silently replace an unread handoff. If `next-session.md` is
 still sitting there when a new one is written, the old file is copied to
-`~/.copilot/projects/{guid}/superseded/` first, and only then is the new one
+`~/.operator/projects/{guid}/superseded/` first, and only then is the new one
 published. Both survive.
 
 **An occupied `next-session.md` does not mean the handoff went unread.** It
@@ -380,7 +380,7 @@ session that has to act on it rather than only the one that caused it.
 
 That makes it a rule at both ends of a session:
 
-- **Starting**: if `~/.copilot/projects/{guid}/superseded/` is non-empty, read
+- **Starting**: if `~/.operator/projects/{guid}/superseded/` is non-empty, read
   what is in there alongside `next-session.md` before deciding what you are
   picking up. A banked copy that says it may never have reached
   `next-session.md` is a handoff that may be *newer* than the one you are

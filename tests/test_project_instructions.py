@@ -58,8 +58,8 @@ def _render(source: str, values: dict, *, guid: str = "GUID-1",
             path: str = "/repo/app", label: str = "app") -> str:
     return pi.render(source=source, values=values, guid=guid,
                      project_path=path, label=label,
-                     project_dir_path=f"/home/.copilot/projects/{guid}",
-                     config_path=f"/home/.copilot/projects/{guid}/features.json",
+                     project_dir_path=f"/home/.operator/projects/{guid}",
+                     config_path=f"/home/.operator/projects/{guid}/features.json",
                      version="9.9.9")
 
 

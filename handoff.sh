@@ -10,12 +10,12 @@
 #          [--in-progress "..."] [--context "..."] [--prompt "..."]
 #          [--project-root DIR]
 #
-# The project GUID is resolved from ~/.copilot/projects/catalog.csv
+# The project GUID is resolved from ~/.operator/projects/catalog.csv
 # using --project-root or the current working directory.
 # ═══════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-CATALOG="${HOME}/.copilot/projects/catalog.csv"
+CATALOG="${HOME}/.operator/projects/catalog.csv"
 RESTART_DIR="${COPILOT_OPERATOR_HOME:-${HOME}/.operator}/restart"
 
 # ── Helpers ─────────────────────────────────────────────────────
@@ -150,8 +150,8 @@ If --instance is omitted, handoff tries to infer it from running
 operator sessions whose working directory matches the project root.
 
 WHAT IT DOES
-    1. Resolves project GUID from ~/.copilot/projects/catalog.csv
-    2. Writes ~/.copilot/projects/{guid}/next-session.md
+    1. Resolves project GUID from ~/.operator/projects/catalog.csv
+    2. Writes ~/.operator/projects/{guid}/next-session.md
     3. Touches ~/.operator/restart/{instance} to trigger operator restart
 HELP
 }
@@ -225,7 +225,7 @@ fi
 
 # ── Resolve GUID ────────────────────────────────────────────────
 guid=$(resolve_guid "$project_root")
-project_dir="${HOME}/.copilot/projects/${guid}"
+project_dir="${HOME}/.operator/projects/${guid}"
 handoff_file="${project_dir}/next-session.md"
 restart_marker="${RESTART_DIR}/${instance}"
 

@@ -67,6 +67,7 @@ from operator_mux import (                                    # noqa: E402
 from project_paths import (                                   # noqa: E402
     catalog_rows,
     guid_is_usable,
+    operator_home as _operator_home,
     primary_repo_root,
     project_dir,
     projects_root,
@@ -269,8 +270,15 @@ def is_wsl() -> bool:
 
 # ── paths ───────────────────────────────────────────────────────
 def operator_home() -> Path:
-    override = os.environ.get("COPILOT_OPERATOR_HOME")
-    return Path(override) if override else Path.home() / ".operator"
+    """This toolkit's own state directory.
+
+    Defined in ``project_paths`` and re-exported here. It used to live in this
+    module, which meant :func:`projects_root` -- one import away, in a module
+    this one depends on -- could not reach it and spelled its own parent
+    directory out by hand instead. That is how the project catalog ended up
+    somewhere the rest of the toolkit's state had already left.
+    """
+    return _operator_home()
 
 
 HOME = Path.home()
@@ -288,6 +296,15 @@ LEGACY_RESTART_DIR = HOME / ".copilot" / "restart"
 LEGACY_LOG_FILE = HOME / ".copilot" / "operator.log"
 LEGACY_METRICS_DB = HOME / ".copilot" / "operator-metrics.db"
 LEGACY_BACKUPS_DIR = HOME / ".copilot" / "operator-backups"
+#: The project catalog and the retired-instructions archive were this
+#: toolkit's own state kept in the Copilot CLI's configuration directory.
+#: ``~/.copilot`` belongs to the CLI -- it is where the CLI keeps its
+#: extensions, skills, settings and session store -- so anything of ours in
+#: there is squatting, and is subject to whatever the CLI does to its own
+#: directory. The catalog is the file that maps a project to its id; losing
+#: it does not lose a preference, it loses every project's identity and with
+#: it every handoff and `superseded/` file keyed to that id.
+LEGACY_PROJECTS_DIR = HOME / ".copilot" / "projects"
 
 MUX = Mux()
 
@@ -589,8 +606,55 @@ def migrate_legacy_state() -> None:
                 f"not migrated")
         elif backups:
             moved += _move_legacy(LEGACY_BACKUPS_DIR, BACKUPS_DIR)
+        moved += _migrate_legacy_projects()
         if moved:
             log(f"Migrated {moved} legacy state item(s) into {OPERATOR_HOME}")
+
+
+def _migrate_legacy_projects() -> int:
+    """Move the project catalog and per-project directories out of ~/.copilot.
+
+    Merged entry by entry rather than moved as a directory. The destination
+    can already exist -- a project registered after this version shipped
+    writes straight to the new location -- and moving a directory onto an
+    existing one either fails or, on POSIX, nests it inside itself. Entry by
+    entry also means a single unreadable project does not strand the other
+    seven.
+
+    An entry already present at the destination is left alone rather than
+    overwritten. The new location is the live one by the time this runs, so
+    its copy is the newer of the two; a legacy `next-session.md` written
+    before the move must not be allowed to overwrite a handoff written after
+    it.
+    """
+    legacy = projects_root()
+    if LEGACY_PROJECTS_DIR == legacy:
+        return 0
+    present = dir_present(LEGACY_PROJECTS_DIR)
+    if present is None:
+        log(f"  Could not examine {LEGACY_PROJECTS_DIR} — the project catalog "
+            f"there has been left in place, not migrated")
+        return 0
+    if not present:
+        return 0
+    try:
+        entries = list(LEGACY_PROJECTS_DIR.iterdir())
+    except OSError as exc:
+        log(f"  Could not list {LEGACY_PROJECTS_DIR}: {exc}")
+        return 0
+    legacy.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for src in entries:
+        dest = legacy / src.name
+        occupied = path_present(dest)
+        if occupied is None:
+            log(f"  Could not examine {dest} — {src} left in place")
+            continue
+        if occupied:
+            log(f"  {dest} already exists — {src} left in place, not merged")
+            continue
+        moved += _move_legacy(src, dest)
+    return moved
 
 
 # ── instance ────────────────────────────────────────────────────
@@ -5470,7 +5534,13 @@ def global_instructions_path() -> Path:
 
 
 def instructions_archive_dir() -> Path:
-    return HOME / ".copilot" / project_instructions.ARCHIVE_DIRNAME
+    """Where a retired user-scope instructions file is kept.
+
+    Under ``~/.operator`` for the reason :func:`projects_root` is: archiving a
+    file into the directory whose contents this toolkit does not own is not
+    archiving it.
+    """
+    return operator_home() / project_instructions.ARCHIVE_DIRNAME
 
 
 def _repo_template_path() -> Path:
