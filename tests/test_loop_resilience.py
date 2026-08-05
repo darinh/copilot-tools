@@ -172,6 +172,288 @@ def test_fresh_run_has_no_crash_note(monkeypatch):
     assert "crash" not in seen_preambles[0].lower()
 
 
+# ── the crash note is a claim about one moment ──────────────────
+#
+# It used to be decided once, before the supervisor's loop started, and baked
+# into a preamble every later session reused. Every test above reads
+# `seen_preambles[0]`, so all of them passed throughout: a verdict that is
+# only ever checked on the first launch cannot be caught going stale on the
+# second. `copilot-tools` reached session #223 on a run started 25 days
+# earlier, still reporting the answer taken at loop start.
+
+
+def _loop_with_handoff(monkeypatch, handoff: Path, script):
+    """Run a loop whose sessions are driven by ``script(n, instance)``."""
+    seen: list[str] = []
+
+    def capture(instance, args, session_num, remain_on_exit=False, preamble=""):
+        seen.append(preamble)
+        script(len(seen), instance)
+
+    monkeypatch.setattr(op, "start_session", capture)
+    monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
+    monkeypatch.setattr(op, "stop_session_gracefully", lambda instance: None)
+    monkeypatch.setattr(op, "project_handoff_file", lambda cwd: handoff)
+    return seen
+
+
+def test_a_handoff_written_by_session_one_silences_the_note_for_session_two(
+        monkeypatch, tmp_path):
+    """The false positive, observed live on 2026-08-05.
+
+    A session wrote its handoff, the supervisor relaunched off the restart
+    marker 33 seconds later, and the new session was told no handoff could be
+    found -- while the file sat on disk, unread, being simultaneously offered
+    to it by point (3) of the same preamble.
+    """
+    handoff = tmp_path / "next-session.md"  # absent when the loop starts
+
+    def script(n, instance):
+        if n == 1:
+            # Exactly what `handoff` does: write the file, ask for a restart.
+            handoff.write_text("# handoff", encoding="utf-8")
+            instance.restart_marker.touch()
+        else:
+            instance.stop_marker.touch()
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    seen = _loop_with_handoff(monkeypatch, handoff, script)
+
+    inst = op.Instance("re-decided")
+    inst.save_state(1, "2026-07-27T10:00:00Z",
+                    "3f2a9c1e-1111-2222-3333-444455556666")
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert len(seen) >= 2, "the loop must have launched a second session"
+    assert "crash" in seen[0].lower(), (
+        "no handoff existed when the loop started, so the first session is "
+        "the control: without it a note that never appears would pass too")
+    assert "crash" not in seen[1].lower()
+
+
+def test_a_handoff_at_loop_start_does_not_silence_a_later_crash(
+        monkeypatch, tmp_path):
+    """The false negative, and the more expensive direction.
+
+    A loop that started while a handoff happened to be sitting there never
+    reported crash recovery again -- so the mid-turn kills this note exists to
+    surface were silent for the entire run.
+    """
+    handoff = tmp_path / "next-session.md"
+    handoff.write_text("# handoff", encoding="utf-8")
+
+    def script(n, instance):
+        if n == 1:
+            # The protocol: read the handoff, then delete it. Then die with no
+            # marker to explain it, which is the shape of an external kill.
+            handoff.unlink()
+        else:
+            instance.stop_marker.touch()
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    seen = _loop_with_handoff(monkeypatch, handoff, script)
+
+    inst = op.Instance("stale-clean")
+    inst.save_state(1, "2026-07-27T10:00:00Z",
+                    "3f2a9c1e-1111-2222-3333-444455556666")
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert len(seen) >= 2
+    assert "crash" not in seen[0].lower()
+    assert "crash" in seen[1].lower(), (
+        "the handoff was consumed and the session then died unexplained; "
+        "that is exactly what this note is for")
+
+
+def test_a_fresh_run_still_reports_a_crash_after_its_first_session(
+        monkeypatch, tmp_path):
+    """`--fresh` has no predecessor to judge, and that was read as "never".
+
+    The old verdict was gated on a resume id, which a fresh run never has, so
+    a `--fresh` loop could not produce this note at any point in its life --
+    no matter how many of its own sessions were later killed mid-turn.
+    """
+    handoff = tmp_path / "next-session.md"  # never written by anyone
+
+    def script(n, instance):
+        if n > 1:
+            instance.stop_marker.touch()
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    seen = _loop_with_handoff(monkeypatch, handoff, script)
+
+    inst = op.Instance("fresh-then-killed")
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert len(seen) >= 2
+    assert "crash" not in seen[0].lower(), (
+        "nothing preceded the first session of a fresh run, so there is no "
+        "predecessor to accuse")
+    assert "crash" in seen[1].lower()
+
+
+def test_an_unregistered_project_is_never_reported_as_a_crash(
+        monkeypatch, tmp_path):
+    """The absence of a handoff proves nothing where one could never be
+    written. This holds per launch too, not just on the first."""
+
+    def script(n, instance):
+        if n > 1:
+            instance.stop_marker.touch()
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    seen = _loop_with_handoff(monkeypatch, None, script)
+
+    inst = op.Instance("unregistered")
+    inst.save_state(1, "2026-07-27T10:00:00Z",
+                    "3f2a9c1e-1111-2222-3333-444455556666")
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert len(seen) >= 2
+    assert not any("crash" in p.lower() for p in seen)
+
+
+def test_an_unreadable_catalog_is_never_reported_as_a_crash(
+        monkeypatch, tmp_path):
+    """A probe that failed has established nothing about the last session."""
+
+    def script(n, instance):
+        if n > 1:
+            instance.stop_marker.touch()
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    seen = _loop_with_handoff(monkeypatch, op.CATALOG_UNREADABLE, script)
+
+    inst = op.Instance("unreadable-catalog")
+    inst.save_state(1, "2026-07-27T10:00:00Z",
+                    "3f2a9c1e-1111-2222-3333-444455556666")
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert len(seen) >= 2
+    assert not any("crash" in p.lower() for p in seen)
+
+
+def test_an_unexaminable_handoff_is_never_reported_as_a_crash(
+        monkeypatch, tmp_path):
+    """`path_present` is tri-state on purpose: a denied probe is not an
+    absent file, and only absence is evidence about the last session."""
+    handoff = tmp_path / "next-session.md"
+
+    def script(n, instance):
+        if n > 1:
+            instance.stop_marker.touch()
+        instance.exit_file.write_text("0", encoding="utf-8")
+
+    seen = _loop_with_handoff(monkeypatch, handoff, script)
+
+    # Denied for the handoff only. Blanketing `path_present` would also blind
+    # the stop/detach marker reads, and the loop would then end by exhausting
+    # its unreadable-marker budget after a single session -- with `seen`
+    # holding one entry and no note in it, which is what this asserts anyway.
+    real_present = op.path_present
+    monkeypatch.setattr(
+        op, "path_present",
+        lambda p: None if Path(p) == handoff else real_present(p))
+
+    inst = op.Instance("unexaminable")
+    inst.save_state(1, "2026-07-27T10:00:00Z",
+                    "3f2a9c1e-1111-2222-3333-444455556666")
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=False)
+
+    assert len(seen) >= 2, (
+        "the loop must reach a second launch, or the tri-state handling is "
+        "not what ended it")
+    assert not any("crash" in p.lower() for p in seen)
+
+
+# ── a session that ended by handoff must be recorded as one ─────
+
+
+def test_a_session_ended_by_a_restart_request_is_traced(monkeypatch, tmp_path):
+    """`restart=True` was unreachable, and the trace was read as proof.
+
+    `_record_session_exit` sat only in the branch that had already established
+    the restart marker was absent, so the field it wrote could not take any
+    other value. 979 recorded exits all said `restart=False`, and that was
+    read as "no session has ever ended by handoff" when it only ever showed
+    where the call sat. The handoff path arrives via the *live-session* branch
+    -- `handoff` touches the marker while copilot is still up -- so this drives
+    that branch specifically, with a multiplexer session that exists.
+    """
+    import json
+
+    import operator_trace
+    from conftest import FakeMux
+
+    inst = op.Instance("handoff-ender")
+    mux = FakeMux()
+    monkeypatch.setattr(op, "MUX", mux)
+    monkeypatch.setattr(op, "SESSION_ID_WAIT", 0)
+
+    def script(n, instance):
+        if n == 1:
+            # The session comes up here rather than being pre-created: an
+            # instance whose session already exists at loop start is refused
+            # outright by `handle_existing_session`, so pre-creating it would
+            # test the refusal instead of the restart path.
+            mux.sessions[instance.session] = {
+                "cwd": "", "argv": [], "remain_on_exit": True, "dead": False}
+            # Still running: no exit file. This is the handoff shape.
+            instance.restart_marker.touch()
+        else:
+            instance.exit_file.write_text("0", encoding="utf-8")
+            instance.stop_marker.touch()
+
+    _loop_with_handoff(monkeypatch, tmp_path / "next-session.md", script)
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    exits = [json.loads(x) for x in
+             operator_trace.trace_path(op.OPERATOR_HOME)
+             .read_text(encoding="utf-8").splitlines()
+             if json.loads(x).get("event") == "session_exit"]
+
+    assert exits, "a session ending by restart request must be recorded at all"
+    assert exits[0]["markers"]["restart"] is True
+    assert exits[0]["instance"] == "handoff-ender"
+    assert exits[0]["markers"]["exit_code"] is None, (
+        "copilot was still up, so no exit code can belong to this session; "
+        "reading a stale one would give it the crash signature exactly")
+
+
+def test_a_restart_request_seen_after_the_session_is_gone_is_traced(
+        monkeypatch, tmp_path):
+    """The other restart branch: the marker is there but copilot has already
+    exited. Also must not be filed as an unexplained death."""
+    import json
+
+    import operator_trace
+
+    def script(n, instance):
+        instance.exit_file.write_text("0", encoding="utf-8")
+        if n == 1:
+            instance.restart_marker.touch()
+        else:
+            instance.stop_marker.touch()
+
+    _loop_with_handoff(monkeypatch, tmp_path / "next-session.md", script)
+
+    inst = op.Instance("gone-with-marker")
+    op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    exits = [json.loads(x) for x in
+             operator_trace.trace_path(op.OPERATOR_HOME)
+             .read_text(encoding="utf-8").splitlines()
+             if json.loads(x).get("event") == "session_exit"]
+
+    assert exits
+    assert exits[0]["markers"]["restart"] is True
+    assert exits[0]["consecutive"] == 0, (
+        "a requested restart is not a consecutive unexplained exit and must "
+        "not be counted toward the give-up limit")
+
+
+
+
 def test_unexpected_exit_without_marker_is_relaunched(monkeypatch):
     """An unexpected session death (crash, or `operator stop-session`) with no
     restart marker and no stop/detach marker must be relaunched automatically
