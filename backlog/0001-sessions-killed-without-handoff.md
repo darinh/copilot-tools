@@ -212,3 +212,114 @@ It is recorded here so the next re-measurement has a boundary to test against,
 and this time the records on either side of it can be told apart by their
 `code=` stamp instead of their date.
 
+## Correction, 2026-08-05: the boundary was testable all along, and it holds
+
+The correction above tells its reader to scope the re-measurement by `code=`.
+**That instruction is not usable either, for the same reason as the one it
+replaced, one level further up.** The `code=` stamp is written by the change
+that introduced it, and no supervisor has loaded that change.
+
+Measured 2026-08-05T11:35Z, before anything was altered:
+
+- The six supervisors are the *same processes* as at the 06:30Z measurement —
+  pids unchanged, all created 2026-08-04 13:27:53–13:28:41. None has
+  restarted.
+- `~/.operator/restart/` holds no `*.loopcode.json` for any instance, though
+  every instance has the `*.loopargs.json` written three lines earlier in the
+  same startup. The stamp has never been written.
+- `trace.jsonl` contains **zero** `supervisor_start` events over its whole
+  history, and all 979 `session_exit` records read `code=unrecorded`.
+
+So a third re-measurement scoped as instructed would again have found nothing
+and concluded nothing. The lesson from the previous correction generalises
+one step further: **an instruction that depends on a fix is only as good as
+the deployment of that fix**, and "landed on `main`" is not deployment when
+the consumer is a process that imported its code days ago.
+
+### The instrument that was supposed to catch this said nothing
+
+`operator ls` was given a staleness notice in that same change, precisely so
+this could not recur. It printed nothing. A supervisor with no record read
+`CODE_UNKNOWN`, and `CODE_UNKNOWN` is deliberately silent to keep the notice
+from becoming noise — so on a machine where **not one supervisor could be
+checked at all**, the output was byte-identical to a machine where every
+supervisor was current. That is the fourth iteration of this item's signature
+failure, now inside the remedy for the third.
+
+The defect is one this repository already has a name for: a read that failed
+and a read that returned nothing were collapsed into one answer. `_digest_file`
+keeps the two apart, and says in its own docstring why — but the outer read of
+the record did not, catching `OSError` and `ValueError` together. A record
+*observed absent* while its supervisor is running is a definite observation,
+not a failure to look: the record is written by the same change that reads it,
+so a running supervisor that has left none either predates it or could not
+write one, and both mean the verdict is unavailable until it restarts.
+
+Fixed here by splitting `CODE_UNRECORDED` out of `CODE_UNKNOWN` and reporting
+it as its own group with the same `restart-loop` remedy and a different
+reason. Verified against this machine rather than only in tests: the patched
+`operator list` names all six supervisors, where the shipped one printed
+nothing.
+
+### What the censored trace could still see: the kills
+
+The previous correction concluded that records after the boundary "cannot
+answer this question". That is too strong, and the over-correction cost this
+item a whole cycle. **A censored population is censored in a direction, and
+the direction decides which questions survive it.**
+
+The pre-fix code the supervisors are running calls `_record_session_exit` from
+the `else` of `if marker_set(instance.restart_marker)` (verified in
+`ea2331b:copilot_operator.py`, the parent of the fix). The branch that writes
+nothing is the *handoff* branch. A session killed mid-turn leaves no restart
+marker, takes the `else`, and **is recorded** — by exactly the code that is
+running. The blind spot runs opposite to the question this item asks.
+
+So the boundary is testable with the instrument in place, and it was testable
+in 06:30Z too. Measured 2026-08-05T11:35Z:
+
+- Across the six instances, `SESSION_NUM` has advanced 65 past the last
+  session each one has a `session_exit` for — so **at least 59 sessions have
+  ended** since 01:02:59Z.
+- `trace.jsonl` records `session_exit` for **none** of them. Under the running
+  code, that means every one of the 59 ended on the restart-marker branch,
+  i.e. by handoff.
+- The trace is not merely dead: it holds 50 `invoke`/`exit` records after the
+  boundary, the most recent 2026-08-05T11:34:41Z.
+
+Corroborated by `operator.log`, which the same supervisors write through a
+different code path. After the boundary it holds **59 `restart signal
+detected!` and zero `copilot exited unexpectedly`** — no `Giving up`, and no
+unreadable-marker lines either. The 59 matches the count derived from
+`SESSION_NUM` exactly, from an instrument that shares no code with it. All
+time, that log holds 289 restart signals against **1150** unexpected exits, so
+it is demonstrably capable of recording the event whose absence is being
+claimed.
+
+**The kills stopped at 2026-08-05T01:02:59Z and have not resumed in the 10.7
+hours and 59 sessions since.** That is now a measurement rather than a hedge.
+
+What is still not established is *why*, and nothing here identifies the
+emitter — the fifth hypothesis is still owed. Two things about the boundary
+remain unexplained and should not be smoothed over: nothing landed at
+01:02:59Z that anyone has connected to the kills, and the surviving `__warm__`
+multiplexer server started at 01:02:58Z, inside the final wave, which is a
+coincidence this item has already been burned by once. The item stays open on
+the cause. What changes is that the harm is no longer ongoing, so the next
+reader is diagnosing a stopped fault, not a live one — and should check first
+whether it has resumed, by the same two instruments, before anything else.
+
+**Re-measurement recipe, for whoever is next.** It does not depend on any
+unshipped fix:
+
+- `operator.log`: count `restart signal detected!` against `copilot exited
+  unexpectedly` after your boundary. Non-zero unexpected exits means the
+  kills are back.
+- `trace.jsonl`: any `session_exit` at all after your boundary is a kill under
+  pre-fix supervisors. Once a supervisor has been restarted onto post-fix
+  code, its records carry `code=` and both endings appear, so check
+  `markers.restart` before reading a record as a kill.
+- `operator list` now names any supervisor whose code is stale or unrecorded.
+  If it names one, that instance's records are pre-fix and the rule above
+  applies to them.
+
