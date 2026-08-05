@@ -123,6 +123,21 @@ def test_an_unparseable_record_is_unknown():
     assert op.loop_code_state(inst)[0] == op.CODE_UNKNOWN
 
 
+@pytest.mark.parametrize("text", ["null", "[]", '"a string"', "17", "true"])
+def test_valid_json_that_is_not_a_record_is_unknown(text):
+    """`json.loads` accepts far more than the object this writes.
+
+    A truncation or a stray `echo` leaves a file that parses cleanly and has
+    no `.get`, so the ValueError guard lets it through and the AttributeError
+    comes out of `operator ls` -- one instance's damaged file taking down the
+    status listing for all of them. Unreadable and unparseable already answer
+    "cannot tell"; so must this.
+    """
+    inst = op.Instance("notanobject")
+    inst.loop_code_file.write_text(text, encoding="utf-8")
+    assert op.loop_code_state(inst) == (op.CODE_UNKNOWN, [])
+
+
 def test_a_record_with_no_files_is_unknown():
     inst = op.Instance("empty")
     _record(inst, [])
@@ -325,19 +340,39 @@ def test_the_fingerprint_keeps_answering_for_the_code_it_loaded(
 
 def test_an_unreadable_source_does_not_hash_as_a_constant(
         tmp_path, monkeypatch):
-    """Two different unreadable files must not produce equal fingerprints by
-    both collapsing to the same placeholder digest."""
-    a, b = tmp_path / "a.py", tmp_path / "b.py"
-    a.write_bytes(b"aaa\n")
-    b.write_bytes(b"bbb\n")
+    """An unreadable source must be recorded as unknown, not as empty.
 
-    monkeypatch.setattr(op, "_loaded_operator_sources", lambda: [a])
-    first = op.running_code_fingerprint()["digest"]
+    The tempting shortcut is to let a failed read fall through to the digest
+    of no bytes. That reads as a perfectly ordinary answer, so the file joins
+    the fingerprint as a value the checker will happily compare -- and every
+    unreadable file then agrees with every other one, which is a verdict of
+    *current* built entirely out of files nobody could examine.
+
+    Its predecessor made neither file unreadable: it hashed two ordinary
+    files with different contents and asserted the digests differed, which is
+    true of an implementation that folds unreadable files into a constant and
+    true of one that crashes on them. It restated
+    `test_digest_changes_with_the_bytes` under a name that promised the
+    branch was covered.
+    """
+    src, empty = tmp_path / "src.py", tmp_path / "empty.py"
+    src.write_bytes(b"contents that cannot be read\n")
+    empty.write_bytes(b"")
+
+    monkeypatch.setattr(op, "_loaded_operator_sources", lambda: [src])
+    _unreadable(monkeypatch, src)
+    recorded = op.running_code_fingerprint()["files"][0]["sha256"]
+    assert recorded is None, (
+        f"an unreadable source was recorded as {recorded!r}, a value the "
+        "checker will compare as though the file had been examined")
+
+    monkeypatch.undo()
     monkeypatch.setattr(op, "_RUNNING_CODE", None)
-    monkeypatch.setattr(op, "_loaded_operator_sources", lambda: [b])
-    second = op.running_code_fingerprint()["digest"]
-
-    assert first != second
+    monkeypatch.setattr(op, "_loaded_operator_sources", lambda: [empty])
+    assert op.running_code_fingerprint()["files"][0]["sha256"] is not None, (
+        "a readable empty file is a known quantity and must be recorded as "
+        "one -- otherwise this test passes against an implementation that "
+        "records everything as unknown")
 
 
 def test_saving_and_reading_back_reports_current(tmp_path, monkeypatch):

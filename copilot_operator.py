@@ -2199,6 +2199,14 @@ def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
         # was lost. Both mean "cannot tell", which must not be reported as
         # either running code being current or a supervisor being stale.
         return CODE_UNKNOWN, []
+    if not isinstance(payload, dict):
+        # Valid JSON that is not an object -- `null`, `[]`, a bare string.
+        # `json.loads` raises nothing for these, so the guard above lets them
+        # through and `.get` would raise AttributeError out of `operator ls`,
+        # taking down the status command for every instance over one damaged
+        # file belonging to one. A record we cannot read is the same answer as
+        # a record that is not there.
+        return CODE_UNKNOWN, []
     files = payload.get("files")
     if not isinstance(files, list) or not files:
         return CODE_UNKNOWN, []
