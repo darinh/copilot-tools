@@ -956,13 +956,26 @@ def test_a_record_within_the_tolerance_survives_to_the_grace(monkeypatch, ahead)
 def test_the_allowance_is_not_slack(monkeypatch):
     """The other side of the bound, so it cannot be satisfied by making the
     allowance absurdly large. A record written right now must still be
-    believed for essentially the whole grace."""
+    believed for essentially the whole grace.
+
+    Deliberately does NOT place the clock the way its neighbours do: the
+    interval between writing a record and asking about it is exactly what
+    this test is about, and removing it would make this the `ahead=0.0` case
+    of the test above with a different name. What it costs is that the
+    measured window is the grace minus that interval -- `time.time()` and the
+    mtime it is differenced against are microseconds apart, and on Linux that
+    landed at 29.999971 against a bare `>= 30.0`, red on four CI legs and
+    green on Windows. So the floor carries the same 0.1 of slop the ceiling
+    test carries for the poll resolution, which is four orders of magnitude
+    more than the gap and still far too little for any narrowing of the
+    window to hide in.
+    """
     inst = op.Instance("windowfloor")
     op._record_supervisor_starting(inst, 6002)
     _dead_pids(monkeypatch)
     clock = _fast_clock(monkeypatch)
 
-    assert _believed_for(inst, clock) >= op.SUPERVISOR_STARTUP_GRACE
+    assert _believed_for(inst, clock) >= op.SUPERVISOR_STARTUP_GRACE - 0.1
 
 
 def _worst_case_record(instance: op.Instance, pid: int) -> None:
