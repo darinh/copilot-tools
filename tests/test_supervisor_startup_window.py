@@ -1167,13 +1167,24 @@ def test_a_record_past_the_tolerance_is_still_pruned(monkeypatch):
 
 
 def test_the_exact_boundary_still_obeys_the_allowance(monkeypatch):
-    """And the tightest input there is does not escape the ceiling: believed
-    from -tolerance to +grace is the allowance, exactly, which is what makes
-    the allowance the right number for every wait to add."""
+    """The allowance is the worst case *exactly*, not an upper bound on it.
+
+    Ceiling-and-floor together still let the constant be inflated: raise it to
+    100 and `window <= allowance` gets easier while `window >= grace` is
+    untouched, so a belief window far wider than anything the waits budget
+    for would sail through both. What closes that is measuring the widest
+    window there is and requiring the constant to *equal* it -- believed from
+    -tolerance to +grace is the allowance, which is what makes it the right
+    number for every wait to add rather than merely a safe one.
+    """
     inst = op.Instance("boundaryceiling")
     op._record_supervisor_starting(inst, 6006)
     _dead_pids(monkeypatch)
     clock = _fast_clock(monkeypatch)
     clock.now = inst.loop_startup_file.stat().st_mtime - op.CLOCK_SKEW_TOLERANCE
 
-    assert _believed_for(inst, clock) <= op.SUPERVISOR_STARTUP_ALLOWANCE + 0.1
+    widest = _believed_for(inst, clock)
+
+    assert abs(widest - op.SUPERVISOR_STARTUP_ALLOWANCE) <= 0.1, (
+        f"the widest window is {widest}s but every wait budgets "
+        f"{op.SUPERVISOR_STARTUP_ALLOWANCE}s for it")
