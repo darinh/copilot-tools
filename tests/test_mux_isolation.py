@@ -263,8 +263,8 @@ def test_the_spawn_predicate_depends_on_its_argument():
 
 
 def test_the_predicate_reads_both_separators_on_every_platform():
-    """The program name must be extracted the same way whichever separator the
-    argv happens to use, on whichever platform is running.
+    """The program name must be extracted the same way whichever platform's
+    path syntax the argv uses, on whichever platform is running.
 
     ``os.path`` is the *running* platform's path syntax, and this guard is
     asked about argv naming the other one. ``os.path.basename`` on POSIX
@@ -272,19 +272,47 @@ def test_the_predicate_reads_both_separators_on_every_platform():
     filename character there -- so the membership test saw ``c:\\tools\\tmux``,
     missed, and the guard delegated a tmux invocation to the real binary.
 
-    Be honest about what this test can do: it cannot fail on Windows, where
-    ``basename`` already splits both separators and the bug is unreachable.
-    Only the four POSIX legs can falsify it. That is the whole lesson of the
-    defect -- a green local Windows suite was not evidence about the other
-    platforms, and the parametrised full-path case above passed here while
-    spawning a real tmux on every Linux and macOS runner.
+    ``C:tmux.exe`` is here because the first fix for that was a hand-rolled
+    split on both separators, which read a drive-*relative* path (legal on
+    Windows: it resolves against the current directory of drive C:) as the name
+    ``c:tmux`` and delegated it. ``os.path.basename`` had handled that spelling
+    correctly on Windows all along, so the hand-rolled fix closed the POSIX
+    hole by opening a Windows one, and only an adversarial review caught it.
+    A guard fix that moves the hole is worth a case of its own.
+
+    Be honest about what the Windows-path rows can do: they cannot fail on
+    Windows, where ``basename`` already splits both separators and the original
+    bug is unreachable. Only the four POSIX legs can falsify those. That is the
+    whole lesson of the defect -- a green local Windows suite was not evidence
+    about the other platforms, and the parametrised full-path case above passed
+    here while spawning a real tmux on every Linux and macOS runner. The
+    ``C:tmux.exe`` row is the exception, and fails everywhere when the drive
+    prefix is mishandled.
     """
-    for sep in ("/", "\\"):
-        assert _is_a_multiplexer_spawn([f"C:{sep}tools{sep}tmux.exe"]) is True
-        assert _is_a_multiplexer_spawn([f"{sep}usr{sep}bin{sep}tmux"]) is True
-        # Negative control on the same spelling: a separator-blind reading that
-        # answered True for everything would satisfy the two lines above.
-        assert _is_a_multiplexer_spawn([f"{sep}usr{sep}bin{sep}python"]) is False
+    refused = [
+        "tmux", "tmux.exe",                     # bare names
+        "./tmux", ".\\tmux.exe",                # relative, either syntax
+        "/usr/bin/tmux", "C:\\tools\\tmux.exe",  # absolute, either syntax
+        "C:/tools/tmux.exe",                    # Windows drive, POSIX separator
+        "C:tmux.exe",                           # drive-relative
+        "\\\\server\\share\\tmux.exe",           # UNC
+        "PSMUX.EXE", "/opt/bin/pmux",
+    ]
+    for argv0 in refused:
+        assert _is_a_multiplexer_spawn([argv0]) is True, \
+            f"the guard would delegate {argv0!r} to a real multiplexer"
+
+    # Negative controls on the identical spellings. Without these, a reading
+    # that answered True for everything would satisfy every line above -- and
+    # a guard that refuses the whole suite proves nothing by refusing tmux.
+    delegated = [
+        "python", "python.exe", "./python", "/usr/bin/python",
+        "C:\\tools\\python.exe", "C:python.exe", "\\\\server\\share\\python.exe",
+        "tmuxinator",  # a real program whose name merely starts with one of ours
+    ]
+    for argv0 in delegated:
+        assert _is_a_multiplexer_spawn([argv0]) is False, \
+            f"the guard would refuse {argv0!r}, which is not a multiplexer"
 
 
 def test_a_non_multiplexer_subprocess_is_delegated_untouched():
