@@ -938,8 +938,7 @@ def install_env(tmp_path, monkeypatch):
     """A miniature repo and a home to deploy it into."""
     repo = tmp_path / "repo"
     (repo / "templates").mkdir(parents=True)
-    (repo / "templates" / "copilot-instructions.md").write_text("v1", encoding="utf-8")
-    (repo / "templates" / "mcp-config.json").write_text("{}", encoding="utf-8")
+    (repo / "templates" / "mcp-config.json").write_text("v1", encoding="utf-8")
     (repo / "skills" / "demo").mkdir(parents=True)
     (repo / "skills" / "demo" / "SKILL.md").write_text("v1", encoding="utf-8")
     home = tmp_path / "copilot"
@@ -964,11 +963,11 @@ def test_unmodified_template_updates_without_asking(install_env, monkeypatch):
     manifest = install_manifest.empty_manifest()
     setup_tools.install_templates(assume_yes=True, manifest=manifest)
 
-    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    (repo / "templates" / "mcp-config.json").write_text("v2", encoding="utf-8")
     _forbid_ask(monkeypatch)
     setup_tools.install_templates(manifest=manifest)
 
-    assert (home / "copilot-instructions.md").read_text(encoding="utf-8") == "v2"
+    assert (home / "mcp-config.json").read_text(encoding="utf-8") == "v2"
 
 
 def test_unmodified_skill_updates_without_asking(install_env, monkeypatch):
@@ -988,26 +987,26 @@ def test_locally_edited_template_still_asks(install_env, monkeypatch):
     manifest = install_manifest.empty_manifest()
     setup_tools.install_templates(assume_yes=True, manifest=manifest)
 
-    (home / "copilot-instructions.md").write_text("MY EDITS", encoding="utf-8")
-    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    (home / "mcp-config.json").write_text("MY EDITS", encoding="utf-8")
+    (repo / "templates" / "mcp-config.json").write_text("v2", encoding="utf-8")
     asked = []
     monkeypatch.setattr(setup_tools, "ask",
                         lambda q, *_a, **_k: asked.append(q) or False)
     setup_tools.install_templates(manifest=manifest)
 
     assert asked, "a locally edited file must not be silently overwritten"
-    assert (home / "copilot-instructions.md").read_text(encoding="utf-8") == "MY EDITS"
+    assert (home / "mcp-config.json").read_text(encoding="utf-8") == "MY EDITS"
 
 
 def test_edited_template_is_replaced_when_consented(install_env, monkeypatch):
     repo, home, _ = install_env
     manifest = install_manifest.empty_manifest()
     setup_tools.install_templates(assume_yes=True, manifest=manifest)
-    (home / "copilot-instructions.md").write_text("MY EDITS", encoding="utf-8")
-    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    (home / "mcp-config.json").write_text("MY EDITS", encoding="utf-8")
+    (repo / "templates" / "mcp-config.json").write_text("v2", encoding="utf-8")
     monkeypatch.setattr(setup_tools, "ask", lambda *_a, **_k: True)
     setup_tools.install_templates(manifest=manifest)
-    assert (home / "copilot-instructions.md").read_text(encoding="utf-8") == "v2"
+    assert (home / "mcp-config.json").read_text(encoding="utf-8") == "v2"
 
 
 def test_without_a_manifest_setup_falls_back_to_asking(install_env, monkeypatch):
@@ -1015,15 +1014,15 @@ def test_without_a_manifest_setup_falls_back_to_asking(install_env, monkeypatch)
     the old conservative behaviour."""
     repo, home, _ = install_env
     home.mkdir(parents=True, exist_ok=True)
-    (home / "copilot-instructions.md").write_text("from an older setup",
+    (home / "mcp-config.json").write_text("from an older setup",
                                                   encoding="utf-8")
-    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    (repo / "templates" / "mcp-config.json").write_text("v2", encoding="utf-8")
     asked = []
     monkeypatch.setattr(setup_tools, "ask",
                         lambda q, *_a, **_k: asked.append(q) or False)
     setup_tools.install_templates(manifest=install_manifest.empty_manifest())
     assert asked
-    assert (home / "copilot-instructions.md").read_text(
+    assert (home / "mcp-config.json").read_text(
         encoding="utf-8") == "from an older setup"
 
 
@@ -1033,10 +1032,10 @@ def test_install_records_what_it_wrote(install_env):
     setup_tools.install_templates(assume_yes=True, manifest=manifest)
     setup_tools.install_skills(assume_yes=True, manifest=manifest)
 
-    entry = manifest["artifacts"]["templates/copilot-instructions.md"]
+    entry = manifest["artifacts"]["templates/mcp-config.json"]
     assert entry["version"] == setup_tools.TOOLKIT_VERSION
     assert entry["sha256"] == install_manifest.file_digest(
-        home / "copilot-instructions.md")
+        home / "mcp-config.json")
     assert "skills/demo" in manifest["artifacts"]
 
 
@@ -1045,10 +1044,10 @@ def test_an_already_current_file_becomes_tracked(install_env):
     upgrade can be applied silently."""
     _repo, home, _ = install_env
     home.mkdir(parents=True, exist_ok=True)
-    (home / "copilot-instructions.md").write_text("v1", encoding="utf-8")
+    (home / "mcp-config.json").write_text("v1", encoding="utf-8")
     manifest = install_manifest.empty_manifest()
     setup_tools.install_templates(assume_yes=True, manifest=manifest)
-    assert "templates/copilot-instructions.md" in manifest["artifacts"]
+    assert "templates/mcp-config.json" in manifest["artifacts"]
 
 
 def test_declining_leaves_the_artifact_untracked(install_env, monkeypatch):
@@ -1056,19 +1055,80 @@ def test_declining_leaves_the_artifact_untracked(install_env, monkeypatch):
     would overwrite it without asking."""
     repo, home, _ = install_env
     home.mkdir(parents=True, exist_ok=True)
-    (home / "copilot-instructions.md").write_text("mine", encoding="utf-8")
-    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    (home / "mcp-config.json").write_text("mine", encoding="utf-8")
+    (repo / "templates" / "mcp-config.json").write_text("v2", encoding="utf-8")
     manifest = install_manifest.empty_manifest()
     monkeypatch.setattr(setup_tools, "ask", lambda *_a, **_k: False)
     setup_tools.install_templates(manifest=manifest)
-    assert "templates/copilot-instructions.md" not in manifest["artifacts"]
+    assert "templates/mcp-config.json" not in manifest["artifacts"]
 
 
 def test_deployed_artifacts_covers_templates_and_skills(install_env):
     keys = {key for key, _kind, _src, _dest in setup_tools.deployed_artifacts()}
-    assert "templates/copilot-instructions.md" in keys
     assert "templates/mcp-config.json" in keys
     assert "skills/demo" in keys
+
+
+def test_the_retired_instructions_file_is_no_longer_deployed(install_env):
+    """The artifact this release stops installing.
+
+    Asserted against ``deployed_artifacts`` rather than against
+    ``TEMPLATE_ARTIFACTS``, because that is the list every installer and the
+    status report actually read -- and a key that came back here would mean
+    setup re-deploying the file on the next run, silently undoing whatever
+    ``operator projects retire`` had just done.
+    """
+    keys = {key for key, _kind, _src, _dest in setup_tools.deployed_artifacts()}
+    assert "templates/copilot-instructions.md" not in keys
+    assert any(key == "templates/copilot-instructions.md"
+               for key, _dest, _label, _cmd in setup_tools.RETIRED_ARTIFACTS)
+
+
+def test_a_leftover_retired_artifact_is_reported_and_names_its_command(
+        install_env, capsys):
+    """Silence about it would be the worst outcome of no longer listing it.
+
+    ``deployed_artifacts`` has stopped naming the file, so nothing else in
+    setup would mention a 29 KB instructions document that is still being
+    loaded into every session on the machine.
+    """
+    _repo, home, _operator_home = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "copilot-instructions.md").write_text("old", encoding="utf-8")
+    assert setup_tools.report_retired_artifacts() == 1
+    out = capsys.readouterr().out
+    assert "copilot-instructions.md" in out
+    assert "operator projects retire" in out
+
+
+def test_nothing_is_reported_once_the_retired_artifact_is_gone(install_env,
+                                                              capsys):
+    _repo, home, _operator_home = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    assert setup_tools.report_retired_artifacts() == 0
+    assert "copilot-instructions.md" not in capsys.readouterr().out
+
+
+def test_setup_never_removes_the_retired_artifact_itself(install_env, capsys):
+    """Removal and replacement must not be separable.
+
+    Setup cannot write the per-project ``AGENTS.md`` files -- that needs the
+    user's answer about repositories that already have one -- so a setup that
+    deleted the global file would open exactly the window in which the machine
+    has the conventions in no place at all.
+    """
+    _repo, home, _operator_home = install_env
+    home.mkdir(parents=True, exist_ok=True)
+    dest = home / "copilot-instructions.md"
+    dest.write_text("old", encoding="utf-8")
+    setup_tools.report_retired_artifacts()
+    ctx = install_manifest.MigrationContext(
+        copilot_dir=home, operator_home=_operator_home, repo_root=_repo,
+        manifest=install_manifest.empty_manifest(),
+        from_version="1.3.0", to_version="1.4.0", log=lambda _m: None)
+    install_manifest.upgrade_v1_3_0_to_v1_4_0(ctx)
+    assert dest.read_text(encoding="utf-8") == "old"
+    assert any("operator projects retire" in note for note in ctx.notes)
 
 
 def test_status_reports_stale_and_exits_nonzero(install_env, capsys):
@@ -1079,7 +1139,7 @@ def test_status_reports_stale_and_exits_nonzero(install_env, capsys):
     manifest["package_version"] = setup_tools.TOOLKIT_VERSION
     install_manifest.save(operator_home, manifest)
 
-    (repo / "templates" / "copilot-instructions.md").write_text("v2", encoding="utf-8")
+    (repo / "templates" / "mcp-config.json").write_text("v2", encoding="utf-8")
     code = setup_tools.report_status()
     out = capsys.readouterr().out
     assert code == 1
@@ -1208,9 +1268,9 @@ def test_unreadable_template_is_not_overwritten_even_with_yes(install_env,
     """
     repo, home, _ = install_env
     home.mkdir(parents=True, exist_ok=True)
-    dest = home / "copilot-instructions.md"
+    dest = home / "mcp-config.json"
     dest.write_text("MY CAREFULLY EDITED INSTRUCTIONS", encoding="utf-8")
-    (repo / "templates" / "copilot-instructions.md").write_text("v2",
+    (repo / "templates" / "mcp-config.json").write_text("v2",
                                                                 encoding="utf-8")
     _deny_lstat(monkeypatch, dest)
 
@@ -1218,7 +1278,7 @@ def test_unreadable_template_is_not_overwritten_even_with_yes(install_env,
     setup_tools.install_templates(assume_yes=True, manifest=manifest)
 
     assert dest.read_text(encoding="utf-8") == "MY CAREFULLY EDITED INSTRUCTIONS"
-    assert "templates/copilot-instructions.md" not in manifest["artifacts"], \
+    assert "templates/mcp-config.json" not in manifest["artifacts"], \
         "an artifact nobody could examine must not be recorded as installed"
 
 
@@ -1229,7 +1289,7 @@ def test_unreadable_template_is_reported_not_silently_skipped(install_env,
     never receives an update and nothing ever says why."""
     _repo, home, _ = install_env
     home.mkdir(parents=True, exist_ok=True)
-    dest = home / "copilot-instructions.md"
+    dest = home / "mcp-config.json"
     dest.write_text("mine", encoding="utf-8")
     _deny_lstat(monkeypatch, dest)
 
@@ -1282,7 +1342,7 @@ def test_a_machine_with_an_unreadable_artifact_is_not_treated_as_fresh(
     old state migrations exist to fix, and skipping them there is silent."""
     _repo, home, _ = install_env
     home.mkdir(parents=True, exist_ok=True)
-    dest = home / "copilot-instructions.md"
+    dest = home / "mcp-config.json"
     dest.write_text("mine", encoding="utf-8")
     _deny_lstat(monkeypatch, dest)
 
@@ -1333,12 +1393,12 @@ def test_a_dangling_link_at_a_destination_is_not_written_through(install_env,
     repo, home, _ = install_env
     home.mkdir(parents=True, exist_ok=True)
     elsewhere = home.parent / "elsewhere.md"
-    dest = home / "copilot-instructions.md"
+    dest = home / "mcp-config.json"
     try:
         os.symlink(elsewhere, dest)
     except (OSError, NotImplementedError, AttributeError):
         pytest.skip("this platform will not create symlinks")
-    (repo / "templates" / "copilot-instructions.md").write_text("v2",
+    (repo / "templates" / "mcp-config.json").write_text("v2",
                                                                 encoding="utf-8")
 
     assert dest.exists() is False, "precondition: the primitive says absent"
@@ -1360,12 +1420,12 @@ def test_yes_does_not_write_through_a_dangling_link(install_env):
     repo, home, _ = install_env
     home.mkdir(parents=True, exist_ok=True)
     elsewhere = home.parent / "elsewhere.md"
-    dest = home / "copilot-instructions.md"
+    dest = home / "mcp-config.json"
     try:
         os.symlink(elsewhere, dest)
     except (OSError, NotImplementedError, AttributeError):
         pytest.skip("this platform will not create symlinks")
-    (repo / "templates" / "copilot-instructions.md").write_text("v2",
+    (repo / "templates" / "mcp-config.json").write_text("v2",
                                                                 encoding="utf-8")
 
     setup_tools.install_templates(assume_yes=True,
@@ -1384,12 +1444,12 @@ def test_yes_does_not_write_through_a_link_to_a_real_file(install_env):
     home.mkdir(parents=True, exist_ok=True)
     dotfiles = home.parent / "dotfiles.md"
     dotfiles.write_text("THE USER'S DOTFILES COPY", encoding="utf-8")
-    dest = home / "copilot-instructions.md"
+    dest = home / "mcp-config.json"
     try:
         os.symlink(dotfiles, dest)
     except (OSError, NotImplementedError, AttributeError):
         pytest.skip("this platform will not create symlinks")
-    (repo / "templates" / "copilot-instructions.md").write_text("v2",
+    (repo / "templates" / "mcp-config.json").write_text("v2",
                                                                 encoding="utf-8")
 
     setup_tools.install_templates(assume_yes=True,

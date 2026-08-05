@@ -53,6 +53,7 @@ py-modules = [
     "operator_runner",
     "handoff_tool",
     "project_features",
+    "project_instructions",
     "project_paths",
     "setup_tools",
     "worktree_guard_backend",

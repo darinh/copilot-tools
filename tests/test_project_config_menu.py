@@ -18,6 +18,7 @@ import pytest
 
 import copilot_operator
 import project_features
+import project_instructions
 from project_features import (
     BACKLOG_GITHUB_ISSUES,
     BACKLOG_NONE,
@@ -36,6 +37,7 @@ def home(monkeypatch, tmp_path):
     fake = tmp_path / "home"
     fake.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake))
+    monkeypatch.setattr(copilot_operator, "HOME", fake)
     return fake
 
 
@@ -391,7 +393,7 @@ def test_a_write_that_fails_is_reported_and_not_claimed(home, monkeypatch,
 # Wiring
 # ---------------------------------------------------------------------------
 
-def test_the_menu_offers_the_screen(monkeypatch, capsys):
+def test_the_menu_offers_the_screen(monkeypatch, capsys, home):
     """The entry point a human actually reaches it through.
 
     The index is read off the rendered menu rather than hard-coded, so
@@ -432,3 +434,176 @@ def test_projects_is_reserved_so_it_cannot_be_joined_as_an_instance():
 
 def test_the_help_text_documents_the_subcommand():
     assert "operator projects" in copilot_operator.HELP
+
+
+# ---------------------------------------------------------------------------
+# Retiring the user-scope instructions file
+# ---------------------------------------------------------------------------
+
+def _plant_global(home):
+    """Put a user-scope instructions file where the operator looks for it."""
+    path = home / ".copilot" / project_instructions.GLOBAL_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# Conventions\n", encoding="utf-8")
+    return path
+
+
+def test_the_file_this_screen_retires_is_the_one_loaded_everywhere(home):
+    """Not a path this test invented: the operator's own accessor."""
+    assert copilot_operator.global_instructions_path() == \
+        home / ".copilot" / project_instructions.GLOBAL_NAME
+
+
+def test_a_planted_file_is_seen_and_an_absent_one_is_not(home):
+    assert copilot_operator.user_instructions_present() is False
+    _plant_global(home)
+    assert copilot_operator.user_instructions_present() is True
+
+
+def test_a_file_that_cannot_be_examined_counts_as_present(monkeypatch, home):
+    """A stat that fails is not an answer of "absent".
+
+    The file is still being read into every session on this machine; saying
+    nothing about it because a probe raised would hide the exact condition
+    this screen exists to end.
+    """
+    monkeypatch.setattr(copilot_operator, "path_present", lambda p: None)
+    assert copilot_operator.user_instructions_present() is True
+
+
+def test_the_offer_appears_only_while_the_file_is_there(catalog, monkeypatch,
+                                                        capsys, home):
+    catalog.write_text(f'"/a/one",{GUID}\n', encoding="utf-8")
+    answers(monkeypatch, "")
+    copilot_operator.browse_project_configurations()
+    assert "Retire" not in capsys.readouterr().out
+
+    _plant_global(home)
+    answers(monkeypatch, "")
+    copilot_operator.browse_project_configurations()
+    assert "Retire" in capsys.readouterr().out
+
+
+def test_the_offer_is_reached_by_the_index_it_prints(catalog, monkeypatch,
+                                                     capsys, home):
+    """The index is read off the screen rather than assumed.
+
+    Hard-coding it would keep passing while a project row silently moved
+    under the number, which on this screen means retiring the file when the
+    human asked to edit a project's features.
+    """
+    catalog.write_text(f'"/a/one",{GUID}\n"/a/two",{OTHER_GUID}\n', encoding="utf-8")
+    _plant_global(home)
+    called = []
+    monkeypatch.setattr(copilot_operator, "retire_user_instructions",
+                        lambda: called.append(True) or 0)
+    answers(monkeypatch, "")
+    copilot_operator.browse_project_configurations()
+    rendered = capsys.readouterr().out
+    matches = [line for line in rendered.splitlines() if "Retire" in line]
+    assert len(matches) == 1, f"no single entry for it:\n{rendered}"
+    index = matches[0].strip().split(")")[0]
+
+    answers(monkeypatch, index, "")
+    assert copilot_operator.browse_project_configurations() == 0
+    assert called == [True]
+
+
+def test_the_offer_does_not_displace_a_project(catalog, monkeypatch, home):
+    """It is appended below the projects, so project 1 is still project 1."""
+    catalog.write_text(f'"/a/one",{GUID}\n', encoding="utf-8")
+    _plant_global(home)
+    opened = []
+    monkeypatch.setattr(copilot_operator, "show_project_config",
+                        lambda project: opened.append(project["path"]) or 0)
+    monkeypatch.setattr(copilot_operator, "retire_user_instructions",
+                        lambda: pytest.fail("chose the wrong entry"))
+    answers(monkeypatch, "1", "")
+    assert copilot_operator.browse_project_configurations() == 0
+    assert opened == ["/a/one"]
+
+
+def test_an_out_of_range_choice_is_still_refused_with_the_offer_shown(
+        catalog, monkeypatch, capsys, home):
+    """The upper bound moves with the offer; one past it is not the offer."""
+    catalog.write_text(f'"/a/one",{GUID}\n', encoding="utf-8")
+    _plant_global(home)
+    monkeypatch.setattr(copilot_operator, "retire_user_instructions",
+                        lambda: pytest.fail("3 is not the retirement entry"))
+    answers(monkeypatch, "3", "")
+    assert copilot_operator.browse_project_configurations() == 0
+    assert "Out of range" in capsys.readouterr().err
+
+
+def test_the_main_menu_says_so_while_the_file_is_there(monkeypatch, capsys,
+                                                       home):
+    monkeypatch.setattr(copilot_operator, "active_instances", lambda: [])
+    answers(monkeypatch, "")
+    copilot_operator.show_menu()
+    assert project_instructions.GLOBAL_NAME not in capsys.readouterr().out
+
+    _plant_global(home)
+    answers(monkeypatch, "")
+    copilot_operator.show_menu()
+    assert project_instructions.GLOBAL_NAME in capsys.readouterr().out
+
+
+def test_the_retire_subcommand_reaches_it(monkeypatch):
+    seen = []
+    monkeypatch.setattr(copilot_operator, "retire_user_instructions",
+                        lambda assume_yes=False: seen.append(assume_yes) or 0)
+    monkeypatch.setattr(copilot_operator, "migrate_legacy_state", lambda: None)
+    monkeypatch.setattr(copilot_operator, "browse_project_configurations",
+                        lambda: pytest.fail("retire went to the browser"))
+    assert copilot_operator._dispatch_command(["projects", "retire"]) == 0
+    assert seen == [False]
+
+
+def test_the_yes_flag_is_what_carries_consent(monkeypatch):
+    """Without it the write is asked about; the flag must reach the function."""
+    seen = []
+    monkeypatch.setattr(copilot_operator, "retire_user_instructions",
+                        lambda assume_yes=False: seen.append(assume_yes) or 0)
+    monkeypatch.setattr(copilot_operator, "migrate_legacy_state", lambda: None)
+    assert copilot_operator._dispatch_command(
+        ["projects", "retire", "--yes"]) == 0
+    assert seen == [True]
+
+
+def test_an_unknown_projects_subcommand_is_refused(monkeypatch, capsys):
+    """Otherwise a typo silently opens the browser and looks like success."""
+    monkeypatch.setattr(copilot_operator, "migrate_legacy_state", lambda: None)
+    monkeypatch.setattr(copilot_operator, "browse_project_configurations",
+                        lambda: pytest.fail("a typo reached the browser"))
+    monkeypatch.setattr(copilot_operator, "retire_user_instructions",
+                        lambda assume_yes=False: pytest.fail("not retire"))
+    assert copilot_operator._dispatch_command(["projects", "retyre"]) == 1
+    assert "retyre" in capsys.readouterr().err
+
+
+def test_bare_projects_still_opens_the_browser(monkeypatch):
+    """The refusal above must not have swallowed the no-argument form."""
+    called = []
+    monkeypatch.setattr(copilot_operator, "browse_project_configurations",
+                        lambda: called.append(True) or 0)
+    monkeypatch.setattr(copilot_operator, "migrate_legacy_state", lambda: None)
+    assert copilot_operator._dispatch_command(["projects"]) == 0
+    assert called == [True]
+
+
+def test_the_help_text_documents_the_retire_subcommand():
+    assert "operator projects retire" in copilot_operator.HELP
+
+
+def test_the_archive_sits_beside_the_file_it_preserves(home):
+    """Under ``~/.copilot``, not the repository and not a temp directory."""
+    archive = copilot_operator.instructions_archive_dir()
+    assert archive == home / ".copilot" / project_instructions.ARCHIVE_DIRNAME
+    assert archive.parent == copilot_operator.global_instructions_path().parent
+
+
+def test_the_template_is_the_one_shipped_beside_the_operator():
+    path = copilot_operator._repo_template_path()
+    assert path.name == project_instructions.TEMPLATE_NAME
+    assert path.parent.name == "templates"
+    assert copilot_operator.path_present(path) is True

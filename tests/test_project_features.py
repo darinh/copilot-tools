@@ -25,6 +25,7 @@ from unittest import mock
 import pytest
 
 import project_features
+import project_instructions
 from project_features import (
     BACKLOG_FOLDER,
     BACKLOG_GITHUB_ISSUES,
@@ -43,8 +44,14 @@ from project_features import (
 REPO = Path(__file__).resolve().parent.parent
 TEMPLATE = REPO / "templates" / "copilot-instructions.md"
 
-_GATE = re.compile(r"^\*Enabled by feature flag: `(?P<slug>[a-z0-9-]+)`\*\s*$",
-                   re.MULTILINE)
+#: Imported rather than re-spelled. A second definition of "which feature
+#: turns this section on" is the duplicated discovery rule this repository has
+#: already paid for once -- and here it would be worse than a duplicate, since
+#: the renderer in ``project_instructions`` decides what actually ships from
+#: this pattern. ``tests/test_project_instructions.py`` carries the positive
+#: and negative controls for the pattern itself, so importing it does not cost
+#: an independent check of whether it matches anything.
+_GATE = project_instructions.GATE
 _TABLE_SEPARATOR = re.compile(r"^\|[\s:|-]+\|$")
 _EMPHASIS = re.compile(r"[*`]")
 

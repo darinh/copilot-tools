@@ -255,7 +255,32 @@ The `templates/copilot-instructions.md` file establishes conventions for:
 - **Branching Strategy** — feature branches worked on in worktrees, merged to `main`, conventional commits
 - **Git Worktrees** — all work happens in `<repoRoot>/.worktrees/`; always on, not optional
 
-Copy to `~/.copilot/copilot-instructions.md` and customize for your workflow.
+### These live in each project, not in your home directory
+
+Setup no longer copies that file to `~/.copilot/copilot-instructions.md`. A
+file at that path is read by **every** Copilot session on the machine, in every
+directory, project or not — and its enrollment section then tells the agent to
+resolve a project root, read the catalog, and offer to set the directory up.
+Opening a terminal anywhere started a conversation about the project system.
+
+Instead each registered project gets its own `AGENTS.md`, holding only the
+sections its features turned on and naming its project id outright, so nothing
+in it has a catalog to look up or a directory to enroll:
+
+```
+operator projects retire
+```
+
+That writes every project's `AGENTS.md` **before** it touches the global file,
+archives the global file to `~/.copilot/retired/` and verifies the copy by
+reading it back, and only then removes it. One project that cannot be written
+stops the removal — the failure mode is the conventions in two places, never in
+none. A repository that already has an `AGENTS.md` is asked about and appended
+to, never overwritten, and regenerating replaces only the block between the
+`copilot-tools managed conventions` markers.
+
+If you already keep an `AGENTS.md` at user scope, it is reported and left
+alone: it is not this toolkit's file.
 
 ## Backlog
 
@@ -340,6 +365,7 @@ copilot-tools/
 ├── operator_console.py            # UTF-8 console output
 ├── project_paths.py               # Project identity: catalog and per-project dirs
 ├── project_features.py            # The feature vocabulary, and each project's choices
+├── project_instructions.py        # Renders each project's AGENTS.md; retires the global file
 ├── handoff_tool.py                # Session handoff
 ├── backlog_tool.py                # Backlog parser, validator, and HTML view
 ├── setup_tools.py                 # Cross-platform environment setup
@@ -365,7 +391,7 @@ copilot-tools/
 │   └── operator-backlog-*/
 │       └── SKILL.md               # Filing, refinement and the check-in
 ├── templates/
-│   ├── copilot-instructions.md    # Workflow conventions
+│   ├── copilot-instructions.md    # Source for each project's AGENTS.md; no longer deployed
 │   └── mcp-config.json            # MCP server config
 ├── tests/                         # pytest suite + bash coordination tests
 └── docs/

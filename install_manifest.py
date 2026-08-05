@@ -426,6 +426,37 @@ def _name_version(chunk: str) -> str:
 # from 1.0.0 to 1.3.0 still runs every step in between, in order.
 
 
+def upgrade_v1_3_0_to_v1_4_0(ctx: "MigrationContext") -> None:
+    """``copilot-instructions.md`` stops being a user-scope artifact.
+
+    Setup no longer deploys ``~/.copilot/copilot-instructions.md``. A file at
+    that path is loaded into every Copilot session on the machine, in every
+    directory, and its enrollment section then tells the agent to offer to set
+    that directory up as a project — which is why opening a terminal anywhere
+    started a conversation about the catalog.
+
+    **This migration deliberately deletes nothing.** The replacement is a
+    per-repository ``AGENTS.md``, writing it needs the user's answer about
+    repositories that already have one, and a removal that happened here would
+    be separated from its replacement by however long it took the user to
+    notice. A machine interrupted in that window would have the conventions in
+    no place at all. So this notes the file and names the command that moves
+    it; setup repeats the notice on every later run for as long as it is
+    still there.
+
+    The filename is spelled out rather than imported. ``project_instructions``
+    imports this module, and a migration is in any case a record of the world
+    as it was at one version — it must not start reading a constant that later
+    versions are free to change.
+    """
+    path = ctx.copilot_dir / "copilot-instructions.md"
+    if path_present(path) is False:
+        return
+    ctx.note(f"  {path} is no longer installed by setup.")
+    ctx.note("  It is left in place; run `operator projects retire` to move "
+             "these conventions into each project's AGENTS.md.")
+
+
 def discover_migrations(namespace: dict | None = None) -> list[tuple[str, str, Callable]]:
     """Find upgrade functions by name, sorted by the version they upgrade to."""
     found = []
