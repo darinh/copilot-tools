@@ -91,22 +91,78 @@ def console_entry_points(text):
     return found
 
 
-def _module_level_defs(tree, name):
-    """Every module-level ``def name`` -- plural, because a later one wins."""
-    return [node for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == name]
+def _module_scope_statements(body):
+    """Every statement that runs in module scope, control flow included.
 
-
-def _imports_the_guard(tree):
-    """True when ``GUARD`` is bound by importing it from ``GUARD_MODULE``."""
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ImportFrom) or node.module != GUARD_MODULE:
+    Descends into ``if``/``try``/``for``/``while``/``with`` because a binding
+    in there still changes what ``main`` resolves at call time, and stops at
+    ``def``/``class`` because a name bound inside one of those is local to it
+    and cannot.
+    """
+    for node in body:
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
             continue
-        for alias in node.names:
-            if alias.name == GUARD and (alias.asname or alias.name) == GUARD:
-                return True
-    return False
+        for field in ("body", "orelse", "finalbody"):
+            yield from _module_scope_statements(getattr(node, field, []) or [])
+        for handler in getattr(node, "handlers", []) or []:
+            yield from _module_scope_statements(handler.body)
+
+
+def _is_the_real_import(node):
+    """True for exactly ``from operator_console import enable_utf8_output``."""
+    if not isinstance(node, ast.ImportFrom) or node.module != GUARD_MODULE:
+        return False
+    return any(alias.name == GUARD and alias.asname in (None, GUARD)
+               for alias in node.names)
+
+
+def _bound_names(node):
+    """The names a single statement binds in the scope that contains it."""
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [alias.asname or alias.name.split(".")[0]
+                for alias in node.names]
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [node.name]
+    targets = []
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        targets = [node.target]
+    elif isinstance(node, (ast.For, ast.AsyncFor)):
+        targets = [node.target]
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        targets = [item.optional_vars for item in node.items
+                   if item.optional_vars is not None]
+    names = []
+    for target in targets:
+        names.extend(child.id for child in ast.walk(target)
+                     if isinstance(child, ast.Name))
+    return names
+
+
+def _guard_binding_problem(tree):
+    """Why the module's ``GUARD`` name is not trustworthy, or ``None``.
+
+    Existence of the import is not enough. The name has to be bound by that
+    import, unconditionally, and nothing may rebind it afterwards -- a
+    ``def``, an ``= lambda: None``, or a second import of the same name from
+    somewhere else all leave the call site spelled identically while calling
+    something that does nothing.
+    """
+    unconditional = [node for node in tree.body if _is_the_real_import(node)]
+    rebindings = [node for node in _module_scope_statements(tree.body)
+                  if GUARD in _bound_names(node) and not _is_the_real_import(node)]
+    if rebindings:
+        first = rebindings[0]
+        return (f"line {first.lineno}: {GUARD} is rebound at module level, so "
+                f"the call in the entry point need not reach "
+                f"{GUARD_MODULE}.{GUARD}")
+    if not unconditional:
+        return (f"never imports {GUARD} from {GUARD_MODULE} at module level "
+                f"unconditionally")
+    return None
 
 
 def _first_real_statement(func):
@@ -140,19 +196,32 @@ def unguarded(source, function_name):
     except SyntaxError as exc:                            # pragma: no cover
         return f"could not be parsed: {exc}"
 
-    defined = _module_level_defs(tree, function_name)
+    defined = [node for node in _module_scope_statements(tree.body)
+               if function_name in _bound_names(node)]
     if not defined:
         return f"has no module-level def {function_name}(...)"
-    # The *last* definition is the one that ends up bound, so it is the one
-    # that runs. Reading the first would let a correct earlier copy vouch for
-    # a broken later one.
+    # The *last* binding is the one that ends up on the module, so it is the
+    # one the console script calls. Reading the first would let a correct
+    # earlier copy vouch for whatever replaced it -- and the replacement need
+    # not be another `def`: `main = _broken` rebinds it just as well.
     func = defined[-1]
+    if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return (f"line {func.lineno}: {function_name} is rebound after its "
+                f"def, so the function this scan can read is not the one "
+                f"that runs")
 
-    if _module_level_defs(tree, GUARD):
-        return (f"defines its own {GUARD}() at module level, which shadows "
-                f"the import from {GUARD_MODULE}")
-    if not _imports_the_guard(tree):
-        return f"never imports {GUARD} from {GUARD_MODULE}"
+    # A decorator runs before the body does, and it can both write to stdout
+    # itself and replace the function with a wrapper that writes before it
+    # delegates. Either way the guard is no longer the first thing that runs,
+    # so the shape this scan certifies is no longer the shape being shipped.
+    if func.decorator_list:
+        return (f"line {func.lineno}: {function_name}() is decorated, and a "
+                f"decorator runs before the body, so {GUARD}() is no longer "
+                f"the first thing to happen")
+
+    binding = _guard_binding_problem(tree)
+    if binding is not None:
+        return binding
 
     statement = _first_real_statement(func)
     if statement is None:
@@ -328,6 +397,89 @@ def main(argv=None) -> int:
     return 0
 '''
 
+DECORATED_MAIN = '''\
+from operator_console import enable_utf8_output
+
+
+def announce(func):
+    print("about to run")
+    return func
+
+
+@announce
+def main(argv=None) -> int:
+    enable_utf8_output()
+    return 0
+'''
+
+LOCAL_IMPORT_AFTER_THE_CALL = '''\
+def main(argv=None) -> int:
+    enable_utf8_output()
+    from operator_console import enable_utf8_output
+    return 0
+'''
+
+IMPORT_IS_CONDITIONAL = '''\
+if False:
+    from operator_console import enable_utf8_output
+
+
+def main(argv=None) -> int:
+    enable_utf8_output()
+    return 0
+'''
+
+REBOUND_TO_A_LAMBDA = '''\
+from operator_console import enable_utf8_output
+
+enable_utf8_output = lambda: None
+
+
+def main(argv=None) -> int:
+    enable_utf8_output()
+    return 0
+'''
+
+REIMPORTED_FROM_ELSEWHERE = '''\
+from operator_console import enable_utf8_output
+from somewhere_else import enable_utf8_output
+
+
+def main(argv=None) -> int:
+    enable_utf8_output()
+    return 0
+'''
+
+REBOUND_CONDITIONALLY = '''\
+from operator_console import enable_utf8_output
+
+if sys.platform == "win32":
+    def enable_utf8_output():
+        pass
+
+
+def main(argv=None) -> int:
+    enable_utf8_output()
+    return 0
+'''
+
+REASSIGNED_MAIN = '''\
+from operator_console import enable_utf8_output
+
+
+def _broken(argv=None) -> int:
+    print("no guard here")
+    return 0
+
+
+def main(argv=None) -> int:
+    enable_utf8_output()
+    return 0
+
+
+main = _broken
+'''
+
 FIRES = {
     "the call is absent": MISSING,
     "the call is not first": TOO_LATE,
@@ -336,6 +488,14 @@ FIRES = {
     "the import is renamed so the call is not the name": RENAMED_ON_IMPORT,
     "the named function does not exist": NO_MAIN,
     "a later def replaces a compliant one": REDEFINED_MAIN,
+    "a decorator runs before the body": DECORATED_MAIN,
+    "the import is function-local and after the call":
+        LOCAL_IMPORT_AFTER_THE_CALL,
+    "the import only happens conditionally": IMPORT_IS_CONDITIONAL,
+    "the name is rebound to a do-nothing lambda": REBOUND_TO_A_LAMBDA,
+    "a second import takes the name over": REIMPORTED_FROM_ELSEWHERE,
+    "a conditional def takes the name over": REBOUND_CONDITIONALLY,
+    "the entry point is reassigned after its def": REASSIGNED_MAIN,
 }
 
 PASSES = {
@@ -357,5 +517,14 @@ def test_the_detector_leaves_compliant_code_alone(name):
 
 
 def test_the_finding_names_the_line():
+    """The number is computed from the fixture, not pinned to its layout.
+
+    Asserting the literal "line 6" would pass for a detector that always said
+    6, and would break on an edit to the fixture that changed nothing about
+    the behaviour. Asserting only that *some* number appears would accept a
+    detector that reported the wrong one.
+    """
+    offending = TOO_LATE.splitlines().index(
+        "    parser = argparse.ArgumentParser()") + 1
     problem = unguarded(TOO_LATE, "main")
-    assert "line 6" in problem, problem
+    assert f"line {offending}" in problem, problem
