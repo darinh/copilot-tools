@@ -14,10 +14,15 @@ import csv
 import os
 import platform
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
+from install_manifest import file_present
+
 __all__ = ["primary_repo_root", "guid_is_usable", "projects_root",
-           "project_dir", "resolved_str", "catalog_rows"]
+           "project_dir", "resolved_str", "catalog_rows", "normalized_key",
+           "catalog_guid", "CatalogLookup", "CATALOG_MISSING",
+           "CATALOG_UNREADABLE", "CATALOG_NO_ENTRY", "CATALOG_UNUSABLE_ID"]
 
 # A background supervisor with no console of its own would otherwise flash a
 # real console window for each of these calls on Windows.
@@ -245,3 +250,102 @@ def guid_is_usable(guid: str) -> bool:
     # Catches the platform-specific leftovers, notably a Windows drive-relative
     # token like `C:x`, whose final component is not the whole string.
     return guid == Path(guid).name
+
+
+IS_WINDOWS = platform.system() == "Windows"
+
+#: Why a catalog lookup produced no project id. Callers phrase their own
+#: message from these rather than being handed one, because the two readers
+#: (``handoff_tool`` and ``backlog_tool``) say different things to different
+#: audiences about the same fact -- and a shared *message* would force them to
+#: drift on the fact in order to differ on the wording.
+CATALOG_MISSING = "catalog-missing"
+CATALOG_UNREADABLE = "catalog-unreadable"
+CATALOG_NO_ENTRY = "no-entry"
+CATALOG_UNUSABLE_ID = "unusable-id"
+
+
+@dataclass(frozen=True)
+class CatalogLookup:
+    """The outcome of one catalog lookup.
+
+    ``guid`` is non-empty exactly when ``reason`` is ``None``. The failures are
+    kept apart rather than collapsed into "no guid" because they call for
+    opposite actions: an absent catalog wants creating, an unreadable one wants
+    a permission fixed, a missing row wants a line added, and an unusable id
+    wants the line it already has corrected. One of those instructions
+    delivered for another situation is worse than none.
+    """
+
+    guid: "str | None" = None
+    reason: "str | None" = None
+    detail: str = ""
+
+
+def normalized_key(path, windows=None) -> str:
+    """A path in the form two references to the same location compare equal in.
+
+    Case is folded on Windows and kept everywhere else, because that is where
+    the filesystem's own comparison differs. Both sides of any comparison must
+    come through here; see :func:`resolved_str` for why resolution alone is
+    not enough.
+
+    ``windows`` overrides the platform detection. It exists so that the caller
+    that owns a module-level ``IS_WINDOWS`` -- and whose tests patch that name
+    to exercise the other platform's rule -- can keep doing so without a second
+    copy of the folding rule living in that module. A flag passed in is
+    testable; a second implementation is only testable separately, and that is
+    how the two spellings come to disagree.
+    """
+    resolved = resolved_str(path)
+    fold = IS_WINDOWS if windows is None else windows
+    return resolved.lower() if fold else resolved
+
+
+def catalog_guid(project_root, catalog=None) -> CatalogLookup:
+    """The project id ``catalog`` records for ``project_root``, if any.
+
+    The single owner of "what the catalog says about this project". It lived
+    in ``handoff_tool`` alone until ``backlog_tool`` needed the same answer,
+    and a second match loop is precisely the thing that drifts: this repository
+    has already paid for one duplicated discovery rule that let a file escape
+    every assertion while every assertion stayed green.
+
+    ``project_root`` must already be the *primary* checkout -- resolve it with
+    :func:`primary_repo_root` first. A worktree path will not match, which is
+    the correct outcome for a lookup keyed on project identity, but only if
+    the caller knows that is what it asked.
+
+    The presence probe is tri-state on purpose. ``file_present`` answers
+    ``None`` for a catalog whose parent directory denies a stat, and that is
+    *not* reported as missing: ``open`` below would have handed the file over
+    without complaint, and "catalog not found" would send the reader off to
+    create a file that is already sitting there.
+    """
+    catalog = Path(catalog) if catalog is not None else (
+        projects_root() / "catalog.csv")
+    if file_present(catalog) is False:
+        return CatalogLookup(reason=CATALOG_MISSING, detail=str(catalog))
+    target = normalized_key(project_root)
+    try:
+        with open(catalog, "r", encoding="utf-8", errors="replace",
+                  newline="") as fh:
+            for row in catalog_rows(fh):
+                if row is None or len(row) < 2:
+                    continue
+                path, guid = row[0].strip().strip('"'), row[1].strip().strip('"')
+                if not path:
+                    continue
+                try:
+                    matched = normalized_key(path) == target
+                except OSError:
+                    continue
+                if not matched:
+                    continue
+                if not guid_is_usable(guid):
+                    return CatalogLookup(reason=CATALOG_UNUSABLE_ID,
+                                         detail=guid)
+                return CatalogLookup(guid=guid)
+    except OSError as exc:
+        return CatalogLookup(reason=CATALOG_UNREADABLE, detail=str(exc))
+    return CatalogLookup(reason=CATALOG_NO_ENTRY, detail=target)

@@ -35,6 +35,8 @@ import pytest
 
 import backlog_tool
 from backlog_tool import (
+    ACTIVE_STATUSES,
+    APPROVED_STATUSES,
     BACKLOG_DIRNAME,
     COMMIT_REQUIRED_STATUSES,
     EVIDENCE_HEADING,
@@ -42,6 +44,7 @@ from backlog_tool import (
     KNOWN_FIELDS,
     NO_SPEC,
     OPEN_STATUS,
+    PROPOSED_STATUS,
     REQUIRED_FIELDS,
     STATUSES,
     TERMINAL_STATUSES,
@@ -550,3 +553,200 @@ def _embedded_json(page: str) -> str:
         page, re.S)
     assert match, "the page no longer carries an embedded data block"
     return match.group(1)
+
+
+# ---------------------------------------------------------------------------
+# The approval gate -- the vocabulary that expresses it
+# ---------------------------------------------------------------------------
+
+def test_the_vocabulary_can_express_filed_but_not_approved():
+    """A premise, not a rule.
+
+    The gate is "an agent works only what the product owner approved". That
+    sentence is unenforceable until the data can tell "somebody wrote this
+    down" apart from "somebody decided it should be built", so every control
+    below rests on this value existing and meaning neither approved nor
+    finished.
+    """
+    assert PROPOSED_STATUS in STATUSES
+    assert PROPOSED_STATUS not in APPROVED_STATUSES
+    assert PROPOSED_STATUS not in TERMINAL_STATUSES
+    assert OPEN_STATUS in APPROVED_STATUSES
+    assert set(ACTIVE_STATUSES) | set(TERMINAL_STATUSES) == set(STATUSES), (
+        "every status must be either live or terminal; one that is neither "
+        "falls through R7 entirely and can carry any combination of fields")
+
+
+def _proposed(text: str = GOOD) -> str:
+    return mutate(text, f"status: {OPEN_STATUS}", f"status: {PROPOSED_STATUS}")
+
+
+def _with_blocks(text: str, target: "int | str") -> str:
+    return mutate(text, "spec: none", f"blocks: {target}\nspec: none")
+
+
+def _status_variant(status: str, text: str = GOOD) -> str:
+    """``text`` re-stated with ``status``, plus the fields that status needs."""
+    out = mutate(text, f"status: {OPEN_STATUS}", f"status: {status}")
+    if status in TERMINAL_STATUSES:
+        out = mutate(out, "opened: 2026-08-04",
+                     "opened: 2026-08-04\nclosed: 2026-08-05")
+    return out
+
+
+def _other(item_id: int, slug: str, status: str = OPEN_STATUS) -> "tuple":
+    """A second well-formed item, as ``(filename, text)``.
+
+    Refuses id 1 rather than quietly producing a no-op mutation: ``GOOD``
+    already carries it, so ``mutate`` would have nothing to change and the
+    caller would be handed a duplicate of the fixture under a second name.
+    """
+    assert item_id != 1, "id 1 is the fixture's; a second item needs its own"
+    text = mutate(GOOD, "id: 1", f"id: {item_id}")
+    text = mutate(text, "title: A known good item", f"title: Item {item_id}")
+    if status != OPEN_STATUS:
+        text = _status_variant(status, text)
+    return f"{item_id:04d}-{slug}.md", text
+
+
+def _loaded(root: Path) -> list:
+    items, parse_problems = backlog_tool.load(root / BACKLOG_DIRNAME)
+    assert not parse_problems, parse_problems
+    return items
+
+
+def _reason(root: Path, item_id: int) -> "str | None":
+    items = _loaded(root)
+    index = backlog_tool.by_filename_id(items)
+    item = index[item_id]
+    return backlog_tool.why_not_workable(item, index)
+
+
+def test_an_approved_item_is_workable(tmp_path):
+    """Negative control for the gate.
+
+    Without it, a gate that refused everything would satisfy every positive
+    control below while making the queue permanently empty -- which reads as a
+    quiet backlog rather than a broken one.
+    """
+    write_backlog(tmp_path)
+    assert _reason(tmp_path, 1) is None
+    assert [i.filename_id for i in backlog_tool.workable(_loaded(tmp_path))] == [1]
+
+
+def test_an_item_awaiting_approval_is_not_workable(tmp_path):
+    write_backlog(tmp_path, _proposed())
+    reason = _reason(tmp_path, 1)
+    assert reason and "awaiting approval" in reason, reason
+    assert backlog_tool.workable(_loaded(tmp_path)) == []
+
+
+@pytest.mark.parametrize("status", TERMINAL_STATUSES)
+def test_a_finished_item_is_not_workable(tmp_path, status):
+    write_backlog(tmp_path, _status_variant(status))
+    reason = _reason(tmp_path, 1)
+    assert reason and status in reason, reason
+
+
+def test_the_escape_hatch_makes_a_blocking_item_workable(tmp_path):
+    """The lawful move for an agent that finds a defect mid-task.
+
+    This is the negative control for R12 below, and the more important half of
+    the pair: a gate with no legal way through does not stop an agent, it
+    makes the agent approve its own item and carry on -- which repeals the
+    gate while appearing to honour it, and leaves nothing behind that says so.
+    """
+    blocker, blocker_text = _other(2, "a-blocking-defect")
+    blocker_text = _with_blocks(_proposed(blocker_text), 1)
+    write_backlog(tmp_path, extra={blocker: blocker_text})
+    assert problems(tmp_path) == []
+    assert _reason(tmp_path, 2) is None
+    assert sorted(i.filename_id
+                  for i in backlog_tool.workable(_loaded(tmp_path))) == [1, 2]
+
+
+def test_the_escape_hatch_cannot_be_bootstrapped_from_an_unapproved_item(tmp_path):
+    """Two moves would otherwise repeal the gate: file A, then file B
+    blocking A, and B is workable on an authority A never had."""
+    write_backlog(tmp_path, _proposed())
+    blocker, blocker_text = _other(2, "a-blocking-defect")
+    write_backlog(tmp_path, _proposed(),
+                  extra={blocker: _with_blocks(_proposed(blocker_text), 1)})
+    reason = _reason(tmp_path, 2)
+    assert reason and "rather than approved" in reason, reason
+    assert backlog_tool.workable(_loaded(tmp_path)) == []
+
+
+def test_the_escape_hatch_expires_when_the_item_it_blocks_is_finished(tmp_path):
+    """Nothing is being unblocked once the blocked item is closed, so the
+    exception lapses and the item goes back to needing approval."""
+    finished_text = _status_variant("rejected")
+    blocker, blocker_text = _other(2, "a-blocking-defect")
+    write_backlog(tmp_path, finished_text,
+                  extra={blocker: _with_blocks(_proposed(blocker_text), 1)})
+    reason = _reason(tmp_path, 2)
+    assert reason and "#1" in reason and "rejected" in reason, reason
+
+
+def test_the_refusal_says_which_item_it_names(tmp_path):
+    """Assert the reason, not the boolean.
+
+    A refusal is the most multiplexed answer this function has -- five
+    different situations produce one -- and a test that accepted any of them
+    would pass with the gate wired to the wrong field.
+    """
+    blocker, blocker_text = _other(2, "a-blocking-defect")
+    write_backlog(tmp_path, GOOD,
+                  extra={blocker: _with_blocks(_proposed(blocker_text), 9)})
+    reason = _reason(tmp_path, 2)
+    assert reason and "9" in reason and "does not exist" in reason, reason
+
+
+# ---------------------------------------------------------------------------
+# R11 / R12 -- the 'blocks' reference, checked at rest
+# ---------------------------------------------------------------------------
+
+def test_a_blocks_reference_to_an_approved_item_is_accepted(tmp_path):
+    """Negative control for both rules below."""
+    blocker, blocker_text = _other(2, "a-blocking-defect")
+    write_backlog(tmp_path, extra={blocker: _with_blocks(blocker_text, 1)})
+    assert problems(tmp_path) == []
+
+
+def test_a_blocks_reference_that_is_not_a_number_is_reported(tmp_path):
+    write_backlog(tmp_path, _with_blocks(GOOD, "the parser item"))
+    assert reported(tmp_path, "is not an integer item id")
+
+
+def test_an_item_that_blocks_itself_is_reported(tmp_path):
+    """Otherwise an item is its own authority, which is no authority."""
+    write_backlog(tmp_path, _with_blocks(GOOD, 1))
+    assert reported(tmp_path, "names the item itself")
+
+
+def test_a_blocks_reference_to_a_missing_item_is_reported(tmp_path):
+    write_backlog(tmp_path, _with_blocks(GOOD, 4242))
+    assert reported(tmp_path, "does not exist")
+
+
+def test_a_blocks_reference_to_an_unapproved_item_is_reported(tmp_path):
+    blocker, blocker_text = _other(2, "a-blocking-defect")
+    write_backlog(tmp_path, _proposed(),
+                  extra={blocker: _with_blocks(blocker_text, 1)})
+    assert reported(tmp_path, "cannot be the authority")
+
+
+@pytest.mark.parametrize("field,value", [("closed", "2026-08-05"),
+                                         ("commit", "0" * 40)])
+def test_an_item_awaiting_approval_carries_no_closing_fields(tmp_path, field,
+                                                             value):
+    """R7 covers every live status, not just ``open``.
+
+    Written against ``ACTIVE_STATUSES`` rather than the literal so that a
+    status added to that tuple is covered the day it is added, rather than the
+    day somebody remembers this file.
+    """
+    text = mutate(_proposed(), "opened: 2026-08-04",
+                  f"opened: 2026-08-04\n{field}: {value}")
+    write_backlog(tmp_path, text)
+    assert reported(tmp_path, f"{PROPOSED_STATUS!r} but a {field!r}")

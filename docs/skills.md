@@ -4,7 +4,7 @@ Skills extend Copilot CLI agents with specialized capabilities. They're markdown
 
 ## Included in this repo
 
-Both skills install for the **user**, not for one project: `setup.ps1` /
+These skills install for the **user**, not for one project: `setup.ps1` /
 `setup.sh` copy them to `~/.copilot/skills/<name>/`, so they are available in
 every project on the machine. Project-level skills (`.github/skills/`) are
 shared with everyone who clones that repo; user-level skills follow you.
@@ -27,6 +27,37 @@ directory, and how agents message each other with `operator send` /
 
 Use Roslyn for C# structural questions. For other languages, use the built-in
 code intelligence, LSP, or search tools in your environment.
+
+### operator-backlog-newitem
+
+**Location**: `skills/operator-backlog-newitem/SKILL.md`
+**Install**: automatic — `setup.ps1` / `setup.sh` install it to `~/.copilot/skills/`
+
+File something into the tracked backlog the moment it surfaces, rather than
+losing it to the end of a session. Items are filed as `proposed` — filing is
+not approving — and the skill's rule for when to file unprompted is
+asymmetric on purpose: a filed item the owner rejects costs one line of
+review, and an unfiled one costs the whole observation.
+
+### operator-backlog-refinement
+
+**Location**: `skills/operator-backlog-refinement/SKILL.md`
+**Install**: automatic — `setup.ps1` / `setup.sh` install it to `~/.copilot/skills/`
+
+Walk the queue with the product owner: what is awaiting approval, what each
+item actually claims, and `backlog approve` for the ones that should be worked.
+Approving, rejecting and prioritising are the owner's decisions; the skill
+prepares them and does not make them.
+
+### operator-backlog-scrum
+
+**Location**: `skills/operator-backlog-scrum/SKILL.md`
+**Install**: automatic — `setup.ps1` / `setup.sh` install it to `~/.copilot/skills/`
+
+The periodic check-in: commits since the last one, backlog files touched, what
+is ready and what is waiting on you. The watermark it measures from lives in
+the per-project directory, so it survives the session that wrote it, and
+`--peek` reports a period without consuming it.
 
 To install a skill into a single project instead, copy its directory into that
 project's `.github/skills/`:

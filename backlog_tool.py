@@ -72,31 +72,65 @@ import sys
 import tempfile
 import webbrowser
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from install_manifest import path_present
-from project_paths import resolved_str
+from project_paths import (
+    CATALOG_MISSING,
+    CATALOG_NO_ENTRY,
+    CATALOG_UNREADABLE,
+    CATALOG_UNUSABLE_ID,
+    catalog_guid,
+    primary_repo_root,
+    project_dir,
+    projects_root,
+    resolved_str,
+)
 
 __all__ = [
     "STATUSES", "TERMINAL_STATUSES", "COMMIT_REQUIRED_STATUSES", "OPEN_STATUS",
+    "PROPOSED_STATUS", "ACTIVE_STATUSES", "APPROVED_STATUSES",
     "NO_SPEC", "BACKLOG_DIRNAME", "EVIDENCE_HEADING", "REQUIRED_FIELDS",
     "KNOWN_FIELDS", "ITEM_FILENAME", "Item", "BacklogFormatError",
     "checkout_root", "item_paths", "split_front_matter", "parse_item", "load",
-    "check", "render_html", "main",
+    "check", "workable", "why_not_workable", "by_filename_id", "next_id",
+    "slug_for", "render_item", "create_item", "approve_item",
+    "WatermarkError", "watermark_path", "read_watermark", "write_watermark",
+    "ScrumReport", "scrum_report", "format_scrum",
+    "render_html", "main",
 ]
 
 #: The complete status vocabulary. This tuple is the only place the legal
 #: values are written down; tests read it rather than repeating the literals,
 #: because a test that spells its own copy of a vocabulary stops testing the
 #: vocabulary the moment the two disagree.
-STATUSES = ("open", "closed", "rejected")
+STATUSES = ("proposed", "open", "closed", "rejected")
 
-#: The one status that means work is outstanding.
+#: Filed, but not yet approved by the product owner. This value exists so the
+#: approval gate can be *expressed*: ``open`` alone conflates "somebody wrote
+#: this down" with "somebody decided it should be built", and a gate cannot be
+#: enforced against a distinction the data cannot make. An agent may file one
+#: of these unprompted; it may not work one.
+PROPOSED_STATUS = "proposed"
+
+#: Approved, outstanding work. The one status an agent may pick up freely.
 OPEN_STATUS = "open"
 
 #: Statuses that end an item's life. Both require a ``closed`` date: a
 #: rejection is a decision with a date, not an absence.
 TERMINAL_STATUSES = ("closed", "rejected")
+
+#: Statuses that mean the item is still alive. These carry neither a closing
+#: date nor a commit -- the complement of :data:`TERMINAL_STATUSES`, spelled
+#: out rather than derived so that adding a status forces a decision about
+#: which side it falls on instead of defaulting into one.
+ACTIVE_STATUSES = ("proposed", "open")
+
+#: Statuses that carry the product owner's approval. An agent may work an item
+#: with one of these, or an item whose ``blocks`` field earns it the exception
+#: documented in :func:`workable`. Nothing else.
+APPROVED_STATUSES = ("open",)
 
 #: Statuses that require a resolvable ``commit``. Only ``closed`` does --
 #: ``rejected`` means nothing shipped, so demanding a SHA for it would force
@@ -121,7 +155,7 @@ EVIDENCE_HEADING = "## Evidence"
 ITEM_FILENAME = re.compile(r"^(\d{4})-[a-z0-9]+(?:-[a-z0-9]+)*\.md$")
 
 REQUIRED_FIELDS = ("id", "title", "status", "opened", "spec")
-OPTIONAL_FIELDS = ("closed", "commit", "requirement")
+OPTIONAL_FIELDS = ("closed", "commit", "requirement", "blocks")
 KNOWN_FIELDS = REQUIRED_FIELDS + OPTIONAL_FIELDS
 
 _DELIMITER = "---"
@@ -386,6 +420,15 @@ def check(repo_root=None, *, resolve_commits: bool = True) -> list:
         return problems
 
     seen_ids: dict = {}
+    # Every item by the id its *filename* carries. Filename ids are used for
+    # the cross-references below because they are the ids guaranteed to parse:
+    # a front-matter id that disagrees or will not convert is R2's and R3's
+    # problem to report, and resolving a reference against it would turn one
+    # item's typo into a second, spurious complaint against whoever pointed at
+    # it. The first item wins a collision; R3 reports the collision itself.
+    by_id: dict = {}
+    for item in items:
+        by_id.setdefault(item.filename_id, item)
     for item in items:
         name = item.name
         front = item.front
@@ -442,20 +485,20 @@ def check(repo_root=None, *, resolve_commits: bool = True) -> list:
             problems.append(
                 f"{name}: the {EVIDENCE_HEADING!r} section is missing or empty")
 
-        # R7. Terminal items carry a closing date; open items carry neither a
+        # R7. Terminal items carry a closing date; live items carry neither a
         # closing date nor a commit.
         closed_on = front.get("closed", "")
         commit = front.get("commit", "")
         if status in TERMINAL_STATUSES and not closed_on:
             problems.append(
                 f"{name}: status is {status!r} but no 'closed' date is set")
-        if status == OPEN_STATUS:
+        if status in ACTIVE_STATUSES:
             if closed_on:
                 problems.append(
-                    f"{name}: status is 'open' but a 'closed' date is set")
+                    f"{name}: status is {status!r} but a 'closed' date is set")
             if commit:
                 problems.append(
-                    f"{name}: status is 'open' but a 'commit' is set")
+                    f"{name}: status is {status!r} but a 'commit' is set")
 
         # R8. A closed item names a commit, and that commit resolves here. A
         # close pointing at nothing is a claim that something shipped with
@@ -516,7 +559,599 @@ def check(repo_root=None, *, resolve_commits: bool = True) -> list:
                             f"{name}: requirement {requirement!r} does not "
                             f"appear in {spec}")
 
+        # R11. A 'blocks' reference names another item, by id.
+        #
+        # This field is the approval gate's escape hatch, so it is the field
+        # most worth breaking: an agent that finds a defect while working an
+        # approved item files it as 'proposed' and names the item it is
+        # blocking, and that reference is what lets the agent carry on. A
+        # reference that resolves to nothing would hand out the exception for
+        # free while looking exactly like an audited one.
+        blocks = front.get("blocks", "")
+        blocked = None
+        if blocks:
+            try:
+                blocked_id = int(blocks)
+            except ValueError:
+                problems.append(
+                    f"{name}: blocks {blocks!r} is not an integer item id")
+            else:
+                if blocked_id == item.filename_id:
+                    problems.append(
+                        f"{name}: blocks names the item itself; an item "
+                        "cannot be the reason it may be worked")
+                elif blocked_id not in by_id:
+                    problems.append(
+                        f"{name}: blocks names item {blocked_id}, which does "
+                        "not exist")
+                else:
+                    blocked = by_id[blocked_id]
+
+        # R12. The item named by 'blocks' is not itself awaiting approval.
+        #
+        # Without this the gate repeals itself in two moves: file A as
+        # 'proposed', then file B as 'proposed' blocking A, and B is workable
+        # on A's authority -- which A never had. Authority has to come from
+        # something the product owner touched, so a chain may not begin at an
+        # unapproved item.
+        if blocked is not None and blocked.status == PROPOSED_STATUS:
+            problems.append(
+                f"{name}: blocks item {blocked.filename_id}, which is itself "
+                f"{PROPOSED_STATUS!r}; an unapproved item cannot be the "
+                "authority for working another")
+
     return problems
+
+
+# --------------------------------------------------------------------------
+# The approval gate
+# --------------------------------------------------------------------------
+
+def why_not_workable(item, by_id) -> "str | None":
+    """Why an agent may not work ``item``, or ``None`` when it may.
+
+    The single owner of the gate. It answers with a *reason* rather than a
+    boolean because every caller needs to say why: a queue that silently omits
+    an item teaches an agent nothing, and an agent that cannot see why its item
+    is ineligible is an agent about to edit the status field itself.
+
+    Three answers are possible and they are kept apart:
+
+    * approved -- ``None``;
+    * terminal or unrecognised -- there is nothing to work;
+    * awaiting approval -- eligible only through the ``blocks`` exception.
+
+    **The exception exists because the gate is unenforceable without it.** An
+    agent permitted to touch only approved items has no lawful move when it
+    finds a defect while working one. Given none it will either stall, or file
+    an item and approve it itself -- which repeals the gate while appearing to
+    honour it, and leaves no trace that says so. So the lawful move is written
+    down: file the defect, name the approved item it blocks, and carry on. The
+    exception is narrow (the blocked item must itself be approved, which
+    :func:`check` enforces at rest as R12) and it is *recorded*, which is the
+    property that matters. A gate nobody can pass legally is not a stricter
+    gate; it is the same gate with the audit trail removed.
+    """
+    status = item.status
+    if status in APPROVED_STATUSES:
+        return None
+    if status in TERMINAL_STATUSES:
+        return f"status is {status!r}"
+    if status != PROPOSED_STATUS:
+        return f"status {status!r} is not one of {', '.join(STATUSES)}"
+    blocks = item.front.get("blocks", "")
+    if not blocks:
+        return ("awaiting approval by the product owner, and it names no "
+                "approved item that it blocks")
+    try:
+        blocked_id = int(blocks)
+    except ValueError:
+        return (f"awaiting approval, and blocks {blocks!r} is not an item id, "
+                "so it grants nothing")
+    blocked = by_id.get(blocked_id)
+    if blocked is None:
+        return (f"awaiting approval, and it blocks item {blocked_id}, which "
+                "does not exist")
+    if blocked.status not in APPROVED_STATUSES:
+        return (f"awaiting approval, and the item it blocks (#{blocked_id}) "
+                f"is {blocked.status!r} rather than approved")
+    return None
+
+
+def by_filename_id(items) -> dict:
+    """``{filename id: item}``, first occurrence winning a collision.
+
+    Collisions are R3's to report. Resolving them differently here would make
+    a cross-reference mean one thing to the checker and another to the queue.
+    """
+    out: dict = {}
+    for item in items:
+        out.setdefault(item.filename_id, item)
+    return out
+
+
+def workable(items) -> list:
+    """The items an agent is allowed to pick up, in the order given."""
+    index = by_filename_id(items)
+    return [item for item in items if why_not_workable(item, index) is None]
+
+
+# --------------------------------------------------------------------------
+# Writing items
+# --------------------------------------------------------------------------
+
+_SLUG_SEPARATORS = re.compile(r"[^a-z0-9]+")
+#: Long enough to stay recognisable, short enough that the filename survives a
+#: deep checkout path on Windows, where MAX_PATH still bites tools that have
+#: not opted into long paths.
+SLUG_MAX = 56
+
+
+def slug_for(title: str) -> str:
+    """A filename slug for ``title`` that :data:`ITEM_FILENAME` will match.
+
+    Everything outside ``[a-z0-9]`` becomes a separator, runs collapse, and the
+    ends are trimmed -- which is exactly the pattern's grammar, so the result
+    cannot fail to match. A title with nothing usable in it (an id number, say,
+    or a title written in a script this transliterates away) yields ``item``
+    rather than an empty string: an empty slug would produce ``0008-.md``,
+    which the discovery pattern does not match, so the file would sit in
+    ``backlog/`` being validated by nothing.
+    """
+    slug = _SLUG_SEPARATORS.sub("-", title.lower()).strip("-")
+    if len(slug) > SLUG_MAX:
+        slug = slug[:SLUG_MAX].rstrip("-")
+    return slug or "item"
+
+
+def next_id(directory) -> int:
+    """One past the highest id present.
+
+    Propagates the :class:`BacklogFormatError` from :func:`item_paths` rather
+    than catching it. A directory that cannot be listed would otherwise
+    allocate id 1 and write over the item that already holds it -- the failure
+    mode where "I could not see the backlog" is spent as "the backlog is
+    empty".
+
+    Two agents in two worktrees can still allocate the same id; that is
+    inherent to a queue with no lock, and it is caught at merge by R3 rather
+    than papered over here.
+    """
+    highest = 0
+    for path in item_paths(directory):
+        highest = max(highest, int(ITEM_FILENAME.match(path.name).group(1)))
+    return highest + 1
+
+
+def _today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def render_item(*, item_id: int, title: str, evidence: str,
+                status: str = PROPOSED_STATUS, opened: "str | None" = None,
+                spec: str = NO_SPEC, blocks: "int | None" = None,
+                why: str = "", notes: str = "") -> str:
+    """One item as text, or :class:`BacklogFormatError` if it cannot be one.
+
+    The refusals are the interesting part. A title spanning two lines would
+    put its second line into the front-matter block, where it parses as a
+    malformed field -- a file this function wrote that this module's own
+    parser rejects. An empty evidence section fails R6 for the same reason a
+    human-written one does: an item with no evidence is a rumour, and a tool
+    that emits rumours faster than a human can weed them is worse than no tool.
+    """
+    title = title.strip()
+    if not title:
+        raise BacklogFormatError("an item needs a title")
+    if "\n" in title or "\r" in title:
+        raise BacklogFormatError(
+            "a title is one line; this one spans several, and the rest would "
+            "land in the front-matter block as malformed fields")
+    evidence = evidence.strip()
+    if not evidence:
+        raise BacklogFormatError(
+            "an item needs evidence: what was observed, when, and how it is "
+            "reproducible. An item with none is a rumour")
+    if status not in STATUSES:
+        raise BacklogFormatError(
+            f"status {status!r} is not one of {', '.join(STATUSES)}")
+    if status in TERMINAL_STATUSES:
+        raise BacklogFormatError(
+            f"{status!r} ends an item's life and needs a closing date and, for "
+            "a close, the SHA that did the work -- so it cannot be the status "
+            "a new item is filed under")
+
+    front = [f"id: {item_id}", f"title: {title}", f"status: {status}",
+             f"opened: {opened or _today()}"]
+    if blocks is not None:
+        front.append(f"blocks: {blocks}")
+    front.append(f"spec: {spec}")
+
+    body = [f"{EVIDENCE_HEADING}\n\n{evidence}\n"]
+    if why.strip():
+        body.append(f"## Why it matters\n\n{why.strip()}\n")
+    if notes.strip():
+        body.append(f"## Notes\n\n{notes.strip()}\n")
+    return "---\n" + "\n".join(front) + "\n---\n\n" + "\n".join(body)
+
+
+def _write_new(path: Path, text: str) -> None:
+    """Write ``text`` to ``path``, refusing to replace anything already there.
+
+    ``x`` rather than ``w``: the id allocation above is a read followed by a
+    write, and two agents racing through it must not have one silently
+    overwrite the other's evidence. The loser gets an error naming the file.
+
+    ``newline="\\n"`` is explicit because the default translates to
+    ``os.linesep``, which would emit CRLF on Windows for a file every other
+    platform writes with LF.
+    """
+    with open(path, "x", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+
+
+def create_item(directory, **kwargs) -> Path:
+    """Write a new item into ``directory`` and return its path.
+
+    ``kwargs`` are :func:`render_item`'s, minus ``item_id``, plus an optional
+    ``slug``.
+    """
+    directory = Path(directory)
+    slug = kwargs.pop("slug", None)
+    item_id = next_id(directory)
+    text = render_item(item_id=item_id, **kwargs)
+    name = f"{item_id:04d}-{slug or slug_for(kwargs['title'])}.md"
+    if not ITEM_FILENAME.match(name):
+        raise BacklogFormatError(
+            f"{name!r} does not match {ITEM_FILENAME.pattern!r}, so nothing "
+            "would ever validate it")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    _write_new(path, text)
+    return path
+
+
+def _dominant_newline(raw: bytes) -> str:
+    return "\r\n" if b"\r\n" in raw else "\n"
+
+
+def approve_item(directory, item_id: int) -> Path:
+    """Move item ``item_id`` from ``proposed`` to ``open``.
+
+    This is the product owner's act, and the whole point of the gate, so it
+    changes exactly one line and refuses everything else. It will not approve
+    an item that is already approved or already terminal, because both would
+    be silent no-ops that read as an approval having happened.
+
+    The file's existing line endings are preserved. A rewrite that flipped
+    them would render as a whole-file diff, and a one-line decision that shows
+    up as a hundred-line change is a decision nobody can review.
+    """
+    directory = Path(directory)
+    match = [p for p in item_paths(directory)
+             if int(ITEM_FILENAME.match(p.name).group(1)) == item_id]
+    if not match:
+        raise BacklogFormatError(f"no backlog item with id {item_id}")
+    path = match[0]
+    raw = path.read_bytes()
+    item = parse_item(path)
+    if item.status == OPEN_STATUS:
+        raise BacklogFormatError(
+            f"{path.name} is already {OPEN_STATUS!r}; nothing to approve")
+    if item.status != PROPOSED_STATUS:
+        raise BacklogFormatError(
+            f"{path.name} is {item.status!r}, not {PROPOSED_STATUS!r}; only a "
+            "proposed item can be approved")
+
+    newline = _dominant_newline(raw)
+    lines = raw.decode("utf-8").splitlines()
+    out, replaced, in_front = [], 0, False
+    for index, line in enumerate(lines):
+        if line.strip() == _DELIMITER:
+            if not in_front and index == 0:
+                in_front = True
+            elif in_front:
+                in_front = False
+            out.append(line)
+            continue
+        if in_front and line.startswith("status:"):
+            out.append(f"status: {OPEN_STATUS}")
+            replaced += 1
+            continue
+        out.append(line)
+    if replaced != 1:
+        raise BacklogFormatError(
+            f"{path.name}: expected exactly one 'status:' line in the front "
+            f"matter, found {replaced}")
+    with open(path, "w", encoding="utf-8", newline=newline) as fh:
+        fh.write(newline.join(out) + newline)
+    return path
+
+
+# --------------------------------------------------------------------------
+# The check-in watermark
+# --------------------------------------------------------------------------
+
+#: Where the watermark lives inside the per-project directory.
+WATERMARK_NAME = "backlog-scrum.json"
+
+
+class WatermarkError(RuntimeError):
+    """The check-in watermark could not be located, read or written."""
+
+
+def watermark_path(start=None) -> Path:
+    """Where this project's check-in watermark lives.
+
+    Outside the repository and outside session state, both deliberately.
+
+    Session state is the artifact this repository has *measured* not to
+    survive: ``~/.operator/trace.jsonl`` records 940 session exits and not one
+    wrote a handoff, so anything a session held died with it. A watermark kept
+    there would silently reset to "the beginning of time" at every check-in,
+    which reads as a working report.
+
+    Tracked content is wrong for the opposite reason. "Since I last looked" is
+    a fact about one reader on one machine; committing it would put every
+    parallel agent's check-in on the same line of the same file, and merge it
+    into a shared answer that is nobody's.
+
+    So it is the per-project directory -- keyed on the *primary* checkout via
+    :func:`primary_repo_root`, so that every worktree of one project shares one
+    watermark. A worktree is a second directory for the same project, and two
+    watermarks for one project would each report the other's work as new.
+    """
+    root = primary_repo_root(start)
+    found = catalog_guid(root)
+    if found.guid is not None:
+        return project_dir(found.guid) / WATERMARK_NAME
+    catalog = projects_root() / "catalog.csv"
+    if found.reason == CATALOG_MISSING:
+        raise WatermarkError(
+            f"No project catalog at {catalog}, so there is nowhere durable to "
+            "record a check-in. Run this repository's setup, or create the "
+            f"catalog with a line reading:\n  \"{resolved_str(root)}\",<guid>")
+    if found.reason == CATALOG_UNREADABLE:
+        raise WatermarkError(
+            f"Cannot read the project catalog {catalog}: {found.detail}\n"
+            "Refusing to report a check-in rather than report one from a "
+            "watermark that may exist and could not be found.")
+    if found.reason == CATALOG_UNUSABLE_ID:
+        raise WatermarkError(
+            f"The catalog entry for {resolved_str(root)} has an unusable "
+            f"project id: {found.detail!r}. The second column must be one "
+            "plain directory name, such as a GUID.")
+    if found.reason == CATALOG_NO_ENTRY:
+        raise WatermarkError(
+            f"No catalog entry for {resolved_str(root)}, so this project has "
+            "no per-project directory to keep a check-in watermark in. Add "
+            f"one:\n  \"{resolved_str(root)}\",<guid>")
+    raise WatermarkError(
+        f"The catalog lookup for {resolved_str(root)} failed for a reason "
+        f"this command does not recognise: {found.reason!r} {found.detail!r}")
+
+
+def read_watermark(path) -> "dict | None":
+    """The recorded check-in, or ``None`` when there has never been one.
+
+    ``None`` means *never written*, and nothing else. A watermark that exists
+    but cannot be read raises, because the two answers lead opposite ways: an
+    absent watermark correctly reports the whole history as new, and an
+    unreadable one doing the same thing would look exactly like a first run
+    while quietly discarding the boundary -- reporting work as new that the
+    reader has already been told about, on a report whose entire value is that
+    it says what changed.
+    """
+    path = Path(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise WatermarkError(f"Cannot read the watermark {path}: {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise WatermarkError(
+            f"The watermark {path} is not valid JSON: {exc}. Delete it to "
+            "start a fresh check-in history, knowing that the next report "
+            "will cover everything.") from exc
+    if not isinstance(data, dict):
+        raise WatermarkError(
+            f"The watermark {path} holds {type(data).__name__}, not an object")
+    return data
+
+
+def write_watermark(path, commit: "str | None", *, when=None) -> dict:
+    """Record a check-in at ``commit``. Raises :class:`WatermarkError`.
+
+    Written to a sibling temp file and moved into place, so an interrupted
+    write leaves the previous watermark intact rather than a truncated file
+    that :func:`read_watermark` would then refuse.
+    """
+    path = Path(path)
+    payload = {
+        "commit": commit or "",
+        "checked_at": (when or datetime.now(timezone.utc)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+    }
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".scrum-",
+                                   suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise WatermarkError(
+            f"Cannot write the watermark {path}: {exc}. The next check-in "
+            "would repeat this one.") from exc
+    return payload
+
+
+# --------------------------------------------------------------------------
+# The check-in report
+# --------------------------------------------------------------------------
+
+def _git(args, cwd) -> "tuple[int, str]":
+    """Run git and return ``(returncode, stdout)``; ``(-1, "")`` if it cannot.
+
+    A git that will not run is reported as a failure, never as empty output.
+    Empty output is what "nothing changed" looks like, and a report that
+    cannot tell those apart says "no news" on the day it stopped working.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True,
+            encoding="utf-8", errors="replace", timeout=30, **_POPEN_KWARGS,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return -1, ""
+    return proc.returncode, proc.stdout or ""
+
+
+@dataclass(frozen=True)
+class ScrumReport:
+    """What changed since the previous check-in.
+
+    ``notes`` carries anything that went wrong while assembling the report.
+    They are part of the report rather than a log line because a check-in that
+    silently omits a section is indistinguishable from a quiet week.
+    """
+
+    head: str = ""
+    since: str = ""
+    since_when: str = ""
+    first_run: bool = False
+    since_resolves: bool = True
+    commits: tuple = ()
+    item_changes: tuple = ()
+    counts: tuple = ()
+    ready: tuple = ()
+    awaiting: tuple = ()
+    problems: tuple = ()
+    notes: tuple = ()
+
+
+def scrum_report(repo_root=None, watermark: "dict | None" = None, *,
+                 resolve_commits: bool = True) -> ScrumReport:
+    """Assemble the check-in for ``repo_root`` against ``watermark``."""
+    root = Path(repo_root) if repo_root is not None else checkout_root()
+    notes: list = []
+
+    rc, out = _git(["rev-parse", "HEAD"], root)
+    head = out.strip() if rc == 0 else ""
+    if not head:
+        notes.append("this checkout has no commits yet, so nothing is dated "
+                     "against a revision")
+
+    since = (watermark or {}).get("commit", "") or ""
+    since_when = (watermark or {}).get("checked_at", "") or ""
+    first_run = watermark is None
+    since_resolves = bool(since) and _commit_resolves(since, root)
+    if since and not since_resolves:
+        notes.append(
+            f"the last check-in recorded commit {since[:12]}, which does not "
+            "resolve here -- a rewritten history, or another clone. Reporting "
+            "everything instead of silently reporting nothing.")
+
+    commits: list = []
+    item_changes: list = []
+    if since_resolves and head:
+        rc, out = _git(["log", "--no-merges", "--format=%h %s",
+                        f"{since}..{head}"], root)
+        if rc != 0:
+            notes.append("could not list commits since the last check-in")
+        else:
+            commits = [line for line in out.splitlines() if line.strip()]
+        rc, out = _git(["diff", "--name-status", f"{since}..{head}", "--",
+                        BACKLOG_DIRNAME], root)
+        if rc != 0:
+            notes.append("could not list backlog changes since the last "
+                         "check-in")
+        else:
+            for line in out.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2 and ITEM_FILENAME.match(
+                        Path(parts[-1]).name):
+                    item_changes.append((parts[0][:1], Path(parts[-1]).name))
+
+    items, parse_problems = load(root / BACKLOG_DIRNAME)
+    del parse_problems  # check() reports these, with the rest
+    problems = check(root, resolve_commits=resolve_commits)
+    index = by_filename_id(items)
+    counts = tuple((status, sum(1 for i in items if i.status == status))
+                   for status in STATUSES)
+    ready = tuple((i.filename_id, i.title) for i in items
+                  if why_not_workable(i, index) is None)
+    awaiting = tuple((i.filename_id, i.title) for i in items
+                     if i.status == PROPOSED_STATUS
+                     and why_not_workable(i, index) is not None)
+    return ScrumReport(
+        head=head, since=since, since_when=since_when, first_run=first_run,
+        since_resolves=since_resolves, commits=tuple(commits),
+        item_changes=tuple(item_changes), counts=counts, ready=ready,
+        awaiting=awaiting, problems=tuple(problems), notes=tuple(notes),
+    )
+
+
+def format_scrum(report: ScrumReport) -> str:
+    """The check-in as text. One function, so the CLI cannot render a second
+    version of it that says something else."""
+    sections: list = []
+    if report.first_run:
+        sections.append("First check-in for this project: there is no earlier "
+                        "one to measure against, so the git history below is "
+                        "left out and everything else is current state.")
+    elif report.since_when:
+        sections.append(f"Since the check-in of {report.since_when} "
+                        f"({report.since[:12] or 'no commit recorded'}).")
+    else:
+        sections.append("Since the previous check-in, which recorded no "
+                        "commit to measure from.")
+
+    if report.commits:
+        sections.append("\n".join(
+            [f"Commits ({len(report.commits)}):"]
+            + [f"  {line}" for line in report.commits]))
+    elif not report.first_run and report.since_resolves:
+        sections.append("Commits: none.")
+
+    if report.item_changes:
+        sections.append("\n".join(
+            ["Backlog files touched:"]
+            + [f"  {code} {name}" for code, name in report.item_changes]))
+
+    sections.append("Backlog: " + ", ".join(
+        f"{count} {status}" for status, count in report.counts))
+
+    sections.append("\n".join(
+        [f"Ready to work ({len(report.ready)}):"]
+        + ([f"  {item_id:>4}  {title}" for item_id, title in report.ready]
+           or ["  (nothing; every item is done, or waiting on you)"])))
+
+    sections.append("\n".join(
+        [f"Awaiting your approval ({len(report.awaiting)}):"]
+        + ([f"  {item_id:>4}  {title}" for item_id, title in report.awaiting]
+           or ["  (nothing)"])))
+
+    if report.problems:
+        sections.append("\n".join(
+            [f"Conformance problems ({len(report.problems)}):"]
+            + [f"  {problem}" for problem in report.problems]))
+    if report.notes:
+        sections.append("\n".join(
+            ["Caveats on this report:"]
+            + [f"  - {note}" for note in report.notes]))
+    return "\n\n".join(sections)
 
 
 # --------------------------------------------------------------------------
@@ -561,6 +1196,7 @@ def render_html(repo_root=None, *, resolve_commits: bool = True) -> str:
     root = Path(repo_root) if repo_root is not None else checkout_root()
     items, parse_problems = load(root / BACKLOG_DIRNAME)
     problems = check(root, resolve_commits=resolve_commits)
+    index = by_filename_id(items)
 
     payload = {
         "repo": root.name,
@@ -577,6 +1213,12 @@ def render_html(repo_root=None, *, resolve_commits: bool = True) -> str:
                 "commit": item.front.get("commit", ""),
                 "spec": item.front.get("spec", ""),
                 "requirement": item.front.get("requirement", ""),
+                "blocks": item.front.get("blocks", ""),
+                # Why an agent may not pick this up, in the same words the
+                # `ready --explain` queue uses. A view that showed status but
+                # not eligibility would leave a reader to re-derive the gate,
+                # and a re-derived rule is a second rule.
+                "blocked_because": why_not_workable(item, index) or "",
                 "body": item.body,
             }
             for item in items
@@ -616,6 +1258,7 @@ _PAGE = """<!DOCTYPE html>
  .tag { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em;
         padding: .12rem .5rem; border-radius: 999px; border: 1px solid; }
  .open { color: #d68910; } .closed { color: #27ae60; } .rejected { opacity: .5; }
+ .proposed { color: #8e44ad; }
  .meta { display: flex; gap: 1.2rem; flex-wrap: wrap; font-size: .8rem;
          opacity: .7; padding: 0 .9rem .5rem; }
  .body { padding: 0 .9rem 1rem; border-top: 1px solid #8884; margin-top: .3rem; }
@@ -698,6 +1341,8 @@ function draw() {
     if (i.commit) meta.push('commit <code>' + esc(i.commit.slice(0, 12)) + '</code>');
     meta.push('spec <code>' + esc(i.spec) + '</code>');
     if (i.requirement) meta.push('requirement \\u201c' + esc(i.requirement) + '\\u201d');
+    if (i.blocks) meta.push('blocks #' + esc(i.blocks));
+    if (i.blocked_because) meta.push('not workable: ' + esc(i.blocked_because));
     meta.push('<code>' + esc(i.file) + '</code>');
     el.innerHTML =
       '<div class="head"><span class="id">#' + esc(i.id) + '</span>' +
@@ -787,6 +1432,97 @@ def _cmd_html(args, root: Path) -> int:
     return 0
 
 
+def _cmd_ready(args, root: Path) -> int:
+    """The queue an agent may work, and why everything else is not in it."""
+    items, problems = load(root / BACKLOG_DIRNAME)
+    for problem in problems:
+        print(f"unparsed: {problem}", file=sys.stderr)
+    index = by_filename_id(items)
+    ready = [i for i in items if why_not_workable(i, index) is None]
+    for item in ready:
+        print(f"{item.filename_id:>4}  {item.status:<8}  {item.title}")
+    if not ready:
+        print("(nothing is ready to work)")
+    if args.explain:
+        print("", file=sys.stderr)
+        for item in items:
+            reason = why_not_workable(item, index)
+            if reason is not None:
+                print(f"{item.filename_id:>4}  not workable: {reason}",
+                      file=sys.stderr)
+    return 0
+
+
+def _cmd_new(args, root: Path) -> int:
+    evidence = args.evidence or ""
+    if args.evidence_file:
+        try:
+            evidence = Path(args.evidence_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"cannot read {args.evidence_file}: {exc}", file=sys.stderr)
+            return 1
+    try:
+        path = create_item(
+            root / BACKLOG_DIRNAME, title=args.title, evidence=evidence,
+            status=args.status, spec=args.spec, blocks=args.blocks,
+            why=args.why or "", notes=args.notes or "", slug=args.slug)
+    except BacklogFormatError as exc:
+        print(f"refusing to file this item: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"cannot write the item: {exc}", file=sys.stderr)
+        return 1
+    print(path)
+    # Validate what was just written, in the same breath. A tool that files an
+    # item the checker then rejects has moved the failure to whoever runs the
+    # suite next, with no clue that this command caused it.
+    remaining = [p for p in check(root) if p.startswith(path.name)]
+    if remaining:
+        for problem in remaining:
+            print(problem, file=sys.stderr)
+        print("the item was written, and it does not conform; fix it in place",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_approve(args, root: Path) -> int:
+    try:
+        path = approve_item(root / BACKLOG_DIRNAME, args.id)
+    except BacklogFormatError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"cannot rewrite the item: {exc}", file=sys.stderr)
+        return 1
+    print(f"{path.name}: {PROPOSED_STATUS} -> {OPEN_STATUS}")
+    return 0
+
+
+def _cmd_scrum(args, root: Path) -> int:
+    try:
+        mark = watermark_path(root)
+        recorded = read_watermark(mark)
+    except WatermarkError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    report = scrum_report(root, recorded)
+    print(format_scrum(report))
+    if args.peek:
+        print("\n(--peek: the watermark was left where it was, so the next "
+              "check-in covers this period again)")
+        return 0
+    try:
+        write_watermark(mark, report.head)
+    except WatermarkError as exc:
+        # Loudly, and with a non-zero exit. A check-in that reported fine and
+        # failed to move its watermark repeats itself next time, and a repeated
+        # report looks like a week in which nothing happened.
+        print(f"\n{exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="backlog",
@@ -805,6 +1541,43 @@ def main(argv=None) -> int:
 
     sub.add_parser("check", help="validate every item").set_defaults(
         func=_cmd_check)
+
+    p_ready = sub.add_parser(
+        "ready", help="the items an agent is allowed to work")
+    p_ready.add_argument("--explain", action="store_true",
+                         help="say why each other item is not in the queue")
+    p_ready.set_defaults(func=_cmd_ready)
+
+    p_new = sub.add_parser("new", help="file a new item")
+    p_new.add_argument("--title", required=True)
+    p_new.add_argument("--evidence", default=None,
+                       help="what was observed, when, and how to reproduce it")
+    p_new.add_argument("--evidence-file", default=None,
+                       help="read the evidence section from this file")
+    p_new.add_argument("--why", default=None, help="the 'Why it matters' body")
+    p_new.add_argument("--notes", default=None, help="the 'Notes' body")
+    p_new.add_argument("--status", choices=ACTIVE_STATUSES,
+                       default=PROPOSED_STATUS,
+                       help=f"default {PROPOSED_STATUS}: filing is not "
+                            "approving")
+    p_new.add_argument("--spec", default=NO_SPEC)
+    p_new.add_argument("--blocks", type=int, default=None,
+                       help="the approved item this one is blocking")
+    p_new.add_argument("--slug", default=None,
+                       help="override the slug derived from the title")
+    p_new.set_defaults(func=_cmd_new)
+
+    p_approve = sub.add_parser(
+        "approve", help=f"the product owner's act: {PROPOSED_STATUS} -> "
+                        f"{OPEN_STATUS}")
+    p_approve.add_argument("id", type=int)
+    p_approve.set_defaults(func=_cmd_approve)
+
+    p_scrum = sub.add_parser(
+        "scrum", help="what changed since the previous check-in")
+    p_scrum.add_argument("--peek", action="store_true",
+                         help="report without advancing the watermark")
+    p_scrum.set_defaults(func=_cmd_scrum)
 
     p_html = sub.add_parser("html", help="write a self-contained HTML view")
     p_html.add_argument("--out", default=None)
