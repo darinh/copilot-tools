@@ -1123,3 +1123,97 @@ def test_a_fresh_run_does_not_inherit_an_unaccounted_streak(
     assert len(launched) == op.MAX_UNACCOUNTED_SESSIONS, (
         "a fresh run is owed the full allowance, not the one session left "
         "over from the previous run")
+
+
+# ── whose exit code is it? ──────────────────────────────────────
+# An exit code only accounts for *this* session's ending if the launch
+# managed to clear the last one's. `start_session` clears it best-effort, and
+# the failure it forgives -- a file held open, a directory gone read-only --
+# leaves a code behind that reads exactly like the runner having watched this
+# session end. Trusting it would charge the killed session to idleness again,
+# which is the whole defect.
+def test_a_stale_exit_code_does_not_account_for_an_ending():
+    inst = op.Instance("stale-exit")
+    inst.exit_file.write_text("0", encoding="utf-8")
+    inst.exit_file_cleared = False
+
+    assert op.read_exit_code(inst) == 0, (
+        "the file is readable -- what is in doubt is who wrote it")
+    assert op.ending_was_observed(inst) is False
+
+
+def test_an_exit_code_from_this_session_accounts_for_its_ending():
+    inst = op.Instance("own-exit")
+    inst.exit_file.write_text("0", encoding="utf-8")
+
+    assert op.ending_was_observed(inst) is True
+
+
+def test_no_exit_code_at_all_accounts_for_nothing():
+    inst = op.Instance("no-exit")
+
+    assert op.ending_was_observed(inst) is False
+
+
+def test_launching_records_whether_the_previous_exit_code_was_cleared(
+        tmp_path, monkeypatch):
+    """The flag has to come from the launch that failed to clear the file.
+
+    Nothing later can reconstruct it: a stale code and a fresh one are the
+    same bytes, so the only moment the difference exists is the moment the
+    clear was attempted.
+    """
+    inst = op.Instance("unclearable")
+    inst.exit_file.write_text("0", encoding="utf-8")
+    real_unlink = op.Path.unlink
+
+    def refuse(self, *args, **kwargs):
+        if self.name == inst.exit_file.name:
+            raise PermissionError(13, "Permission denied")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(op, "copilot_executable", lambda: "copilot")
+    monkeypatch.setattr(op.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(op.Instance, "copilot_pid", lambda self: 4321)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(op.Path, "unlink", refuse)
+
+    op.start_session(inst, ["--agent", "test:agent"], 1, remain_on_exit=False)
+
+    assert inst.exit_file_cleared is False, (
+        "a clear that raised must not leave the loop trusting what it left")
+    assert op.ending_was_observed(inst) is False
+
+    monkeypatch.setattr(op.Path, "unlink", real_unlink)
+    op.start_session(inst, ["--agent", "test:agent"], 2, remain_on_exit=False)
+
+    assert inst.exit_file_cleared is True, (
+        "a launch that did clear the file must restore the loop's trust in "
+        "the next code it reads")
+
+
+def test_a_killed_session_with_a_stale_exit_code_is_still_unaccounted(
+        loop_in_repo, monkeypatch):
+    """The loop-level statement of the same thing.
+
+    The session is killed wholesale, but a previous code the launch could not
+    remove is sitting in the exit file. Charging it to idleness would stop
+    this loop at MAX_NOCHANGE_SESSIONS and blame the agent.
+    """
+    _age_past_healthy(monkeypatch)
+    launched: list[int] = []
+
+    def start(instance, args, session_num, remain_on_exit=False, preamble=""):
+        launched.append(session_num)
+        instance.exit_file.write_text("0", encoding="utf-8")
+        instance.exit_file_cleared = False
+
+    monkeypatch.setattr(op, "start_session", start)
+
+    inst = op.Instance("stale-code-killed")
+    rc = op.run_loop_mode(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert rc == op.EXIT_UNACCOUNTED
+    assert len(launched) == op.MAX_UNACCOUNTED_SESSIONS
+    assert inst.read_nochange_count() in (0, None), (
+        "an ending nobody can vouch for must not touch the idleness streak")

@@ -495,6 +495,11 @@ class Instance:
         self.display_name = display_name
         self.id = safe_instance_id(display_name)
         self.session = self.id
+        # Whether the last launch managed to clear the previous session's
+        # exit code. Only `start_session` can know, and only the loop asks;
+        # anything that never launches a session has nothing stale to read,
+        # which is why the optimistic value is the right default here.
+        self.exit_file_cleared = True
         RESTART_DIR.mkdir(parents=True, exist_ok=True)
 
     # -- file locations
@@ -1905,7 +1910,10 @@ def start_session(instance: Instance, copilot_args: list[str], session_num: int,
     argv = _ensure_usage_logging(argv)
 
     remove_file(instance.restart_marker)
-    remove_file(instance.exit_file)
+    # `remove_file` already logs the failure; what is recorded here is the
+    # consequence — an exit code surviving this point belongs to the session
+    # that just ended, not the one about to start.
+    instance.exit_file_cleared = remove_file(instance.exit_file)
     remove_file(instance.session_file)
 
     spec = write_launch_spec(instance, argv, cwd, session_num)
@@ -3592,8 +3600,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                             # With neither, nobody saw the session end — the
                             # signature of the whole pane being killed — and it
                             # is not chargeable evidence of an idle agent.
-                            ending_accounted_for = (
-                                read_exit_code(instance) is not None)
+                            ending_accounted_for = ending_was_observed(instance)
                             if uptime is not None and uptime >= HEALTHY_SESSION_SECONDS:
                                 # Healthy run, then death: whatever killed it,
                                 # it is not the startup failure the limit is
@@ -4508,13 +4515,33 @@ def read_exit_code(instance) -> int | None:
 
     Only call this once the session is gone. `start_session` clears the file
     at launch, but a clearing that failed would let a previous session's code
-    be read against a live one.
+    be read against a live one, so anything deciding whether *this* session's
+    ending was observed must go through :func:`ending_was_observed`.
     """
     try:
         raw = instance.exit_file.read_text(encoding="utf-8").strip()
         return int(raw) if raw else None
     except (OSError, ValueError):
         return None
+
+
+def ending_was_observed(instance) -> bool:
+    """Whether anything outlived this session far enough to record its end.
+
+    An exit code is only evidence about *this* session if the launch managed
+    to clear whatever the last one left behind. `start_session` clears the
+    file, but the clear is best-effort — a file held open or on a path that
+    has gone read-only survives it — and a stale code read against the next
+    session would say "somebody watched this end" about the exact case where
+    nobody did. Deciding it in the other direction costs a killed session
+    being counted against the wrong allowance; deciding it this way costs an
+    orderly exit being counted against the unaccounted one, which is bounded
+    too. Under a failure that already means the state directory is not
+    writable, the second is the one to take.
+    """
+    if not instance.exit_file_cleared:
+        return False
+    return read_exit_code(instance) is not None
 
 
 def _record_session_exit(instance, session_num: int,
