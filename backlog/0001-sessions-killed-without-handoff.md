@@ -225,8 +225,8 @@ Measured 2026-08-05T11:35Z, before anything was altered:
   pids unchanged, all created 2026-08-04 13:27:53–13:28:41. None has
   restarted.
 - `~/.operator/restart/` holds no `*.loopcode.json` for any instance, though
-  every instance has the `*.loopargs.json` written three lines earlier in the
-  same startup. The stamp has never been written.
+  every instance has the `*.loopargs.json` written by the neighbouring line of
+  the same startup path. The stamp has never been written.
 - `trace.jsonl` contains **zero** `supervisor_start` events over its whole
   history, and all 979 `session_exit` records read `code=unrecorded`.
 
@@ -261,6 +261,17 @@ reason. Verified against this machine rather than only in tests: the patched
 `operator list` names all six supervisors, where the shipped one printed
 nothing.
 
+Reporting the absence at all created a second problem, which adversarial
+review caught before this was published: the startup wrote the loop pid file
+*before* the code record, so an `operator ls` landing in that window would see
+a live supervisor with no record and tell a perfectly healthy one, running the
+newest code there is, to restart. A notice that is sometimes wrong stops being
+read — which is how this item got here. The three startup writes now live in
+`_publish_supervisor_records`, which writes the records first and the pid file
+last, making the pid file the commit point: once it exists, what describes it
+already does. The reverse window costs nothing, because every consumer gates
+on the pid file first.
+
 ### What the censored trace could still see: the kills
 
 The previous correction concluded that records after the boundary "cannot
@@ -275,29 +286,64 @@ nothing is the *handoff* branch. A session killed mid-turn leaves no restart
 marker, takes the `else`, and **is recorded** — by exactly the code that is
 running. The blind spot runs opposite to the question this item asks.
 
-So the boundary is testable with the instrument in place, and it was testable
-in 06:30Z too. Measured 2026-08-05T11:35Z:
+That is a statement about one branch, not a guarantee, and the difference
+matters on an item that has already survived three explanations that fitted.
+**A missing record is not by itself proof of a missing kill.** Four ways a
+kill could leave the trace empty, and what closes each of them here:
 
-- Across the six instances, `SESSION_NUM` has advanced 65 past the last
-  session each one has a `session_exit` for — so **at least 59 sessions have
-  ended** since 01:02:59Z.
-- `trace.jsonl` records `session_exit` for **none** of them. Under the running
-  code, that means every one of the 59 ended on the restart-marker branch,
-  i.e. by handoff.
-- The trace is not merely dead: it holds 50 `invoke`/`exit` records after the
-  boundary, the most recent 2026-08-05T11:34:41Z.
+1. *Recording is best-effort.* `_record_session_exit` wraps its whole body in
+   `except Exception: return`, so a kill whose record failed to write looks
+   exactly like no kill. Nothing in the trace can exclude this; it is why the
+   conclusion below rests on a second instrument rather than on this one.
+2. *The supervisor is killed along with its session.* Then no code runs to
+   record anything. Excluded by measurement: all six supervisors are the same
+   processes throughout the window, pids created 2026-08-04 13:27:53–13:28:41
+   and still alive at 12:13Z. Their pids (5928, 15584, 37256, 38140, 62628,
+   38268) are the very ones stamped on the last `session_exit` records the
+   trace holds — so the processes that recorded the final kills are still
+   running, and have recorded nothing since. No supervisor died; every ending
+   was observed by a live one.
+3. *The unreadable-marker path.* If the stop/detach markers cannot be examined,
+   the supervisor takes the `unknown_markers` branch, logs, and continues or
+   gives up without recording. Excluded: `operator.log` holds no
+   "markers cannot be examined" line and no `Giving up` line after the
+   boundary.
+4. *Shutdown mid-poll.* A signal arriving during the poll sleep leaves the loop
+   before the exit is classified. Excluded by the same log: a supervisor that
+   left its loop would have stopped launching sessions, and all six kept
+   launching.
 
-Corroborated by `operator.log`, which the same supervisors write through a
-different code path. After the boundary it holds **59 `restart signal
-detected!` and zero `copilot exited unexpectedly`** — no `Giving up`, and no
-unreadable-marker lines either. The 59 matches the count derived from
-`SESSION_NUM` exactly, from an instrument that shares no code with it. All
-time, that log holds 289 restart signals against **1150** unexpected exits, so
-it is demonstrably capable of recording the event whose absence is being
-claimed.
+Measured 2026-08-05T12:10Z, 11.1 hours after the boundary:
 
-**The kills stopped at 2026-08-05T01:02:59Z and have not resumed in the 10.7
-hours and 59 sessions since.** That is now a measurement rather than a hedge.
+- Across the six live instances, `SESSION_NUM` has advanced 66 past the last
+  session each has a `session_exit` for. One session per instance is still in
+  flight, so **60 sessions have ended** since 01:02:59Z.
+- `trace.jsonl` records `session_exit` for **none** of them.
+- The trace is not merely dead: it holds 52 other records after the boundary,
+  the most recent minutes before the measurement.
+
+The conclusion rests on `operator.log`, which the same supervisors write
+through a different code path, so a failure of the trace's recorder cannot
+also silence it. After the boundary that log holds **60 `restart signal
+detected!` and zero `copilot exited unexpectedly`**. Sixty derived endings,
+sixty restart signals, from two instruments that share no code: every ending
+in the window is individually accounted for as a handoff, leaving none
+unexplained for a kill to hide in. Over its whole life the same log holds 290
+restart signals against **1150** unexpected exits, so it is demonstrably
+capable of recording the event whose absence is being claimed.
+
+The two instruments also agree on the last kill itself. `operator.log` has
+`Session #36: copilot exited unexpectedly after 345s` at 18:02:59 local, and
+the final `session_exit` in the trace is `scripts` session 36 at
+2026-08-05T01:02:59Z. The boundary is a single event seen twice, not an
+artifact of where one instrument stops.
+
+**No kill has been observed by either instrument since 2026-08-05T01:02:59Z —
+11.1 hours and 60 sessions, every one of which is individually accounted for
+as a handoff.** That is a measurement rather than the previous hedge, and it
+is still a statement about what two instruments can see: hypothesis 1 above
+has no independent refutation, only the implausibility of 60 consecutive
+recorder failures that spared the log.
 
 What is still not established is *why*, and nothing here identifies the
 emitter — the fifth hypothesis is still owed. Two things about the boundary
@@ -322,4 +368,17 @@ unshipped fix:
 - `operator list` now names any supervisor whose code is stale or unrecorded.
   If it names one, that instance's records are pre-fix and the rule above
   applies to them.
+
+Two arithmetic traps, both of which produced a wrong sentence in this session
+before being caught:
+
+- **Compare against the boundary exclusively.** The last kill happened *at*
+  01:02:59Z, so `>=` counts it as post-boundary and reports one unexpected
+  exit in a window that has none. The same instant is the end of the old
+  regime, not the start of the new one.
+- **Subtract the sessions still in flight.** `SESSION_NUM` counts the session
+  currently running, so endings is the advance minus one per live instance —
+  66 across six instances is 60 endings, not 66. Getting this wrong breaks
+  the match against the log's restart-signal count, which is the whole
+  corroboration.
 

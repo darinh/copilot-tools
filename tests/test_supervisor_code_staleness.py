@@ -12,6 +12,7 @@ from __future__ import annotations
 import builtins
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -522,6 +523,57 @@ def test_tracing_never_raises_on_a_bad_code_argument(tmp_path):
         tmp_path, instance="proj", session=1, code=None)
 
 
+# ── the startup window ──────────────────────────────────────────
+def test_the_code_record_exists_by_the_time_the_pid_file_does(monkeypatch):
+    """The invariant that keeps the notice honest during startup.
+
+    Every consumer treats the loop pid file as "a supervisor is running", so
+    if it appears first there is a window in which a healthy supervisor
+    running the newest code reads as having recorded nothing -- and
+    `operator ls` tells it to restart. Observed as a real ordering bug: the
+    pid file used to be written three lines before the record.
+    """
+    inst = op.Instance("ordering")
+    seen = {}
+    real_write = op.Path.write_text
+
+    def spy(self, *args, **kwargs):
+        if self == inst.loop_pid_file:
+            seen["code_present_at_pid_write"] = inst.loop_code_file.exists()
+            seen["args_present_at_pid_write"] = inst.loop_args_file.exists()
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(op.Path, "write_text", spy)
+    op._publish_supervisor_records(inst, ["--agent", "x"])
+
+    assert seen["code_present_at_pid_write"] is True
+    assert seen["args_present_at_pid_write"] is True
+
+
+def test_publishing_writes_all_three_records(monkeypatch):
+    """The negative control for the ordering test above: an implementation
+    that satisfied the order by never writing the pid file at all would pass
+    it vacuously, because the spy would simply never fire."""
+    inst = op.Instance("published")
+    op._publish_supervisor_records(inst, [])
+
+    assert inst.loop_pid_file.exists()
+    assert inst.loop_code_file.exists()
+    assert inst.loop_args_file.exists()
+    assert inst.loop_pid_file.read_text(encoding="utf-8").strip() == str(
+        os.getpid())
+
+
+def test_a_supervisor_that_just_published_reads_as_current():
+    """End to end through the real files: publish, then ask the question
+    `operator ls` asks. Anything other than `current` here means a freshly
+    started supervisor would be told to restart itself."""
+    inst = op.Instance("freshstart")
+    op._publish_supervisor_records(inst, [])
+
+    assert op.loop_code_state(inst) == (op.CODE_CURRENT, [])
+
+
 # ── what an operator sees ───────────────────────────────────────
 def _snap(**over):
     snap = {"name": "proj", "loop_pid": 123, "session_live": True,
@@ -550,9 +602,15 @@ def test_an_unknown_verdict_is_not_reported_as_stale():
 def test_an_unrecorded_supervisor_is_called_out():
     """The case this check exists for and could not report: measured
     2026-08-05T11:35Z, all six running supervisors predated the record, so
-    every one read `unknown` and `operator ls` printed nothing at all."""
+    every one read `unknown` and `operator ls` printed nothing at all.
+
+    Asserts the label rather than the bare verdict string. `CODE_UNRECORDED`
+    *is* the word "unrecorded", so a summary that merely dumped the raw
+    verdict into the row would satisfy the looser assertion without the
+    notice ever having been written.
+    """
     summary = op._instance_summary(_snap(loop_code=op.CODE_UNRECORDED))
-    assert "unrecorded" in summary
+    assert "[supervisor code unrecorded]" in summary
 
 
 def test_an_unrecorded_supervisor_is_not_called_stale():
@@ -634,7 +692,13 @@ def test_an_unreadable_record_does_not_produce_the_notice(monkeypatch, capsys):
 def test_stale_and_unrecorded_are_reported_as_separate_reasons(
         monkeypatch, capsys):
     """Both need the same restart for different reasons, and one sentence
-    covering both would say something false about one of them."""
+    covering both would say something false about one of them.
+
+    Asserts that each instance is listed under *its own* reason, not that one
+    group is printed before the other. Pinning the group order would fail on
+    a refactor that swapped two correct blocks, which is a fact about today's
+    print statements rather than about the behaviour.
+    """
     monkeypatch.setattr(op, "active_instances",
                         lambda: [op.Instance("alpha"), op.Instance("beta")])
     snaps = {"alpha": _snap(name="alpha", loop_code=op.CODE_STALE),
@@ -645,10 +709,10 @@ def test_stale_and_unrecorded_are_reported_as_separate_reasons(
     op.list_instances()
     out = capsys.readouterr().out
 
-    assert "operator restart-loop alpha" in out
-    assert "operator restart-loop beta" in out
-    # The stale sentence must not be the one that introduces beta.
-    assert out.index("changed on disk") < out.index("did not record")
+    assert "changed on disk" in out
+    assert "did not record" in out
+    assert out.index("operator restart-loop alpha") > out.index("changed on disk")
+    assert out.index("operator restart-loop beta") > out.index("did not record")
 
 
 def test_the_listing_says_nothing_when_every_supervisor_is_current(

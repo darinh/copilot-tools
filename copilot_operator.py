@@ -2216,6 +2216,38 @@ def _save_loop_code(instance: Instance) -> None:
         log(f"  Warning: could not record the running operator code: {exc}")
 
 
+def _publish_supervisor_records(instance: Instance, user_args: list[str]) -> None:
+    """Write this supervisor's startup records, pid file last.
+
+    The order is the point, which is why these three writes live in one named
+    function instead of inline where they cannot be tested. Every other part
+    of the toolkit treats the loop pid file as the answer to "is a supervisor
+    running", so it is the *commit point*: once it exists, the records that
+    describe that supervisor already do.
+
+    Written the other way round -- which is how it was -- a concurrent
+    ``operator ls`` lands between the pid file and the code record and sees a
+    live supervisor that has recorded nothing, which is now a reportable
+    state. It would tell a perfectly healthy supervisor, running the newest
+    code there is, to restart. The window is short and the consequence is
+    only a printed line, but a notice that is sometimes wrong is the kind
+    that stops being read, and this one exists precisely because the previous
+    one said nothing.
+
+    Reversing it costs nothing: the failure it introduces is a record with no
+    pid file, and every consumer gates on the pid file first, so nothing ever
+    looks at it.
+    """
+    # Recorded so this supervisor can be replaced later without guessing how
+    # it was started. Written every time, so it tracks the live invocation.
+    _save_loop_args(instance, user_args)
+    # ...and which operator source it is actually running. A supervisor keeps
+    # the code it imported for the whole run, so this is the only place the
+    # answer is still knowable.
+    _save_loop_code(instance)
+    instance.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
+
 def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
     """Is the supervisor running the code that is on disk now?
 
@@ -3689,14 +3721,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     unknown_markers = 0
     resume_id_used = ""
     adopting = adopt
-    instance.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
-    # Recorded so this supervisor can be replaced later without guessing how
-    # it was started. Written every time, so it tracks the live invocation.
-    _save_loop_args(instance, user_args)
-    # ...and which operator source it is actually running. A supervisor keeps
-    # the code it imported for the whole run, so this is the only place the
-    # answer is still knowable.
-    _save_loop_code(instance)
+    _publish_supervisor_records(instance, user_args)
     operator_trace.record_supervisor_start(
         OPERATOR_HOME, instance=instance.display_name,
         session=start_session_num, code=running_code_fingerprint())
