@@ -39,6 +39,7 @@ Three properties are load-bearing, and each of them is a scar:
 from __future__ import annotations
 
 import hashlib
+import ntpath
 import os
 import re
 import tempfile
@@ -102,7 +103,17 @@ GATE = re.compile(r"^\*Enabled by feature flag: `(?P<slug>[a-z0-9-]+)`\*\s*$",
                   re.MULTILINE)
 
 _H2 = re.compile(r"^## (?P<title>.+?)\s*$")
-_FENCES = ("```", "~~~")
+
+#: A fence is a run of at least three backticks or tildes. The *run* is
+#: captured, not a fixed three characters: a block opened with ```` may
+#: contain ``` lines, and CommonMark closes it only on a run of the same
+#: character at least as long, with nothing but whitespace after it. Reading
+#: an inner ``` as the close puts the rest of the example back into the
+#: document as prose -- and the examples in this template have `## ` headings
+#: at column zero, so those fragments then become sections with no gate on
+#: them, which is how content for a feature that is *off* gets emitted.
+_FENCE_OPEN = re.compile(r"^(?P<run>`{3,}|~{3,})")
+_FENCE_INFO_TICK = "`"
 
 
 # --------------------------------------------------------------------------
@@ -115,6 +126,70 @@ class Section:
 
     title: str
     body: str
+
+
+def _basename(path: str) -> str:
+    """The last component of a path written in *either* platform's syntax.
+
+    ``ntpath`` rather than ``os.path``: a catalog row is written in the native
+    form of the machine that created it, and this toolkit runs on both. On
+    Linux ``os.path.basename(r"C:\\repos\\app")`` is the whole string, because
+    a backslash is an ordinary filename character there — so the label would
+    be the full path. ``ntpath`` is pure syntax and understands both
+    separators and drive prefixes, so it is the union of the two rather than a
+    guess at which one this row came from.
+    """
+    return ntpath.basename(str(path).rstrip("/\\"))
+
+
+def _closes_fence(stripped: str, opening: str) -> bool:
+    """Whether a line ends the fence opened by ``opening``.
+
+    CommonMark's rule, not ``startswith``: the same character, a run at least
+    as long, and nothing but whitespace afterwards. All three matter here.
+    Same-character, because ``~~~`` does not close ```` ``` ````. At least as
+    long, because a ``` line inside a ```` block is content. And no info
+    string, because ```` ```python ```` opens a nested block rather than
+    closing the outer one -- which is exactly the shape a document about
+    writing Markdown contains.
+    """
+    opened = _FENCE_OPEN.match(stripped)
+    if opened is None:
+        return False
+    run = opened.group("run")
+    if run[0] != opening[0] or len(run) < len(opening):
+        return False
+    rest = stripped[len(run):]
+    if opening[0] == _FENCE_INFO_TICK:
+        return rest.strip() == ""
+    # A tilde fence may carry an info string on the opening line, so a closing
+    # tilde run is only a close when nothing follows it either way.
+    return rest.strip() == ""
+
+
+def outside_fences(text: str):
+    """Yield ``(index, line)`` for every line that is not inside a fence.
+
+    Marker hunting has to use this. A repository's own ``AGENTS.md`` may well
+    contain this toolkit's marker lines *as an example* -- documentation about
+    the managed block is the obvious case -- and a raw substring search reads
+    that sample as a real managed block. The consequence is not cosmetic:
+    ``_place_one`` skips the consent prompt when it believes a managed block
+    is present, and ``compose`` then overwrites everything between the two
+    sampled lines. That is user content destroyed without being asked.
+    """
+    fence = ""
+    for index, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        if fence:
+            if _closes_fence(stripped, fence):
+                fence = ""
+            continue
+        opened = _FENCE_OPEN.match(stripped)
+        if opened is not None:
+            fence = opened.group("run")
+            continue
+        yield index, line
 
 
 def split_sections(text: str) -> "tuple[str, list[Section]]":
@@ -143,13 +218,14 @@ def split_sections(text: str) -> "tuple[str, list[Section]]":
     for line in text.splitlines(keepends=True):
         stripped = line.strip()
         if fence:
-            if stripped.startswith(fence):
+            if _closes_fence(stripped, fence):
                 fence = ""
             target = body if title is not None else preamble
             target.append(line)
             continue
-        if any(stripped.startswith(marker) for marker in _FENCES):
-            fence = stripped[:3]
+        opened = _FENCE_OPEN.match(stripped)
+        if opened is not None:
+            fence = opened.group("run")
             target = body if title is not None else preamble
             target.append(line)
             continue
@@ -263,8 +339,38 @@ def render(*, source: str, values: dict, guid: str, project_path: str,
 # Placing it in a repository
 # --------------------------------------------------------------------------
 
+def _marker_offsets(existing: str) -> "tuple[list[int], list[int]]":
+    """Byte offsets of the begin and end markers that are really markers.
+
+    Two narrowings, and both close a way to destroy a repository's own file:
+
+    Markers inside a fenced block do not count. An ``AGENTS.md`` that
+    *documents* the managed block quotes these lines in a code sample, and
+    reading that sample as a live block means ``_place_one`` skips the consent
+    prompt and ``compose`` overwrites the sample and everything between.
+
+    A marker must also be the whole line. ``MANAGED_BEGIN in existing`` is
+    true of a sentence that merely mentions it, and prose is not a delimiter.
+    """
+    begins: list[int] = []
+    ends: list[int] = []
+    offset = 0
+    lines = existing.splitlines(keepends=True)
+    plain = {index for index, _ in outside_fences(existing)}
+    for index, line in enumerate(lines):
+        if index in plain:
+            stripped = line.strip()
+            if stripped == MANAGED_BEGIN:
+                begins.append(offset)
+            elif stripped == MANAGED_END:
+                ends.append(offset + len(line.rstrip("\r\n")))
+        offset += len(line)
+    return begins, ends
+
+
 def managed_block_present(existing: str) -> bool:
-    return MANAGED_BEGIN in existing and MANAGED_END in existing
+    begins, ends = _marker_offsets(existing)
+    return bool(begins) or bool(ends)
 
 
 def compose(existing: "str | None", managed: str) -> str:
@@ -282,22 +388,20 @@ def compose(existing: "str | None", managed: str) -> str:
     """
     if existing is None or not existing.strip():
         return managed
-    begins = existing.count(MANAGED_BEGIN)
-    ends = existing.count(MANAGED_END)
-    if begins == 0 and ends == 0:
+    begins, ends = _marker_offsets(existing)
+    if not begins and not ends:
         return existing.rstrip("\n") + "\n\n" + managed
-    if begins != 1 or ends != 1:
+    if len(begins) != 1 or len(ends) != 1:
         raise InstructionsError(
-            f"found {begins} '{MANAGED_BEGIN}' and {ends} '{MANAGED_END}' "
-            "markers; expected one of each. Fix them by hand — refusing to "
-            "guess which block is the live one.")
-    start = existing.index(MANAGED_BEGIN)
-    stop = existing.index(MANAGED_END)
+            f"found {len(begins)} '{MANAGED_BEGIN}' and {len(ends)} "
+            f"'{MANAGED_END}' markers; expected one of each. Fix them by "
+            "hand — refusing to guess which block is the live one.")
+    start = begins[0]
+    stop = ends[0]
     if stop < start:
         raise InstructionsError(
             "the managed-conventions end marker comes before its begin "
             "marker. Fix them by hand.")
-    stop += len(MANAGED_END)
     tail = existing[stop:]
     return existing[:start] + managed.rstrip("\n") + tail
 
@@ -536,7 +640,7 @@ def _place_one(project: dict, *, source: str, version: str, projects_root,
                decide) -> ProjectOutcome:
     guid = project["guid"]
     root = Path(project["path"])
-    label = project.get("label") or root.name or project["path"]
+    label = project.get("label") or _basename(project["path"]) or project["path"]
     present = path_present(root)
     if present is False:
         return ProjectOutcome(guid, project["path"], label, MISSING,

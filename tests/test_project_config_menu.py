@@ -607,3 +607,65 @@ def test_the_template_is_the_one_shipped_beside_the_operator():
     assert path.name == project_instructions.TEMPLATE_NAME
     assert path.parent.name == "templates"
     assert copilot_operator.path_present(path) is True
+
+
+def test_a_catalog_row_that_will_not_parse_stops_the_removal(
+        catalog, monkeypatch, capsys, home):
+    """A row that cannot be read is not a row naming no project.
+
+    Three reviewers found this independently. The screen printed the skipped
+    rows, said the file would stay, and then retired it anyway — so a machine
+    with one malformed catalog line lost the conventions for whatever project
+    that line named. The failure mode must be a duplicate, never a gap.
+    """
+    _plant_global(home)
+    catalog.write_text(f'"/a/one",{GUID}\nnonsense-with-no-comma\n',
+                       encoding="utf-8")
+    monkeypatch.setattr(project_instructions, "retire",
+                        lambda *a, **k: pytest.fail(
+                            "retired despite an unparseable catalog row"))
+    assert copilot_operator.retire_user_instructions(assume_yes=True) == 1
+    assert copilot_operator.user_instructions_present() is True
+    assert "stays" in capsys.readouterr().err
+
+
+def test_a_clean_catalog_is_not_treated_as_a_partial_read(catalog, monkeypatch,
+                                                          home):
+    """The control: the refusal above must not block the ordinary case."""
+    _plant_global(home)
+    catalog.write_text(f'"/a/one",{GUID}\n', encoding="utf-8")
+    seen = []
+
+    class _Result:
+        removed = True
+        archived = None
+        problems: list = []
+        blockers: list = []
+        user_agents: list = []
+
+    monkeypatch.setattr(project_instructions, "retire",
+                        lambda *a, **k: seen.append(True) or _Result())
+    monkeypatch.setattr(project_instructions, "resolve_source",
+                        lambda *a, **k: ("# text\n", "the repository template"))
+    assert copilot_operator.retire_user_instructions(assume_yes=True) == 0
+    assert seen == [True]
+
+
+def test_an_unreadable_catalog_removes_nothing(catalog, monkeypatch, home):
+    _plant_global(home)
+    monkeypatch.setattr(copilot_operator, "catalog_projects",
+                        lambda: copilot_operator.CATALOG_UNREADABLE)
+    monkeypatch.setattr(project_instructions, "retire",
+                        lambda *a, **k: pytest.fail("retired blindly"))
+    assert copilot_operator.retire_user_instructions(assume_yes=True) == 1
+    assert copilot_operator.user_instructions_present() is True
+
+
+def test_an_empty_catalog_removes_nothing(catalog, monkeypatch, home):
+    """Removing it with no project registered takes it off the machine."""
+    _plant_global(home)
+    catalog.write_text("", encoding="utf-8")
+    monkeypatch.setattr(project_instructions, "retire",
+                        lambda *a, **k: pytest.fail("retired with no projects"))
+    assert copilot_operator.retire_user_instructions(assume_yes=True) == 1
+    assert copilot_operator.user_instructions_present() is True

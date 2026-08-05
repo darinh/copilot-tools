@@ -4790,8 +4790,14 @@ def retire_user_instructions(assume_yes: bool = False) -> int:
     if problems:
         for problem in problems:
             print(f"    ! {problem}")
-        print("  Those rows name projects that cannot be given an "
-              f"{project_instructions.AGENTS_NAME}, so the file above stays.")
+        print(f"\n  Those rows name projects that cannot be given an "
+              f"{project_instructions.AGENTS_NAME}, so {global_path} stays.",
+              file=sys.stderr)
+        print("  A row that will not parse is not a row naming no project. "
+              "Removing the file while one of them is unreadable would take "
+              "the conventions away from a project that never got them.",
+              file=sys.stderr)
+        return 1
     if not projects:
         print(f"\n  No projects registered in {project_catalog_path()}. "
               "Removing the file now would take the conventions off this "

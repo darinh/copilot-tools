@@ -130,12 +130,16 @@ Manifest: /home/you/.operator/install-manifest.json
 
 Deployed artifacts:
   templates/mcp-config.json           1.0.0  up to date
-  templates/copilot-instructions.md   1.0.0  outdated (unmodified — safe to update)
   skills/operator-agents                  —  not installed
+
+Retired artifacts:
+  ~/.copilot/copilot-instructions.md         still present
+    Read by every session on this machine. `operator projects retire`
+    gives each project its own AGENTS.md and takes this away.
 ```
 
-Exits `1` when anything needs updating, so it works in a shell conditional.
-It writes nothing.
+Exits `1` when anything needs updating — including a retired artifact still
+sitting there — so it works in a shell conditional. It writes nothing.
 
 This is the answer to "I pulled on my other machine — do I need to re-run
 setup?"
@@ -168,6 +172,13 @@ Two rules:
 - **Be idempotent.** A partially applied upgrade may be run again.
 - **Check before you touch.** The state you are migrating may not exist on a
   machine that skipped several versions.
+
+A third, for anything that would *remove* state: an upgrade is not consent.
+`upgrade_v1_3_0_to_v1_4_0` is the worked example — it finds
+`~/.copilot/copilot-instructions.md`, which this version stopped deploying,
+and only names it and the command that retires it. Deleting it there would
+take a machine's conventions away during a `git pull`, before anything had
+been written to replace them.
 
 ### When they run
 

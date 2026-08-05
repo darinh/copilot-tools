@@ -15,6 +15,7 @@ started deleting files it had not replaced.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -706,3 +707,226 @@ def test_the_archive_directory_is_never_pruned_by_this_module():
     # `preserve`, and one for the global file itself. Anything more is a
     # deletion nobody argued for.
     assert len(unlinks) == 3, f"unexpected deletions: {unlinks}"
+
+
+# ---------------------------------------------------------------------------
+# Fences, markers and labels: the review round
+#
+# Every test below is a defect three adversarial reviewers found in code that
+# already had 55 passing tests over it. They are kept apart from the sections
+# above so the next reader can see what the first pass did not think of.
+# ---------------------------------------------------------------------------
+
+def test_a_four_tick_fence_is_not_closed_by_an_inner_three_tick_line():
+    """CommonMark closes a fence on a run at least as long, not any run.
+
+    A document about writing Markdown -- which this template is -- wraps
+    triple-tick examples in a four-tick fence. Reading the inner ``` as the
+    close puts the rest of the example back into the document as prose, and
+    the examples here carry `## ` headings at column zero, so those fragments
+    become sections with no gate marker on them. Content for a feature that
+    is *off* is then emitted.
+    """
+    text = (
+        "## Kept\n"
+        "````markdown\n"
+        "```python\n"
+        "x = 1\n"
+        "```\n"
+        "## Not a heading\n"
+        "````\n"
+        "tail\n"
+    )
+    _preamble, sections = pi.split_sections(text)
+    assert [s.title for s in sections] == ["Kept"]
+    assert "## Not a heading" in sections[0].body
+
+
+def test_the_four_tick_case_would_fail_a_three_character_fence_tracker():
+    """The control for the test above.
+
+    A tracker that stored only ``stripped[:3]`` closes on the inner ``` and
+    produces a second section. Asserting that here means the test above is
+    pinned to the fix rather than to an implementation that never had the bug.
+    """
+    text = (
+        "## Kept\n````\n```\n## Not a heading\n```\n````\n"
+    )
+    naive = [line for line in text.splitlines() if line.startswith("## ")]
+    assert len(naive) == 2, "the input must contain the trap being tested"
+
+
+def test_a_tilde_fence_is_not_closed_by_backticks():
+    text = "## One\n~~~\n```\n## Inside\n```\n~~~\n"
+    _preamble, sections = pi.split_sections(text)
+    assert [s.title for s in sections] == ["One"]
+
+
+def test_a_closing_run_may_be_longer_than_the_opening_one():
+    text = "## One\n```\nbody\n`````\n## Two\n"
+    _preamble, sections = pi.split_sections(text)
+    assert [s.title for s in sections] == ["One", "Two"]
+
+
+def test_a_fence_line_with_an_info_string_does_not_close_a_fence():
+    """```` ```python ```` opens; it never closes."""
+    text = "## One\n```\n```python\n## Inside\n```\n## Two\n"
+    _preamble, sections = pi.split_sections(text)
+    assert [s.title for s in sections] == ["One", "Two"]
+
+
+def test_the_real_template_still_splits_into_its_gated_sections(template):
+    """The fence rewrite must not have changed the document it exists for."""
+    _preamble, sections = pi.split_sections(template)
+    slugs = [pi.gate_slug(s.body) for s in sections]
+    assert set(s for s in slugs if s) == set(project_features.SLUGS)
+
+
+def test_markers_quoted_in_a_code_sample_are_not_a_managed_block():
+    """An AGENTS.md that documents this toolkit is not one it wrote.
+
+    Treating the sample as a live block is not cosmetic: it makes
+    ``managed_block_present`` true, which skips the consent prompt, and then
+    ``compose`` replaces everything between the two sampled lines. That is
+    the user's own file destroyed without being asked.
+    """
+    existing = (
+        "# My conventions\n\n"
+        "copilot-tools writes a block delimited like this:\n\n"
+        "```\n"
+        f"{pi.MANAGED_BEGIN}\n"
+        "...generated conventions...\n"
+        f"{pi.MANAGED_END}\n"
+        "```\n\n"
+        "Keep the rest.\n"
+    )
+    assert pi.managed_block_present(existing) is False
+    out = pi.compose(existing, "MANAGED\n")
+    assert "...generated conventions..." in out, "the sample was clobbered"
+    assert out.startswith(existing.rstrip("\n"))
+    assert out.rstrip("\n").endswith("MANAGED")
+
+
+def test_a_marker_merely_mentioned_in_prose_is_not_a_delimiter():
+    existing = (
+        f"We do not use the {pi.MANAGED_BEGIN} marker here.\n"
+    )
+    assert pi.managed_block_present(existing) is False
+    out = pi.compose(existing, "MANAGED\n")
+    assert existing.rstrip("\n") in out
+
+
+def test_a_real_marker_pair_is_still_found_and_replaced():
+    """The control: the narrowing above must not have switched detection off."""
+    existing = (
+        "# Mine\n\n"
+        f"{pi.MANAGED_BEGIN}\n"
+        "OLD\n"
+        f"{pi.MANAGED_END}\n\n"
+        "# Also mine\n"
+    )
+    assert pi.managed_block_present(existing) is True
+    out = pi.compose(existing, "NEW\n")
+    assert "OLD" not in out
+    assert "NEW" in out
+    assert out.startswith("# Mine\n")
+    assert out.endswith("# Also mine\n")
+
+
+def test_a_marker_line_with_trailing_whitespace_still_counts():
+    existing = (
+        f"{pi.MANAGED_BEGIN}  \nOLD\n"
+        f"  {pi.MANAGED_END}\t\n"
+    )
+    out = pi.compose(existing, "NEW\n")
+    assert "OLD" not in out and "NEW" in out
+
+
+def test_a_lone_begin_marker_is_refused_rather_than_appended_to():
+    existing = f"# Mine\n\n{pi.MANAGED_BEGIN}\nOLD\n"
+    with pytest.raises(pi.InstructionsError):
+        pi.compose(existing, "NEW\n")
+
+
+def test_a_windows_path_label_survives_a_posix_basename(tmp_path):
+    """``Path("C:\\a\\b").name`` is the whole string on Linux.
+
+    Catalog rows are written in the native form of the machine that made
+    them, so a Windows row read on Linux must still label as ``b``. These
+    assertions can only *fail* on a POSIX leg — on Windows ``pathlib`` agrees
+    with ``ntpath`` for these inputs — which is why the source scan below
+    exists as well.
+    """
+    assert pi._basename(r"C:\repos\my-app") == "my-app"
+    assert pi._basename("/home/dev/my-app") == "my-app"
+    assert pi._basename("/home/dev/my-app/") == "my-app"
+    assert pi._basename(r"C:\repos\my-app\\") == "my-app"
+
+
+def test_the_label_cases_would_catch_an_os_path_basename():
+    """The control for the test above, on this platform's os.path."""
+    import posixpath
+    assert posixpath.basename(r"C:\repos\my-app") == r"C:\repos\my-app"
+
+
+def test_no_path_string_is_split_with_the_running_platforms_syntax():
+    """A scan, because the behavioural test above is blind on Windows.
+
+    ``os.path`` is an alias for whichever of ``posixpath``/``ntpath`` is
+    running, so it is the wrong tool for a string that may name the *other*
+    platform's syntax — and every catalog row here is such a string. On
+    Windows ``pathlib`` and ``ntpath`` agree, so a green local suite says
+    nothing; this fires on every leg.
+
+    It reads the parsed tree rather than the text, because the text also
+    contains the *explanation* of why not to do this — a substring scan
+    would trip on the docstring that documents the rule.
+    """
+    source = (Path(__file__).resolve().parent.parent
+              / "project_instructions.py").read_text(encoding="utf-8")
+    banned = {("os", "path", "basename"), ("os", "path", "dirname"),
+              ("os", "path", "split"), ("posixpath", "basename")}
+    found = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Attribute):
+            parts = _dotted(node)
+            if parts in banned:
+                found.add(".".join(parts))
+    assert not found, (
+        f"{sorted(found)} read the running platform's syntax; catalog paths "
+        "may be written in the other one. Use ntpath.")
+    assert "ntpath" in {alias.name for node in ast.walk(ast.parse(source))
+                        if isinstance(node, ast.Import)
+                        for alias in node.names}
+
+
+def _dotted(node) -> tuple:
+    """``os.path.basename`` -> ``("os", "path", "basename")``; else ``()``."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return ()
+    parts.append(node.id)
+    return tuple(reversed(parts))
+
+
+def test_the_scan_above_would_notice_the_wrong_spelling():
+    """Positive control: a detector that matches nothing reports clean.
+
+    The banned call is fed through the same tree walk, so this fails if the
+    walk stops finding anything — which is the way that scan dies silently.
+    """
+    tree = ast.parse("import os\nname = os.path.basename(p)\n")
+    hits = {".".join(_dotted(n)) for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute)}
+    assert "os.path.basename" in hits
+
+
+def test_the_scan_above_does_not_fire_on_the_portable_spelling():
+    """Negative control: ``ntpath.basename`` must pass the same walk."""
+    tree = ast.parse("import ntpath\nname = ntpath.basename(p)\n")
+    hits = {".".join(_dotted(n)) for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute)}
+    assert hits == {"ntpath.basename"}
