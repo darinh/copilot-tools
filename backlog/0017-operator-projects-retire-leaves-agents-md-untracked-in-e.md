@@ -1,8 +1,10 @@
 ---
 id: 17
 title: operator projects retire leaves AGENTS.md untracked in every project it writes
-status: open
+status: closed
 opened: 2026-08-05
+closed: 2026-08-05
+commit: 0047d1f
 spec: none
 ---
 
