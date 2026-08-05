@@ -1,8 +1,10 @@
 ---
 id: 8
 title: A mistyped operator subcommand starts a session instead of erroring
-status: proposed
+status: closed
 opened: 2026-08-05
+closed: 2026-08-05
+commit: 2d0e84d
 spec: none
 ---
 
@@ -29,3 +31,60 @@ It also degrades the tool's own error reporting: `operator ls` cannot ever tell 
 Found incidentally while smoke-testing the supervisor code fingerprint against the real machine (merge 6d2385c); unrelated to that change and present well before it.
 
 The fix is not simply 'reject unknown heads': bare `operator NAME` starting or joining an instance is a deliberate and useful shorthand. The distinction worth drawing is probably that a head which looks like a subcommand typo -- close to a known one by edit distance, or not a valid instance name, or matching no existing instance while stdin is not a tty -- should be refused with a suggestion, while an unambiguous instance name keeps working.
+
+## Delivered
+
+Landed in `2d0e84d` (three commits on `fix/operator-subcommand-typo`).
+
+`_dispatch_command` no longer falls through to `run_dispatch` for a head that
+looks like a mistyped subcommand. It prints what was meant, names the escape
+hatch, and returns 1 without touching any state -- mirroring the refusal
+`operator projects <typo>` already gave one level down. It applies whatever
+follows the head, because `operator stopp NAME` is the more dangerous shape,
+not a lesser one.
+
+The item asked for the harder half of this, and it is where all the work went:
+refusing a typo without refusing a prompt. `operator [copilot-args...]` is
+documented, so every word claimed wrongly is a working invocation taken away.
+Three rules, each modelling one class of mistake:
+
+- **A prefix of at least three characters** -- a truncation (`sto`, `log`).
+  Two characters is not evidence: `in`, `re`, `he` and `me` all prefix a
+  subcommand and all start ordinary sentences.
+- **One Damerau-Levenshtein edit** -- the single-slip model. Damerau because a
+  transposition is one finger slip and two ordinary edits, and `jion`, `sedn`
+  and `verison` are all transpositions.
+- **A word another tool spells for the same job**, enumerated rather than
+  guessed at. `ls` is not a typo of `list`; it is correct spelling from a
+  different program, and no distance measure reaches it.
+
+Together the first two give the property that keeps project names safe: a
+prefix is never longer than what it prefixes and one edit cannot span a length
+gap of two, so **a name two or more characters longer than a subcommand can
+never be refused**. That is the shape of almost every real instance name.
+
+Measured over 63 realistic prompts and 30 typos: 2 refused (`lint` and `end`,
+each genuinely one keystroke from a subcommand and recoverable through the
+escape hatch the message names), 0 typos missed.
+
+`SUBCOMMANDS` is now the single source of truth and `RESERVED_WORDS` derives
+from it. The hand-maintained second copy had already drifted -- `send` and
+`inbox` were dispatched and missing from it -- and nothing broke, which is
+exactly the silence that lets the next omission be a real one.
+
+Verification: 3103 passed, 10 skipped (baseline 3017/10), 36/36
+cross-platform. Two adversarial review rounds across three models, and the
+first round was the valuable one: all three independently rejected the first
+implementation, which scored `difflib` similarity ratios and refused ten of
+thirty ordinary one-word prompts -- including `operator myproject`, the
+documented quick-join, at 0.82. A guard against an unwanted session start that
+instead refuses the documented shorthand has taken more away than it gave.
+
+Round two found a length floor missing from the replacement (`operator in the
+parser ...` was refused), two aliases that gave actively bad advice --
+`quit`/`exit` pointed at `stop`, and bare `operator stop` kills every managed
+instance without asking; `cat`/`tail` pointed at `logs`, which cannot display
+a log at all -- and a property test whose inputs were five characters longer
+than the boundary it claimed to pin, so widening the edit threshold left it
+green. Each is fixed, and the predicate is now mutation-tested: five mutants,
+all killed, where two survived before.
