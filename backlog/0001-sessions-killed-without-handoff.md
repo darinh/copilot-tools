@@ -269,8 +269,19 @@ newest code there is, to restart. A notice that is sometimes wrong stops being
 read — which is how this item got here. The three startup writes now live in
 `_publish_supervisor_records`, which writes the records first and the pid file
 last, making the pid file the commit point: once it exists, what describes it
-already does. The reverse window costs nothing, because every consumer gates
-on the pid file first.
+already does. The reverse window costs nothing, because nothing treats a
+supervisor as running on the strength of a record alone.
+
+Two of the three reviewers read that reordering as *introducing* a race in
+which a starting supervisor is invisible to `operator stop` and
+`operator restart-loop`. The race is real and is now item 0010; the
+attribution is not. The pid file is written near the end of a startup whose
+floor — interpreter plus import, nothing else — measures 105 ms, and moving
+the write after the two records costs 1.9 ms of that, 1.8%. Reverting the
+order would leave the window essentially unchanged and bring back the false
+notice. Worth recording as its own small lesson: **a plausible cause offered
+by review still has to be measured**, which is the same discipline this item
+has needed four times now.
 
 ### What the censored trace could still see: the kills
 
@@ -361,10 +372,14 @@ unshipped fix:
 - `operator.log`: count `restart signal detected!` against `copilot exited
   unexpectedly` after your boundary. Non-zero unexpected exits means the
   kills are back.
-- `trace.jsonl`: any `session_exit` at all after your boundary is a kill under
-  pre-fix supervisors. Once a supervisor has been restarted onto post-fix
-  code, its records carry `code=` and both endings appear, so check
-  `markers.restart` before reading a record as a kill.
+- `trace.jsonl`: under pre-fix supervisors a `session_exit` record means a
+  *non-handoff* ending, not necessarily a kill — `operator stop-session` and
+  any other deliberate teardown take the same branch. Treat a post-boundary
+  record as a lead and corroborate it against `operator.log`, which
+  distinguishes `copilot exited unexpectedly` from a requested stop, before
+  calling it a kill. Once a supervisor has been restarted onto post-fix code,
+  its records carry `code=` and both endings appear, so check
+  `markers.restart` too.
 - `operator list` now names any supervisor whose code is stale or unrecorded.
   If it names one, that instance's records are pre-fix and the rule above
   applies to them.

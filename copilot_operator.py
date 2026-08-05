@@ -2220,10 +2220,12 @@ def _publish_supervisor_records(instance: Instance, user_args: list[str]) -> Non
     """Write this supervisor's startup records, pid file last.
 
     The order is the point, which is why these three writes live in one named
-    function instead of inline where they cannot be tested. Every other part
-    of the toolkit treats the loop pid file as the answer to "is a supervisor
-    running", so it is the *commit point*: once it exists, the records that
-    describe that supervisor already do.
+    function instead of inline where they cannot be tested. Every reader of
+    the *code record* gates on the loop pid file first — `_instance_summary`
+    and `list_instances` both require `snap["loop_pid"]` before they will say
+    anything about `loop_code` — so among those readers the pid file is the
+    commit point: once it exists, the record describing that supervisor
+    already does.
 
     Written the other way round -- which is how it was -- a concurrent
     ``operator ls`` lands between the pid file and the code record and sees a
@@ -2234,9 +2236,18 @@ def _publish_supervisor_records(instance: Instance, user_args: list[str]) -> Non
     that stops being read, and this one exists precisely because the previous
     one said nothing.
 
-    Reversing it costs nothing: the failure it introduces is a record with no
-    pid file, and every consumer gates on the pid file first, so nothing ever
-    looks at it.
+    The args record has a different reader: `restart_loop` gates on the live
+    session rather than on the pid file, and refuses when no args are
+    recorded. Writing args first shrinks that window too, so the reordering
+    is an improvement there rather than a trade.
+
+    What this ordering does **not** do is make a starting supervisor visible.
+    The pid file is written near the end of a startup that already takes
+    upwards of 105 ms, and until it exists `_running_loop_pid` reports that
+    nothing is running -- which `operator stop` and `operator restart-loop`
+    both act on. That window predates this function; moving the write later
+    costs a measured 1.9 ms of it. It is backlog item 0010, and it is not
+    fixable by ordering these three writes.
     """
     # Recorded so this supervisor can be replaced later without guessing how
     # it was started. Written every time, so it tracks the live invocation.

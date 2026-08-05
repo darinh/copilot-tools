@@ -551,9 +551,16 @@ def test_the_code_record_exists_by_the_time_the_pid_file_does(monkeypatch):
 
 
 def test_publishing_writes_all_three_records(monkeypatch):
-    """The negative control for the ordering test above: an implementation
-    that satisfied the order by never writing the pid file at all would pass
-    it vacuously, because the spy would simply never fire."""
+    """The companion to the ordering test above: it asserts the writes happen
+    at all.
+
+    The ordering test cannot be satisfied by an implementation that never
+    writes the pid file -- its spy would not fire and the assertion would
+    raise `KeyError` rather than pass -- so this is not a vacuity guard. It
+    is here because a `KeyError` names the dictionary, not the defect, and
+    the next person to see it should have a second failure that says which
+    file went missing.
+    """
     inst = op.Instance("published")
     op._publish_supervisor_records(inst, [])
 
