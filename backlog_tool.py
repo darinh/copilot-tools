@@ -4,10 +4,10 @@ Why this exists
 ---------------
 
 Open work in a Copilot-tools project survives only in
-``~/.operator/projects/{guid}/next-session.md``, which is read-once and deleted
-at session start. Closed work is answerable from ``git log``; open work was
-answerable from nothing durable at all. It lived in a live agent's context and
-was carried forward as one re-summarised sentence per session -- lossy by
+``~/.operator/projects/{guid}/handoff/{instance}.md``, which is read-once and
+deleted at session start. Closed work is answerable from ``git log``; open work
+was answerable from nothing durable at all. It lived in a live agent's context
+and was carried forward as one re-summarised sentence per session -- lossy by
 construction, and nothing could detect the loss.
 
 ``backlog/`` is the fallback. One file per item, under version control, in the

@@ -168,7 +168,7 @@ def test_handoff_resolves_the_catalog_from_a_worktree(
 
     assert rc == 0
     handoff = (Path.home() / ".operator" / "projects" / "guid-wt"
-               / "next-session.md")
+               / "handoff" / "proj.md")
     assert handoff.is_file()
 
 
@@ -257,7 +257,7 @@ def test_a_catalogued_worktree_does_not_shadow_its_own_project(
 def test_the_writer_and_the_reader_share_one_guid_predicate():
     """Reader and writer must not hold separate ideas of a valid id.
 
-    `handoff_tool` creates ~/.operator/projects/<guid>/next-session.md and
+    `handoff_tool` creates ~/.operator/projects/<guid>/handoff/<instance>.md and
     `copilot_operator` resolves it again to report on it. When those two
     disagreed, an id the writer refused to create was still one the reader
     would happily resolve -- and `../../elsewhere` resolved outside the

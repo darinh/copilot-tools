@@ -135,7 +135,7 @@ FEATURES: tuple[Feature, ...] = (
     Feature(
         slug="session-handoff",
         name="Session Handoff",
-        description="`next-session.md` for cross-session continuity",
+        description="Per-instance handoff files for cross-session continuity",
         options=_FLAG, default=ON, off_value=OFF,
     ),
     Feature(

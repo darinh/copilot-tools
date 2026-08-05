@@ -189,24 +189,17 @@ generated rather than being gated in prose.
 
 *Enabled by feature flag: `session-handoff`*
 
-Agents use `~/.operator/projects/{guid}/next-session.md` for continuity across sessions.
+Agents use `~/.operator/projects/{guid}/handoff/{instance}.md` for continuity
+across sessions. One file per operator instance: the handoff you find is the one
+your own previous session wrote, and a peer working the same checkout has its
+own.
 
 ### On Session Start
 When the user greets you (e.g., "hey", "hello", "hi"), **immediately**:
 
 1. **Check for unmerged work**: Run `git branch --no-merged main` (the ref matters — with no argument git compares against HEAD, which tells you nothing). If any feature branches have unmerged commits, tell the user: *"Found unmerged work on branch X (N commits). Want to continue that, merge it, or start fresh?"*
-2. **Read handoff**: Check if `~/.operator/projects/{guid}/next-session.md` exists. If it does:
+2. **Read handoff**: Check if `~/.operator/projects/{guid}/handoff/{instance}.md` exists. If it does:
    - Read it and use it as your starting context.
-   - **Check who wrote it.** The file names its author: *"Written by operator
-     instance: `name`"*. The mailbox is per-**project** but the restart signal
-     is per-**instance**, so on a shared checkout the handoff you are holding
-     may well be a *peer's*, not your own previous session's. A handoff is
-     written in the first person — "my worktree", "I claimed this", "check
-     `operator inbox x`" — and every one of those is wrong when read by the
-     wrong agent, `operator inbox` destructively so, because reading consumes.
-     If the author is not you, treat the branch claims and mailbox
-     instructions as that peer's, not yours. An older handoff names no author;
-     then you cannot tell, and should not assume.
    - Tell the user what was left in progress and what you're picking up.
    - Delete the file after reading it (it's a one-time handoff, not permanent docs).
 3. **Log the session**: Insert a row into the `session_log` table in the session database (see Session History below).
@@ -227,7 +220,7 @@ handoff --instance <operator-instance-name> --status "What was completed (commit
 The `handoff` command atomically writes the handoff file AND triggers the operator restart. **Never write the handoff file manually** — always use the command.
 
 If the `handoff` command is not available (e.g., not on PATH), fall back to writing
-`~/.operator/projects/{guid}/next-session.md` manually and then creating the restart marker file using
+`~/.operator/projects/{guid}/handoff/{instance}.md` manually and then creating the restart marker file using
 the form for your platform:
 
 **PowerShell (Windows)**
@@ -260,69 +253,29 @@ touch ~/.operator/restart/{instance-name}
 [A ready-to-paste prompt the next agent can execute immediately]
 ```
 
-### Superseded handoffs
+### An unread handoff
 
-`handoff` does not silently replace an unread handoff. If `next-session.md` is
-still sitting there when a new one is written, the old file is copied to
-`~/.operator/projects/{guid}/superseded/` first, and only then is the new one
-published. Both survive.
+`handoff` does not silently replace one. If a handoff is still sitting at your
+instance's path when you write the next one, the old file is moved to
+`{instance}.prev.md` first and the tool says so on stderr.
 
-**An occupied `next-session.md` does not mean the handoff went unread.** It
-means nobody has consumed *that* one yet, and there are two ways to get there.
-The mailbox is keyed by **project**; the restart marker is keyed by
-**instance**. So on a checkout worked by more than one agent, every instance
-publishes to the same file and restarts on its own signal — and the ordinary
-case is not a missed read at all, it is a peer publishing while you worked.
-Measured on this toolkit's own repository: ten handoffs accumulated in one
-project's `superseded/` in a single day, written by at least three distinct
-instances. A session that found that pile read it as ten dropped contexts,
-which fits the evidence perfectly and is the wrong explanation. The `handoff`
-command now names the author in the file and says in its warning which of the
-two happened, so neither end has to guess.
+**That cannot happen in the ordinary flow**, because the protocol has the
+reader delete the file once it has consumed it. So a `.prev.md` beside your
+handoff means a session of *your* instance ended without picking up what the
+one before it left. Read it before you decide what you are working on, and say
+so in your final message if `handoff` warned you about it — that warning goes
+to stderr and dies with the session that saw it.
 
-Two handoffs can still race for the same project: if the tool cannot take its
-lock it publishes anyway rather than discard the live session, so one of the
-two can end up only in `superseded/`. That used to be silent. It is not any
-more — a handoff written without the lock says so in its own first paragraph,
-and the copy banked beside it says that it may never have reached
-`next-session.md` at all. The notice travels with the bytes, so it reaches the
-session that has to act on it rather than only the one that caused it.
-
-That makes it a rule at both ends of a session:
-
-- **Starting**: if `~/.operator/projects/{guid}/superseded/` is non-empty, read
-  what is in there alongside `next-session.md` before deciding what you are
-  picking up. A banked copy that says it may never have reached
-  `next-session.md` is a handoff that may be *newer* than the one you are
-  holding; anything else in there is an unread predecessor, and is older.
-  Read the author stamps too: a pile written by several instances is peers
-  sharing one mailbox, which is a different situation from your own handoffs
-  going unread, and calls for a different response.
-- **Ending**: if `handoff` printed a warning — that it could not take the
-  handoff lock, or that it could not bank a spare copy — say so in your final
-  message. The first case is now recorded in the files themselves as well; the
-  second is not, because the failure *was* that no file could be written, and
-  that warning goes to stderr and dies with your session.
-
-**Nothing ever prunes `superseded/`. That is a promise, not an oversight.** A
-reaper living inside a fix for an unwanted delete is the same bug wearing the
-fix's clothes, and it would be judging files by their age when age is not what
-makes them valuable. The directory only grows when a handoff went unread, which
-is already the anomaly — so a full `superseded/` is a symptom to read, not a
-mess to clear.
-
-- **Never delete from `superseded/` on your own initiative, and never add code
-  that prunes it.** Files in there are sessions whose context was dropped on the
-  floor. Read them before deciding they are noise.
-- If the *user* asks you to clear it, do it — it is their disk and their
-  context. Tell them what is in there first so the choice is informed. The rule
-  above is about you acting unasked, not about overriding them.
+There is one slot, replaced each time, and that is deliberate: a second
+consecutive miss means the read side is broken, and keeping the older of two
+undelivered handoffs would not fix it.
 
 ### Rules
 - The file is ephemeral — read once, then delete. Not documentation.
 - Write it proactively. The user should never have to ask for it.
-- Never hand-roll the preserve-then-publish dance. Use the `handoff` command;
-  writing `next-session.md` yourself is what destroys an unread one.
+- Never write the handoff file yourself. Use the `handoff` command: writing it
+  by hand is what destroys an unread one, and it does not raise the restart
+  marker, so the loop never picks the session up.
 
 ---
 
@@ -360,7 +313,7 @@ CREATE TABLE IF NOT EXISTS session_log (
 
 **Open work belongs in the repository, not in a handoff.**
 
-Everything above this section is ephemeral by design. `next-session.md` is
+Everything above this section is ephemeral by design. A handoff file is
 read-once and deleted at session start. `session_log` lives in a per-session
 database that does not persist. Both are *handover* mechanisms, and neither is
 a record. So closed work is answerable from `git log` and open work has been

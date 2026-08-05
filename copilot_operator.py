@@ -1895,8 +1895,9 @@ def project_catalog_path() -> Path:
     return projects_root() / "catalog.csv"
 
 
-def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
-    """Resolve the handoff (``next-session.md``) path for a project directory.
+def project_handoff_file(cwd: Path,
+                         instance_id: str = "") -> "Path | None | _CatalogUnreadable":
+    """Resolve the handoff path for a project directory.
 
     Looks the directory up in ``~/.operator/projects/catalog.csv`` (the same
     catalog ``handoff``/``handoff_tool.py`` use) and returns the path the
@@ -1904,6 +1905,11 @@ def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
     Returns None if the directory has no catalog entry at all, and
     :data:`CATALOG_UNREADABLE` if the catalog could not be read, which is a
     different answer and must not share a return value with the first.
+
+    Handoffs are keyed by **instance**: ``handoff/{instance_id}.md``. An empty
+    ``instance_id`` yields the project directory's legacy ``next-session.md``,
+    which is what a pre-migration project still has on disk and what a caller
+    with no instance in hand can meaningfully ask about.
 
     The lookup is keyed on the primary checkout, so running from a worktree
     finds the project's real entry instead of reporting it unregistered.
@@ -1966,13 +1972,16 @@ def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
                 if IS_WINDOWS:
                     resolved = resolved.lower()
                 if resolved == target:
-                    return project_dir(guid) / "next-session.md"
+                    base = project_dir(guid)
+                    if instance_id:
+                        return base / "handoff" / f"{instance_id}.md"
+                    return base / "next-session.md"
     except OSError:
         return CATALOG_UNREADABLE
     return CATALOG_UNREADABLE if undecided else None
 
 
-def crash_recovery_verdict(workdir: Path) -> bool:
+def crash_recovery_verdict(workdir: Path, instance_id: str = "") -> bool:
     """Did the session before this launch end without leaving a handoff?
 
     A missing handoff file means the previous session never reached `handoff`
@@ -1996,8 +2005,17 @@ def crash_recovery_verdict(workdir: Path) -> bool:
     An *unregistered* project is a different situation entirely: no catalog
     entry means no handoff file could ever have been written there, so the
     absence proves nothing and must not be reported to the agent as a crash.
+
+    The project-keyed ``next-session.md`` is consulted as a fallback because
+    it is what a project that has not yet been through
+    ``handoff_tool.migrate_project_handoff`` still has on disk. Migration
+    happens on the next *write*, so between this change shipping and this
+    instance's next handoff, the instance file legitimately does not exist
+    while a real handoff sits beside it. Reporting that as a crash would tell
+    the agent its predecessor died in the one situation where the predecessor
+    demonstrably did not.
     """
-    handoff_file = project_handoff_file(workdir)
+    handoff_file = project_handoff_file(workdir, instance_id)
     if handoff_file is CATALOG_UNREADABLE:
         # The catalog would not open. That establishes nothing about whether
         # this project is registered, so it must not be reported as either a
@@ -2012,16 +2030,28 @@ def crash_recovery_verdict(workdir: Path) -> bool:
     # Probed once and held: asking twice invites the two answers to disagree,
     # and the tri-state exists so the unknown case can be decided deliberately.
     present = path_present(handoff_file)
-    if present is False:
-        log("  No handoff file found for this project — treating this as "
-            "crash recovery")
-        return True
     if present is None:
         # Telling the agent a handoff is missing is a claim about the last
         # session. A probe that failed has not established anything.
         log(f"  Could not examine {handoff_file} — not reporting this as "
             f"crash recovery")
-    return False
+        return False
+    if present:
+        return False
+    if instance_id:
+        legacy = handoff_file.parent.parent / "next-session.md"
+        legacy_present = path_present(legacy)
+        if legacy_present is None:
+            log(f"  Could not examine {legacy} — not reporting this as "
+                f"crash recovery")
+            return False
+        if legacy_present:
+            log(f"  No handoff at {handoff_file}, but an unmigrated one is "
+                f"at {legacy} — not reporting this as crash recovery")
+            return False
+    log("  No handoff file found for this project — treating this as "
+        "crash recovery")
+    return True
 
 
 def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = False) -> str:
@@ -4224,7 +4254,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     launch_preamble = build_preamble(
                         agent, instance,
                         crash_recovery=(had_predecessor
-                                        and crash_recovery_verdict(workdir)))
+                                        and crash_recovery_verdict(
+                                            workdir, instance.id)))
                     try:
                         waiting = operator_mail.pending(OPERATOR_HOME, instance.id)
                     except operator_mail.MailError as exc:

@@ -116,7 +116,7 @@ def test_resume_without_handoff_file_gets_crash_note(monkeypatch, tmp_path):
 
     monkeypatch.setattr(op, "start_session", capture)
     monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
-    monkeypatch.setattr(op, "project_handoff_file", lambda cwd: None)
+    monkeypatch.setattr(op, "project_handoff_file", lambda cwd, instance_id="": None)
 
     inst = op.Instance("crashy")
     sid = "3f2a9c1e-1111-2222-3333-444455556666"
@@ -142,7 +142,7 @@ def test_resume_with_handoff_file_present_has_no_crash_note(monkeypatch, tmp_pat
 
     monkeypatch.setattr(op, "start_session", capture)
     monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
-    monkeypatch.setattr(op, "project_handoff_file", lambda cwd: handoff)
+    monkeypatch.setattr(op, "project_handoff_file", lambda cwd, instance_id="": handoff)
 
     inst = op.Instance("tidy")
     sid = "3f2a9c1e-1111-2222-3333-444455556666"
@@ -193,7 +193,7 @@ def _loop_with_handoff(monkeypatch, handoff: Path, script):
     monkeypatch.setattr(op, "start_session", capture)
     monkeypatch.setattr(op, "show_run_summary", lambda run_started: None)
     monkeypatch.setattr(op, "stop_session_gracefully", lambda instance: None)
-    monkeypatch.setattr(op, "project_handoff_file", lambda cwd: handoff)
+    monkeypatch.setattr(op, "project_handoff_file", lambda cwd, instance_id="": handoff)
     return seen
 
 
@@ -732,3 +732,68 @@ def test_an_unexplained_exit_is_traced_with_its_real_exit_code(monkeypatch):
     assert exits[-1]["markers"]["exit_code"] == 0, (
         "the exit code the runner recorded is the whole point")
     assert exits[-1]["markers"]["restart"] is False
+
+
+# -- the handoff is keyed by instance ---------------------------
+#
+# `crash_recovery_verdict` is exercised above through `run_loop_mode` with
+# `project_handoff_file` stubbed out, which is the right shape for testing the
+# loop and the wrong one for testing where the handoff is looked for. These
+# call it directly against a real catalog so the path it builds is part of what
+# is asserted.
+def _catalog(monkeypatch, tmp_path, guid="guid-cr"):
+    projects = tmp_path / "projects"
+    (projects / guid).mkdir(parents=True)
+    project = tmp_path / "checkout"
+    project.mkdir()
+    (projects / "catalog.csv").write_text(
+        f'"{project.resolve()}",{guid}\n', encoding="utf-8")
+    monkeypatch.setattr(op, "projects_root", lambda: projects)
+    monkeypatch.setattr(op, "project_dir", lambda g: projects / g)
+    return project, projects / guid
+
+
+def test_a_peers_handoff_does_not_answer_for_this_instance(monkeypatch, tmp_path):
+    """The bug the re-key removes, asserted on the reader's side.
+
+    Under project keying a peer's handoff sat at the one path this consulted,
+    so this instance was told its predecessor had ended cleanly on the strength
+    of a document written by somebody else. Keyed by instance, a peer's file is
+    not an answer about this instance at all.
+    """
+    project, proj_dir = _catalog(monkeypatch, tmp_path)
+    (proj_dir / "handoff").mkdir()
+    (proj_dir / "handoff" / "peer-y.md").write_text("# handoff", encoding="utf-8")
+
+    assert op.crash_recovery_verdict(project, "peer-x") is True
+
+
+def test_this_instances_own_handoff_answers_for_it(monkeypatch, tmp_path):
+    """The other half. Without it the assertion above would also pass against
+    a verdict that reported a crash unconditionally."""
+    project, proj_dir = _catalog(monkeypatch, tmp_path)
+    (proj_dir / "handoff").mkdir()
+    (proj_dir / "handoff" / "peer-x.md").write_text("# handoff", encoding="utf-8")
+
+    assert op.crash_recovery_verdict(project, "peer-x") is False
+
+
+def test_an_unmigrated_handoff_is_not_reported_as_a_crash(monkeypatch, tmp_path):
+    """Migration happens on the next write, so there is a real window in which
+    the instance file does not exist and a genuine handoff sits beside it.
+
+    Reporting that as a crash would tell the agent its predecessor died in the
+    one situation where the predecessor demonstrably did not -- and it would do
+    so for every project on the machine, once, on the first session after this
+    change ships.
+    """
+    project, proj_dir = _catalog(monkeypatch, tmp_path)
+    (proj_dir / "next-session.md").write_text("# handoff", encoding="utf-8")
+
+    assert op.crash_recovery_verdict(project, "peer-x") is False
+
+
+def test_nothing_anywhere_is_still_a_crash(monkeypatch, tmp_path):
+    """The fallback must not swallow the verdict it was added beside."""
+    project, _ = _catalog(monkeypatch, tmp_path)
+    assert op.crash_recovery_verdict(project, "peer-x") is True
