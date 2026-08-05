@@ -134,3 +134,81 @@ broadcast waves, by something unidentified, and the copilot debug log evidence
 any of this. What is no longer established is that the kills cost a handoff
 every time. Re-measure before assuming either way.
 
+## Correction, 2026-08-05: the fixed instruments were never running
+
+The correction above ends by telling its reader to scope any re-measurement
+to records "at or after 2026-08-05". **That instruction was already false when
+it was written, and following it would have produced the same wrong answer a
+third time.**
+
+Measured at 2026-08-05T06:30Z, before anything was changed:
+
+- Every loop supervisor on this machine was started at 13:27–13:28 local on
+  2026-08-04 (`Win32_Process` creation times; `copilot-tools` is pid 62628,
+  started 13:28:41).
+- `crash_recovery_verdict` and the `session_exit` recording fix landed in
+  8f58a00 at **19:36 local on 2026-08-04** — about six hours *after* every
+  supervisor had already started.
+- A supervisor is a long-lived process that imported the operator's code once,
+  at startup. `restart-loop`'s own docstring says so. None had been restarted,
+  so every supervisor was still executing pre-fix code, and every record it
+  wrote was a pre-fix record wearing a post-fix date.
+
+Two independent observations confirm it rather than inferring it:
+
+1. This session was launched at 23:29:52 local and told "a handoff file could
+   not be found", while `next-session.md` had been written at 23:29:22 — 30
+   seconds *earlier* — and was sitting on disk, and was read. That is the
+   stale once-per-run verdict 8f58a00 removed, still being served.
+2. `trace.jsonl` contains **no `session_exit` of any kind after
+   2026-08-05T01:02:59Z**, across five relaunches in the following hours.
+   That is the unrecorded restart branch, observed: those sessions ended by
+   handoff and the pre-fix code recorded nothing at all for them.
+
+So the population is still censored, and the censoring is invisible in the
+data. This is the third iteration of one failure — an instrument that cannot
+report the thing it is being read as ruling out — and dates cannot detect it,
+because the thing that goes stale is a *process*, not a file.
+
+**Fixed by stamping provenance rather than trusting the clock.** Each
+supervisor now records the digest of the operator source it actually loaded
+(`{instance}.loopcode.json`), emits a `supervisor_start` trace event carrying
+it, and stamps that digest into every `session_exit` it writes. A re-measurement
+is now scoped by `code=`, which is a fact about the instrument, and records
+written before this read `code=unrecorded` — which is the honest answer for
+every record discussed anywhere above. `operator ls` names any instance whose
+supervisor has fallen behind the code on disk, with the `restart-loop` command
+to fix it, because nothing surfaced that before and the remedy already existed.
+
+Note that a toolkit *version* could not have carried this: 8f58a00 changed
+`copilot_operator.py` and bumped no version, so a version comparison would have
+called the stale supervisor and the fixed one identical.
+
+### A fourth hypothesis for the kills, refuted the same day
+
+*One shared multiplexer server.* If all instances were panes of a single
+tmux server, that server dying would kill every session within milliseconds —
+which fits the observed signature exactly, including disjoint consoles. It is
+wrong: each instance has **its own** `tmux.exe server -s <name>` process with
+a distinct parent (measured, 2026-08-05T06:35Z). The correlation that
+suggested it is real but is not causation — the currently-running `__warm__`
+server started at 01:02:58Z, inside the last kill wave (01:02:52–01:02:59Z),
+i.e. it is a *survivor of* that wave, not its cause.
+
+### The kills themselves, re-measured
+
+979 `session_exit` records spanning 2026-08-04T00:20Z (the trace's first
+record — "its whole history" is about 30 hours, not the 25-day run) to
+2026-08-05T01:02:59Z. Clustering exits within 60s of each other gives 175
+waves, of which **156 hit four or more distinct instances** and 135 hit
+exactly six. Median session uptime 344s. Inter-wave gaps during active periods
+are 6–7 minutes and match the following wave's uptimes, so sessions are
+running until the next broadcast rather than dying of anything of their own.
+
+**No wave has occurred since 2026-08-05T01:02:59Z** — 5.5 hours at time of
+writing, spanning at least five clean handoff-ended sessions. Whether that is
+a fix, a coincidence, or the emitter merely being idle is *not* established.
+It is recorded here so the next re-measurement has a boundary to test against,
+and this time the records on either side of it can be told apart by their
+`code=` stamp instead of their date.
+
