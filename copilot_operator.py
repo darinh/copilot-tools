@@ -2455,10 +2455,27 @@ def _starting_loop_pid(instance: Instance) -> int | None:
         pid = 0
     if pid > 0 and _pid_alive(pid):
         return pid
-    if age < SUPERVISOR_STARTUP_GRACE:
+    if -SUPERVISOR_STARTUP_GRACE < age < SUPERVISOR_STARTUP_GRACE:
         return pid
-    # Old enough that a supervisor which was going to publish a pid would
-    # have. Whatever wrote this is gone; stop making callers wait for it.
+    # Two ways to be out of that range, and they are the same statement: this
+    # record's mtime is no longer evidence that a supervisor is on its way.
+    #
+    # Above the grace, it is simply old -- one that was going to publish a pid
+    # would have by now.
+    #
+    # Below *minus* the grace, it is dated so far ahead of the clock that
+    # something moved, and `age < grace` alone would be true of it for as long
+    # as the skew lasts: hours, not the 30 s this is meant to bound. Refusing
+    # forever is not the safe direction it looks like -- `operator --loop`
+    # reports success when it declines to start a second supervisor, so an
+    # unbounded refusal is a launch that silently starts nothing.
+    #
+    # The bound is two-sided rather than `age >= 0` because a record written
+    # microseconds ago routinely reads as microseconds in the *future*:
+    # `time.time()` and a filesystem timestamp are not the same clock, and on
+    # Windows they differ by more than the coarser one's tick. Pruning on any
+    # negative age therefore throws away live records at random, which is the
+    # original bug with a shorter fuse.
     remove_file(path)
     return None
 
@@ -2482,6 +2499,25 @@ def _supervisor_present(instance: Instance) -> int | None:
     if pid is not None:
         return pid
     return _starting_loop_pid(instance)
+
+
+def _supervisor_still_starting(instance: Instance) -> bool:
+    """True when the only evidence of a supervisor is its startup record.
+
+    Every caller that waits for a supervisor to *go* needs this to size its
+    budget. A supervisor that has not finished starting cannot look at a
+    marker yet, and an orphaned record — a spawn whose child died before
+    claiming it — is only resolved by ageing past
+    ``SUPERVISOR_STARTUP_GRACE``. A wait shorter than that grace is
+    guaranteed to time out in exactly the case the grace exists for.
+
+    Not derivable from the pid the caller already holds. The record can name
+    a live pid, a dead launcher shim's pid, or ``0`` for "present, pid
+    unknown", and ``not pid`` catches only the last of those — so the
+    Windows shim case, the whole reason the mtime grace exists, would be the
+    one that silently kept the short budget.
+    """
+    return _running_loop_pid(instance) is None
 
 
 def is_copilot_running(instance: Instance) -> bool:
@@ -2697,9 +2733,23 @@ def _request_supervisor_stop(instance: Instance, timeout: float = 20.0) -> None:
         return
     log(f"  Stop signal sent to loop supervisor for '{instance.display_name}' "
         f"({f'pid {pid}' if pid else 'still starting; pid not yet known'})")
+    # A supervisor that has not published yet cannot look at the marker, so a
+    # wait shorter than the startup grace is guaranteed to expire before an
+    # orphaned record is even eligible to be pruned.
+    if _supervisor_still_starting(instance):
+        timeout += SUPERVISOR_STARTUP_GRACE
     deadline = time.time() + timeout
     while time.time() < deadline and _supervisor_present(instance) is not None:
         time.sleep(0.5)
+    # What upholds the invariant in the docstring. Removing unconditionally
+    # would reinstate the bug this function exists to fix: a supervisor that
+    # is merely slow is still going to read that marker, and the caller is
+    # about to kill its session — without the marker it reads that as a crash
+    # and relaunches. So the marker is only withdrawn once nothing is there
+    # to honour it, which is also the only case where leaving it would strand
+    # it for the next supervisor to trip over.
+    if _supervisor_present(instance) is None:
+        remove_file(instance.stop_marker)
 
 
 def stop_operator(target: str | None = None) -> int:
@@ -2771,15 +2821,34 @@ def stop_loop_only(target: str | None) -> int:
     instance.detach_marker.touch()
     log(f"Detach requested for loop '{target}' "
         f"({f'pid {pid}' if pid else 'still starting; pid not yet known'})")
-    deadline = time.time() + 20
+    # Same budget reasoning as _do_restart_loop: a supervisor that has not
+    # finished starting has to finish before it polls, and an orphaned
+    # startup record is only resolved by ageing out.
+    budget = 20.0 + (SUPERVISOR_STARTUP_GRACE
+                     if _supervisor_still_starting(instance) else 0.0)
+    deadline = time.time() + budget
     while time.time() < deadline:
         if _supervisor_present(instance) is None:
-            print(f"Loop supervisor for '{instance.display_name}' stopped; "
-                  f"session left running.")
-            print(f"  Re-attach: operator join {instance.display_name}")
+            # Gone is not the same as gone *because of us*. A marker still
+            # sitting there was never consumed — the supervisor we saw was an
+            # orphaned record that aged out, or it exited for its own reasons
+            # — and leaving it would make the next supervisor for this
+            # instance detach the moment it started.
+            unconsumed = path_present(instance.detach_marker) is not False
+            remove_file(instance.detach_marker)
+            if unconsumed:
+                print(f"No loop supervisor is running for "
+                      f"'{instance.display_name}'; the one that looked like "
+                      f"it was starting never came up.")
+            else:
+                print(f"Loop supervisor for '{instance.display_name}' stopped; "
+                      f"session left running.")
+                print(f"  Re-attach: operator join {instance.display_name}")
             return 0
         time.sleep(0.5)
-    print(f"Loop supervisor for '{target}' did not stop within 20s.", file=sys.stderr)
+    remove_file(instance.detach_marker)
+    print(f"Loop supervisor for '{target}' did not stop within {budget:g}s.",
+          file=sys.stderr)
     return 1
 
 
@@ -2873,7 +2942,8 @@ def _do_restart_loop(instance: Instance, user_args: list[str],
         # supervisor still starting has to finish starting before it polls at
         # all, so the startup grace is part of the wait too.
         budget = (SESSION_ID_WAIT + POLL_INTERVAL * 2 + 15
-                  + (SUPERVISOR_STARTUP_GRACE if not pid else 0))
+                  + (SUPERVISOR_STARTUP_GRACE
+                     if _supervisor_still_starting(instance) else 0))
         deadline = time.time() + budget
         while time.time() < deadline:
             if _supervisor_present(instance) is None:
@@ -2970,10 +3040,17 @@ def stop_session_only(target: str | None) -> int:
     if not MUX.kill_session(instance.session):
         print(f"Failed to stop session '{instance.session}'.", file=sys.stderr)
         return 1
-    pid = _running_loop_pid(instance)
-    if pid:
-        print(f"Session '{instance.display_name}' stopped; "
-              f"loop supervisor (pid {pid}) will relaunch it shortly.")
+    # The question here is "will anything relaunch this session?", and a
+    # supervisor that is still starting certainly will — it comes up, finds
+    # the session gone with no marker, and reads that as a crash. Answering
+    # from the pid file alone told the user their session would stay down and
+    # then relaunched it seconds later. `is not None`, not truthiness: 0 is a
+    # supervisor whose pid is not knowable yet, not the absence of one.
+    pid = _supervisor_present(instance)
+    if pid is not None:
+        print(f"Session '{instance.display_name}' stopped; loop supervisor "
+              f"({f'pid {pid}' if pid else 'still starting'}) "
+              f"will relaunch it shortly.")
     else:
         print(f"Session '{instance.display_name}' stopped. "
               f"No loop supervisor is running, so it will not restart automatically.")

@@ -284,7 +284,7 @@ def test_stop_signals_a_supervisor_that_has_not_published_yet(monkeypatch):
     inst = op.Instance("stopstarting")
     op._record_supervisor_starting(inst, 4321)
     _dead_pids(monkeypatch, 4321)
-    monkeypatch.setattr(op.time, "sleep", lambda s: None)
+    _fast_clock(monkeypatch)
 
     op._request_supervisor_stop(inst, timeout=0.0)
 
@@ -298,7 +298,7 @@ def test_stop_sets_the_marker_before_looking_for_a_supervisor(monkeypatch):
     inst = op.Instance("ordering")
     op._record_supervisor_starting(inst, 4321)
     _dead_pids(monkeypatch, 4321)
-    monkeypatch.setattr(op.time, "sleep", lambda s: None)
+    _fast_clock(monkeypatch)
     seen: dict = {}
 
     real_present = op._supervisor_present
@@ -623,3 +623,258 @@ def test_cleanup_removes_the_startup_record():
     inst.cleanup_files()
 
     assert not inst.loop_startup_file.exists()
+
+
+# ── what the grace must not become: an unbounded refusal ─────────
+
+def test_a_future_dated_record_naming_a_dead_pid_is_not_believed(monkeypatch):
+    """`age` is `now - mtime`, so a record dated in the future has a
+    *negative* age -- and `age < grace` is true of it for as long as the skew
+    lasts, which is hours, not the 30s the grace is meant to bound.
+
+    Refusing forever is not the safe direction it looks like; the next test
+    is the user-visible half of it.
+    """
+    inst = op.Instance("futuredated")
+    op._record_supervisor_starting(inst, 7777)
+    _age_record(inst, -7200)  # mtime two hours in the future
+    _dead_pids(monkeypatch)
+
+    assert op._starting_loop_pid(inst) is None
+    assert op._supervisor_present(inst) is None
+    assert not inst.loop_startup_file.exists(), (
+        "a record nothing can ever believe should be pruned")
+
+
+def test_a_record_a_hair_in_the_future_is_still_believed(monkeypatch):
+    """The control for the bound above, and it is not hypothetical.
+
+    `time.time()` and a filesystem timestamp are not the same clock, so a
+    record written microseconds ago routinely reads as microseconds in the
+    *future*. A one-sided `age >= 0` prune therefore discards live records at
+    random -- the original bug with a shorter fuse. This test failed
+    intermittently, on real writes, before the bound was made two-sided.
+    """
+    inst = op.Instance("hairfuture")
+    op._record_supervisor_starting(inst, 7778)
+    _age_record(inst, -0.05)  # 50 ms ahead of the clock
+    _dead_pids(monkeypatch)
+
+    assert op._starting_loop_pid(inst) == 7778
+    assert inst.loop_startup_file.exists(), "pruned a record written moments ago"
+
+
+def test_a_future_dated_record_does_not_silently_swallow_a_launch(monkeypatch):
+    """Why the bound matters. Refusing to start a second supervisor is
+    reported as success, because normally it means one is already running --
+    so an unbounded refusal is a launch that reports success and starts
+    nothing, for hours, with no error anywhere."""
+    inst = op.Instance("swallowed")
+    inst.claim("test-token")
+    op._record_supervisor_starting(inst, 7777)
+    _age_record(inst, -7200)
+    _dead_pids(monkeypatch)
+    spawned = {"n": 0}
+
+    def spawn(instance, user_args, is_fresh):
+        spawned["n"] += 1
+        instance.loop_pid_file.write_text("4242", encoding="utf-8")
+        return 4242
+
+    monkeypatch.setattr(op, "_spawn_background_loop", spawn)
+    monkeypatch.setattr(op, "_save_loop_args", lambda instance, args: None)
+    _fast_clock(monkeypatch)
+
+    op.start_loop_headless(inst, ["--agent", "test:agent"], is_fresh=True)
+
+    assert spawned["n"] == 1, (
+        "the launch was refused by a record no live process backs")
+
+
+# ── the wait budgets have to outlast the grace ──────────────────
+
+def test_still_starting_is_not_decided_from_the_pid(monkeypatch):
+    """The discriminator every budget below depends on.
+
+    A startup record can name a live pid, a dead launcher shim's pid, or 0
+    for "present, pid unknown". `not pid` catches only the last -- so the
+    Windows shim case, the entire reason the mtime grace exists, is the one
+    a pid-based test would quietly leave on the short budget.
+    """
+    inst = op.Instance("discriminator")
+    op._record_supervisor_starting(inst, 6060)  # a shim pid, and dead
+    _dead_pids(monkeypatch)
+
+    assert op._supervisor_present(inst) == 6060, "precondition: a truthy pid"
+    assert op._supervisor_still_starting(inst) is True
+
+    inst.loop_pid_file.write_text("6060", encoding="utf-8")
+    _dead_pids(monkeypatch, 6060)
+    assert op._supervisor_still_starting(inst) is False
+
+
+def test_stop_outlasts_the_grace_for_an_orphaned_record(monkeypatch):
+    """A spawn whose child died before claiming the record leaves one naming
+    a dead pid. Nothing will ever consume the stop marker, and the record is
+    only resolved by ageing out -- so a wait shorter than the grace is
+    guaranteed to expire with the marker still down."""
+    inst = op.Instance("orphanstop")
+    op._record_supervisor_starting(inst, 5150)
+    _dead_pids(monkeypatch)
+    clock = _fast_clock(monkeypatch)
+    started = clock.now
+
+    op._request_supervisor_stop(inst, timeout=1.0)
+
+    assert clock.now - started >= op.SUPERVISOR_STARTUP_GRACE, (
+        "gave up before the record it was waiting on could even be pruned")
+    assert op._supervisor_present(inst) is None
+    assert not inst.stop_marker.exists(), (
+        "left a trap for the next supervisor")
+
+
+def test_stop_keeps_the_marker_when_a_supervisor_is_still_there(monkeypatch):
+    """The other direction, and the more dangerous one. Withdrawing the
+    marker on timeout would reinstate the original bug: the caller is about
+    to kill the session, and a supervisor that never saw a marker reads that
+    as a crash and relaunches."""
+    inst = op.Instance("slowstop")
+    inst.loop_pid_file.write_text("5151", encoding="utf-8")
+    _dead_pids(monkeypatch, 5151)
+    _fast_clock(monkeypatch)
+
+    op._request_supervisor_stop(inst, timeout=2.0)
+
+    assert inst.stop_marker.exists(), (
+        "withdrew the stop request from a supervisor that is still running")
+
+
+def test_stop_loop_outlasts_the_grace_and_leaves_no_marker(monkeypatch):
+    """`stop-loop` had a flat 20s budget against a 30s grace, so against an
+    orphaned record it could not do anything *but* time out -- and it left
+    the detach marker behind when it did."""
+    inst = op.Instance("orphandetach")
+    op._record_supervisor_starting(inst, 5252)
+    _dead_pids(monkeypatch)
+    clock = _fast_clock(monkeypatch)
+    started = clock.now
+
+    rc = op.stop_loop_only("orphandetach")
+
+    assert clock.now - started >= op.SUPERVISOR_STARTUP_GRACE
+    assert not inst.detach_marker.exists(), (
+        "left a trap for the next supervisor")
+    assert rc == 0
+
+
+def test_stop_loop_reports_a_supervisor_that_never_came_up(monkeypatch):
+    """Same end state, different truth. Nothing consumed the request, so
+    saying "supervisor stopped" would be a claim about an event that never
+    happened."""
+    inst = op.Instance("neverup")
+    op._record_supervisor_starting(inst, 5353)
+    _dead_pids(monkeypatch)
+    _fast_clock(monkeypatch)
+    said: list = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *a, **k: said.append(" ".join(str(x) for x in a)))
+
+    op.stop_loop_only("neverup")
+
+    assert any("never came up" in s for s in said), said
+
+
+def test_stop_loop_reports_a_real_stop_normally(monkeypatch):
+    """The control for the test above: a supervisor that really does consume
+    the marker and go must still get the ordinary message, or the honesty
+    fix has just broken the common path."""
+    inst = op.Instance("realstop")
+    inst.loop_pid_file.write_text("5454", encoding="utf-8")
+    _dead_pids(monkeypatch, 5454)
+    polls = {"n": 0}
+    real_present = op._supervisor_present
+
+    def present(instance):
+        polls["n"] += 1
+        if polls["n"] >= 3:  # the supervisor consumes the marker and exits
+            op.remove_file(instance.detach_marker)
+            op.remove_file(instance.loop_pid_file)
+        return real_present(instance)
+
+    monkeypatch.setattr(op, "_supervisor_present", present)
+    _fast_clock(monkeypatch)
+    said: list = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *a, **k: said.append(" ".join(str(x) for x in a)))
+
+    rc = op.stop_loop_only("realstop")
+
+    assert rc == 0
+    assert any("session left running" in s for s in said), said
+    assert not any("never came up" in s for s in said), said
+
+
+def test_restart_loop_budget_covers_a_shim_pid(monkeypatch):
+    """`_do_restart_loop` sized its extra allowance off `not pid`, which a
+    dead shim pid defeats -- the exact case the grace exists for."""
+    inst = op.Instance("shimbudget")
+    op._record_supervisor_starting(inst, 5555)
+    _dead_pids(monkeypatch)
+    clock = _fast_clock(monkeypatch)
+    started = clock.now
+    monkeypatch.setattr(op, "_spawn_background_loop",
+                        lambda *a, **k: pytest.fail(
+                            "must not spawn before the old one is gone"))
+
+    op._do_restart_loop(inst, ["--agent", "t:a"], os.getcwd())
+
+    assert clock.now - started >= op.SUPERVISOR_STARTUP_GRACE, (
+        "gave up on a shim-pid record before it could be pruned")
+
+
+# ── "will anything relaunch this?" is the wider question ────────
+
+def test_stop_session_says_a_starting_supervisor_will_relaunch(monkeypatch):
+    """`stop-session` asks whether anything will bring the session back. A
+    supervisor still starting certainly will: it comes up, finds the session
+    gone with no marker, and reads that as a crash."""
+    inst = op.Instance("willrelaunch")
+    inst.claim("test-token")
+    inst.save_state(1, op.utcnow())
+    op._record_supervisor_starting(inst, 0)  # present, pid not yet knowable
+    _dead_pids(monkeypatch)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: True)
+    monkeypatch.setattr(op.MUX, "kill_session", lambda session: True)
+    monkeypatch.setattr(op, "remove_tab", lambda ident: pytest.fail(
+        "the instance is not finished with; something is still going to run"))
+    said: list = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *a, **k: said.append(" ".join(str(x) for x in a)))
+
+    op.stop_session_only("willrelaunch")
+
+    assert any("will relaunch it shortly" in s for s in said), said
+    assert not any("will not restart automatically" in s for s in said), said
+
+
+def test_stop_session_still_says_nothing_will_when_nothing_will(monkeypatch):
+    """The control. With no supervisor of any kind the old message is the
+    correct one, and losing it would be its own bug."""
+    inst = op.Instance("wontrelaunch")
+    inst.claim("test-token")
+    inst.save_state(1, op.utcnow())
+    _dead_pids(monkeypatch)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: True)
+    monkeypatch.setattr(op.MUX, "kill_session", lambda session: True)
+    monkeypatch.setattr(op, "remove_tab", lambda ident: None)
+    said: list = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *a, **k: said.append(" ".join(str(x) for x in a)))
+
+    op.stop_session_only("wontrelaunch")
+
+    assert any("will not restart automatically" in s for s in said), said
