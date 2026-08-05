@@ -595,11 +595,23 @@ def test_the_help_text_documents_the_retire_subcommand():
     assert "operator projects retire" in copilot_operator.HELP
 
 
-def test_the_archive_sits_beside_the_file_it_preserves(home):
-    """Under ``~/.copilot``, not the repository and not a temp directory."""
+def test_the_archive_sits_in_the_toolkits_own_state_directory(home):
+    """Under ``~/.operator``, not the repository and not a temp directory.
+
+    This used to assert the opposite -- that the archive sat *beside* the file
+    it preserves, in ``~/.copilot`` -- and adjacency was the point: somebody
+    looking for the retired file would find it where the original had been.
+
+    That was given up deliberately. ``~/.copilot`` is the Copilot CLI's own
+    configuration directory, and a backup kept in a directory this toolkit
+    does not own is not a backup. Discoverability is answered by the retire
+    screen naming the path it wrote, which is a better answer than adjacency
+    because it does not depend on the user guessing where to look.
+    """
     archive = copilot_operator.instructions_archive_dir()
-    assert archive == home / ".copilot" / project_instructions.ARCHIVE_DIRNAME
-    assert archive.parent == copilot_operator.global_instructions_path().parent
+    assert archive == home / ".operator" / project_instructions.ARCHIVE_DIRNAME
+    assert archive.parent == copilot_operator.operator_home()
+    assert archive.parent != copilot_operator.global_instructions_path().parent
 
 
 def test_the_template_is_the_one_shipped_beside_the_operator():

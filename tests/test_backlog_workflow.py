@@ -362,22 +362,22 @@ def test_approving_an_item_that_does_not_exist_is_refused(repo):
 def home(tmp_path, monkeypatch) -> Path:
     """A relocated home, so no test can reach the real project catalog."""
     fake = tmp_path / "home"
-    (fake / ".copilot" / "projects").mkdir(parents=True)
+    (fake / ".operator" / "projects").mkdir(parents=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake))
     return fake
 
 
 def catalogue(home: Path, root: Path, guid: str = "test-guid") -> Path:
-    catalog = home / ".copilot" / "projects" / "catalog.csv"
+    catalog = home / ".operator" / "projects" / "catalog.csv"
     catalog.write_text(f'"{root.resolve()}",{guid}\n', encoding="utf-8")
-    (home / ".copilot" / "projects" / guid).mkdir(parents=True, exist_ok=True)
+    (home / ".operator" / "projects" / guid).mkdir(parents=True, exist_ok=True)
     return catalog
 
 
 def test_the_watermark_lives_in_the_per_project_directory(repo, home):
     catalogue(home, repo)
     path = backlog_tool.watermark_path(repo)
-    assert path.parent == home / ".copilot" / "projects" / "test-guid"
+    assert path.parent == home / ".operator" / "projects" / "test-guid"
     # The literal, not the module's own constant. Asserting
     # ``path.name == backlog_tool.WATERMARK_NAME`` compares the code's answer
     # against the code's input, and holds for any name at all -- including a
@@ -401,7 +401,7 @@ def test_every_worktree_of_a_project_shares_one_watermark(repo, home, tmp_path):
 
 def test_an_uncatalogued_project_is_told_what_to_add(repo, home):
     """Refusing is right; refusing without the fix is not."""
-    (home / ".copilot" / "projects" / "catalog.csv").write_text(
+    (home / ".operator" / "projects" / "catalog.csv").write_text(
         '"/somewhere/else",other\n', encoding="utf-8")
     with pytest.raises(WatermarkError) as exc:
         backlog_tool.watermark_path(repo)

@@ -593,7 +593,7 @@ def test_a_write_to_an_unwritable_place_raises(tmp_path, monkeypatch):
 def test_config_path_sits_beside_the_handoff(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     path = project_features.config_path("a-guid")
-    assert path == tmp_path / ".copilot" / "projects" / "a-guid" / "features.json"
+    assert path == tmp_path / ".operator" / "projects" / "a-guid" / "features.json"
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +607,7 @@ def project(monkeypatch, tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
     guid = "11111111-2222-3333-4444-555555555555"
-    catalog = tmp_path / "home" / ".copilot" / "projects" / "catalog.csv"
+    catalog = tmp_path / "home" / ".operator" / "projects" / "catalog.csv"
     catalog.parent.mkdir(parents=True)
     catalog.write_text(f'"{root}",{guid}\n', encoding="utf-8")
     monkeypatch.setattr(project_features, "primary_repo_root",

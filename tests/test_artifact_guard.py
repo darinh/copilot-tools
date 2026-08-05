@@ -217,7 +217,7 @@ def test_the_real_home_is_not_guarded_by_default():
     """A peer agent writing a handoff must not fail somebody else's test."""
     if os.environ.get("COPILOT_TOOLS_GUARD_HOME") == "1":
         return
-    projects = Path.home() / ".copilot" / "projects"
+    projects = Path.home() / ".operator" / "projects"
     assert projects not in {d for d, _recursive, _fatal in conftest._GUARDED_DIRS}
 
 
@@ -566,7 +566,7 @@ def test_a_peer_file_deleted_and_recreated_is_reported_each_time(
 # ── the real project catalog ─────────────────────────────────────
 # These guard a file the directory scan above structurally cannot see. It
 # compares sets of NAMES, so a file rewritten in place is identical before and
-# after. That is not hypothetical: the real ~/.copilot/projects/catalog.csv was
+# after. That is not hypothetical: the real ~/.operator/projects/catalog.csv was
 # overwritten by a test run with a single fixture row, six project
 # registrations were lost, and the suite stayed green.
 
@@ -752,7 +752,7 @@ def test_the_documented_bank_name_is_the_one_the_guard_writes(
     # than a mention in passing, and checked as a literal so that renaming the
     # row cannot be absorbed by a correct mention elsewhere in the file.
     rows = [line for line in docs.splitlines()
-            if line.startswith("| `~/.copilot/projects/catalog.csv.pre-test-")]
+            if line.startswith("| `~/.operator/projects/catalog.csv.pre-test-")]
     assert rows, "the banked copy is not listed in the Files table"
     table_name = re.search(r"catalog\.csv\.pre-test-[^\s`|]*", rows[0]).group(0)
     assert "<" in table_name, (

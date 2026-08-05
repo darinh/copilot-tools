@@ -63,7 +63,7 @@ Sharing a project also puts two writers on one handoff file, and that has a
 consequence you cannot derive from the protocol: when two `handoff` calls race
 and one cannot take the lock, it publishes anyway rather than throw away a live
 session, and the losing handoff can end up only in
-`~/.copilot/projects/{guid}/superseded/`. So in a shared project
+`~/.operator/projects/{guid}/superseded/`. So in a shared project
 `next-session.md` is not guaranteed to be the newest handoff. A handoff written
 without the lock now says so in its own first paragraph, and the copy banked
 beside it says it may never have reached `next-session.md` — so read

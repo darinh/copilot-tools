@@ -948,7 +948,7 @@ _LOOKS_LIKE_A_REAL_GUID = re.compile(
 def test_no_example_in_the_template_is_a_usable_guid(template):
     """Nothing here may look like a GUID somebody could paste into the catalog.
 
-    The template shows the format of ``~/.copilot/projects/catalog.csv`` a few
+    The template shows the format of ``~/.operator/projects/catalog.csv`` a few
     lines above an instruction to add an entry to it, and its reader is a model
     that does what it is told. A well-formed value next to a write instruction
     is a value that gets written -- and that file is the user's data, mapping

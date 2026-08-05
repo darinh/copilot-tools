@@ -102,7 +102,7 @@ handoff --instance qs-loop --status "did a thing" --next "do the next thing"
 
 Expected:
 
-1. `~/.copilot/projects/{guid}/next-session.md` is written with `Status` and `Next Steps`.
+1. `~/.operator/projects/{guid}/next-session.md` is written with `Status` and `Next Steps`.
 2. `~/.operator/restart/qs-loop` is created.
 3. Within one poll interval (10s) the operator logs the restart signal, sends `/exit`, captures metrics,
    and starts session #2.

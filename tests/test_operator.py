@@ -792,7 +792,7 @@ def test_project_handoff_file_never_resolves_outside_the_projects_root(
     """The reader must refuse the ids the writer refuses to create.
 
     Before this guard, a catalog id of `../../elsewhere` produced
-    `~/.copilot/projects/../../elsewhere/next-session.md`, which resolves two
+    `~/.operator/projects/../../elsewhere/next-session.md`, which resolves two
     levels above the projects root -- a file the operator would then report on
     and the next agent would read and delete.
     """
