@@ -56,6 +56,38 @@ only `operator.sh`, which is how `handoff.sh` kept an associative array
 through the change that removed operator.sh's — a rule enforced against one
 file is not a rule, it is that file's history.
 
+## `os.path` is the running platform's syntax, not "paths"
+
+`os.path` is an alias for `posixpath` or `ntpath` depending on what is
+executing it, so it is the wrong tool the moment a string names the *other*
+platform's syntax. On Linux, `os.path.basename(r"C:\tools\tmux.exe")` returns
+the whole string — a backslash is an ordinary filename character there — and
+the caller gets `c:\tools\tmux.exe` where it expected `tmux.exe`.
+
+That reached `main` in the test suite's multiplexer guard, which refuses any
+spawn of `tmux`/`psmux`/`pmux` so a unit test can never drive a real server.
+It extracted the program name with `os.path.basename`, so the parametrised
+full-Windows-path case passed on both Windows legs and, on the four POSIX
+legs, the guard missed and spawned. A full green local Windows suite could not
+see it, which is the same shape as the `setuptools` incident above: **a green
+local suite is evidence about one leg.** Before concluding anything from a
+local run, check whether `main` is even green — `gh run list --workflow CI
+--limit 5` — because you can otherwise spend an evening diagnosing a failure
+you inherited.
+
+Use `ntpath` when the string may name either syntax. `ntpath` is pure syntax
+with no filesystem or platform dependence, and it understands drive prefixes,
+UNC paths and both separators, so it is the union of the two rather than a
+guess at it. The first fix here *was* a guess — a hand-rolled split on both
+separators — and it read `C:tmux.exe`, a drive-relative path Windows accepts,
+as `c:tmux`. It closed the POSIX hole by opening a Windows one that
+`os.path.basename` had never had, in the one predicate where under-refusing
+costs other agents their live sessions. Only adversarial review caught it.
+
+`os.path` remains correct where the data provably comes from the running
+machine — `operator_trace.py` reads its own process table, and the choice
+there is deliberate, not an oversight to go fix.
+
 ## Every third-party import must be declared
 
 CI went red on the two Python 3.12 legs on 2026-08-01 and stayed green on the
