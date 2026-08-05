@@ -19,6 +19,7 @@ import ast
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -340,6 +341,326 @@ def test_preserving_the_same_bytes_twice_reuses_the_archive(tmp_path):
     second = pi.preserve(source, archive)
     assert first == second
     assert len(list(archive.iterdir())) == 1
+
+
+def test_the_same_bytes_a_second_apart_are_still_one_archive(tmp_path):
+    """The version of the test above that does not depend on the clock.
+
+    The one above passes whenever both calls land in the same second, which is
+    almost always, so it went green on seven CI legs and eight local runs and
+    failed on the eighth leg with a same-content pair one second apart. Naming
+    the two instants is the whole point: reuse must be keyed on the digest,
+    and the timestamp in the name must not get a vote.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    first = pi.preserve(
+        source, archive, when=datetime(2026, 8, 5, 9, 57, 51, tzinfo=timezone.utc))
+    second = pi.preserve(
+        source, archive, when=datetime(2026, 8, 5, 9, 57, 52, tzinfo=timezone.utc))
+    assert first == second
+    assert first.name == "f-20260805T095751Z-0967115f2813.md"
+    assert len(list(archive.iterdir())) == 1
+
+
+def test_different_bytes_a_second_apart_are_two_archives(tmp_path):
+    """The other direction, which reuse-by-digest must not break.
+
+    Without this, keying on the digest and keying on nothing at all are
+    indistinguishable: both make the test above pass.
+    """
+    source = tmp_path / "f.md"
+    archive = tmp_path / "retired"
+    source.write_bytes(b"first")
+    one = pi.preserve(
+        source, archive, when=datetime(2026, 8, 5, 9, 57, 51, tzinfo=timezone.utc))
+    source.write_bytes(b"second")
+    two = pi.preserve(
+        source, archive, when=datetime(2026, 8, 5, 9, 57, 52, tzinfo=timezone.utc))
+    assert one != two
+    assert one.read_bytes() == b"first"
+    assert two.read_bytes() == b"second"
+    assert len(list(archive.iterdir())) == 2
+
+
+def test_two_files_with_identical_bytes_get_their_own_archives(tmp_path):
+    """An archive is named after the file it came from, not just its bytes.
+
+    Two different files can hold the same bytes, and reuse keyed on the digest
+    alone would hand back the first one's archive as the second one's
+    preserved copy. No bytes would be lost -- they are the same bytes -- but
+    ``retired/`` would carry no record that the second file was ever retired,
+    and its only caller unlinks the original next.
+
+    The two stems are the same length deliberately. With stems of different
+    lengths the stamp-width check rejects the mismatch on its own, so a
+    version of this test using ``a.md`` and ``bbbb.md`` passes even when the
+    stem is not compared at all.
+    """
+    archive = tmp_path / "retired"
+    one = tmp_path / "aaa.md"
+    one.write_bytes(b"identical")
+    two = tmp_path / "bbb.md"
+    two.write_bytes(b"identical")
+    kept_one = pi.preserve(one, archive)
+    kept_two = pi.preserve(two, archive)
+    assert kept_one != kept_two
+    assert kept_one.name.startswith("aaa-")
+    assert kept_two.name.startswith("bbb-")
+    assert len(list(archive.iterdir())) == 2
+
+
+def test_two_files_with_identical_bytes_and_different_suffixes_do_too(tmp_path):
+    """The same argument for the other end of the name.
+
+    The two suffixes are the same length deliberately, for the reason the
+    equal-length stems above are: with ``.md`` against ``.txt`` the stamp
+    check rejects the mismatch by itself, and the test passes without the
+    suffix ever being compared. Two reviewers found that independently.
+    """
+    archive = tmp_path / "retired"
+    md = tmp_path / "AGENTS.md"
+    md.write_bytes(b"identical")
+    py = tmp_path / "AGENTS.py"
+    py.write_bytes(b"identical")
+    kept_md = pi.preserve(md, archive)
+    kept_py = pi.preserve(py, archive)
+    assert kept_md != kept_py
+    assert kept_md.name.endswith(".md")
+    assert kept_py.name.endswith(".py")
+    assert len(list(archive.iterdir())) == 2
+
+
+def test_an_archive_that_no_longer_holds_its_own_bytes_is_refused(tmp_path):
+    """A corrupted archive must not be handed back as a preserved copy.
+
+    ``preserve``'s only caller unlinks the original next, so returning a file
+    that no longer matches its digest would delete the last good copy and
+    report success.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    landed = pi.preserve(source, archive)
+    landed.write_bytes(b"corrupted after the fact")
+    with pytest.raises(InstructionsError):
+        pi.preserve(source, archive)
+
+
+def test_a_stem_with_glob_characters_matches_only_itself(tmp_path):
+    """The scan is not a glob, and a caller-controlled stem is why.
+
+    ``Path.glob`` would read ``a?c`` as "any single character in the middle"
+    and hand back the archive of ``abc.md`` as the preserved copy of
+    ``a?c.md`` -- different bytes, reported as kept.
+
+    The metacharacter has to be ``?`` and the decoy stem has to be the same
+    length. ``[ab]`` -- the obvious choice, and the one this test used first
+    -- cannot show the difference at all: a character class matches exactly
+    one character, so any name a glob wrongly matched would have a
+    three-characters-shorter stem and the stamp check would reject it on its
+    own. That version passed against a glob implementation, and two reviewers
+    said so independently.
+
+    ``a?c.md`` is not a legal filename on Windows, so ``existing_archive`` is
+    called directly. Nothing here needs the source to exist on disk: only its
+    stem and suffix are read.
+    """
+    archive = tmp_path / "retired"
+    decoy = tmp_path / "abc.md"
+    decoy.write_bytes(b"the decoy's bytes")
+    kept_decoy = pi.preserve(decoy, archive)
+    assert kept_decoy.name.startswith("abc-")
+    digest = hashlib.sha256(b"the decoy's bytes").hexdigest()
+    assert pi.existing_archive(archive, "a?c.md", digest) is None
+    assert pi.existing_archive(archive, "abc.md", digest) == kept_decoy
+
+
+def test_a_symlink_is_never_accepted_as_a_preserved_copy(tmp_path):
+    """The reviewers' finding, and the worst shape in this function.
+
+    ``file_digest`` follows links, so a link in the archive directory reads
+    back as whatever it points at. A link pointing at the source being
+    retired digests as a perfect match -- it *is* the source -- so it would be
+    returned as the preserved copy, and the caller unlinking the original
+    would turn it into a dangling link. The bytes would be gone and the run
+    would report success.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"the only copy")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+    digest = hashlib.sha256(b"the only copy").hexdigest()
+    link = archive / f"f-20260805T095751Z-{digest[:12]}.md"
+    try:
+        link.symlink_to(source)
+    except (OSError, NotImplementedError):
+        pytest.skip("this account cannot create symlinks")
+    with pytest.raises(InstructionsError):
+        pi.preserve(source, archive)
+    assert source.read_bytes() == b"the only copy"
+
+
+def test_a_directory_named_like_an_archive_is_refused(tmp_path):
+    """The other non-regular candidate, and the one that needs no privileges.
+
+    ``file_digest`` returns None for a directory, so this was already
+    refused -- but by a check that cannot tell "not a file" from "wrong
+    bytes", and the message said the bytes were wrong.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+    digest = hashlib.sha256(b"same").hexdigest()
+    (archive / f"f-20260805T095751Z-{digest[:12]}.md").mkdir()
+    with pytest.raises(InstructionsError) as caught:
+        pi.preserve(source, archive)
+    assert "not a regular file" in str(caught.value)
+
+
+def test_duplicates_already_on_disk_are_settled_on_deterministically(tmp_path):
+    """Directories retired before the fix already hold the duplicate pairs.
+
+    Reuse has to pick one, pick the same one every time, and not add a third.
+    Sorting the names is what makes the choice stable, and because the stamp
+    is fixed-width and zero-padded, sorted order is chronological: the
+    earliest copy wins, on every platform.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+    digest = hashlib.sha256(b"same").hexdigest()[:12]
+    for stamp in ("20260805T095752Z", "20260805T095751Z", "20260805T095753Z"):
+        (archive / f"f-{stamp}-{digest}.md").write_bytes(b"same")
+    picked = {pi.preserve(source, archive).name for _ in range(3)}
+    assert picked == {f"f-20260805T095751Z-{digest}.md"}
+    assert len(list(archive.iterdir())) == 3
+
+
+def test_the_stamp_pattern_matches_what_archive_name_writes():
+    """The two halves of the naming scheme, pinned against each other.
+
+    ``archive_name`` writes the stamp with ``strftime`` and
+    ``existing_archive`` recognises it with a regex. Nothing else makes them
+    agree, and if they stopped agreeing every archive would look unrecognised
+    and reuse would silently stop working -- which is the bug this whole
+    change is about, returned in a new spelling.
+    """
+    digest = "0" * 64
+    built = pi.archive_name("f.md", digest, datetime(
+        2026, 12, 31, 23, 59, 59, tzinfo=timezone.utc))
+    middle = built[len("f-"):-len(f"-{digest[:12]}.md")]
+    assert pi._STAMP.fullmatch(middle)
+    assert middle == "20261231T235959Z"
+
+
+def test_sixteen_characters_of_anything_is_not_a_stamp(tmp_path):
+    """Length alone is not the shape, and getting this wrong fails a preserve.
+
+    A file whose middle is sixteen arbitrary characters would be taken for an
+    archive, read back, and -- since it is not one -- refused. That refuses
+    the whole preserve, so a stray file in the archive directory would stop
+    the retire it was unrelated to. Sixteen was what the first version
+    checked; a reviewer pointed out that it is not the same question.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+    digest = hashlib.sha256(b"same").hexdigest()[:12]
+    reference = pi.archive_name("f.md", "0" * 64, datetime(
+        2026, 8, 5, 9, 57, 51, tzinfo=timezone.utc))
+    stamp_length = len(reference) - len("f-") - len("-000000000000.md")
+    middle = "notatimestamp!!!"
+    assert len(middle) == stamp_length
+    stray = archive / f"f-{middle}-{digest}.md"
+    stray.write_bytes(b"nothing like the source")
+    landed = pi.preserve(source, archive)
+    assert landed != stray
+    assert landed.read_bytes() == b"same"
+    assert stray.read_bytes() == b"nothing like the source"
+
+
+def test_a_name_with_no_room_for_a_stamp_is_not_an_archive(tmp_path):
+    """Both ends can match at once when there is nothing between them.
+
+    ``f-0967115f2813.md`` starts with the stem and ends with the digest and
+    suffix, sharing characters between the two. There is no stamp in it, so
+    it is not an archive -- and reading it back would refuse a preserve it
+    has nothing to do with.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+    digest = hashlib.sha256(b"same").hexdigest()[:12]
+    stray = archive / f"f-{digest}.md"
+    stray.write_bytes(b"nothing like the source")
+    landed = pi.preserve(source, archive)
+    assert landed != stray
+    assert landed.read_bytes() == b"same"
+    assert stray.read_bytes() == b"nothing like the source"
+
+
+def test_an_unrelated_file_ending_the_same_way_is_not_an_archive(tmp_path):
+    """The middle of the name has to be stamp-shaped to count.
+
+    Matching on the two ends alone would accept any file that happens to
+    start with the stem and end with the digest, and hand it back unread.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+    digest = hashlib.sha256(b"same").hexdigest()[:12]
+    impostor = archive / f"f-notatimestamp-{digest}.md"
+    impostor.write_bytes(b"nothing like the source")
+    landed = pi.preserve(source, archive)
+    assert landed != impostor
+    assert landed.read_bytes() == b"same"
+    assert impostor.read_bytes() == b"nothing like the source"
+
+
+def test_an_archive_directory_that_cannot_be_listed_is_an_error(tmp_path):
+    """Not being able to look is not the same answer as nothing being there.
+
+    Treating a failed listing as "no existing copy" would write a second
+    archive of bytes already kept, and on a directory that stayed unreadable
+    it would keep doing so on every run. The denial is injected rather than
+    staged on disk because the errno a blocked listing produces differs by
+    platform, and a test that passes through a different branch on Windows
+    than on Linux is not evidence about either.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "retired"
+    archive.mkdir()
+
+    def denied(self):
+        raise PermissionError(13, "Permission denied")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "iterdir", denied)
+        with pytest.raises(InstructionsError) as caught:
+            pi.preserve(source, archive)
+    assert "Nothing was removed" in str(caught.value)
+
+
+def test_an_absent_archive_directory_is_not_an_error(tmp_path):
+    """The control for the test above: absent really is 'nothing there'.
+
+    Every first preserve hits this, so mapping FileNotFoundError onto the
+    refusal above would break the ordinary path rather than a rare one.
+    """
+    source = tmp_path / "f.md"
+    source.write_bytes(b"same")
+    archive = tmp_path / "never-created-yet"
+    assert not archive.exists()
+    landed = pi.preserve(source, archive)
+    assert landed.read_bytes() == b"same"
 
 
 def test_preserving_an_unreadable_source_raises(tmp_path):
