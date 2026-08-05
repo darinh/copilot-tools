@@ -303,16 +303,20 @@ def test_stop_sets_the_marker_before_looking_for_a_supervisor(monkeypatch):
     _fast_clock(monkeypatch)
     seen: dict = {}
 
-    real_present = op._supervisor_present
+    real_status = op._supervisor_status
 
     def spy(instance):
         seen.setdefault("marker_at_check", instance.stop_marker.exists())
-        return real_present(instance)
+        return real_status(instance)
 
-    monkeypatch.setattr(op, "_supervisor_present", spy)
+    monkeypatch.setattr(op, "_supervisor_status", spy)
     op._request_supervisor_stop(inst, timeout=0.0)
 
-    assert seen["marker_at_check"] is True
+    assert "marker_at_check" in seen, (
+        "the spy never fired, so this test asserted nothing -- the code under "
+        "test no longer goes through the function being patched")
+    assert seen["marker_at_check"] is True, (
+        "looked for a supervisor before laying the marker down")
 
 
 def test_stop_leaves_no_marker_behind_when_nothing_is_running():
@@ -919,9 +923,9 @@ def test_no_record_is_believed_for_longer_than_the_allowance(monkeypatch, ahead)
     """
     inst = op.Instance(f"window{ahead}".replace(".", ""))
     op._record_supervisor_starting(inst, 6001)
-    _age_record(inst, -ahead)
     _dead_pids(monkeypatch)
     clock = _fast_clock(monkeypatch)
+    clock.now = inst.loop_startup_file.stat().st_mtime - ahead
 
     assert _believed_for(inst, clock) <= op.SUPERVISOR_STARTUP_ALLOWANCE + 0.1
 
@@ -935,12 +939,16 @@ def test_a_record_within_the_tolerance_survives_to_the_grace(monkeypatch, ahead)
     nothing without a single test objecting -- which is the original
     intermittent-failure bug, since a record written microseconds ago
     routinely reads as microseconds in the future.
+
+    The clock is placed rather than the file dated, so the age under test is
+    exactly `-ahead`. Dating the file leaves the write-to-check interval in,
+    which at `ahead=0` makes the window 29.99997s and the floor a coin flip.
     """
     inst = op.Instance(f"floor{ahead}".replace(".", ""))
     op._record_supervisor_starting(inst, 6003)
-    _age_record(inst, -ahead)
     _dead_pids(monkeypatch)
     clock = _fast_clock(monkeypatch)
+    clock.now = inst.loop_startup_file.stat().st_mtime - ahead
 
     assert _believed_for(inst, clock) >= op.SUPERVISOR_STARTUP_GRACE
 
