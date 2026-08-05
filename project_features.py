@@ -252,7 +252,21 @@ def read_config(path) -> "dict | None":
         raise FeatureConfigError(
             f"The feature configuration {path} holds "
             f"{type(data).__name__}, not an object.")
-    features = data.get("features", {})
+    # An absent ``features`` key is refused for the same reason a non-object
+    # one is. ``write_config`` always emits it, so a document without it was
+    # not written by this tool -- it is a different JSON file that happens to
+    # be sitting at this path, or one somebody hand-edited into a shape with
+    # no meaning here. Defaulting it to ``{}`` would treat "this is not our
+    # file" as "our file, with nothing set in it", and the screen would then
+    # report every feature at its default and offer to write those invented
+    # values over it. ``.get(key, {})`` is how that particular collapse gets
+    # written by accident: the sibling check below refuses ``"features": []``
+    # loudly, and the two are the same malformation.
+    if "features" not in data:
+        raise FeatureConfigError(
+            f"The feature configuration {path} has no 'features' object. "
+            "Delete it to fall back to the defaults.")
+    features = data["features"]
     if not isinstance(features, dict):
         raise FeatureConfigError(
             f"The feature configuration {path} has 'features' as "
@@ -319,12 +333,16 @@ def write_config(path, values: dict, *, document: "dict | None" = None) -> dict:
 
     ``document`` is whatever :func:`read_config` last returned for this path.
     Entries in it whose slugs this build does not recognise are carried
-    through untouched -- see :func:`unknown_entries`.
+    through untouched -- as are any that have appeared in the file since, so a
+    setting made by a newer toolkit between that read and this write survives
+    a build that has no name for it. A file that has become unreadable in the
+    meantime is refused rather than overwritten.
 
-    Written to a sibling temp file and moved into place, so an interrupted
-    write leaves the previous configuration intact rather than a truncated
-    file that :func:`read_config` would then refuse -- which would turn a
-    Ctrl-C into a project whose configuration cannot be read at all.
+    Written to a sibling temp file, flushed to the disk itself, and moved into
+    place, so an interrupted write leaves the previous configuration intact
+    rather than a truncated file that :func:`read_config` would then refuse --
+    which would turn a Ctrl-C into a project whose configuration cannot be
+    read at all.
     """
     path = Path(path)
     for slug, value in values.items():
@@ -336,28 +354,61 @@ def write_config(path, values: dict, *, document: "dict | None" = None) -> dict:
                 f"{slug!r} cannot be {value!r}; "
                 f"it takes one of {list(feature.values)}.")
     current = resolved_values(document)
-    merged = {s: v for s, v in stored_values(document).items()
-              if s not in FEATURES_BY_SLUG}
+    # Settings this build has no name for are carried from the file as it is
+    # *now*, not only from the document the caller read. Between that read and
+    # this write the user can install a newer toolkit, or a second operator can
+    # change something -- and this build, which by definition cannot see what
+    # those slugs mean, would write a payload with them missing. A downgrade
+    # has to arrive as a conflict, never as a gap: a silently dropped setting
+    # is indistinguishable from one that was never made.
+    #
+    # A file that has become unreadable is refused rather than overwritten.
+    # Rewriting it would destroy choices nobody managed to look at, which is
+    # exactly what the menu refuses to do one layer up.
+    latest = read_config(path)
+    merged: dict = {}
+    for source in (document, latest):
+        merged.update({s: v for s, v in stored_values(source).items()
+                       if s not in FEATURES_BY_SLUG})
     merged.update({f.slug: values.get(f.slug, current[f.slug])
                    for f in FEATURES})
     payload = {"version": CONFIG_VERSION, "features": merged}
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".features-",
-                                   suffix=".json")
+        fd: "int | None" = None
+        tmp: "str | None" = None
         placed = False
         try:
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".features-",
+                                       suffix=".json")
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                fd = None               # ``fdopen`` owns the descriptor now
                 fh.write(text)
+                # Closing flushes this process's buffers to the OS, and no
+                # further. ``os.replace`` then commits a directory entry that
+                # can outlive the data it points at, so a power loss here
+                # leaves a file that is present, empty, and refused by
+                # ``read_config`` -- the settings destroyed by the write that
+                # was meant to preserve them.
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, path)
             placed = True
         finally:
             # ``finally`` rather than ``except OSError``: a Ctrl-C landing
             # between the write and the replace is not an OSError, and it
             # would leave a .features-*.json behind in the project directory
-            # with nothing that ever cleans it up.
-            if not placed:
+            # with nothing that ever cleans it up. ``mkstemp`` is inside the
+            # ``try`` for the same reason -- an interrupt arriving between it
+            # returning and the block being entered is the one interleaving
+            # that strands a file no cleanup can still see.
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp is not None and not placed:
                 try:
                     os.unlink(tmp)
                 except OSError:

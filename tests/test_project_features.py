@@ -20,6 +20,7 @@ import json
 import os
 import re
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -388,6 +389,130 @@ def test_writing_one_feature_leaves_the_others_where_they_were(tmp_path):
     values = project_features.resolved_values(project_features.read_config(path))
     assert values["spec-driven"] == OFF
     assert values["session-history"] == OFF
+
+
+def test_a_document_with_no_features_object_is_refused(tmp_path):
+    """``{}`` is not "our file with nothing set in it".
+
+    ``write_config`` always emits the key, so a document without it was not
+    written by this tool. Resolving it to the defaults would report every
+    feature confidently on the strength of a file nobody could interpret, and
+    then offer to write those invented values over it. The sibling shape
+    ``"features": []`` is refused loudly; these are the same malformation and
+    ``.get(key, {})`` is how one of them quietly stopped being.
+    """
+    path = tmp_path / "features.json"
+    path.write_text(json.dumps({"version": 1}), encoding="utf-8")
+    with pytest.raises(FeatureConfigError, match="no 'features' object"):
+        project_features.read_config(path)
+
+
+def test_an_empty_object_is_refused(tmp_path):
+    """The narrowest case of the above, and the one a truncation looks like."""
+    path = tmp_path / "features.json"
+    path.write_text("{}", encoding="utf-8")
+    with pytest.raises(FeatureConfigError, match="no 'features' object"):
+        project_features.read_config(path)
+
+
+def test_an_empty_features_object_is_still_accepted(tmp_path):
+    """Negative control: refusing the key's absence must not refuse emptiness.
+
+    A project that has had every feature reset is a real state and a readable
+    one. If this went red with the guard above, the guard would be refusing
+    "nothing is set" rather than "this is not our file".
+    """
+    path = tmp_path / "features.json"
+    path.write_text(json.dumps({"version": 1, "features": {}}), encoding="utf-8")
+    assert project_features.read_config(path) == {"version": 1, "features": {}}
+
+
+def test_a_setting_added_since_the_read_survives_this_write(tmp_path):
+    """A downgrade must arrive as a conflict, never as a gap.
+
+    The caller's document is a snapshot. Between taking it and writing, the
+    user can install a newer toolkit, or a second operator can change
+    something. Carrying unknown slugs from that snapshot alone drops anything
+    that appeared in the meantime -- and a build that has no name for a
+    setting is exactly the build that cannot notice it deleted one.
+    """
+    path = tmp_path / "features.json"
+    project_features.write_config(path, {"spec-driven": OFF})
+    stale = project_features.read_config(path)
+
+    fresh = project_features.read_config(path)
+    fresh["features"]["telepathy"] = "on"
+    path.write_text(json.dumps(fresh), encoding="utf-8")
+
+    project_features.write_config(path, {"session-history": OFF},
+                                  document=stale)
+    final = project_features.read_config(path)
+    assert final["features"]["telepathy"] == "on", (
+        "a setting made after the caller's read was dropped by this write")
+    assert final["features"]["session-history"] == OFF
+
+
+def test_a_file_that_became_unreadable_is_refused_not_overwritten(tmp_path):
+    """Refuse rather than clobber, at the write end too.
+
+    The menu refuses to *show* a configuration it could not read. Writing over
+    one here would destroy the same choices by the other route.
+    """
+    path = tmp_path / "features.json"
+    project_features.write_config(path, {"spec-driven": OFF})
+    document = project_features.read_config(path)
+    path.write_text("{ not json", encoding="utf-8")
+    with pytest.raises(FeatureConfigError):
+        project_features.write_config(path, {"session-history": OFF},
+                                      document=document)
+    assert path.read_text(encoding="utf-8") == "{ not json", (
+        "the refusal overwrote the file it could not read")
+
+
+def test_the_bytes_reach_the_disk_before_the_rename(tmp_path, monkeypatch):
+    """Closing flushes to the OS and no further.
+
+    ``os.replace`` then commits a directory entry that can outlive the data it
+    points at, so a power loss leaves a file that is present, empty, and
+    refused by ``read_config`` -- the settings destroyed by the write meant to
+    preserve them. Asserting the ordering, not just that fsync was called: a
+    flush after the rename is the same defect.
+    """
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync",
+                        lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(os, "replace",
+                        lambda a, b: (events.append("replace"),
+                                      real_replace(a, b))[1])
+    project_features.write_config(tmp_path / "features.json", {"spec-driven": OFF})
+    assert events == ["fsync", "replace"], events
+
+
+def test_an_interrupt_mid_write_strands_nothing_and_keeps_the_old_file(tmp_path):
+    """``KeyboardInterrupt`` is not an ``OSError``.
+
+    Cleanup hangs off ``finally`` rather than ``except OSError`` precisely so
+    that an interrupt is covered too. A temp file created and then forgotten
+    leaves a ``.features-*.json`` in the project directory that nothing ever
+    removes, and the previous configuration must still be the one on disk.
+    """
+    path = tmp_path / "features.json"
+    project_features.write_config(path, {"spec-driven": OFF})
+    before = path.read_text(encoding="utf-8")
+
+    def interrupt(_fd):
+        raise KeyboardInterrupt
+
+    with mock.patch.object(os, "fsync", interrupt):
+        with pytest.raises(KeyboardInterrupt):
+            project_features.write_config(path, {"session-history": OFF})
+
+    strays = [p.name for p in tmp_path.iterdir()
+              if p.name.startswith(".features-")]
+    assert not strays, f"an interrupted write stranded {strays}"
+    assert path.read_text(encoding="utf-8") == before, (
+        "an interrupted write changed the configuration it did not finish")
 
 
 def test_writing_records_every_known_feature_explicitly(tmp_path):
