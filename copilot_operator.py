@@ -54,6 +54,7 @@ import operator_session                                      # noqa: E402
 import operator_trace                                        # noqa: E402
 import operator_work                                         # noqa: E402
 import operator_worktree                                     # noqa: E402
+import operator_ownership                                    # noqa: E402
 import work_claims                                           # noqa: E402
 import backlog_tool                                          # noqa: E402
 import handoff_tool                                          # noqa: E402
@@ -207,7 +208,8 @@ SUBCOMMANDS = ("help", "version", "list", "menu", "projects", "report",
                "ingest", "stop", "stop-loop", "restart-loop", "stop-session",
                "join", "reload", "forget", "send", "reply", "inbox", "logs",
                "trace",
-               "tabs", "restore", "session", "work", "backlog", "worktree")
+               "tabs", "restore", "session", "work", "backlog", "worktree",
+               "ownership")
 
 RESERVED_WORDS = set(SUBCOMMANDS)
 
@@ -4852,6 +4854,7 @@ USAGE
     operator work reclaim --instance NAME --item REF           Take an item whose owner is provably gone (preserves their work)
     operator backlog ready [--explain]                         The items an agent may work, and why the rest are not
     operator backlog close ID [--commit REV|--reject]          End an item's life: shipped, or considered and declined
+    operator ownership check [--project SUB]                   Refuse a branch that changed files outside its subproject
     operator NAME                                              Join a running instance
     operator join [NAME]                                       Join (explicit form)
     operator reload NAME                                       Hot-reload launch spec
@@ -6999,6 +7002,120 @@ def manage_worktree(args: list[str]) -> int:
             "recover": _worktree_recover}[verb](opts, db, root)
 
 
+def manage_ownership(args: list[str]) -> int:
+    """``operator ownership check`` — may this branch be pushed?
+
+    The gate the peer-agents skill calls the only isolation that can fail a
+    build. The decision lives in :mod:`operator_ownership`, which touches
+    neither git nor the filesystem beyond reading the declaration; this
+    function is the part that has to talk to git, and it is deliberately the
+    only part that does.
+
+    Exit codes are the interface, because the caller is a pre-push hook or a
+    CI step and neither reads prose. ``0`` allowed, ``1`` refused, ``2``
+    could not tell. The third is not folded into the second: a hook that
+    treats "the declaration would not parse" as "this branch is fine" is the
+    failure this whole module is written against, and a hook author who
+    wants that has to write ``|| true`` where somebody can see it.
+    """
+    if not args or args[0] in HELP_FLAGS:
+        _ownership_usage(sys.stdout if args else sys.stderr)
+        return 0 if args else 1
+    if args[0] != "check":
+        print(f"Unknown subcommand: operator ownership {args[0]}",
+              file=sys.stderr)
+        print("Expected: check", file=sys.stderr)
+        return 1
+    opts: dict = {"project": None, "against": operator_worktree.
+                  DEFAULT_INTEGRATION, "contracts": False, "json": False}
+    parsed = _parse_flagged_args(
+        args[1:],
+        takes_value={"--project": "project", "--against": "against"},
+        flags={"--allow-contracts": "contracts", "--json": "json"})
+    if parsed is None:
+        return 1
+    opts.update(parsed)
+    root = primary_repo_root(Path.cwd())
+    try:
+        declaration = operator_ownership.read_declaration(root)
+    except operator_ownership.OwnershipError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    changed = _changed_paths(opts["against"])
+    if changed is None:
+        print(f"Could not list the files this branch changed against "
+              f"{opts['against']}. Refusing rather than reporting it clean.",
+              file=sys.stderr)
+        return 2
+    verdict = operator_ownership.check(
+        declaration, changed, subproject=opts["project"],
+        allow_contracts=opts["contracts"])
+    if opts["json"]:
+        print(json.dumps({"ok": verdict.ok, "code": verdict.code,
+                          "subproject": verdict.subproject,
+                          "offending": list(verdict.offending),
+                          "candidates": list(verdict.candidates),
+                          "detail": verdict.detail}, indent=2))
+    else:
+        stream = sys.stdout if verdict.ok else sys.stderr
+        print(f"{verdict.code}: {verdict.detail}"
+              if verdict.detail else verdict.code, file=stream)
+        for path in verdict.offending:
+            print(f"  {path}", file=stream)
+        if verdict.candidates and not verdict.ok:
+            print(f"  declared subprojects: "
+                  f"{', '.join(verdict.candidates)}", file=stream)
+    return 0 if verdict.ok else 1
+
+
+def _ownership_usage(stream) -> None:
+    print("Usage:\n"
+          "  operator ownership check [--project SUB] [--against REF] "
+          "[--allow-contracts] [--json]\n"
+          "\n"
+          "Refuses a branch that changed files outside the subproject it is\n"
+          "working. --project names it; left out, the branch must resolve to\n"
+          "exactly one. Contract paths are refused even to a subproject that\n"
+          "owns them, because they are the interface between subprojects --\n"
+          "--allow-contracts waives that one rule and nothing else.\n"
+          "\n"
+          "Exit 0 allowed, 1 refused, 2 could not tell. The third is not the\n"
+          "second: a hook treating 'the declaration would not parse' as\n"
+          "'this branch is fine' is what this check exists to prevent.\n"
+          "\n"
+          "Declared in .operator/subprojects.json at the repository root:\n"
+          '  {"subprojects": {"api": {"owns": ["services/api"]}},\n'
+          '   "contracts": ["specs/contracts"]}',
+          file=stream)
+
+
+def _changed_paths(against: str) -> "list | None":
+    """Repository-relative paths this branch changed, or None if git refused.
+
+    ``main...HEAD`` -- three dots -- is the merge base, so a branch that has
+    not been rebased is not blamed for what landed on ``main`` behind it.
+    Two dots would report every file changed on the integration branch since
+    the fork as though this branch had touched them, and the check would
+    then refuse work nobody did.
+
+    ``None`` on failure, never ``[]``. An empty list is a real answer -- a
+    branch with no changes passes -- and returning it for "git would not
+    run" is the collapse that turns this gate into a decoration.
+    """
+    proc = _run_git(["diff", "--name-only", f"{against}...HEAD"])
+    if proc is None or proc.returncode != 0:
+        return None
+    return [line for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _run_git(args: list[str]):
+    try:
+        return subprocess.run(["git", *args], capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def manage_backlog(args: list[str]) -> int:
     """``operator backlog …`` — the tracked backlog, from the operator CLI.
 
@@ -7435,6 +7552,8 @@ def _dispatch_command(args: list[str]) -> int:
         return manage_backlog(args[1:])
     if head == "worktree":
         return manage_worktree(args[1:])
+    if head == "ownership":
+        return manage_ownership(args[1:])
 
     # Positional shortcut: `operator foo` joins a running instance named foo.
     if len(args) == 1 and not head.startswith("-") and head not in RESERVED_WORDS:

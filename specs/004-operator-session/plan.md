@@ -519,6 +519,56 @@ running while these edits landed, and reported three failures in
 reads the file as it finds it. Do not edit source while a six-minute suite is
 running, and re-run before believing a failure that arrives from one.
 
+### G6 — subproject path ownership, as delivered
+
+`operator ownership check` refuses a branch that changed files outside the
+subproject it is working. The decision lives in `operator_ownership.py`,
+which touches neither git nor the filesystem beyond reading the declaration;
+`manage_ownership` in `copilot_operator.py` is the only part that talks to
+git. That split is the reason the rule set could be mutation-tested at all —
+57 tests, 18 mutants killed, 0 survived, 0 never ran.
+
+Ownership is declared in `.operator/subprojects.json` at the repository
+root, tracked, so CI and a reviewer see the same file the check reads:
+
+```json
+{"subprojects": {"api": {"owns": ["services/api"]}},
+ "contracts": ["specs/contracts"]}
+```
+
+Six decisions carry the design, each pinned by a test:
+
+- **Paths are repository-relative git syntax, never `os.path`.** `git diff
+  --name-only` emits forward slashes on every platform. `normalize()`
+  accepts either separator and does not fold case, because git is
+  case-sensitive about tracked paths and folding would hand one subproject
+  another's file on a case-insensitive filesystem only.
+- **Containment is segment-wise and runs one way.** `services/api` does not
+  own `services/api-v2/` — the `startswith` trap, the same one
+  `operator_worktree._is_inside` avoids. Mutation added the other half:
+  comparing at the *path's* length rather than the prefix's makes an
+  ancestor look owned, which is permissive for ownership and restrictive
+  for contracts simultaneously. No test in the suite caught that; the
+  mutant did.
+- **An unreadable or malformed declaration raises; only an absent one
+  returns `None`.** A failed read collapsing to "no rules" reports every
+  branch clean, which is this repository's most expensive defect shape.
+- **`main...HEAD`, three dots.** Two dots would blame an un-rebased branch
+  for everything that landed on `main` behind it, and the gate would refuse
+  work nobody on the branch did. `_changed_paths` returns `None`, never
+  `[]`, when git refuses: an empty list is a real answer that passes.
+- **Contract paths are refused even to a subproject that owns them**, since
+  they are the interface between subprojects. `--allow-contracts` waives
+  that one rule and does not also grant ownership.
+- **Exit 0 allowed, 1 refused, 2 could not tell.** The third is not folded
+  into the second, so an author who wants "could not tell" to pass has to
+  write `|| true` where a reviewer can see it. `no-declaration` and
+  `nothing-changed` are separate passing codes from `owned`, so "the check
+  does not apply" never reads as "the check ran and approved", and
+  ambiguity — two subprojects that could each own everything changed — is
+  refused rather than resolved by picking the first, which would log a
+  subproject nobody chose.
+
 ## Risks
 
 | Risk | Mitigation |

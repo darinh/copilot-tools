@@ -300,7 +300,24 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       because half the suite writes a fixture catalog into `tmp_path`, and
       `tests/test_artifact_guard.py` already guards the real one — the two
       divide the space. 47 tests, 14 mutants killed, 0 survived, 0 unanchored.
-- [ ] G6 Subproject path-ownership check on push
+- [x] G6 Subproject path-ownership check on push — `operator ownership check`.
+      `operator_ownership.py` decides; it touches neither git nor the
+      filesystem beyond reading `.operator/subprojects.json`, so the whole
+      rule set is testable as syntax. Paths are repository-relative git
+      syntax and containment is segment-wise, never `startswith`, so
+      `services/api` does not own `services/api-v2/` — and, as mutation
+      showed, does not own `services` either: containment runs one way.
+      Comparison is `main...HEAD`, three dots, so an un-rebased branch is
+      not blamed for what landed on `main` behind it. Contract paths are
+      refused even to a subproject that owns them; `--allow-contracts`
+      waives that one rule and does not also grant ownership. Exit 0
+      allowed, 1 refused, 2 could not tell — the third deliberately not
+      folded into the second, because a hook reading "the declaration would
+      not parse" as "this branch is fine" is the failure the check exists
+      to prevent. An absent declaration and an empty diff are separate
+      passing codes from `owned`, so "the check does not apply" never reads
+      as "the check ran and approved". 57 tests, 18 mutants killed, 0
+      survived, 0 never ran.
 - [x] G7 No-commit-to-`main` hook — a permission hook, not a git hook.
       `.git/hooks` holds only samples, a hook is per-clone, does not travel
       with the repository, and `--no-verify` removes it. `git commit` on

@@ -107,6 +107,7 @@ Word counts are per section, as generated with every flag on.
 | | · what a peer is, vs a sub-agent | | guardrail | keep | — a concept needed *before* the decision to delegate |
 | | · check your inbox at session start and before a handoff | | check | delete | mechanism 3 — launch preamble prints unread count |
 | | · always pass your instance name to `operator inbox` | | check | delete | `operator inbox` refuses a nameless **consuming** read; `--peek` stays free |
+| | · give a peer its own folder; "there is no enforcement" | | guardrail | keep 1 sentence, rewritten | **G6** `operator ownership check` is the enforcement, where a declaration exists: exit 1 if the branch left its subproject, 2 if it could not tell. The sentence should now say a boundary is enforceable if declared, not that none is. |
 | | · delivery semantics, etiquette, worked example | | procedure | delete | `skills/peer-agents` (shipped, F1) |
 | 11 | Parallel Agents | 559 | procedure | delete all | the four pasted SQL statements become one `operator` subcommand that claims atomically; that removes the copy-paste surface rather than relocating it |
 | 12 | Branching Strategy | 65 | mixed | keep ~25 | |
