@@ -329,7 +329,23 @@ Status is tracked in SQL during execution; this file is the reconciled record.
 - [ ] G8 New root and subproject templates
 - [ ] G9 Marker migration — recognise both spellings, rewrite old→new
 - [ ] G10 Move build/test/lint out of the managed block (D11)
-- [ ] G11 Test that appended project content survives regeneration (FR-7)
+- [x] G11 Test that appended project content survives regeneration (FR-7) —
+      end-to-end through `retire` → `render` → `compose` → the atomic write,
+      not `compose` alone, because every step between is somewhere the
+      surrounding bytes could be dropped. The existing idempotence test is a
+      weaker claim than it looks: it regenerates the *same* block, so an
+      implementation that ignored the existing file and wrote the block alone
+      still passes it. These regenerate a block that genuinely **changed** —
+      a new version, and a feature turned off so the block *shrinks* — and
+      compare everything outside the markers byte for byte. The fixture is
+      deliberately ugly (trailing spaces, a doubled blank line, a tab)
+      because a "preserving" implementation that round-trips through a line
+      list loses exactly those and nothing else, and tidy fixture prose would
+      not see it. A project that *documents* the markers in a fenced sample
+      keeps its documentation. `merged` is asserted distinct from `written`:
+      claiming "we made this file" over someone's prose is the claim the
+      preservation contract denies. 9 mutants killed, 0 survived, 0 never
+      ran — including both whitespace round-trips.
 - [ ] G12 Feature flags default off; one platform's commands; emit `CLAUDE.md`
 - [ ] G13 Set the budget from measured residue and make generation error above it
 

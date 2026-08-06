@@ -955,6 +955,146 @@ def test_a_second_run_is_idempotent(machine):
     assert len(list(machine["archive"].iterdir())) == 1
 
 
+# ---------------------------------------------------------------------------
+# FR-7 -- a project's own content survives regeneration, byte for byte
+#
+# `test_a_second_run_is_idempotent` above is a weaker claim than it looks:
+# it regenerates the *same* block, so a `_place_one` that ignored the
+# existing file entirely and wrote the block alone would still pass it on
+# the second run. What FR-7 promises is that content survives a block that
+# genuinely changed -- a new toolkit version, a feature turned on, a section
+# rewritten -- because that is the only regeneration anyone will ever run.
+# These tests drive the whole path (`render` -> `compose` -> the atomic
+# write), not `compose` on its own, since every one of those steps is
+# somewhere the surrounding bytes could be dropped.
+# ---------------------------------------------------------------------------
+
+APPENDED_ABOVE = (
+    "# alpha\n"
+    "\n"
+    "Build: `make check`. Run one test with `pytest -k name`.\n"
+    "\n"
+)
+
+APPENDED_BELOW = (
+    "\n"
+    "## Notes we wrote ourselves\n"
+    "\n"
+    "Trailing whitespace matters here:   \n"
+    "So do blank lines.\n"
+    "\n"
+    "\n"
+    "And a tab\tin the middle.\n"
+)
+
+
+def _regenerate_around_project_content(machine, **second_run):
+    """Place, append the project's own prose above and below, regenerate.
+
+    Returns the block-stripped remainder before and after, plus the two
+    managed blocks, so a caller can assert both halves: what changed, and
+    what did not.
+    """
+    _retire(machine)
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    written = target.read_text(encoding="utf-8")
+    target.write_text(APPENDED_ABOVE + written.rstrip("\n") + "\n"
+                      + APPENDED_BELOW, encoding="utf-8")
+    before = target.read_text(encoding="utf-8")
+    result = _retire(machine, **second_run)
+    after = target.read_text(encoding="utf-8")
+    return before, after, result
+
+
+def _split_out_the_block(text: str) -> "tuple[str, str, str]":
+    """`text` as (above, the managed block, below)."""
+    assert text.count(MANAGED_BEGIN) == 1, text
+    assert text.count(MANAGED_END) == 1, text
+    head, rest = text.split(MANAGED_BEGIN, 1)
+    block, tail = rest.split(MANAGED_END, 1)
+    return head, block, tail
+
+
+def test_project_content_survives_a_block_that_actually_changed(machine):
+    """The regeneration FR-7 is about: the toolkit version moved on.
+
+    Everything outside the markers is compared byte for byte -- including
+    the trailing spaces, the doubled blank line and the tab, because a
+    "preserving" implementation that round-trips through a line list and
+    rejoins with `\\n` loses exactly those and nothing else, and no test
+    written with tidy fixture prose would see it.
+    """
+    before, after, result = _regenerate_around_project_content(
+        machine, version="10.0.0")
+    assert [o.state for o in result.outcomes] == [MERGED, MERGED]
+
+    old_head, old_block, old_tail = _split_out_the_block(before)
+    new_head, new_block, new_tail = _split_out_the_block(after)
+
+    assert old_block != new_block, (
+        "the block did not change, so this test proved only what the "
+        "idempotence test already proves")
+    assert "9.9.9" in old_block and "10.0.0" in new_block
+    assert (new_head, new_tail) == (old_head, old_tail)
+    assert new_head == APPENDED_ABOVE
+    assert new_tail.endswith(APPENDED_BELOW)
+
+
+def test_project_content_survives_a_feature_being_turned_off(machine):
+    """The other axis: the block shrinks. Content below it must not be
+    dragged up with the removed section."""
+    config = (machine["projects_root"] / "GUID-1"
+              / project_features.CONFIG_NAME)
+    _retire(machine)
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    target.write_text(
+        APPENDED_ABOVE + target.read_text(encoding="utf-8").rstrip("\n")
+        + "\n" + APPENDED_BELOW, encoding="utf-8")
+    before = target.read_text(encoding="utf-8")
+    config.write_text(json.dumps(
+        {"version": 1, "features": {"session-handoff": "off"}}),
+        encoding="utf-8")
+    _retire(machine)
+    after = target.read_text(encoding="utf-8")
+
+    old_head, old_block, old_tail = _split_out_the_block(before)
+    new_head, new_block, new_tail = _split_out_the_block(after)
+    assert "handoff prose" in old_block
+    assert "handoff prose" not in new_block
+    assert (new_head, new_tail) == (old_head, old_tail)
+
+
+def test_appended_content_that_quotes_the_markers_is_not_eaten(machine):
+    """A project documenting the managed block writes these lines into a
+    fenced sample. Read as live markers, the sample and everything between
+    it and the real block is what `compose` replaces -- so the file loses
+    the paragraph explaining the very thing that ate it."""
+    _retire(machine)
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    documented = (
+        target.read_text(encoding="utf-8").rstrip("\n") + "\n"
+        + "\n## How the managed block is delimited\n\n"
+        + "```markdown\n" + MANAGED_BEGIN + "\n...\n" + MANAGED_END
+        + "\n```\n\nKeep your own notes outside it.\n")
+    target.write_text(documented, encoding="utf-8")
+    _retire(machine, version="10.0.0")
+    after = target.read_text(encoding="utf-8")
+    assert "Keep your own notes outside it." in after
+    assert "## How the managed block is delimited" in after
+    assert after.count(MANAGED_BEGIN) == 2
+    assert "10.0.0" in after
+
+
+def test_regeneration_reports_merged_not_written(machine):
+    """The state is what a caller logs, and `written` over a file that
+    already held someone's prose reads as "we made this file" -- which is
+    the claim the whole preservation contract denies."""
+    _, _, result = _regenerate_around_project_content(machine,
+                                                      version="10.0.0")
+    assert result.outcomes[0].state == MERGED
+    assert result.outcomes[0].state != WRITTEN
+
+
 def test_no_projects_at_all_refuses_to_remove_anything(machine):
     result = pi.retire(
         [], source=SOURCE, source_origin="a test",

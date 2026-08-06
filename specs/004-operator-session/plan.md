@@ -569,6 +569,39 @@ Six decisions carry the design, each pinned by a test:
   refused rather than resolved by picking the first, which would log a
   subproject nobody chose.
 
+### G11 — preservation, as tested
+
+FR-7 promises that everything outside the managed block survives
+regeneration byte-for-byte. The promise was already implemented correctly in
+`compose`; what was missing was a test that could tell.
+
+`test_a_second_run_is_idempotent` looked like that test and is not. It
+regenerates the *same* block, so a `_place_one` that ignored the existing
+file entirely and wrote the block alone passes it — the second run produces
+the same bytes either way. The regeneration anyone actually runs is one
+where the block *changed*: a new toolkit version, a feature turned on, a
+section rewritten.
+
+So the four new tests drive `retire` → `render` → `compose` →
+`write_text_atomic` end to end and change the block on both axes — a version
+bump, and a feature turned **off** so the block shrinks and content below it
+could be dragged up with the removed section. The fixture prose is
+deliberately ugly: trailing spaces, a doubled blank line, a tab mid-line.
+A "preserving" implementation that round-trips the surrounding text through
+`splitlines()` and rejoins with `\n` loses exactly those characters and
+nothing else, and a test written with tidy prose cannot see it. Both such
+mutants are killed by these tests and by nothing else in the file.
+
+Two smaller claims ride along. A project that *documents* the managed block
+in a fenced code sample keeps both the sample and everything between it and
+the real block — the failure mode being a file that loses the paragraph
+explaining the mechanism that ate it. And `merged` is asserted to be a
+different outcome from `written`, because `written` over a file that already
+held someone's prose reads in the log as "we made this file", which is the
+one claim the preservation contract exists to deny.
+
+9 mutants killed, 0 survived, 0 never ran.
+
 ## Risks
 
 | Risk | Mitigation |
