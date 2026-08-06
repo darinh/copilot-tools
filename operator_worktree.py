@@ -70,6 +70,11 @@ WORKTREE_DIRTY = "worktree-dirty"
 INSIDE_TARGET = "inside-target"
 GIT_FAILED = "git-failed"
 
+#: `new` found this instance already holding the item with a checkout it could
+#: confirm. Distinct from ITEM_HELD, which is somebody *else* holding it: the
+#: next move is `finish`, not `reclaim`.
+ALREADY_YOURS = "already-yours"
+
 #: The prefix a derived branch carries. Deliberately not one of the
 #: conventional `feat/` `fix/` `docs/` prefixes: choosing between those from a
 #: work-item reference is a guess about intent, and a wrong guess ships in the
@@ -111,6 +116,24 @@ def derived_branch(item: str) -> str:
 def default_path(root, branch: str) -> Path:
     """``<primary checkout>/.worktrees/<slug>``, the layout AGENTS.md states."""
     return Path(root) / WORKTREES_DIR / slug(branch)
+
+
+def _anchored(root, value) -> str:
+    """``value`` as an absolute path, resolved against ``root`` when relative.
+
+    Every git call this module makes is ``git -C <root> ...``, where git reads
+    a relative worktree path as root-relative. A presence probe resolves the
+    same string against the *process* cwd, which is a different directory the
+    moment anyone runs the command from inside a worktree. So a relative path
+    recorded verbatim means creation and inspection are looking at two places,
+    and the dangerous half is `finish`: it probes the wrong location, sees
+    nothing, calls the tree already gone, prunes the registration and releases
+    the claim while the real checkout is still on disk with work in it.
+
+    Anchoring here removes the disagreement at the source rather than asking
+    every later reader to remember which root a stored string was relative to.
+    """
+    return os.path.abspath(os.path.join(str(root), str(value)))
 
 
 def _same_path(left, right) -> bool:
@@ -260,9 +283,45 @@ def new(db, root, *, item: str, instance: str, subproject: str = "",
     reporting is that somebody else holds the item -- and the two have
     different next moves, `operator work list` and `reclaim` against one and a
     person against the other.
+
+    The compensation is conditional, and that condition is the whole of its
+    correctness. ``work_claims.claim`` *resumes* rather than refuses when the
+    same instance asks for an item it already holds -- deliberately, so a
+    restarted agent can pick its work back up. So a `new` that finds its own
+    live claim did not create it, and releasing it on refusal would hand the
+    agent's existing checkout to the next sweep as an ownerless tree. This
+    reads the claim before asking for it, refuses outright when a checkout it
+    could confirm is already recorded, and releases only a claim this call
+    actually took.
     """
     branch = branch or derived_branch(item)
-    target = Path(path) if path else default_path(root, branch)
+    target = Path(_anchored(root, path if path else default_path(root, branch)))
+
+    before = work_claims.claim_for_item(db, item)
+    mine_before = before is not None and before.instance == instance
+    if mine_before and before.worktree:
+        if not _claimed_platform_ok(before):
+            return WorktreeResult(
+                verb="new", refused=FOREIGN_PLATFORM, item=item,
+                instance=instance, path=before.worktree, branch=before.branch,
+                claim=before,
+                detail=f"{instance!r} already holds {item!r} with a worktree "
+                       f"recorded on a {before.platform or 'foreign'} system")
+        standing = install_manifest.dir_present(Path(before.worktree))
+        if standing is not False:
+            # True, or a probe that could not answer. Only evidence of absence
+            # justifies making a second tree for an item that already has one
+            # -- and a claim rewritten on the way to a refusal is a claim
+            # pointing at a checkout nobody made.
+            return WorktreeResult(
+                verb="new", refused=ALREADY_YOURS, item=item,
+                instance=instance, path=before.worktree, branch=before.branch,
+                claim=before,
+                detail=f"{instance!r} already holds {item!r} at "
+                       f"{before.worktree}; use `operator worktree finish` "
+                       f"to retire it",
+                notes=(("the recorded directory could not be examined, and is "
+                        "assumed to be there",) if standing is None else ()))
 
     try:
         held = operator_work.request(
@@ -275,12 +334,16 @@ def new(db, root, *, item: str, instance: str, subproject: str = "",
                               branch=branch, detail=str(exc))
 
     def undo(refused: str, detail: str, note: str = "") -> WorktreeResult:
-        operator_work.release(db, item=item, instance=instance)
+        if mine_before:
+            kept = ("the claim was already yours and was left held; its "
+                    "recorded worktree now names a tree that was not made",)
+        else:
+            operator_work.release(db, item=item, instance=instance)
+            kept = ("the claim taken for this call was released again",)
         return WorktreeResult(
             verb="new", refused=refused, item=item, instance=instance,
             path=str(target), branch=branch, detail=detail,
-            notes=(("the claim taken for this call was released again",)
-                   + ((note,) if note else ())))
+            notes=kept + ((note,) if note else ()))
 
     present = install_manifest.path_present(target)
     if present is True:
@@ -332,6 +395,40 @@ def _merged_into(root, branch: str, into: str, runner=None) -> bool:
     return True
 
 
+def _ignored_content(tree, runner=None) -> tuple:
+    """A note naming ignored files that removing ``tree`` will take with it.
+
+    ``git status --porcelain`` does not list ignored files, so a tree holding
+    nothing but ignored content reads as clean and ``worktree remove``
+    succeeds -- taking a local ``.env`` or an unpushed note with it. Refusing
+    on ignored content instead would be worse than the disease: every tree
+    that has run a build or a test suite carries some, so `finish` would
+    refuse essentially always and the first thing anyone reached for would be
+    a force flag this module does not have.
+
+    So the boundary is stated rather than defended: git's own ``worktree
+    remove`` deletes ignored content and this command does not change that,
+    but it says what it is about to take. A failure to ask produces no note,
+    because a note is an improvement on silence and not a precondition for
+    the removal.
+    """
+    try:
+        listed = operator_work._git(
+            ["status", "--porcelain", "--ignored=matching",
+             "--untracked-files=all"], tree, runner=runner)
+    except GitUnavailable:
+        return ()
+    names = [line[3:].strip() for line in listed.splitlines()
+             if line.startswith("!!")]
+    if not names:
+        return ()
+    shown = ", ".join(names[:5])
+    if len(names) > 5:
+        shown += f", and {len(names) - 5} more"
+    return (f"{len(names)} ignored path(s) were removed with the tree: "
+            f"{shown}",)
+
+
 def finish(db, root, *, item: str, instance: str, into: str = DEFAULT_INTEGRATION,
            cwd=None, runner=None) -> WorktreeResult:
     """Retire a work item's checkout and the claim on it.
@@ -375,7 +472,8 @@ def finish(db, root, *, item: str, instance: str, into: str = DEFAULT_INTEGRATIO
                                      f"{os.name} one")
 
     here = Path(cwd) if cwd is not None else Path.cwd()
-    if _is_inside(here, held.worktree):
+    tree = _anchored(root, held.worktree)
+    if _is_inside(here, tree):
         return WorktreeResult(verb="finish", refused=INSIDE_TARGET, item=item,
                               instance=instance, claim=held,
                               path=held.worktree, branch=held.branch,
@@ -383,11 +481,11 @@ def finish(db, root, *, item: str, instance: str, into: str = DEFAULT_INTEGRATIO
                                      f"{held.worktree}; change out of it "
                                      f"first")
 
-    present = install_manifest.dir_present(Path(held.worktree))
+    present = install_manifest.dir_present(Path(tree))
     if present is True:
         try:
             status = operator_work._git(["status", "--porcelain"],
-                                        held.worktree, runner=runner)
+                                        tree, runner=runner)
         except GitUnavailable as exc:
             return WorktreeResult(verb="finish", refused=GIT_FAILED, item=item,
                                   instance=instance, claim=held,
@@ -399,15 +497,16 @@ def finish(db, root, *, item: str, instance: str, into: str = DEFAULT_INTEGRATIO
                                   path=held.worktree, branch=held.branch,
                                   detail=f"{held.worktree} has uncommitted "
                                          f"changes; commit them first")
+        ignored = _ignored_content(tree, runner=runner)
         try:
-            operator_work._git(["worktree", "remove", str(held.worktree)],
+            operator_work._git(["worktree", "remove", str(tree)],
                                root, runner=runner)
         except GitUnavailable as exc:
             return WorktreeResult(verb="finish", refused=GIT_FAILED, item=item,
                                   instance=instance, claim=held,
                                   path=held.worktree, branch=held.branch,
                                   detail=str(exc))
-        removed_note = ()
+        removed_note = ignored
     elif present is False:
         # The directory is already gone. Pruning the registration is the
         # remaining half of a removal somebody started, and it deletes no
@@ -529,6 +628,7 @@ def survey(db, root, *, probes=None, now=None,
 
 
 __all__ = [
+    "ALREADY_YOURS",
     "DEAD",
     "DEFAULT_INTEGRATION",
     "FOREIGN_PLATFORM",

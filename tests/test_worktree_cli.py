@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -242,6 +243,104 @@ def test_new_refuses_a_path_it_could_not_examine(db: Path, repo: Path,
     result = _new(db, repo)
     assert result.refused == owt.PATH_UNREADABLE
     assert wc.claim_for_item(db, "0007") is None
+
+
+def test_new_refuses_a_second_tree_for_an_item_this_instance_already_holds(
+        db: Path, repo: Path) -> None:
+    """`work_claims.claim` resumes rather than refuses for the same instance,
+    so a `new` that found its own live claim did not create it. Reported as
+    its own refusal because the next move is `finish`, not `reclaim`."""
+    first = _new(db, repo)
+    second = _new(db, repo)
+    assert second.ok is False
+    assert second.refused == owt.ALREADY_YOURS
+    assert owt._same_path(second.path, first.path)
+
+
+def test_new_never_releases_a_claim_it_did_not_take(db: Path,
+                                                    repo: Path) -> None:
+    """The compensating release is correct only for a claim this call created.
+    Firing it against a resumed claim releases the agent's *existing*
+    checkout, which the next sweep then reads as an ownerless tree."""
+    first = _new(db, repo)
+    tree = Path(first.path)
+    # The recorded tree is gone, so a second `new` is a legitimate recovery
+    # and proceeds past the already-yours refusal into a resumed claim.
+    shutil.rmtree(tree)
+    result = _new(db, repo, path=str(repo / "blocked"), probes=FakeProbes())
+    assert result.ok is False
+    held = wc.claim_for_item(db, "0007")
+    assert held is not None and held.instance == "alpha", (
+        "the resumed claim was released by a call that did not take it")
+    assert any("left held" in note for note in result.notes)
+
+
+def test_new_anchors_a_relative_path_to_the_repository_not_the_cwd(
+        db: Path, repo: Path, monkeypatch, tmp_path: Path) -> None:
+    """Every git call is `git -C <root>`, where a relative worktree path is
+    root-relative, while a presence probe resolves it against the process cwd.
+    Recorded verbatim, the two disagree the moment anyone runs the command
+    from somewhere else -- and `finish` then probes the wrong place, calls the
+    tree already gone and releases the claim over a live checkout."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    result = _new(db, repo, path="side/tree")
+    assert result.ok is True
+    assert os.path.isabs(result.path)
+    assert owt._same_path(result.path, repo / "side" / "tree")
+    assert install_manifest.dir_present(repo / "side" / "tree") is True
+    assert owt._same_path(wc.claim_for_item(db, "0007").worktree,
+                          repo / "side" / "tree")
+
+
+def test_finish_anchors_a_relative_worktree_recorded_by_an_older_claim(
+        db: Path, repo: Path, monkeypatch, tmp_path: Path) -> None:
+    """A claim written before paths were anchored still names a relative
+    path. Read from a different cwd it probes as absent, and the absent branch
+    prunes and releases -- so the legacy shape is resolved, not trusted."""
+    _new(db, repo)
+    with wc.connect(db) as conn:
+        conn.execute("UPDATE work_claims SET worktree = ? WHERE item = ?",
+                     (os.path.join(".worktrees", "work-0007"), "0007"))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    result = owt.finish(db, repo, item="0007", instance="alpha", cwd=elsewhere)
+    assert result.ok is True
+    assert install_manifest.dir_present(repo / ".worktrees" / "work-0007") is False
+    assert not any("already gone" in note for note in result.notes), (
+        "the relative path probed as absent and took the prune branch")
+
+
+def test_finish_names_the_ignored_content_it_is_about_to_remove(
+        db: Path, repo: Path) -> None:
+    """`status --porcelain` does not list ignored files, so a tree holding
+    only ignored content reads as clean and `worktree remove` takes it. This
+    command does not refuse over that -- every tree that has run a build
+    carries some, and refusing always is how a force flag gets asked for --
+    but it does not take it silently either."""
+    (repo / ".gitignore").write_text("secrets.env\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "--quiet", "-m", "ignore")
+    tree = Path(_new(db, repo).path)
+    (tree / "secrets.env").write_text("TOKEN=hunter2\n", encoding="utf-8")
+    assert _git(tree, "status", "--porcelain").strip() == ""
+
+    result = owt.finish(db, repo, item="0007", instance="alpha", cwd=repo)
+    assert result.ok is True
+    assert install_manifest.dir_present(tree) is False
+    assert any("secrets.env" in note for note in result.notes), result.notes
+
+
+def test_finish_says_nothing_about_ignored_content_when_there_is_none(
+        db: Path, repo: Path) -> None:
+    """The positive control for the note above: a note that appears either way
+    reports nothing, and would train its reader to skip it."""
+    tree = Path(_new(db, repo).path)
+    result = owt.finish(db, repo, item="0007", instance="alpha", cwd=repo)
+    assert result.ok is True
+    assert not any("ignored" in note for note in result.notes), result.notes
 
 
 def test_new_releases_its_own_claim_when_git_refuses(db: Path,

@@ -131,6 +131,24 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       DEAD owners — STALE is reported as itself, as `reclaim` already does.
       The mutating verbs are absent from the module by construction, asserted
       by an AST scan with a positive control.
+      Three defects found by adversarial review, all fixed here. `undo`
+      released unconditionally, but `work_claims.claim` *resumes* rather than
+      refuses for the same instance, so a `new` that found its own live claim
+      had not created it and the compensating release orphaned the agent's
+      existing checkout; `new` now reads the claim first, refuses
+      `already-yours` when it can confirm a recorded checkout, and releases
+      only a claim this call took. A relative `--path` was recorded verbatim,
+      but git resolves it against the repository root while a presence probe
+      resolves it against the process cwd — so `finish` run from elsewhere
+      probed the wrong place, called a live tree gone, pruned and released;
+      paths are now anchored to the root on the way in and legacy relative
+      claims are anchored on the way out. And `status --porcelain` does not
+      list ignored files, so a tree holding only ignored content read as clean
+      and `worktree remove` took it silently: gating on `--ignored` would
+      refuse on any tree that had run a build and would be answered with a
+      force flag, so the boundary is stated instead — `finish` names the
+      ignored paths it is about to remove, with a positive control asserting
+      it stays quiet when there are none.
 - [ ] E5 `operator reply`, retiring the inbox-polling semantics
 
 ## Phase F — skills and rationale

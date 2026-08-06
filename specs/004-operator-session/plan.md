@@ -220,6 +220,40 @@ branch only when `git merge-base --is-ancestor` proves it merged, with
 is UNCLAIMED or provably DEAD — STALE is reported as itself, for the same
 reason `reclaim` refuses it.
 
+Adversarial review found three defects in the first cut of this, and the first
+is the one worth carrying forward as a rule. `work_claims.claim` *resumes*
+rather than refuses when the same instance asks for an item it already holds —
+deliberately, so a restarted agent can pick its work back up — which means a
+`new` that finds its own live claim did not create it. The unconditional
+compensating release therefore had a case where it released a claim the call
+had never taken, handing the agent's own checkout to the next sweep as an
+ownerless tree. The compensation is now conditional on having actually taken
+the claim, and `new` refuses `already-yours` up front when it can confirm a
+recorded checkout is still standing. The general form: a compensating action
+is only safe against the state the compensating call itself created, and
+"I asked for X and got X" does not establish that.
+
+The second is the platform-syntax failure wearing new clothes. A relative
+`--path` was recorded verbatim, but every git call here is `git -C <root>`,
+where git reads a relative worktree path as root-relative, while a presence
+probe resolves the same string against the process cwd. Recorded verbatim the
+two disagree the moment anyone runs the command from inside a worktree — and
+the dangerous half is `finish`, which probes the wrong place, finds nothing,
+concludes the tree is already gone, prunes the registration and releases the
+claim over a live checkout. Paths are anchored to the root on the way in, and
+legacy relative claims anchored on the way out.
+
+The third is a boundary rather than a bug, and is stated rather than defended:
+`git status --porcelain` does not list ignored files, so a tree holding only
+ignored content reads as clean and `worktree remove` takes it. Gating on
+`--ignored` would refuse on any tree that has run a build or a test suite,
+which is every tree, and a command that refuses always is answered with the
+force flag this module deliberately does not have. So `finish` still removes
+ignored content, exactly as git's own `worktree remove` does, but it names
+what it is taking first — with a positive control asserting the note stays
+absent when there is nothing to report, because a note that appears either way
+trains its reader to skip it.
+
 ## Phase G+H — the audit
 
 Before the template changes, produce a table classifying every candidate line as
