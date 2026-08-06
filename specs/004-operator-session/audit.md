@@ -67,7 +67,7 @@ Word counts are per section, as generated with every flag on.
 | 1 | Git Worktrees — Always | 378 | mixed | keep ~60 | |
 | | · never edit the primary checkout | | check | delete | **G3** hook denies `edit`/`create` resolving outside the assigned worktree |
 | | · layout, primary-root resolution, both platforms' snippets | | procedure | delete | `skills/worktrees` (shipped, F1); `operator worktree new` computes the path |
-| | · `/.worktrees/` in tracked `.gitignore` | | check | delete | **G4** enroll writes it; test asserts enroll wrote it |
+| | · `/.worktrees/` in tracked `.gitignore` | | check | delete | **G4** `operator worktree new` writes it (there is no enroll); tests assert it was written, not doubled, not staged |
 | | · one per branch, never nest, `cd` out before removing | | check | delete | `operator worktree new`/`finish` already refuse; test pins the refusals |
 | | · leave worktrees you did not create alone | | check | keep 1 sentence | hook denies `git worktree remove` of a tree whose branch the session does not own |
 | | · branches merge to `main`, there is no `develop` | | guardrail | keep (once, in §12) | — a negative fact; the failure is *inventing* a branch |
@@ -84,7 +84,7 @@ Word counts are per section, as generated with every flag on.
 | | · verify the worktree before reading the findings | | guardrail | keep 1 sentence | — the failure is believing a report |
 | | · the 454-line story and `git fsck` recovery | | rationale + procedure | move | `docs/rationale.md`; recovery commands to `skills/worktrees` |
 | 4 | Project Configuration System | 106 | data | keep ~60 | ids and paths the agent cannot derive |
-| | · "you must not offer to enroll this directory" | | check | delete | **G5** enrollment refuses for an already-enrolled project |
+| | · "you must not offer to enroll this directory" | | check | delete | **G5** an AST scan proves no production module writes the catalog or mints a project id, so nothing *can* enroll |
 | 5 | Session Handoff Protocol | 679 | mixed | keep ~35 | |
 | | · on-session-start steps (unmerged work, read handoff, log) | | procedure | delete | mechanism 3 — `operator` prints them at launch, where the trigger is certain |
 | | · never write `next-session.md` by hand | | check | delete | hook denies `create`/`edit` targeting the handoff path |

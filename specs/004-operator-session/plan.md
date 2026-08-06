@@ -464,6 +464,55 @@ exactness that actually does the work is what the docstring now names.
 
 Eleven mutants, all killed, none unanchored.
 
+**Delivered (G5): the prohibition gets a scan, not a refusal.**
+
+The task said "refuse to offer enrollment for an already-enrolled project",
+and there is nothing to refuse. Registering a project is exactly two writes —
+a row in `catalog.csv` mapping a directory to an id, and the id itself, minted
+fresh — and neither is performed anywhere in first-party production code.
+Every catalog write in the repository is a test writing a fixture into
+`tmp_path`; every `uuid4()` is a temp-file suffix, a message id, a trace id or
+a session claim.
+
+So `tests/test_enrollment_conformance.py` pins the absence rather than adding
+a refusal to a path that does not exist. That is a better guarantee than the
+prose it replaces: `AGENTS.md` asks an agent not to do something it was
+perfectly able to do, and the scan says the machinery is not there, which
+holds for an agent that never reads the line.
+
+Three things about the detector are load-bearing, and two of them are scars
+from this task.
+
+*It is an AST scan, not a text search.* `"catalog" in line and "write" in
+line` matches the scan's own docstring, matches every comment about the rule,
+and misses `p = catalog_path(); p.write_text(...)` — wrong in both directions
+simultaneously.
+
+*Alias resolution is scoped, and the first draft's was not.* `p = CATALOG`
+followed by `open(p, "w")` is enrollment the unscoped draft caught — along
+with 200-odd other names in `copilot_operator.py`, because once any name
+enters the set an assignment from it *anywhere* in the file adds another and
+the transitive closure eats the module. It reported fifteen false positives in
+production code on the first run. A scan that reports everything is switched
+off exactly as fast as one that reports nothing. Confined to one function body
+the same algorithm yields `{catalog, path}`, `{catalog}` and `{found}` across
+the three largest modules.
+
+*Three positive controls failed on the first run, and the detector was fixed
+rather than the controls.* `self.catalog.write_text(...)` — the obvious way to
+write enrollment — was invisible, because the scan looked at bare names and
+never at attribute names. Controls stronger than the detector are the only
+kind worth writing.
+
+The one surviving mutant was the alias fixed-point loop: cutting it to a
+single pass changed no answer, because every control had its definition before
+its use. `_own_nodes` yields `ast.walk` order, which is *breadth-first*, so an
+assignment inside an `if` is visited after a top-level statement that reads
+it. The control is now that shape, and it is the only one that can tell one
+pass from convergence.
+
+Fourteen mutants, all killed, none unanchored. 47 tests.
+
 One process lesson, cheap and worth recording: the Phase F/G3 full suite was
 running while these edits landed, and reported three failures in
 `operator_worktree.py` and `copilot_operator.py` that do not exist. A suite

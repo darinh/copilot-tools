@@ -287,7 +287,19 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       checkout still happens. Never staged, because a generated line in
       the index is one that gets committed inside somebody else's change.
       11 mutants killed, 0 survived, 0 never ran.
-- [ ] G5 Refuse to offer enrollment for an already-enrolled project
+- [x] G5 Refuse to offer enrollment for an already-enrolled project —
+      delivered as `tests/test_enrollment_conformance.py`, and the shape
+      changed once measured. There is no enrollment to refuse: registering
+      a project is exactly two writes — a row in `catalog.csv` and a freshly
+      minted id — and **no first-party production module performs either**.
+      So instead of a refusal on a path that does not exist, the check pins
+      the absence: an AST scan over every production `*.py` reporting any
+      write to a catalog-derived path, and any `uuid` minted *into* one.
+      That is a stronger backing than the prose had, because it holds even
+      for an agent that never reads the line. Reads pass; `tests/` is exempt
+      because half the suite writes a fixture catalog into `tmp_path`, and
+      `tests/test_artifact_guard.py` already guards the real one — the two
+      divide the space. 47 tests, 14 mutants killed, 0 survived, 0 unanchored.
 - [ ] G6 Subproject path-ownership check on push
 - [x] G7 No-commit-to-`main` hook — a permission hook, not a git hook.
       `.git/hooks` holds only samples, a hook is per-clone, does not travel
