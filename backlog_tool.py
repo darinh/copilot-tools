@@ -497,24 +497,27 @@ def check(repo_root=None, *, resolve_commits: bool = True) -> list:
             problems.append(
                 f"{name}: the {EVIDENCE_HEADING!r} section is missing or empty")
 
-        # R7. Terminal items carry a closing date; live items carry neither a
-        # closing date nor a commit.
+        # R7. Terminal items carry a closing date; live items carry none.
         closed_on = front.get("closed", "")
         commit = front.get("commit", "")
         if status in TERMINAL_STATUSES and not closed_on:
             problems.append(
                 f"{name}: status is {status!r} but no 'closed' date is set")
-        if status in ACTIVE_STATUSES:
-            if closed_on:
-                problems.append(
-                    f"{name}: status is {status!r} but a 'closed' date is set")
-            if commit:
-                problems.append(
-                    f"{name}: status is {status!r} but a 'commit' is set")
+        if status in ACTIVE_STATUSES and closed_on:
+            problems.append(
+                f"{name}: status is {status!r} but a 'closed' date is set")
 
         # R8. A closed item names a commit, and that commit resolves here. A
         # close pointing at nothing is a claim that something shipped with
         # nothing behind it.
+        #
+        # Every other status names none, because a SHA *is* the claim that
+        # work landed. ``rejected`` is the case that costs the most and the
+        # one this rule was widened for: nothing shipped, so a SHA against a
+        # rejection reads as evidence of work that never happened. It is
+        # reachable -- rejecting an item that was already carrying a commit
+        # moves it out of the live statuses, and a rule that only asked about
+        # those would have watched the field become legal on its way past.
         if status in COMMIT_REQUIRED_STATUSES:
             if not commit:
                 problems.append(
@@ -523,6 +526,9 @@ def check(repo_root=None, *, resolve_commits: bool = True) -> list:
                 problems.append(
                     f"{name}: commit {commit!r} does not resolve to a commit "
                     "in this repository")
+        elif commit and status in STATUSES:
+            problems.append(
+                f"{name}: status is {status!r} but a 'commit' is set")
 
         # R9. The spec-kit mapping. Either a path that exists under specs/, or
         # the explicit literal 'none'.
@@ -862,6 +868,18 @@ def _item_path(directory, item_id: int) -> Path:
     return match[0]
 
 
+def _field_line(key: str, value, ending: str) -> str:
+    """One front-matter line, with no trailing space when ``value`` is empty.
+
+    ``closed:`` and ``commit:`` are legal empty, and the template in this
+    project's own documentation writes them bare. ``f"{key}: {value}"`` would
+    write ``"commit: "`` instead -- same meaning to the parser, but a
+    whitespace-only difference from every hand-written item, and one that a
+    later reader has to open a hex dump to explain.
+    """
+    return f"{key}:{' ' + str(value) if str(value) else ''}{ending}"
+
+
 def _set_front_matter(path: Path, updates: dict, *, require: tuple = ()) -> None:
     """Set each ``key: value`` in ``updates`` in ``path``'s front matter.
 
@@ -909,7 +927,7 @@ def _set_front_matter(path: Path, updates: dict, *, require: tuple = ()) -> None
         key = match.group(1) if match else None
         if key in updates:
             ending = line[len(line.rstrip("\r\n")):]
-            out.append(f"{key}: {updates[key]}{ending}")
+            out.append(_field_line(key, updates[key], ending))
             seen[key] += 1
         else:
             out.append(line)
@@ -931,7 +949,8 @@ def _set_front_matter(path: Path, updates: dict, *, require: tuple = ()) -> None
         at = closing if anchor is None else anchor
         previous = out[at - 1] if at else ""
         ending = previous[len(previous.rstrip("\r\n")):] or "\n"
-        out[at:at] = [f"{key}: {updates[key]}{ending}" for key in missing]
+        out[at:at] = [_field_line(key, updates[key], ending)
+                      for key in missing]
 
     # Bytes, not text: an encoding-aware write would translate newlines on the
     # way out and undo the preservation above.
@@ -994,7 +1013,9 @@ def close_item(directory, item_id: int, *, commit: "str | None" = None,
     requiring approval first would mean approving something in order to decline
     it. It takes no commit, because nothing shipped -- demanding one forces
     whoever rejects an item to invent a SHA, and an invented SHA looks exactly
-    like evidence.
+    like evidence. A commit the item was *already* carrying is cleared for the
+    same reason: refusing the flag while letting an inherited SHA through would
+    leave exactly the record the refusal exists to prevent.
 
     ``commit`` is any revision this repository can resolve; what is written is
     the full SHA it resolves to. It is required for a close: R8 rejects a
@@ -1026,6 +1047,13 @@ def close_item(directory, item_id: int, *, commit: "str | None" = None,
                 "and a SHA recorded against a rejection reads as though "
                 "something had")
         updates = {"status": status, "closed": when or _today()}
+        if item.front.get("commit", ""):
+            # A SHA the item was already carrying is the same claim the
+            # refusal above exists to prevent, arriving by a different route.
+            # It is only illegal while the item is live, so a rejection would
+            # otherwise launder it: the field stops being reported at the
+            # exact moment nobody looks at the item again.
+            updates["commit"] = ""
     else:
         if not commit:
             raise BacklogFormatError(

@@ -532,6 +532,49 @@ def test_a_rejection_refuses_a_commit(repo):
     assert "nothing shipped" in str(exc.value)
 
 
+def test_a_rejection_clears_a_commit_the_item_was_already_carrying(repo):
+    """The refusal above guards the flag; this guards the field.
+
+    A commit is illegal only while an item is live, so rejecting one that
+    carries a SHA would move it into a status where nothing reports it -- the
+    record the refusal exists to prevent, arriving by the route nobody is
+    watching. Reachable by hand-editing, which is how the field gets there.
+    """
+    path = file_one(repo)
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.replace("\nspec:", "\ncommit: " + "a" * 40 + "\nspec:"),
+                    encoding="utf-8")
+    backlog_tool.close_item(backlog_dir(repo), 1, reject=True, repo_root=repo)
+    item = backlog_tool.parse_item(path)
+    assert item.status == backlog_tool.REJECTED_STATUS
+    assert item.front["commit"] == ""
+    assert backlog_tool.check(repo) == []
+
+
+def test_a_cleared_field_is_written_bare_rather_than_with_a_trailing_space(
+        repo):
+    """``commit:`` is how every hand-written item and the documented template
+    spell an empty field. ``commit: `` parses the same and differs from all of
+    them by one invisible byte, which costs a later reader a hex dump to
+    explain."""
+    path = file_one(repo)
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.replace("\nspec:", "\ncommit: " + "a" * 40 + "\nspec:"),
+                    encoding="utf-8")
+    backlog_tool.close_item(backlog_dir(repo), 1, reject=True, repo_root=repo)
+    assert "\ncommit:\n" in path.read_text(encoding="utf-8")
+
+
+def test_a_rejection_leaves_an_absent_commit_field_absent(repo):
+    """Clearing is a repair, not a normalisation. The ordinary rejection has
+    no commit to clear, and writing a blank field into every one of them would
+    put a line in the file that answers a question nobody asked."""
+    file_one(repo)
+    path = backlog_tool.close_item(backlog_dir(repo), 1, reject=True,
+                                   repo_root=repo)
+    assert "commit" not in backlog_tool.parse_item(path).front
+
+
 def test_a_close_with_no_commit_is_refused(repo):
     approved_one(repo)
     with pytest.raises(backlog_tool.BacklogFormatError) as exc:

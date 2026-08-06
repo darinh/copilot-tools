@@ -91,7 +91,7 @@ requirement: User Story 2 - Autonomous loop mode and handoff on Windows
 | `status` | always | `proposed`, `open`, `closed` or `rejected`. |
 | `opened` | always | `YYYY-MM-DD`. |
 | `closed` | when `closed` or `rejected` | `YYYY-MM-DD`. Absent while live. |
-| `commit` | when `closed` | The SHA that closed it. Must resolve here. |
+| `commit` | when `closed` | The SHA that closed it. Must resolve here, and must be empty under every other status. |
 | `spec` | always | A path under `specs/` that exists, or `none`. |
 | `requirement` | optional | Text that must occur in that spec file. |
 | `blocks` | optional | The id of the approved item this one is blocking. |
@@ -174,7 +174,12 @@ worst: a check that reads as evidence and is not.
 `closed` date and no `commit`, because nothing shipped -- demanding a SHA
 there would force whoever rejects an item to invent one, and an invented SHA
 looks exactly like evidence. `backlog close --reject` therefore refuses a
-`--commit` outright rather than ignoring it.
+`--commit` outright rather than ignoring it, **and clears a `commit` the item
+was already carrying**. The field is illegal only while an item is live, so
+without that a rejection would launder one: hand-edit a SHA onto an open
+item, reject it, and the value stops being reported at the exact moment
+nobody looks at the item again. `backlog check` now objects to a `commit`
+under any status that does not require one, not only under a live one.
 
 `backlog close` writes those fields; it does not make the decision. What it
 adds over editing the file is that the two ways this edit goes wrong are

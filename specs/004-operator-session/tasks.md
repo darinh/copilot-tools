@@ -105,6 +105,12 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       The rewrite is the same byte-preserving one approval uses, generalised
       to insert `closed:` and `commit:` beside `opened:` carrying that line's
       own ending — approval only ever rewrote a line that had one to copy.
+      Adversarial review found the remaining hole: `commit` was illegal only
+      under a *live* status, so a rejection laundered one — hand-edit a SHA
+      onto an open item, reject it, and the value stops being reported at the
+      moment nobody looks at the item again. `--reject` now clears a set
+      `commit`, and R8 objects to one under any status that does not require
+      one rather than only under a live one.
 - [ ] E4 `operator worktree new` / `finish` / `recover`
 - [ ] E5 `operator reply`, retiring the inbox-polling semantics
 

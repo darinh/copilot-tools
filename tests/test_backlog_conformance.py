@@ -444,6 +444,23 @@ def test_an_open_item_carrying_a_commit_is_reported(tmp_path):
     assert reported(tmp_path, "but a 'commit' is set")
 
 
+def test_a_rejected_item_carrying_a_commit_is_reported(tmp_path):
+    """Nothing shipped, so a SHA here reads as evidence of work that never
+    happened.
+
+    This is the direction the rule was widened for, and it is reachable rather
+    than theoretical: the field is illegal while the item is live, so a rule
+    that only asked about live statuses would watch it become legal the moment
+    the item was rejected. That is precisely when nobody is looking at it
+    again.
+    """
+    text = mutate(GOOD, f"status: {OPEN_STATUS}", "status: rejected")
+    text = mutate(text, "opened: 2026-08-04",
+                  "opened: 2026-08-04\nclosed: 2026-08-05\ncommit: " + "0" * 40)
+    write_backlog(tmp_path, text)
+    assert reported(tmp_path, "but a 'commit' is set")
+
+
 def test_a_rejected_item_needs_no_commit(tmp_path):
     """Negative control. Nothing shipped, so demanding a SHA would force
     whoever rejects an item to invent one."""
