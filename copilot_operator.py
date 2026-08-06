@@ -54,6 +54,7 @@ import operator_session                                      # noqa: E402
 import operator_trace                                        # noqa: E402
 import operator_work                                         # noqa: E402
 import work_claims                                           # noqa: E402
+import backlog_tool                                          # noqa: E402
 import handoff_tool                                          # noqa: E402
 import install_manifest                                      # noqa: E402
 import project_features                                      # noqa: E402
@@ -204,7 +205,7 @@ EXIT_UNACCOUNTED = 4
 SUBCOMMANDS = ("help", "version", "list", "menu", "projects", "report",
                "ingest", "stop", "stop-loop", "restart-loop", "stop-session",
                "join", "reload", "forget", "send", "inbox", "logs", "trace",
-               "tabs", "restore", "session", "work")
+               "tabs", "restore", "session", "work", "backlog")
 
 RESERVED_WORDS = set(SUBCOMMANDS)
 
@@ -4708,6 +4709,8 @@ USAGE
     operator work list                                         Who holds which work item, and whether they are running
     operator work request --instance NAME --item REF           Claim a work item
     operator work reclaim --instance NAME --item REF           Take an item whose owner is provably gone (preserves their work)
+    operator backlog ready [--explain]                         The items an agent may work, and why the rest are not
+    operator backlog close ID [--commit REV|--reject]          End an item's life: shipped, or considered and declined
     operator NAME                                              Join a running instance
     operator join [NAME]                                       Join (explicit form)
     operator reload NAME                                       Hot-reload launch spec
@@ -6631,6 +6634,30 @@ def manage_work(args: list[str]) -> int:
             "reclaim": _work_reclaim}[verb](opts, db)
 
 
+def manage_backlog(args: list[str]) -> int:
+    """``operator backlog …`` — the tracked backlog, from the operator CLI.
+
+    A delegation and not a reimplementation. ``backlog_tool`` already owns the
+    vocabulary, the approval gate and every rule ``check`` enforces; a second
+    argument parser here would be a second copy of all three, and the copy is
+    the thing that drifts. What this adds is discoverability: an agent reads
+    ``operator …`` in its instructions, and a verb reachable only through a
+    separate console script is a verb it will not find -- and an agent that
+    cannot find `close` edits the status field by hand.
+
+    ``argparse`` exits rather than returning, so ``--help`` and a malformed
+    argument arrive here as :class:`SystemExit`. Letting one escape would take
+    the operator down through a path that has nothing to do with operator
+    state; its code is the exit code, which is what this call would have
+    returned anyway.
+    """
+    try:
+        return backlog_tool.main(args, prog="operator backlog")
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else (0 if not exc.code
+                                                           else 1)
+
+
 def _record_session_exit(instance, session_num: int,
                          stop_state, detach_state, restart_state,
                          consecutive: int, uptime: float | None = None,
@@ -7037,6 +7064,8 @@ def _dispatch_command(args: list[str]) -> int:
         return manage_session(args[1:])
     if head == "work":
         return manage_work(args[1:])
+    if head == "backlog":
+        return manage_backlog(args[1:])
 
     # Positional shortcut: `operator foo` joins a running instance named foo.
     if len(args) == 1 and not head.startswith("-") and head not in RESERVED_WORDS:

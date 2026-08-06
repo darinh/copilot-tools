@@ -296,6 +296,8 @@ backlog list          # one line per item
 backlog ready         # what an agent may work right now
 backlog new --title "..." --evidence "..."   # file an item, awaiting approval
 backlog approve 3     # the owner's act: proposed -> open
+backlog close 3       # shipped: records today and the SHA HEAD resolves to
+backlog close 3 --reject   # considered and declined; no commit, because none
 backlog scrum         # what changed since the last check-in
 backlog check         # validate every item; non-zero on failure
 backlog html --open   # a self-contained page, in a browser
@@ -325,9 +327,17 @@ from its fix is a window in which the backlog is wrong. In practice the close
 is the branch's last commit, naming the SHA of the one before it; filling in a
 SHA and then `git commit --amend` records an object the amend destroys.
 
+`backlog close` writes that pair for you and enforces the same gate `ready`
+does: it closes only an item an agent was allowed to work, so filing your own
+item and marking it shipped is not a path. Declining one is `--reject`, which
+is deliberately *not* gated on approval — the ordinary thing to decline is an
+unapproved proposal — and writes no commit, because nothing shipped. Both
+verbs are also reachable as `operator backlog …`, which is a delegation to
+this same tool rather than a second implementation of it.
+
 `tests/test_backlog_conformance.py` enforces the format, the spec mapping, and
 that every closing SHA actually resolves; `tests/test_backlog_workflow.py`
-covers filing, approval and the check-in. See
+covers filing, approval, closing and the check-in. See
 [`backlog/README.md`](backlog/README.md) for the field reference.
 
 ## MCP Servers

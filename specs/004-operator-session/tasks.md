@@ -86,7 +86,25 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       `platform` column recording the writer's `os.name` lets a reclaim refuse
       a worktree from the other kind of system on recorded evidence instead of
       guessing from the path's shape.
-- [ ] E3 `operator backlog ready` / `close` — preserving the `proposed` gate
+- [x] E3 `operator backlog ready` / `close` — preserving the `proposed` gate.
+      `operator backlog` delegates to `backlog_tool.main`, which already owns
+      the vocabulary, the gate and every rule `check` enforces; a second
+      parser in `copilot_operator.py` would be a second copy of all three.
+      `backlog close` is the new verb: `close_item` refuses an item
+      `why_not_workable` would have kept out of the queue, so filing an item
+      and marking it shipped is not a two-command bypass of the approval that
+      `ready` enforces on a path nobody has to take. It admits the recorded
+      `blocks` exception for the same reason the gate does — an item lawfully
+      worked that cannot be lawfully closed sends the agent to the status
+      field by hand. `--reject` is deliberately outside that check, because
+      the ordinary thing to decline is a proposal nobody approved, and it
+      refuses a `--commit` rather than ignoring one. `--commit` is resolved
+      through `git rev-parse ...^{commit}` and stored as the full SHA, so a
+      revision that resolves to nothing, or to a blob or tree, is refused, and
+      `HEAD` cannot be recorded as a word that names something else tomorrow.
+      The rewrite is the same byte-preserving one approval uses, generalised
+      to insert `closed:` and `commit:` beside `opened:` carrying that line's
+      own ending — approval only ever rewrote a line that had one to copy.
 - [ ] E4 `operator worktree new` / `finish` / `recover`
 - [ ] E5 `operator reply`, retiring the inbox-polling semantics
 

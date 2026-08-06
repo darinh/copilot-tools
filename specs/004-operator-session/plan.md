@@ -102,7 +102,8 @@ item away from the instance holding it is made in exactly one place.
 
 Delivered as `operator_work.py` (`agent_identity`, `preserve`, `request`,
 `release`, `heartbeat`, `listing`, `reclaim`) with `operator work` in
-`copilot_operator.py` (E1, E2). E3–E5 remain.
+`copilot_operator.py` (E1, E2), and `operator backlog` delegating to
+`backlog_tool.main` (E3). E4–E5 remain.
 
 Two properties are load-bearing rather than convenient.
 
@@ -168,6 +169,21 @@ parameter so both branches are exercised on every CI leg rather than each leg
 testing only its own half. It answers "foreign" for a leading `/` on Windows
 before consulting the drive, because `ntpath.splitdrive("//home/dev")` reports
 the UNC share `//home` and a drive test alone would call a POSIX path native.
+
+**The approval gate is checked where it can be bypassed, not only where it is
+advertised.** `backlog ready` filters the queue, and a queue is a thing an
+agent can simply not consult; `close` is the write that turns "I filed this"
+into "this shipped". So `close_item` asks `why_not_workable` — the gate's
+single owner, not a second copy of its reasoning — and refuses anything that
+answer keeps out of the queue. That it consults the same function is what
+makes the `blocks` hatch work here for free: an item an agent was lawfully
+allowed to work is an item it can lawfully close, and the alternative is an
+agent with a finished job and no legal way to record it, which is how a status
+field gets hand-edited. `--reject` sits outside the check on purpose, since
+requiring approval before a rejection would mean approving something in order
+to decline it, and it refuses a `--commit` rather than dropping one — a SHA
+against a rejection reads as though something had shipped, which is the class
+of wrong this repository treats as worst: a record that looks like evidence.
 
 ## Phase G+H — the audit
 

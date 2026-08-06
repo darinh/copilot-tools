@@ -24,6 +24,8 @@ backlog html --open          # a self-contained page, opened in a browser
 ```
 backlog new --title "..." --evidence "..."   # files it as 'proposed'
 backlog approve 3                            # the owner's act: proposed -> open
+backlog close 3 [--commit REV]               # shipped; records the SHA and the date
+backlog close 3 --reject                     # considered and declined; no commit
 backlog scrum [--peek]                       # what changed since the last check-in
 ```
 
@@ -156,8 +158,8 @@ practice the close is the last commit of the branch that does the work:
 
 ```
 git commit -m "feat: the work"            # this is the SHA to record
-git rev-parse HEAD                        # -> put it in the item's commit:
-git commit -m "docs: close backlog item N"
+backlog close 7                           # --commit defaults to HEAD
+git commit -m "docs: close backlog item 7"
 git merge --no-ff                         # both land on main together
 ```
 
@@ -171,11 +173,24 @@ worst: a check that reads as evidence and is not.
 `rejected` means the item was considered and will not be done. It takes a
 `closed` date and no `commit`, because nothing shipped -- demanding a SHA
 there would force whoever rejects an item to invent one, and an invented SHA
-looks exactly like evidence.
+looks exactly like evidence. `backlog close --reject` therefore refuses a
+`--commit` outright rather than ignoring it.
 
-There is no `backlog close` and no `backlog reject`. Closing is tied to a SHA
-that does not exist until the work commits, and rejecting is the owner's
-judgement -- neither is a mechanical edit a tool should make on its own.
+`backlog close` writes those fields; it does not make the decision. What it
+adds over editing the file is that the two ways this edit goes wrong are
+refused rather than committed. It resolves `--commit` to a full SHA and
+refuses a revision this repository cannot resolve, so an item cannot close
+against a SHA that does not exist -- and it resolves `HEAD` rather than
+storing the word, which would name a different commit after the next one.
+And **it enforces the approval gate a second time**: it closes only an item
+`backlog ready` would have offered -- approved, or `proposed` with the
+`blocks` hatch above. Without that, the gate holds on the one path an agent
+is not obliged to take, and filing your own item and marking it shipped is a
+two-command bypass. Rejection is deliberately outside that check, because the
+ordinary thing to decline is a proposal nobody approved.
+
+Both verbs are also spelled `operator backlog close` and `operator backlog
+ready`, which delegate to this tool rather than reimplementing it.
 
 ## What stops this rotting
 
