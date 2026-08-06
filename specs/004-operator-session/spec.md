@@ -68,8 +68,21 @@ feature exists to stop.
 ### FR-2 — Assignment is resolved before the session starts
 
 `operator session start --instance <name> [--project <sub>]` resolves, in
-order: a live claim held by this instance (resume), a claim whose owner is
+order: a claim held by this instance (resume), a claim whose owner is
 provably dead (offer, oldest first), otherwise no assignment.
+
+An instance's **own** claim is resumed without consulting the liveness
+cascade. After a restart the claim's recorded pid is the previous process of
+this same instance, so the cascade returns DEAD by construction — and reading
+that as "not mine" would put the agent's own item on the offer list for
+somebody else to take. Ownership is by instance name; liveness answers a
+question about *other* instances. `--project` filters what may be offered and
+deliberately does not filter the resume, because the alternative is stranding
+a live claim whose owner was told to look elsewhere.
+
+An offer takes nothing. It is a report that a claim's owner is provably gone;
+taking it is `operator work reclaim`, which must preserve that owner's
+uncommitted work first (FR-4).
 
 The agent never discovers its own worktree, because both discovery routes are
 silently wrong:
@@ -112,9 +125,32 @@ as dangling objects.
 
 ### FR-5 — Session end is one call
 
-`operator session end` writes the instance handoff, releases the work-item
-claim, and closes the session log **atomically**. Three calls is three chances
-to end a session having done one of them.
+`operator session end` writes the instance handoff, closes the session log and
+disposes of the work-item claim in one call. Three calls is three chances to
+end a session having done one of them.
+
+**The claim is kept unless `--done` is passed.** FR-5 as first written released
+it unconditionally, which cannot be right: the ordinary reason a session ends
+is a handoff mid-item, and FR-2's resume path exists for exactly that — an
+unconditional release would empty the claim before anything could resume it.
+It is also the safe direction of the two errors. A claim retained when it
+should have been released is recovered by the FR-3 cascade once its owner is
+provably gone; a claim released when it should have been kept hands a live
+agent's worktree to somebody else, and nothing recovers that.
+
+Atomicity is the *ordering*, and it is asserted rather than argued. The
+handoff is written first; the log close and the claim disposal share one
+`BEGIN IMMEDIATE` transaction in the one database that holds both. So a failed
+handoff changes nothing, a failed transaction leaves the handoff on disk with
+the claim still held, and there is no ordering in which a claim is released
+and no handoff was written. That last combination is the one that must not
+exist — it loses the context *and* hands the worktree to somebody else — and
+`tests/test_session_lifecycle.py` asserts it at every point the call can fail.
+
+The session log is append-only and keyed by instance and session. A row left
+open by a session that never reached `session end` is closed as `abandoned` by
+the next `session start` for that instance, which is a recorded fact about a
+crash rather than a row silently reused.
 
 ### FR-6 — The managed block carries only what cannot be enforced
 

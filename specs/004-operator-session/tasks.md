@@ -30,10 +30,15 @@ Status is tracked in SQL during execution; this file is the reconciled record.
 
 ## Phase D — session lifecycle (FR-2, FR-5)
 
-- [ ] D1 `operator session start --instance <n> [--project <sub>]`
-- [ ] D2 Feed `instanceName` / `worktreePath` / `workItemRef` / `branchName` into
-      the preamble and the template substitutions
-- [ ] D3 `operator session end` — atomic handoff + claim release + log close
+- [x] D1 `operator session start --instance <n> [--project <sub>]`
+- [x] D2 Feed `instanceName` / `worktreePath` / `workItemRef` / `branchName` into
+      the preamble (`build_preamble(..., assignment=)`) and expose them as a
+      substitution table (`operator_session.assignment_values`). The template
+      *consumer* lands with G8, which is where the templates that read it are
+      written — there is no substitution mechanism in `project_instructions`
+      today to wire it into.
+- [x] D3 `operator session end` — handoff, then log close and claim disposal in
+      one transaction; the claim is kept unless `--done` (FR-5, amended)
 - [ ] D4 Wire the supervisor loop to `session start` / `end`; the loop calls
       `work heartbeat`, not the agent by its own judgement
 

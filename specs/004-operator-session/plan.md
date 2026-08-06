@@ -66,6 +66,18 @@ session-log close). Partial failure leaves a recoverable state, never a released
 claim with no handoff — that combination loses the context *and* hands the
 worktree to somebody else.
 
+Delivered as `operator_session.py` (`resolve_assignment`, `start_session`,
+`end_session`, `describe`, `assignment_values`) and `operator session
+start|end` in `copilot_operator.py`. The session log lives in the same
+`work.db` as the claims, deliberately: the log close and the claim disposal
+share one `BEGIN IMMEDIATE` transaction, and a transaction cannot span two
+sqlite files without attaching one to the other — a lock-ordering problem
+bought to keep two files apart for no reason anybody named.
+
+FR-5 was amended during this phase: the claim is **retained** by default and
+released only with `--done`. See FR-5 for why an unconditional release
+contradicts FR-2's resume path.
+
 ## Phase G+H — the audit
 
 Before the template changes, produce a table classifying every candidate line as

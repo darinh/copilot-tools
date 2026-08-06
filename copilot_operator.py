@@ -50,7 +50,9 @@ if _HERE not in sys.path:
 
 import operator_ingest                                       # noqa: E402
 import operator_mail                                         # noqa: E402
+import operator_session                                      # noqa: E402
 import operator_trace                                        # noqa: E402
+import handoff_tool                                          # noqa: E402
 import install_manifest                                      # noqa: E402
 import project_features                                      # noqa: E402
 import project_instructions                                  # noqa: E402
@@ -65,6 +67,7 @@ from operator_mux import (                                    # noqa: E402
     Mux, MuxError, MuxNotFoundError, safe_instance_id,
 )
 from project_paths import (                                   # noqa: E402
+    catalog_guid,
     catalog_rows,
     guid_is_usable,
     operator_home as _operator_home,
@@ -193,7 +196,7 @@ EXIT_UNACCOUNTED = 4
 SUBCOMMANDS = ("help", "version", "list", "menu", "projects", "report",
                "ingest", "stop", "stop-loop", "restart-loop", "stop-session",
                "join", "reload", "forget", "send", "inbox", "logs", "trace",
-               "tabs", "restore")
+               "tabs", "restore", "session")
 
 RESERVED_WORDS = set(SUBCOMMANDS)
 
@@ -2054,7 +2057,8 @@ def crash_recovery_verdict(workdir: Path, instance_id: str = "") -> bool:
     return True
 
 
-def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = False) -> str:
+def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = False,
+                   assignment=None) -> str:
     text = (
         "You are running under an automated operator wrapper that a human set up. "
         "Key facts: (1) You have blanket human approval for ALL decisions — tool calls, "
@@ -2078,6 +2082,15 @@ def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = F
             "ended without the handoff being written. If you intended to end the "
             "session, please make sure you write a handoff first next time."
         )
+    # The assignment is resolved by `operator session start` before the agent's
+    # first token (FR-2), and reaches it here. Nothing is said when there is
+    # nothing to say: `describe` returns "" for an unassigned session, and an
+    # always-present line reading "you have no assignment" would be paid for on
+    # every token of every session that has none.
+    if assignment is not None:
+        described = operator_session.describe(assignment)
+        if described:
+            text += f" (7) {described}"
     return text
 
 
@@ -4592,6 +4605,8 @@ USAGE
     operator --loop --headless [--name NAME] [copilot-args...] Loop mode without attaching
     operator send --from NAME --to NAME "message"              Message another instance
     operator inbox [NAME] [--peek|--history|--json]            Read messages sent to an instance
+    operator session start --instance NAME [--project SUB]     Resolve this instance's work assignment
+    operator session end --instance NAME --status T --next T   Handoff, close the session log, dispose of the claim
     operator NAME                                              Join a running instance
     operator join [NAME]                                       Join (explicit form)
     operator reload NAME                                       Hot-reload launch spec
@@ -6011,6 +6026,215 @@ def ending_was_observed(instance) -> bool:
     return read_exit_code(instance) is not None
 
 
+def _session_usage(stream) -> None:
+    print("Usage:\n"
+          "  operator session start --instance NAME [--session N] "
+          "[--project SUB] [--json]\n"
+          "  operator session end   --instance NAME [--session N] "
+          "--status TEXT --next TEXT [--done] [--json]\n"
+          "\n"
+          "start  resolves this instance's assignment before its first token:\n"
+          "       a claim it already holds (resume), else claims whose owners\n"
+          "       are provably gone (offered, oldest first), else nothing.\n"
+          "end    writes the handoff, closes the session log and disposes of\n"
+          "       the claim in one call. The claim is kept unless --done.",
+          file=stream)
+
+
+def _session_db(cwd: Path):
+    """The claim/session database for the project ``cwd`` belongs to.
+
+    Resolved from the *primary* checkout, so a session started inside a
+    worktree finds the project's real entry instead of minting a second one.
+    """
+    root = primary_repo_root(cwd)
+    found = catalog_guid(root)
+    if found.guid is None:
+        print(f"No catalog entry for {root} — this project is not registered.",
+              file=sys.stderr)
+        return None
+    return operator_session.db_path(project_dir(found.guid))
+
+
+def _parse_session_args(args: list[str]) -> "dict | None":
+    """Options for ``session start``/``end``.
+
+    An unrecognised option is refused rather than ignored, for the reason
+    ``send`` gives: a caller who typed ``--relase`` and saw a success message
+    believes an effect happened that did not.
+    """
+    opts: dict = {"instance": "", "session": None, "project": None,
+                  "json": False, "done": False, "status": "", "next": "",
+                  "context": "", "prompt": "", "in_progress": ""}
+    takes_value = {"--instance": "instance", "--project": "project",
+                   "--status": "status", "--next": "next",
+                   "--context": "context", "--prompt": "prompt",
+                   "--in-progress": "in_progress"}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        key, _, inline = arg.partition("=")
+        if key in takes_value:
+            if inline or "=" in arg:
+                opts[takes_value[key]] = inline
+            else:
+                if i + 1 >= len(args):
+                    print(f"Missing value for {key}", file=sys.stderr)
+                    return None
+                opts[takes_value[key]] = args[i + 1]
+                i += 1
+        elif key == "--session":
+            raw = inline if "=" in arg else (args[i + 1] if i + 1 < len(args) else "")
+            if "=" not in arg:
+                i += 1
+            try:
+                opts["session"] = int(raw)
+            except ValueError:
+                print(f"--session takes a number, not {raw!r}", file=sys.stderr)
+                return None
+        elif arg == "--json":
+            opts["json"] = True
+        elif arg in ("--done", "--release"):
+            opts["done"] = True
+        else:
+            print(f"Unknown option: {arg}", file=sys.stderr)
+            return None
+        i += 1
+    if not opts["instance"]:
+        print("Missing required: --instance NAME", file=sys.stderr)
+        return None
+    return opts
+
+
+def _session_start(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    session_num = opts["session"]
+    if session_num is None:
+        session_num = _read_session_number(instance)
+    operator_session.init_db(db)
+    assignment = operator_session.start_session(
+        db, instance=instance, session=session_num,
+        subproject=opts["project"])
+    if opts["json"]:
+        print(json.dumps({
+            "kind": assignment.kind,
+            "instance": assignment.instance,
+            "session": session_num,
+            **operator_session.assignment_values(assignment),
+            "offers": [{"item": o.item, "instance": o.claim.instance,
+                        "reason": o.reason} for o in assignment.offers],
+            "stale": [{"item": o.item, "instance": o.claim.instance,
+                       "reason": o.reason} for o in assignment.stale],
+        }, indent=2))
+        return 0
+    if assignment.kind == operator_session.RESUME:
+        print(f"Resuming {assignment.item} "
+              f"({assignment.worktree or 'no worktree recorded'})")
+    elif assignment.kind == operator_session.OFFER:
+        print("No claim held. Reclaimable (oldest first):")
+        for offer in assignment.offers:
+            print(f"  {offer.item}  held by {offer.claim.instance}  "
+                  f"— {offer.reason}")
+    else:
+        print("No assignment.")
+    for offer in assignment.stale:
+        # Reported, never offered: STALE means the cascade could not establish
+        # the owner is gone, and guessing is how two agents end up in one tree.
+        print(f"  (stale, not offered) {offer.item} held by "
+              f"{offer.claim.instance} — {offer.reason}", file=sys.stderr)
+    return 0
+
+
+def _read_session_number(instance_id: str) -> int:
+    """The session number this instance's supervisor last recorded, else 0.
+
+    Zero rather than a guess: the log row is keyed by instance and session,
+    and inventing a plausible number would put a real session's record under
+    somebody else's key.
+    """
+    try:
+        state = Instance(instance_id).load_state()
+    except Exception:                                   # noqa: BLE001
+        return 0
+    if not isinstance(state, dict):
+        return 0
+    try:
+        return int(state.get("SESSION_NUM", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _session_end(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    if not opts["status"] or not opts["next"]:
+        print("Missing required: --status and --next (the handoff is written "
+              "first, and an empty one is not a handoff)", file=sys.stderr)
+        return 1
+    session_num = opts["session"]
+    if session_num is None:
+        session_num = _read_session_number(instance)
+    operator_session.init_db(db)
+
+    def write_handoff():
+        rc = handoff_tool.main([
+            "--instance", opts["instance"],
+            "--status", opts["status"],
+            "--next", opts["next"],
+            "--in-progress", opts["in_progress"],
+            "--context", opts["context"],
+            "--prompt", opts["prompt"],
+        ])
+        if rc != 0:
+            raise RuntimeError(f"handoff exited {rc}")
+        return None
+
+    result = operator_session.end_session(
+        db, instance=instance, session=session_num,
+        write_handoff=write_handoff, release_claim=opts["done"])
+
+    if opts["json"]:
+        print(json.dumps({
+            "ok": result.ok, "instance": result.instance,
+            "session": result.session, "item": result.item,
+            "handoff_written": result.handoff_written,
+            "log_closed": result.log_closed,
+            "claim_released": result.claim_released,
+            "claim_retained": result.claim_retained,
+            "failure": result.failure, "notes": list(result.notes),
+        }, indent=2))
+    else:
+        if result.failure:
+            print(f"session end incomplete: {result.failure}", file=sys.stderr)
+        else:
+            kept = (f"claim {result.item} kept" if result.claim_retained
+                    else (f"claim {result.item} released" if result.claim_released
+                          else "no claim held"))
+            print(f"Handoff written, session log closed, {kept}.")
+        for note in result.notes:
+            print(f"  note: {note}", file=sys.stderr)
+    return 0 if result.ok else 1
+
+
+def manage_session(args: list[str]) -> int:
+    """``operator session start|end`` — the two ends of one session (FR-2, FR-5)."""
+    if not args or args[0] in HELP_FLAGS:
+        _session_usage(sys.stdout if args else sys.stderr)
+        return 0 if args else 1
+    verb = args[0]
+    if verb not in ("start", "end"):
+        print(f"Unknown subcommand: operator session {verb}", file=sys.stderr)
+        print("Did you mean `operator session start` or "
+              "`operator session end`?", file=sys.stderr)
+        return 1
+    opts = _parse_session_args(args[1:])
+    if opts is None:
+        return 1
+    db = _session_db(Path.cwd())
+    if db is None:
+        return 1
+    return _session_start(opts, db) if verb == "start" else _session_end(opts, db)
+
+
 def _record_session_exit(instance, session_num: int,
                          stop_state, detach_state, restart_state,
                          consecutive: int, uptime: float | None = None,
@@ -6413,6 +6637,8 @@ def _dispatch_command(args: list[str]) -> int:
         return manage_tabs(args[1:])
     if head == "restore":
         return restore_tabs(args[1:])
+    if head == "session":
+        return manage_session(args[1:])
 
     # Positional shortcut: `operator foo` joins a running instance named foo.
     if len(args) == 1 and not head.startswith("-") and head not in RESERVED_WORDS:
