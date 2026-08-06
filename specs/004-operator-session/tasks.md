@@ -423,6 +423,42 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       what tells them apart.
 - [ ] G13 Set the budget from measured residue and make generation error above it
 
+## HELD — do not start G8, G10 or G13 without the human
+
+**Stop here.** These three are the only remaining implementation tasks, and
+all three **delete rules from the managed block**. The human explicitly
+reserved that conversation for themselves before any rule comes out:
+
+- **G8** replaces the root template wholesale and adds a subproject one.
+- **G10** moves build/test/lint out of the block (D11).
+- **G13** sets a word budget and makes generation *error* above it, which is
+  only reachable once G8 and G10 have cut the block down. The measured
+  residue is in `audit.md`; the recommendation is **700 words**, set against
+  the all-on figure of 4,358. After G12's platform selection the block
+  measures 4,332 words on Windows and 4,321 on POSIX.
+
+This note exists because the hold was, until now, recorded only in one
+agent's session context. That is a single point of failure of exactly the
+kind this feature is about: the next agent to pick the plan up would have
+found three unchecked boxes, no reason not to do them, and would have
+deleted conventions out of eight repositories on the strength of a tick-list.
+A constraint that lives only in a context window is not a constraint.
+
+`V1` and `V2` cannot be ticked while these are open — they are whole-feature
+gates, not per-task ones. Everything delivered so far is mutation-tested with
+zero survivors, and the suite is green (4158 passed, 9 skipped); neither fact
+closes them.
+
+Also open for the human, and the sharpest judgement call in the feature:
+FR-8 makes `_values_for` **refuse** a project that never chose its features.
+Every one of the eight registered projects on this machine is unconfigured,
+so every one of them fails regeneration until somebody opens
+`operator projects` — where **Record these as chosen** now answers it in one
+keystroke without changing a single value. That refusal is what makes "an
+enabled section is a live requirement" true rather than decorative, and it is
+deliberate, but it is a behaviour change that touches every project at once
+and it should be somebody's decision rather than an agent's.
+
 ## Verification
 
 - [ ] V1 Full suite green (baseline 3383 passed, 10 skipped)
