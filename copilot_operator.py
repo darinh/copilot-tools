@@ -53,6 +53,7 @@ import operator_mail                                         # noqa: E402
 import operator_session                                      # noqa: E402
 import operator_trace                                        # noqa: E402
 import operator_work                                         # noqa: E402
+import operator_worktree                                     # noqa: E402
 import work_claims                                           # noqa: E402
 import backlog_tool                                          # noqa: E402
 import handoff_tool                                          # noqa: E402
@@ -205,7 +206,7 @@ EXIT_UNACCOUNTED = 4
 SUBCOMMANDS = ("help", "version", "list", "menu", "projects", "report",
                "ingest", "stop", "stop-loop", "restart-loop", "stop-session",
                "join", "reload", "forget", "send", "inbox", "logs", "trace",
-               "tabs", "restore", "session", "work", "backlog")
+               "tabs", "restore", "session", "work", "backlog", "worktree")
 
 RESERVED_WORDS = set(SUBCOMMANDS)
 
@@ -6634,6 +6635,181 @@ def manage_work(args: list[str]) -> int:
             "reclaim": _work_reclaim}[verb](opts, db)
 
 
+WORKTREE_VERBS = ("new", "finish", "recover")
+
+
+def _worktree_usage(stream) -> None:
+    print("Usage:\n"
+          "  operator worktree new     --instance NAME --item REF "
+          "[--project SUB] [--branch NAME] [--path PATH] [--json]\n"
+          "  operator worktree finish  --instance NAME [--item REF] "
+          "[--into REF] [--json]\n"
+          "  operator worktree recover [--preserve] [--json]\n"
+          "\n"
+          "A checkout is 1:1 with a work item: `new` takes the claim and\n"
+          "creates the tree together, and releases the claim again if the\n"
+          "tree cannot be made.\n"
+          "`finish` refuses a tree with uncommitted changes rather than\n"
+          "tidying it, and deletes the branch only when --into already\n"
+          "contains it.\n"
+          "`recover` reports; it removes nothing. --preserve commits the\n"
+          "uncommitted work of an unclaimed tree, or one whose owner is\n"
+          "provably gone, to a wip/ branch.",
+          file=stream)
+
+
+def _parse_worktree_args(args: list[str]) -> "dict | None":
+    opts: dict = {"instance": "", "item": "", "project": None, "branch": "",
+                  "path": "", "into": operator_worktree.DEFAULT_INTEGRATION,
+                  "preserve": False, "json": False}
+    parsed = _parse_flagged_args(
+        args,
+        takes_value={"--instance": "instance", "--item": "item",
+                     "--project": "project", "--branch": "branch",
+                     "--path": "path", "--into": "into"},
+        flags={"--preserve": "preserve", "--json": "json"})
+    if parsed is None:
+        return None
+    opts.update(parsed)
+    return opts
+
+
+def _worktree_new(opts: dict, db, root) -> int:
+    instance = safe_instance_id(opts["instance"])
+    if not opts["item"]:
+        print("Missing required: --item REF", file=sys.stderr)
+        return 1
+    operator_session.init_db(db)
+    result = operator_worktree.new(
+        db, root, item=opts["item"], instance=instance,
+        subproject=opts["project"] or "", branch=opts["branch"] or None,
+        path=opts["path"] or None,
+        mux_session=Instance(opts["instance"]).session,
+        pid=_agent_pid(Instance(opts["instance"])))
+    if opts["json"]:
+        print(json.dumps(_worktree_json(result), indent=2))
+        return 0 if result.ok else 1
+    if not result.ok:
+        print(f"Refused: {result.detail}", file=sys.stderr)
+        for note in result.notes:
+            print(f"  note: {note}", file=sys.stderr)
+        return 1
+    print(f"{result.item}: {result.path} ({result.branch})")
+    for note in result.notes:
+        print(f"  note: {note}")
+    return 0
+
+
+def _worktree_json(result) -> dict:
+    return {"ok": result.ok, "verb": result.verb, "item": result.item,
+            "instance": result.instance, "path": result.path,
+            "branch": result.branch, "branch_deleted": result.branch_deleted,
+            "refused": result.refused, "detail": result.detail,
+            "notes": list(result.notes)}
+
+
+def _worktree_finish(opts: dict, db, root) -> int:
+    instance = safe_instance_id(opts["instance"])
+    operator_session.init_db(db)
+    item = _claimed_item(db, opts, instance)
+    if item is None:
+        print(f"{instance} holds no work item.", file=sys.stderr)
+        return 1
+    result = operator_worktree.finish(db, root, item=item, instance=instance,
+                                      into=opts["into"])
+    if opts["json"]:
+        print(json.dumps(_worktree_json(result), indent=2))
+        return 0 if result.ok else 1
+    if not result.ok:
+        print(f"Refused: {result.detail}", file=sys.stderr)
+        if result.refused == operator_worktree.WORKTREE_DIRTY:
+            print("Nothing here commits, stages or discards them for you: "
+                  "that is the one thing this command must never be a faster "
+                  "way to do.", file=sys.stderr)
+        return 1
+    print(f"{result.item}: {result.path} removed, claim released"
+          f"{', branch ' + result.branch + ' deleted' if result.branch_deleted else ''}.")
+    for note in result.notes:
+        print(f"  note: {note}")
+    return 0
+
+
+def _worktree_recover(opts: dict, db, root) -> int:
+    operator_session.init_db(db)
+    try:
+        rows = operator_worktree.survey(db, root, preserve=opts["preserve"])
+    except operator_work.GitUnavailable as exc:
+        print(f"Refused: {exc}", file=sys.stderr)
+        return 1
+    if opts["json"]:
+        print(json.dumps([{
+            "path": row.path, "branch": row.branch, "state": row.state,
+            "item": None if row.claim is None else row.claim.item,
+            "instance": None if row.claim is None else row.claim.instance,
+            "verdict": None if row.liveness is None else row.liveness.verdict,
+            "reason": None if row.liveness is None else row.liveness.reason,
+            "preserved_branch": (None if row.preserved is None
+                                 else row.preserved.branch),
+            "preserved_commit": (None if row.preserved is None
+                                 else row.preserved.commit),
+            "note": row.note,
+        } for row in rows], indent=2))
+        return 0
+    for row in rows:
+        owner = f"  {row.claim.instance} ({row.claim.item})" if row.claim else ""
+        print(f"{row.state:<12}{row.path}{owner}")
+        if row.branch:
+            print(f"{'':4}{row.branch}")
+        if row.liveness is not None:
+            print(f"{'':4}{row.liveness.reason}")
+        if row.note:
+            print(f"{'':4}{row.note}")
+        if row.preserved is not None and row.preserved.branch:
+            print(f"{'':4}uncommitted work preserved on "
+                  f"{row.preserved.branch} "
+                  f"({(row.preserved.commit or '')[:12]})")
+    if not opts["preserve"] and any(
+            row.state in (operator_worktree.UNCLAIMED, operator_worktree.DEAD)
+            for row in rows):
+        print("\nRe-run with --preserve to commit the uncommitted work in "
+              "those trees to a wip/ branch. Nothing is removed either way.")
+    return 0
+
+
+def manage_worktree(args: list[str]) -> int:
+    """``operator worktree new|finish|recover`` — the checkout of a work item.
+
+    The verbs are asymmetric on purpose. ``new`` and ``finish`` both write on
+    the assumption that the agent running them knows what is in the tree;
+    ``recover`` is what runs when nobody does, so it reports and preserves and
+    removes nothing at all.
+    """
+    if not args or args[0] in HELP_FLAGS:
+        _worktree_usage(sys.stdout if args else sys.stderr)
+        return 0 if args else 1
+    verb = args[0]
+    if verb not in WORKTREE_VERBS:
+        print(f"Unknown subcommand: operator worktree {verb}", file=sys.stderr)
+        print(f"Expected one of: {', '.join(WORKTREE_VERBS)}", file=sys.stderr)
+        return 1
+    opts = _parse_worktree_args(args[1:])
+    if opts is None:
+        return 1
+    if verb != "recover" and not opts["instance"]:
+        print("Missing required: --instance NAME", file=sys.stderr)
+        return 1
+    db = _session_db(Path.cwd())
+    if db is None:
+        return 1
+    # The *primary* checkout, never `Path.cwd()`: every one of these verbs
+    # runs from inside a worktree at least half the time, and git's worktree
+    # commands addressed at a linked worktree operate on the same repository
+    # but the layout is anchored on the primary checkout's `.worktrees/`.
+    root = primary_repo_root(Path.cwd())
+    return {"new": _worktree_new, "finish": _worktree_finish,
+            "recover": _worktree_recover}[verb](opts, db, root)
+
+
 def manage_backlog(args: list[str]) -> int:
     """``operator backlog …`` — the tracked backlog, from the operator CLI.
 
@@ -7066,6 +7242,8 @@ def _dispatch_command(args: list[str]) -> int:
         return manage_work(args[1:])
     if head == "backlog":
         return manage_backlog(args[1:])
+    if head == "worktree":
+        return manage_worktree(args[1:])
 
     # Positional shortcut: `operator foo` joins a running instance named foo.
     if len(args) == 1 and not head.startswith("-") and head not in RESERVED_WORDS:

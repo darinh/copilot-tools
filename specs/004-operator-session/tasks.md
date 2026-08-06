@@ -111,7 +111,26 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       moment nobody looks at the item again. `--reject` now clears a set
       `commit`, and R8 objects to one under any status that does not require
       one rather than only under a live one.
-- [ ] E4 `operator worktree new` / `finish` / `recover`
+- [x] E4 `operator worktree new` / `finish` / `recover` — `operator_worktree.py`
+      plus the CLI in `copilot_operator.py`. `new` takes the claim *before* it
+      probes the path, because the claim is the only step with a
+      compare-and-swap behind it and "the directory is absent" is not a
+      reservation two agents cannot both observe; every refusal after the
+      claim compensates by releasing the claim it just took. The branch
+      defaults to `work/{item}` rather than guessing among `feat/`, `fix/` and
+      `docs/`, and the directory is resolved from the *primary* root, since
+      `--show-toplevel` inside a worktree would nest one inside another.
+      `finish` refuses on not-owner, no recorded worktree, a foreign-platform
+      claim, a cwd inside the target, a dirty tree, an unreadable directory
+      and any git failure; it releases the claim last so a failure leaves it
+      held, removes with `git worktree remove` and never `--force`, prunes
+      only on evidence of absence rather than an unknown probe, and deletes
+      the branch only when `merge-base --is-ancestor` proves it merged, with
+      `-d` and never `-D`. `recover` reports and removes nothing; `--preserve`
+      reuses `operator_work.preserve` and fires only for UNCLAIMED or provably
+      DEAD owners — STALE is reported as itself, as `reclaim` already does.
+      The mutating verbs are absent from the module by construction, asserted
+      by an AST scan with a positive control.
 - [ ] E5 `operator reply`, retiring the inbox-polling semantics
 
 ## Phase F — skills and rationale

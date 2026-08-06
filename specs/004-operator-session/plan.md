@@ -102,8 +102,9 @@ item away from the instance holding it is made in exactly one place.
 
 Delivered as `operator_work.py` (`agent_identity`, `preserve`, `request`,
 `release`, `heartbeat`, `listing`, `reclaim`) with `operator work` in
-`copilot_operator.py` (E1, E2), and `operator backlog` delegating to
-`backlog_tool.main` (E3). E4–E5 remain.
+`copilot_operator.py` (E1, E2), `operator backlog` delegating to
+`backlog_tool.main` (E3), and `operator worktree` as `operator_worktree.py`
+(E4). E5 remains.
 
 Two properties are load-bearing rather than convenient.
 
@@ -184,6 +185,40 @@ requiring approval before a rejection would mean approving something in order
 to decline it, and it refuses a `--commit` rather than dropping one — a SHA
 against a rejection reads as though something had shipped, which is the class
 of wrong this repository treats as worst: a record that looks like evidence.
+
+**A worktree is created by the same call that takes the claim, and the claim
+is taken first.** The keying model makes a worktree 1:1 with a work item, so
+`operator worktree new` does both or neither: it requests the item, then
+probes the path, then runs `git worktree add`, and every refusal after the
+claim calls a compensating release of the claim it took microseconds earlier.
+The order is the load-bearing part. Probing the filesystem first reads as the
+cheaper check, but "the directory is absent" is not a reservation — two agents
+can both observe it and both proceed — whereas the claim is the one step with
+a compare-and-swap behind it. Reversed, a second agent asking for an item
+somebody already holds is told `path-exists`, which names the wrong problem
+and sends it to delete a live agent's checkout. The compensating release is
+safe for the same reason the ordering is: it releases *this call's own* claim,
+identified by owner, not whatever claim happens to be there.
+
+The branch defaults to `work/{item}` rather than `feat/`, `fix/` or `docs/`,
+because choosing among those from an item reference is a guess that then ships
+in the branch name; `--branch` takes the answer when the agent has one. The
+directory is `<primaryRoot>/.worktrees/<branch with separators flattened>`,
+resolved from the *primary* checkout — `git rev-parse --show-toplevel` inside
+a worktree names the worktree, so using it would nest one inside another.
+
+`finish` is the asymmetric half. It refuses when the caller is not the owner,
+when no worktree is recorded, when the claim was written on the other
+platform, when the cwd is inside the target, when the tree is dirty, when the
+directory cannot be read, and when git fails — and it releases the claim
+*last*, so any failure leaves the claim held, which is the recoverable
+direction. It removes with `git worktree remove` and never `--force`, prunes
+only on evidence of *absence* rather than on a `None` probe, and deletes the
+branch only when `git merge-base --is-ancestor` proves it merged, with
+`git branch -d` rather than `-D`. `recover` reports and removes nothing; its
+`--preserve` reuses `operator_work.preserve`, and only for trees whose owner
+is UNCLAIMED or provably DEAD — STALE is reported as itself, for the same
+reason `reclaim` refuses it.
 
 ## Phase G+H — the audit
 
