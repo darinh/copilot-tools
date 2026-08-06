@@ -19,6 +19,7 @@ for a reclaim that destroyed something and then rebuilt it.
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -162,6 +163,7 @@ NASTY = [
     (".leading", "trailing."),
     ("a~b^c:d?e*f[g", "back\\slash"),
     ("item.lock", "inst.lock"),
+    ("item.lock.lock", "inst.lock.lock.lock"),
     ("@", "@{"),
     ("", ""),
     ("\x01\x7f", "control\tchars"),
@@ -242,20 +244,23 @@ def test_a_claim_taken_with_an_unconfirmable_identity_does_not_read_dead(
     assert live.assess(held, probes=probes).verdict == live.LIVE
 
 
-def test_the_operator_process_pid_is_never_what_a_claim_records(
+def test_agent_pid_reports_the_agent_or_nothing_never_this_process(
         monkeypatch) -> None:
     """`_agent_pid` answers about the agent, not about the command.
 
     ``operator work request`` exits within a second of writing the claim, so
-    its own pid is the one value guaranteed to be wrong.
+    its own pid is the one value guaranteed to be wrong -- and it is exactly
+    what `operator_session.runtime_identity` substitutes when handed ``None``,
+    which is why this path does not reuse it. With nothing to point at the
+    answer is ``None``, and a claim written from it carries no pid at all.
     """
     instance = op.Instance("alpha")
     monkeypatch.setattr(op.Instance, "copilot_pid", lambda self: None)
     monkeypatch.setattr(op, "_running_loop_pid", lambda inst: None)
     assert op._agent_pid(instance) is None
-    monkeypatch.setattr(op.Instance, "copilot_pid", lambda self: os.getpid())
+    monkeypatch.setattr(op.Instance, "copilot_pid", lambda self: 4242)
     monkeypatch.setattr(op, "_pid_alive", lambda pid: True)
-    assert op._agent_pid(instance) == os.getpid()
+    assert op._agent_pid(instance) == 4242
 
 
 def test_a_dead_copilot_pid_falls_back_to_the_supervisor(monkeypatch) -> None:
@@ -533,18 +538,148 @@ def test_the_dead_owner_is_judged_before_anything_is_written(
     assert git.calls == []
 
 
+def test_an_owner_that_stirs_between_the_verdict_and_the_write_keeps_its_item(
+        db: Path, repo: Path) -> None:
+    """The verdict is computed from a row read some milliseconds earlier, and
+    the owner's *name* does not change when it comes back. So a compare-and-
+    swap on the name alone still fires at an owner that has, in the meantime,
+    published fresh evidence of being alive -- which is the one outcome the
+    whole cascade exists to prevent.
+
+    The refresh is injected during preservation because that is the widest
+    part of the window: it runs several git commands in a worktree that may
+    be large.
+    """
+    _claim(db, worktree=repo)
+    _dirty(repo)
+    import operator_work as module
+    real = module.preserve
+
+    def stirring_preserve(*args, **kwargs):
+        result = real(*args, **kwargs)
+        wc.claim(db, item="0007", instance="alpha", worktree=str(repo),
+                 pid=1000, boot_id="boot-2")
+        return result
+
+    module.preserve = stirring_preserve
+    try:
+        result = ow.reclaim(db, item="0007", to_instance="beta",
+                            probes=FakeProbes(pids={1000: False}))
+    finally:
+        module.preserve = real
+    assert result.ok is False
+    assert result.refused == ow.RACED
+    assert wc.claim_for_item(db, "0007").instance == "alpha"
+    assert result.preservation is not None and result.preservation.dirty
+
+
+def test_the_preserved_branch_survives_a_refused_reassign(
+        db: Path, repo: Path) -> None:
+    """A race loses the reclaim, not the work. The branch written before the
+    refusal is left in place: the owner it was taken from is the one who gets
+    it back, and deleting it would be the only destructive act in the file."""
+    _claim(db, worktree=repo)
+    _dirty(repo)
+    import operator_work as module
+    real = module.preserve
+
+    def stirring_preserve(*args, **kwargs):
+        result = real(*args, **kwargs)
+        wc.claim(db, item="0007", instance="alpha", worktree=str(repo),
+                 pid=1000, boot_id="boot-2")
+        return result
+
+    module.preserve = stirring_preserve
+    try:
+        result = ow.reclaim(db, item="0007", to_instance="beta",
+                            probes=FakeProbes(pids={1000: False}))
+    finally:
+        module.preserve = real
+    assert result.refused == ow.RACED
+    assert "wip/0007-alpha" in _git(repo, "branch", "--list")
+
+
+def test_a_worktree_recorded_in_another_platforms_syntax_refuses(
+        db: Path) -> None:
+    """`Path(r"C:\\repos\\app")` on POSIX is a *relative* path, so a presence
+    probe reports it absent, preservation concludes there is nothing to save,
+    and the reclaim reassigns a worktree it never looked at. The refusal is
+    the only safe answer: nobody here can read that tree.
+    """
+    foreign = ("C:\\repos\\app" if os.name != "nt" else "/home/dev/app")
+    with pytest.raises(ow.GitUnavailable):
+        ow.preserve(foreign, item="0007", instance="alpha")
+    _claim(db, worktree=foreign)
+    result = ow.reclaim(db, item="0007", to_instance="beta",
+                        probes=FakeProbes(pids={1000: False}))
+    assert result.ok is False
+    assert result.refused == ow.PRESERVE_FAILED
+    assert wc.claim_for_item(db, "0007").instance == "alpha"
+
+
+def test_a_native_path_is_not_mistaken_for_a_foreign_one(repo: Path) -> None:
+    """The negative control. A refusal that fires on every path would pass the
+    test above while making reclaim useless."""
+    assert ow._foreign_path(str(repo)) is False
+    assert ow._foreign_path(repo) is False
+
+
+@pytest.mark.parametrize("windows,path,foreign", [
+    (False, "C:\\repos\\app", True),
+    (False, "\\\\server\\share\\app", True),
+    (False, "/home/dev/app", False),
+    (False, "relative/dir", False),
+    (True, "/home/dev/app", True),
+    (True, "C:\\repos\\app", False),
+    (True, "\\\\server\\share\\app", False),
+    (True, "relative\\dir", False),
+])
+def test_foreign_paths_are_judged_in_both_syntaxes_on_any_platform(
+        windows, path, foreign) -> None:
+    """Both branches, on every CI leg.
+
+    Left to read ``os.name``, each leg exercises only its own half, and the
+    other half's verdict is decided by whichever platform happens to run the
+    suite -- with the POSIX half mattering most, since that is where a Windows
+    path reads as an ordinary relative name.
+    """
+    assert ow._foreign_path(path, windows=windows) is foreign
+
+
 # ── the module issues no mutating verb, statically ──────────────
 def test_no_mutating_git_verb_appears_in_the_module_at_all() -> None:
     """A source scan beside the behavioural tests, because the behavioural
     ones can only cover the paths a test reached. FR-4's promise is about
-    every path, including the ones added tomorrow."""
-    source = Path(ow.__file__).read_text(encoding="utf-8")
-    quoted = [f'"{verb}"' for verb in
-              ("stash", "reset", "clean", "checkout", "restore", "rm", "mv")]
-    offenders = [token for token in quoted if token in source]
+    every path, including the ones added tomorrow.
+
+    Over the parsed tree rather than the raw text: a text scan has to pick a
+    quote style, and the one thing a forbidden verb would not do is arrive in
+    the spelling the scan happened to choose. Every string constant in the
+    module is checked, wherever it sits, so `'stash'`, a name in a list, and a
+    default argument are all caught.
+    """
+    tree = ast.parse(Path(ow.__file__).read_text(encoding="utf-8"))
+    forbidden = {"stash", "reset", "clean", "checkout", "restore", "rm", "mv"}
+    offenders = sorted({
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and node.value in forbidden})
     assert offenders == [], (
-        f"{offenders} appears as a git argument in operator_work.py; FR-4 "
+        f"{offenders} appears as a string constant in operator_work.py; FR-4 "
         f"forbids these verbs in a departed owner's worktree")
+
+
+def test_the_verb_scan_would_notice_a_single_quoted_offender() -> None:
+    """The positive control. A scan that matches nothing reports a clean tree,
+    which reads exactly like success -- and the previous spelling of this test
+    matched only double-quoted tokens, so `'stash'` walked straight past it."""
+    tree = ast.parse("def f():\n    return _git(['stash', 'list'], root)\n")
+    forbidden = {"stash", "reset", "clean", "checkout", "restore", "rm", "mv"}
+    found = sorted({
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and node.value in forbidden})
+    assert found == ["stash"]
 
 
 # ── listing ─────────────────────────────────────────────────────

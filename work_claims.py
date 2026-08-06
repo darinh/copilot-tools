@@ -269,6 +269,7 @@ def release(path, *, item: str, instance: str) -> bool:
 
 
 def reassign(path, *, item: str, expect_owner: str, to_instance: str,
+             expect_claim: "Claim | None" = None,
              worktree=None, branch=None, boot_id=None, mux_session=None,
              pid=None, pid_start=None, now=None) -> Claim:
     """Move a claim from a departed owner to a new one, if ``expect_owner``
@@ -280,12 +281,33 @@ def reassign(path, *, item: str, expect_owner: str, to_instance: str,
     old owner is gone is :mod:`operator_liveness`'s job, and preserving that
     owner's uncommitted work is ``operator work reclaim``'s -- this function
     is only the last, atomic step.
+
+    ``expect_owner`` alone is too weak for the caller that judged the owner
+    dead, because the name does not change when the owner comes back: an
+    instance that re-registers between the verdict and this call still matches
+    it, and the reassign proceeds against an owner that is now demonstrably
+    alive. ``expect_claim`` closes that window by comparing the whole row the
+    verdict was computed from -- a refreshed heartbeat, a new pid, a new boot
+    id or a moved worktree all refuse. It is optional so that a caller with no
+    prior read (there is none today, but the signature outlives that) is not
+    forced to invent one.
+
+    The comparison is inside the same ``BEGIN IMMEDIATE`` as the update, so
+    nothing can slip between the check and the write. What it cannot see is a
+    refresh that leaves every column identical -- a heartbeat written inside
+    the same whole second as the one already stored, since
+    :data:`TS_FORMAT` has no sub-second field. That window is narrow and, more
+    to the point, it is a window in which the owner published no new evidence
+    of being alive.
     """
     stamp = now or utcnow()
     with connect(path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         held = _claim_for_item(conn, item)
         if held is None or held.instance != expect_owner:
+            raise ClaimRefused(ITEM_HELD, item=item, instance=to_instance,
+                               holder=held)
+        if expect_claim is not None and held != expect_claim:
             raise ClaimRefused(ITEM_HELD, item=item, instance=to_instance,
                                holder=held)
         busy = _claim_for_instance(conn, to_instance)

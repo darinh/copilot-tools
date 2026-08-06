@@ -29,6 +29,7 @@ was, and the working tree is never read for anything but ``git add``.
 """
 from __future__ import annotations
 
+import ntpath
 import os
 import shutil
 import subprocess
@@ -124,6 +125,40 @@ def _git(args: "list[str]", repo, *, env_extra: "dict | None" = None,
     return proc.stdout
 
 
+def _foreign_path(raw, *, windows: "bool | None" = None) -> bool:
+    """Whether ``raw`` names a path in the *other* platform's syntax.
+
+    A claim records the worktree the way the machine that took it spelled it,
+    and nothing converts it. Read the other way round the string is not
+    invalid, which is the whole problem: ``Path("C:\\\\repos\\\\app")`` on POSIX
+    is a *relative* path -- a backslash is an ordinary filename character
+    there -- so a presence probe answers "not there", preservation concludes
+    there is nothing to save, and the reclaim reassigns a worktree whose
+    uncommitted work it never looked at. That is the exact failure FR-4
+    exists to prevent, arrived at through a string.
+
+    ``ntpath`` rather than ``os.path`` for the drive test, because ``os.path``
+    *is* the running platform's syntax and so cannot answer a question about
+    the other one. A false positive costs a refused reclaim; a false negative
+    costs somebody's uncommitted work.
+
+    ``windows`` is a parameter rather than a read of ``os.name`` at the point
+    of use so that both branches can be tested on every CI leg. Patching
+    ``os.name`` would do it too, and takes ``pathlib`` with it: ``Path()``
+    consults the same attribute and raises ``NotImplementedError`` for the
+    flavour it cannot instantiate.
+    """
+    text = str(raw)
+    drive = ntpath.splitdrive(text)[0]
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:
+        # Rooted with no drive and no UNC share is POSIX syntax. Windows would
+        # silently resolve it against whichever drive happens to be current.
+        return not drive and text[:1] in ("/", "\\")
+    return bool(drive) or "\\" in text
+
+
 def _ref_component(text: str) -> str:
     """One path segment of a branch name, safe for ``git check-ref-format``.
 
@@ -135,7 +170,11 @@ def _ref_component(text: str) -> str:
     while ".." in cleaned:
         cleaned = cleaned.replace("..", ".")
     cleaned = cleaned.strip(".-")
-    if cleaned.endswith(".lock"):
+    # A loop, not an `if`: stripping one suffix from `foo.lock.lock` leaves a
+    # name that still ends in `.lock`, which git refuses at `git branch` --
+    # the last step of a preservation, after the commit exists and with
+    # nothing pointing at it.
+    while cleaned.endswith(".lock"):
         cleaned = cleaned[:-len(".lock")].rstrip(".-")
     if cleaned == "@":                            # git refuses a lone `@`
         cleaned = ""
@@ -295,6 +334,10 @@ def preserve(worktree, *, item: str, instance: str, runner=None) -> Preservation
     commit built by ``commit-tree``, which is the whole reason for going the
     long way round instead of committing normally.
     """
+    if _foreign_path(worktree):
+        raise GitUnavailable(
+            f"worktree {worktree!r} was recorded in another platform's path "
+            f"syntax and cannot be examined from here")
     root = Path(worktree)
     # `dir_present` rather than `is_dir`, which answers False both for a path
     # that is not there and for one that could not be examined. Only the first
@@ -474,6 +517,7 @@ def reclaim(path, *, item: str, to_instance: str, probes=None, now=None,
     try:
         moved = work_claims.reassign(path, item=item,
                                      expect_owner=held.instance,
+                                     expect_claim=held,
                                      to_instance=to_instance,
                                      worktree=held.worktree,
                                      branch=held.branch, now=None, **identity)

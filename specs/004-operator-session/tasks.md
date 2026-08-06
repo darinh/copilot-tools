@@ -77,7 +77,10 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       a source scan in `tests/test_work_cli.py` asserts it. A preservation
       that fails refuses the reclaim (`preserve-failed`) rather than handing
       on a tree nobody could read, and an existing `wip/` branch is never
-      moved — the second crash on one item is exactly when one exists.
+      moved — the second crash on one item is exactly when one exists. The
+      final swap compares the whole claim row the verdict was computed from
+      (`work_claims.reassign(expect_claim=…)`), not just the owner's name,
+      which does not change when a dead-judged owner comes back.
 - [ ] E3 `operator backlog ready` / `close` — preserving the `proposed` gate
 - [ ] E4 `operator worktree new` / `finish` / `recover`
 - [ ] E5 `operator reply`, retiring the inbox-polling semantics

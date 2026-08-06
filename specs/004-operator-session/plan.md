@@ -133,11 +133,30 @@ first thing they reach for is one of the verbs this module never issues.
 
 Ordering follows from the same asymmetry: no-such-claim, already-mine,
 instance-busy, then the cascade, then preservation, then a compare-and-swap
-against the judged owner. Every refusal that can be decided from the database
-is decided before any git work, so a reclaim that was going to be refused
-never leaves a branch behind. STALE is refused, not stolen — the cascade's
-whole point is that "I could not confirm it is alive" and "I confirmed it is
-dead" are different answers.
+against the whole row the verdict was computed from. Every refusal that can be
+decided from the database is decided before any git work, so a reclaim that
+was going to be refused never leaves a branch behind. STALE is refused, not
+stolen — the cascade's whole point is that "I could not confirm it is alive"
+and "I confirmed it is dead" are different answers.
+
+The compare-and-swap is on the row and not on the owner's *name*, because the
+name is the one thing that does not change when a dead-judged owner comes
+back: `work_claims.reassign` gained an optional `expect_claim`, compared
+inside the same `BEGIN IMMEDIATE` as the update, so a refreshed heartbeat, a
+new pid, a new boot id or a moved worktree all refuse. Adversarial review
+found that hole; the residual window is a refresh that leaves every column
+identical, which needs a heartbeat inside the same whole second as the one
+already stored and publishes no new evidence of life anyway.
+
+A worktree recorded in the *other* platform's path syntax refuses too, and
+that one is worth naming because it fails silently in the dangerous
+direction: `Path(r"C:\repos\app")` on POSIX is a relative path — a backslash
+is an ordinary filename character there — so a presence probe reports the
+worktree absent, preservation concludes there is nothing to save, and the
+reclaim reassigns a tree it never looked at. `_foreign_path` asks `ntpath`,
+which is pure syntax and understands both spellings, and takes the platform
+as a parameter so both branches are exercised on every CI leg rather than
+each leg testing only its own half.
 
 ## Phase G+H — the audit
 
