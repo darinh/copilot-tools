@@ -364,7 +364,63 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       claiming "we made this file" over someone's prose is the claim the
       preservation contract denies. 9 mutants killed, 0 survived, 0 never
       ran — including both whitespace round-trips.
-- [ ] G12 Feature flags default off; one platform's commands; emit `CLAUDE.md`
+- [x] G12 Feature flags default off; one platform's commands; emit `CLAUDE.md`
+      (FR-8). The six `_FLAG` features now ship `default=OFF`, so an enabled
+      section is something somebody chose. `tracked-backlog` deliberately does
+      **not** move: `tracked_backlog_backend()` returns its `default` under
+      *every* uncertainty — no catalog, an unreadable file, an unregistered
+      project — so that value is the enforcing answer three conformance
+      guards depend on, and flipping it would retire them on all eight CI
+      legs while every leg stayed green.
+      Measured before flipping: all eight registered projects on this machine
+      have no `features.json`. Resolving an absent configuration to the new
+      defaults would therefore strip every optional section from eight
+      repositories at once, with the diff attributed to a version bump. So
+      `_values_for` **refuses** a project that has never chosen, naming the
+      file and `operator projects`; `retire` turns that into a per-project
+      `failed` that blocks removal of the global file — conventions in two
+      places rather than none.
+      One platform's commands: `<!-- operator:platform windows|posix -->` …
+      `<!-- operator:endplatform -->` brackets each variant in the template
+      and `select_platform` keeps the host's, chosen once per run by
+      `host_platform()` from `os.name`. An HTML comment rather than the
+      `**PowerShell (Windows)**` label above the fence — the label is prose,
+      spelled three ways in the template already, and matching on prose would
+      silently keep both variants the first time somebody reworded a heading.
+      Markers are hunted outside fences only, for the same reason the
+      managed-block finder is: a repository documenting this mechanism writes
+      the markers in a fence, and reading the sample as real would delete the
+      rest of the section on one platform and nothing at all on the other.
+      Unbalanced markers raise rather than being recovered from — that
+      asymmetry is invisible to a run on either machine alone. A platform
+      name this build does not know is *kept*, the same answer an unknown
+      gate slug gets and for the same reason. Removing a block joins the
+      blank line above it to the one below, so the collapse of that doubled
+      blank is confined to the seam; a blank run the template wrote is left
+      exactly as written (both halves pinned).
+      `render` takes `platform` with **no default**: a default would make
+      every test that forgot it agree with the machine it ran on, so the
+      Windows legs and the POSIX legs would each prove only their own half.
+      `CLAUDE.md` carries `@AGENTS.md` and none of the conventions —
+      duplicating them would put two texts that can disagree in front of one
+      agent in one turn, with the newer one right and neither file saying
+      which that is. It is written after `AGENTS.md`, never before. A file
+      already there *with* a managed block is regenerated; one *without* is
+      left alone and is not a blocker, because its whole content is an import
+      line and a second consent prompt per project would spend the operator's
+      attention on the file carrying no conventions. Both files are staged
+      and committed together, from a pathspec built out of what is on disk —
+      `git add` and `git commit` both treat a pathspec matching nothing as
+      fatal, so a project that declined its `AGENTS.md` would otherwise have
+      its staging reported as a git failure for naming a file that was
+      correctly never written.
+      Mutation: 3/0/0 on the defaults change, 11/0/0 on the platform and
+      `CLAUDE.md` work. The one survivor of the first pass — collapsing blank
+      runs unconditionally — was a real gap: the shipped template contains no
+      doubled blank line today, so the confined rule and the unconditional
+      one agree on it and stop agreeing the moment somebody writes one.
+      `test_a_blank_run_away_from_the_seam_is_left_exactly_as_written` is
+      what tells them apart.
 - [ ] G13 Set the budget from measured residue and make generation error above it
 
 ## Verification

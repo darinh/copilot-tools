@@ -644,6 +644,90 @@ cannot fire.
 
 6 mutants killed, 0 survived, 0 never ran.
 
+### G12 delivered — FR-8: defaults off, one platform, `CLAUDE.md`
+
+**The measurement that shaped it.** Before flipping anything: all eight
+registered projects under `~/.operator/projects/` have no `features.json`.
+Every one is running on the defaults. So "default off" is not a change to
+what new projects get — it is a change to what *every existing project* gets
+on its next routine regeneration, and resolving an absent configuration to
+the new defaults would have stripped every optional section from eight
+repositories at once, with the diff attributed to a version bump.
+
+Three consequences, each a deliberate decision:
+
+- **The six `_FLAG` features ship `default=OFF`.** An enabled section is now
+  something somebody chose, which is what makes "every enabled section is a
+  live requirement" true rather than aspirational.
+- **`tracked-backlog` does not move.** `tracked_backlog_backend()` returns
+  `FEATURES_BY_SLUG[TRACKED_BACKLOG].default` under *every* uncertainty — no
+  catalog in CI, an unreadable file, an unregistered project — so that value
+  is the enforcing answer three conformance guards depend on. Flipping it
+  would retire those guards on all eight CI legs while every leg stayed
+  green, which is the exact shape this plan keeps finding and refusing.
+- **`_values_for` refuses a project that never chose**, naming the file and
+  `operator projects`. `retire` turns that into a per-project `failed` that
+  blocks removal of the global file — the conventions end up in two places
+  rather than none, which is the direction every other decision here takes.
+
+**One platform's commands.** `<!-- operator:platform windows -->` …
+`<!-- operator:endplatform -->` brackets each variant in the template;
+`select_platform` keeps the host's, chosen once per `retire` run so one run
+cannot produce files that disagree.
+
+An HTML comment rather than the `**PowerShell (Windows)**` label above the
+fence. The label is prose, it is already spelled three different ways in the
+template, and a renderer matching on prose would silently keep both variants
+the first time somebody reworded a heading — a failure that looks like a
+formatting nit and is actually the file asking an agent to choose a shell.
+
+The rules that are load-bearing, each pinned:
+
+- **Markers are hunted outside fences only.** A repository documenting this
+  mechanism writes the markers in a fence, and reading the sample as real
+  would delete the rest of that section on one platform and nothing at all
+  on the other. Same rule, same reason, as the managed-block finder.
+- **Unbalanced markers raise.** Recovering silently means a stray begin
+  marker is invisible to a run on either machine alone.
+- **An unknown platform name is kept**, the same answer an unknown gate slug
+  gets: the block is an older build's only copy of that text.
+- **The blank-line collapse is confined to the seam.** Removing a block joins
+  the blank above it to the blank below, and a doubled blank is the one
+  difference a reader does see in a file whose whole claim is that it looks
+  the same on both platforms. Collapsing unconditionally passes every other
+  test — the shipped template happens to contain no doubled blank line, so
+  the two rules agree on it and stop agreeing the moment somebody writes one.
+- **`render` takes `platform` with no default.** A default would make every
+  test that forgot the argument agree with the machine it ran on, so the
+  Windows legs and the POSIX legs would each prove only their own half and
+  the suite would look complete.
+
+**`CLAUDE.md`.** It holds `@AGENTS.md` and none of the conventions. Reports on
+whether Claude Code reads `AGENTS.md` natively conflict and an import costs
+one line, so the import is written rather than the question resolved.
+Duplicating the conventions would put two texts that can disagree in front of
+one agent in the same turn, with the newer one right and neither file saying
+which that is.
+
+It is written *after* `AGENTS.md`, never before — a repository holding an
+import of a file that was never written is worse than one holding neither. A
+`CLAUDE.md` already there *with* a managed block is regenerated, because a
+file this tool wrote is a file this tool keeps true; one *without* is left
+alone and is **not** a blocker. That asymmetry is deliberate: consent belongs
+at `AGENTS.md`, where the content is, and a second prompt per project for the
+file carrying no conventions would spend the operator's attention on the
+least important thing in the run.
+
+Both files are staged and committed together, from a pathspec built out of
+what is on disk. `git add` and `git commit` both treat a pathspec that matches
+nothing as fatal, so a project that declined its `AGENTS.md` — and therefore
+never got a `CLAUDE.md` — would otherwise have its staging reported as a git
+failure for correctly not writing a file.
+
+Mutation: 3 killed / 0 survived / 0 never ran on the defaults change; 11 / 0 /
+0 on the platform and `CLAUDE.md` work, after the one survivor named above was
+turned into a test.
+
 ## Risks
 
 | Risk | Mitigation |

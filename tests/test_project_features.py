@@ -120,19 +120,32 @@ def test_every_gated_section_names_a_feature_that_exists(template):
         f"vocabulary does not declare: {sorted(gated - set(SLUGS))}")
 
 
-def test_the_example_enabled_features_line_matches_the_defaults(template):
+def test_the_example_enabled_features_line_is_one_this_module_could_produce(template):
     """The line a new project's instructions file is copied from.
 
     It is the one place the slugs appear as a list, so it is the one place a
     project's own file inherits verbatim -- and it must be a list this module
     would actually produce.
+
+    It is deliberately *not* compared against the defaults. Since FR-8 those
+    are off, so pinning the example to them would force the sample line to
+    read "Enabled features: tracked-backlog." -- an example that teaches
+    nothing about the file it is an example of. What still has to hold is
+    that every slug in it is real and that the ordering is the one this
+    module emits, which is what a typo or a renamed feature breaks.
     """
     section = template[template.index("### What to write in a per-project file"):]
     match = re.search(r"Enabled features: ([^.]+)\.", section, re.DOTALL)
     assert match, "no 'Enabled features:' line in the example project file"
     listed = [s.strip() for s in re.split(r",\s*", match.group(1)) if s.strip()]
-    defaults = project_features.resolved_values(None)
-    assert listed == list(project_features.enabled_slugs(defaults))
+    assert listed, "the example lists no features, so this proves nothing"
+    unknown = [slug for slug in listed if slug not in project_features.SLUGS]
+    assert not unknown, unknown
+    values = {f.slug: (f.default if f.slug in listed else f.off_value)
+              for f in FEATURES}
+    values.update({slug: ON for slug in listed
+                   if slug != TRACKED_BACKLOG})
+    assert listed == list(project_features.enabled_slugs(values))
 
 
 def test_a_feature_the_template_does_not_offer_is_reported(template):
@@ -169,7 +182,8 @@ def test_an_enabled_features_line_that_drifts_is_reported(template):
                                "Enabled features: telepathy, session-handoff", 1)
     assert mutated != template, "the substitution found nothing to replace"
     with pytest.raises(AssertionError):
-        test_the_example_enabled_features_line_matches_the_defaults(mutated)
+        test_the_example_enabled_features_line_is_one_this_module_could_produce(
+            mutated)
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +254,16 @@ def test_an_absent_configuration_resolves_to_the_defaults():
 
 
 def test_a_partial_configuration_keeps_the_defaults_for_the_rest():
-    resolved = project_features.resolved_values({"features": {"spec-driven": OFF}})
-    assert resolved["spec-driven"] == OFF
-    assert resolved["session-handoff"] == ON
+    """Set one thing, and the rest fall to their shipped default -- which
+    since FR-8 is off for every flag. The stored value is the *on* one here
+    so the two are told apart: if resolution were simply returning off for
+    everything, this would still show it."""
+    resolved = project_features.resolved_values(
+        {"features": {"spec-driven": ON}})
+    assert resolved["spec-driven"] == ON
+    assert resolved["session-handoff"] == OFF
+    assert resolved["session-handoff"] == (
+        project_features.FEATURES_BY_SLUG["session-handoff"].default)
 
 
 def test_a_backlog_on_github_issues_still_counts_as_enabled():
@@ -257,7 +278,8 @@ def test_a_backlog_on_github_issues_still_counts_as_enabled():
 
 def test_enabled_features_line_lists_only_what_is_on():
     values = project_features.resolved_values(
-        {"features": {"spec-driven": OFF, TRACKED_BACKLOG: BACKLOG_NONE}})
+        {"features": {"spec-driven": OFF, "session-handoff": ON,
+                      TRACKED_BACKLOG: BACKLOG_NONE}})
     line = project_features.enabled_features_line(values)
     assert "spec-driven" not in line
     assert TRACKED_BACKLOG not in line
@@ -381,10 +403,12 @@ def test_writing_preserves_settings_this_build_does_not_understand(tmp_path):
 
 def test_a_written_configuration_reads_back(tmp_path):
     path = tmp_path / "features.json"
-    project_features.write_config(path, {TRACKED_BACKLOG: BACKLOG_GITHUB_ISSUES})
+    project_features.write_config(
+        path, {TRACKED_BACKLOG: BACKLOG_GITHUB_ISSUES, "session-handoff": ON})
     values = project_features.resolved_values(project_features.read_config(path))
     assert values[TRACKED_BACKLOG] == BACKLOG_GITHUB_ISSUES
     assert values["session-handoff"] == ON
+    assert values["session-history"] == OFF
 
 
 def test_writing_one_feature_leaves_the_others_where_they_were(tmp_path):

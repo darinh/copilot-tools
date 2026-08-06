@@ -53,10 +53,14 @@ import project_features
 from install_manifest import file_digest, path_present
 
 __all__ = [
-    "InstructionsError", "AGENTS_NAME", "MANAGED_BEGIN", "MANAGED_END",
+    "InstructionsError", "AGENTS_NAME", "CLAUDE_NAME",
+    "MANAGED_BEGIN", "MANAGED_END",
     "CONFIGURATION_SECTION", "ARCHIVE_DIRNAME", "GATE", "Section",
     "TEMPLATE_KEY", "TEMPLATE_NAME", "GLOBAL_NAME",
-    "split_sections", "gate_slug", "render", "compose", "managed_block_present",
+    "WINDOWS", "POSIX", "PLATFORMS", "PLATFORM_BEGIN", "PLATFORM_END",
+    "host_platform", "select_platform",
+    "split_sections", "gate_slug", "render", "render_claude",
+    "compose", "managed_block_present",
     "write_text_atomic", "preserve", "user_scope_agents_files", "resolve_source",
     "WRITTEN", "MERGED", "UNCHANGED", "DECLINED", "MISSING", "FAILED",
     "BLOCKING_STATES", "ProjectOutcome", "RetirementResult", "retire",
@@ -78,6 +82,15 @@ class InstructionsError(RuntimeError):
 #: one is a repository whose author has already decided where this content
 #: goes.
 AGENTS_NAME = "AGENTS.md"
+
+#: The Claude-facing file. Reports on whether Claude Code reads ``AGENTS.md``
+#: natively conflict, and an import costs one line, so the import is written
+#: rather than the question being resolved. It holds ``@AGENTS.md`` and
+#: nothing else that duplicates the conventions -- two copies of the same
+#: rules is the failure this whole feature exists to stop, and it would be a
+#: particularly bad one here because the two files are read by the same agent
+#: in the same turn.
+CLAUDE_NAME = "CLAUDE.md"
 
 #: The markers that delimit the block. The old spelling is still *read*: a
 #: writer that knew only the new one would find no block in a file carrying
@@ -127,6 +140,26 @@ ARCHIVE_DIRNAME = "retired"
 #: checks it.
 GATE = re.compile(r"^\*Enabled by feature flag: `(?P<slug>[a-z0-9-]+)`\*\s*$",
                   re.MULTILINE)
+
+#: The two platform vocabularies a command can be written in. A generated
+#: block carries **one** of them, chosen from the machine doing the
+#: generating, because a file that shows both makes the reader choose and the
+#: reader is an agent that will sometimes choose wrong. Every incident of that
+#: shape costs a wrong command run against a real repository.
+WINDOWS = "windows"
+POSIX = "posix"
+PLATFORMS = (WINDOWS, POSIX)
+
+#: The markers that bracket a platform-specific run of lines in the template.
+#: An HTML comment rather than the ``**PowerShell (Windows)**`` label above
+#: the fence: the label is prose, it is spelled three different ways in the
+#: template already, and a renderer that matched on prose would silently keep
+#: both variants the first time somebody rewrote a heading. These markers are
+#: invisible in every Markdown renderer and are checked by a conformance
+#: test, so drift is a failing build rather than a doubled block.
+PLATFORM_BEGIN = re.compile(r"^<!-- operator:platform (?P<name>[a-z0-9-]+) -->$")
+PLATFORM_END = "<!-- operator:endplatform -->"
+
 
 _H2 = re.compile(r"^## (?P<title>.+?)\s*$")
 
@@ -281,6 +314,83 @@ def gate_slug(body: str) -> "str | None":
     return match.group("slug") if match else None
 
 
+def host_platform(os_name: "str | None" = None) -> str:
+    """Which vocabulary this machine's commands are written in.
+
+    ``os.name`` rather than ``sys.platform`` or a path separator: the only
+    question being asked is which shell the reader will paste into, and
+    ``nt``/``posix`` is exactly that split. It is a parameter so the tests can
+    ask for the other one without patching a module they do not own.
+    """
+    return WINDOWS if (os.name if os_name is None else os_name) == "nt" else POSIX
+
+
+def select_platform(body: str, platform: str) -> str:
+    """*body* with every other platform's bracketed lines removed.
+
+    The markers themselves come out too, on both branches -- a kept block that
+    still carried them would put them in the repository, where the next run
+    would read them again and the *user's* own text could not be told from
+    the template's.
+
+    A name outside :data:`PLATFORMS` is **kept**, for the same reason
+    :func:`render` keeps a section gated behind a slug it does not know: the
+    block is the older build's only copy of that text, and a build that
+    dropped everything it did not recognise would delete conventions purely
+    by being out of date.
+
+    Unbalanced markers raise. Silently recovering would mean a stray begin
+    marker deletes the entire rest of a section on one platform and nothing
+    at all on the other -- a difference no single-platform test run can see.
+    """
+    lines = body.splitlines(keepends=True)
+    eligible = {index for index, _line in outside_fences(body)}
+    kept: list[str] = []
+    current: "str | None" = None
+    opened_at = 0
+    # Set whenever a line is removed -- a marker or a whole block. Removing a
+    # span joins the blank line above it to the blank line below it, and a
+    # doubled blank is the one difference a reader *does* see, in a file whose
+    # whole claim is that it looks the same on both platforms. Collapsing is
+    # confined to the seam: a blank run anywhere a removal did not happen is
+    # the template's own and is left alone.
+    seam = False
+    for index, line in enumerate(lines):
+        if index in eligible:
+            stripped = line.strip()
+            match = PLATFORM_BEGIN.match(stripped)
+            if match is not None:
+                if current is not None:
+                    raise InstructionsError(
+                        f"line {index + 1}: a platform block for {current!r} "
+                        f"opened at line {opened_at + 1} is still open")
+                current = match.group("name")
+                opened_at = index
+                seam = True
+                continue
+            if stripped == PLATFORM_END:
+                if current is None:
+                    raise InstructionsError(
+                        f"line {index + 1}: {PLATFORM_END} with no platform "
+                        f"block open")
+                current = None
+                seam = True
+                continue
+        if current is not None and current in PLATFORMS and current != platform:
+            seam = True
+            continue
+        if (seam and not line.strip() and kept and not kept[-1].strip()):
+            seam = False
+            continue
+        seam = False
+        kept.append(line)
+    if current is not None:
+        raise InstructionsError(
+            f"line {opened_at + 1}: a platform block for {current!r} was "
+            f"never closed")
+    return "".join(kept)
+
+
 # --------------------------------------------------------------------------
 # Rendering one project's conventions
 # --------------------------------------------------------------------------
@@ -331,13 +441,19 @@ def _header(label: str, project_path: str, values: dict, version: str) -> str:
 
 
 def render(*, source: str, values: dict, guid: str, project_path: str,
-           label: str, project_dir_path, config_path, version: str) -> str:
+           label: str, project_dir_path, config_path, version: str,
+           platform: str) -> str:
     """The managed block for one project, markers included.
 
     Deterministic: the same inputs produce the same bytes, with no timestamp
     anywhere in it. A block that embedded the time it was written would show
     up as a diff in every repository every time anything regenerated it, and
     a diff that is always there is a diff nobody reads.
+
+    *platform* is required rather than defaulted to the host. A default would
+    make every test that forgot it agree with the machine it ran on, so the
+    Windows legs and the POSIX legs would each prove only their own half and
+    the suite would look complete.
     """
     _preamble, sections = split_sections(source)
     parts = [_header(label, project_path, values, version)]
@@ -356,9 +472,39 @@ def render(*, source: str, values: dict, guid: str, project_path: str,
             # ``project_features.write_config`` refuses.
             if feature is not None and not project_features.is_enabled(values, slug):
                 continue
-        parts.append(f"## {section.title}\n{section.body}")
+        parts.append(f"## {section.title}\n"
+                     f"{select_platform(section.body, platform)}")
     body = "\n".join(part.rstrip("\n") + "\n" for part in parts)
     return f"{MANAGED_BEGIN}\n\n{body}\n{MANAGED_END}\n"
+
+
+def render_claude(*, label: str, version: str) -> str:
+    """The managed block for ``CLAUDE.md``: an import and the reason for it.
+
+    Deliberately not a second copy of the conventions. Claude Code reads both
+    files in the same turn, so duplicating them would put two texts that can
+    disagree in front of one reader -- and the one that is wrong would be
+    whichever was regenerated last, which is not visible from either file.
+    """
+    return (
+        f"{MANAGED_BEGIN}\n"
+        "\n"
+        f"# {label} — working conventions\n"
+        "\n"
+        f"@{AGENTS_NAME}\n"
+        "\n"
+        f"The conventions live in `{AGENTS_NAME}`, which every agent tool "
+        "reads. This\n"
+        "file imports it rather than repeating it, so there is one text to "
+        "keep true.\n"
+        "\n"
+        f"Generated by copilot-tools {version}. Everything between the "
+        "markers is\n"
+        "regenerated by `operator projects`; write anything of your own "
+        "outside them.\n"
+        "\n"
+        f"{MANAGED_END}\n"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -784,7 +930,7 @@ class RetirementResult:
 
 
 def _place_one(project: dict, *, source: str, version: str, projects_root,
-               decide) -> ProjectOutcome:
+               decide, platform: str) -> ProjectOutcome:
     guid = project["guid"]
     root = Path(project["path"])
     label = project.get("label") or _basename(project["path"]) or project["path"]
@@ -805,6 +951,7 @@ def _place_one(project: dict, *, source: str, version: str, projects_root,
         project_dir_path=project_dir_path,
         config_path=project_dir_path / project_features.CONFIG_NAME,
         version=version,
+        platform=platform,
     )
     target = root / AGENTS_NAME
     exists = path_present(target)
@@ -828,35 +975,102 @@ def _place_one(project: dict, *, source: str, version: str, projects_root,
         return ProjectOutcome(guid, project["path"], label, FAILED,
                               str(exc), target)
     if existing is not None and combined == existing:
-        return ProjectOutcome(guid, project["path"], label, UNCHANGED,
-                              "already up to date", target)
+        state, detail = UNCHANGED, "already up to date"
+    else:
+        try:
+            write_text_atomic(target, combined)
+        except InstructionsError as exc:
+            return ProjectOutcome(guid, project["path"], label, FAILED,
+                                  str(exc), target)
+        state = MERGED if existing is not None else WRITTEN
+        detail = ""
+    # After ``AGENTS.md``, never before: ``CLAUDE.md`` is an import of it, and
+    # a repository holding an import of a file that was never written is a
+    # worse state than one holding neither.
+    trouble = _place_claude(root, label=label, version=version)
+    if trouble is not None:
+        return ProjectOutcome(guid, project["path"], label, FAILED,
+                              trouble, target)
+    return ProjectOutcome(guid, project["path"], label, state, detail, target)
+
+
+def _place_claude(root, *, label: str, version: str) -> "str | None":
+    """Write the project's ``CLAUDE.md``. Returns a message, or ``None``.
+
+    A file already there *without* a managed block is left alone, and that is
+    not a blocker. It is the user's own, the whole of what this would write
+    is one import line, and asking a second consent question per project --
+    for the file that contains none of the conventions -- would spend the
+    operator's attention on the least important thing in the run. The
+    ``AGENTS.md`` prompt is where consent belongs, because that is where the
+    content is.
+    """
+    target = Path(root) / CLAUDE_NAME
+    exists = path_present(target)
+    if exists is None:
+        return f"{target} could not be examined"
+    existing: "str | None" = None
+    if exists:
+        try:
+            existing = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            return f"{target} could not be read: {exc}"
+        if not managed_block_present(existing):
+            return None
+    try:
+        combined = compose(existing,
+                           render_claude(label=label, version=version))
+    except InstructionsError as exc:
+        return str(exc)
+    if existing is not None and combined == existing:
+        return None
     try:
         write_text_atomic(target, combined)
     except InstructionsError as exc:
-        return ProjectOutcome(guid, project["path"], label, FAILED,
-                              str(exc), target)
-    state = MERGED if existing is not None else WRITTEN
-    return ProjectOutcome(guid, project["path"], label, state, "", target)
+        return str(exc)
+    return None
 
 
 def _values_for(guid: str, projects_root) -> dict:
-    """The project's feature values, defaults when it has never chosen.
+    """The project's feature values. Refuses a project that never chose.
 
     An *unreadable* configuration raises rather than resolving to the
     defaults. Rendering a project's conventions from invented values would
     write a confident document about choices nobody managed to read, and then
     put it in the repository.
+
+    An *absent* one raises too, and that is the half FR-8 forces. Flags
+    default off, so resolving an absent configuration would render a block
+    with every optional section removed — and on the machine this was written
+    on, every registered project was relying on the defaults, so a routine
+    version bump would have stripped the conventions out of eight
+    repositories at once, with the diff attributed to the version bump.
+
+    "Default off" is meant to make an enabled section a live requirement.
+    Refusing here is what makes that true: a section is present because
+    somebody chose it, and a project that has not chosen is told so instead
+    of being answered for. ``retire`` turns this into a per-project failure
+    that blocks removal of the global file, which is the safe direction — the
+    conventions end up in two places rather than none.
     """
     path = Path(projects_root) / guid / project_features.CONFIG_NAME
     try:
         document = project_features.read_config(path)
     except project_features.FeatureConfigError as exc:
         raise InstructionsError(str(exc)) from exc
+    if document is None:
+        raise InstructionsError(
+            f"{path} has never been written, so this project has not chosen "
+            f"its features. Run `operator projects` to choose them. Refusing "
+            f"to render a block from the defaults: they are all off, and "
+            f"answering for a project that never chose would quietly delete "
+            f"the conventions it is using today.")
     return project_features.resolved_values(document)
 
 
 def retire(projects, *, source: str, source_origin: str, global_path,
            archive_dir, projects_root, home, version: str,
+           platform: "str | None" = None,
            decide=lambda project, existing: False,
            log=lambda message: None,
            recheck=lambda: None,
@@ -880,13 +1094,20 @@ def retire(projects, *, source: str, source_origin: str, global_path,
     after the snapshot would never be written to, and removing the global file
     anyway is the gap this whole function exists to prevent. Returning a
     message aborts; returning ``None`` proceeds.
+
+    ``platform`` is which shell's commands the blocks are written in, and
+    defaults to this machine's. It is resolved once here rather than per
+    project so that one run cannot produce files that disagree.
     """
+    if platform is None:
+        platform = host_platform()
     result = RetirementResult(source_origin=source_origin)
     result.user_agents = user_scope_agents_files(home)
     for project in projects:
         try:
             outcome = _place_one(project, source=source, version=version,
-                                 projects_root=projects_root, decide=decide)
+                                 projects_root=projects_root, decide=decide,
+                                 platform=platform)
         except InstructionsError as exc:
             outcome = ProjectOutcome(project["guid"], project["path"],
                                      project.get("label") or project["path"],

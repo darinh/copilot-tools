@@ -51,16 +51,33 @@ def template() -> str:
 
 @pytest.fixture
 def defaults() -> dict:
+    """Every flag on.
+
+    Named `defaults` for history; since FR-8 the *defaults* are off, and a
+    fixture that is everything-off makes every "turning this off drops its
+    section" test vacuous — the section was already gone. What these tests
+    need is a baseline where each section is present, so that removing one
+    is observable.
+    """
+    return {**project_features.resolved_values(None),
+            **{slug: project_features.ON
+               for slug in project_features.SLUGS
+               if slug != project_features.TRACKED_BACKLOG}}
+
+
+@pytest.fixture
+def shipped_defaults() -> dict:
     return project_features.resolved_values(None)
 
 
 def _render(source: str, values: dict, *, guid: str = "GUID-1",
-            path: str = "/repo/app", label: str = "app") -> str:
+            path: str = "/repo/app", label: str = "app",
+            platform: str = pi.POSIX) -> str:
     return pi.render(source=source, values=values, guid=guid,
                      project_path=path, label=label,
                      project_dir_path=f"/home/.operator/projects/{guid}",
                      config_path=f"/home/.operator/projects/{guid}/features.json",
-                     version="9.9.9")
+                     version="9.9.9", platform=platform)
 
 
 # ---------------------------------------------------------------------------
@@ -440,10 +457,362 @@ def test_a_rendered_block_carries_only_the_new_spelling(template):
         source=template, values=project_features.resolved_values(None),
         guid="GUID", project_path="/tmp/x", label="x",
         project_dir_path=Path("/tmp/p"), config_path=Path("/tmp/p/f.json"),
-        version="1.0.0")
+        version="1.0.0", platform=pi.POSIX)
     assert LEGACY_BEGIN not in rendered
     assert LEGACY_END not in rendered
     assert rendered.startswith(MANAGED_BEGIN)
+
+
+# ---------------------------------------------------------------------------
+# FR-8 -- flags default off, and what that must not silently do
+# ---------------------------------------------------------------------------
+
+def test_every_flag_ships_off(shipped_defaults):
+    """The requirement itself: a section is in a project's conventions
+    because somebody needs it, not because nobody chose."""
+    flags = [f for f in project_features.FEATURES
+             if f.slug != project_features.TRACKED_BACKLOG]
+    assert flags, "no flags left to check -- this test would pass vacuously"
+    for feature in flags:
+        assert feature.default == feature.off_value, feature.slug
+        assert not project_features.is_enabled(shipped_defaults, feature.slug)
+
+
+def test_the_backlog_choice_still_defaults_to_the_enforcing_answer():
+    """The one feature deliberately not flipped, and the reason is not
+    cosmetic. `tracked_backlog_backend` answers with this default under
+    every uncertainty -- no catalog in CI, an unreadable file, a project
+    nobody registered. Defaulting it to `none` stands three real guards
+    down on all eight legs while every one of them stays green."""
+    feature = project_features.FEATURES_BY_SLUG[project_features.TRACKED_BACKLOG]
+    assert feature.default == project_features.BACKLOG_FOLDER
+    assert feature.default != feature.off_value
+
+
+def test_a_project_that_never_chose_is_refused_not_answered_for(machine):
+    """"Default off" must not mean "quietly delete what they were using".
+
+    Every registered project on the machine this was written on had no
+    configuration file, so resolving an absent one would have stripped the
+    optional sections out of eight repositories at once on the next routine
+    regeneration -- with the diff attributed to a version bump. Refusing is
+    what makes an enabled section a live requirement rather than an
+    accident of who last ran the tool.
+    """
+    (machine["projects_root"] / "GUID-1"
+     / project_features.CONFIG_NAME).unlink()
+    result = _retire(machine)
+    outcome = result.outcomes[0]
+    assert outcome.state == FAILED
+    assert "has not chosen its features" in outcome.detail
+    assert "operator projects" in outcome.detail
+
+
+def test_the_refusal_keeps_the_global_file_where_it_is(machine):
+    """The safe direction: conventions in two places, never in none."""
+    (machine["projects_root"] / "GUID-1"
+     / project_features.CONFIG_NAME).unlink()
+    result = _retire(machine)
+    assert not result.removed
+    assert machine["global_path"].exists()
+
+
+def test_the_refusal_does_not_touch_that_project_s_file(machine):
+    """A project that has not chosen keeps whatever it already had. Writing
+    an all-off block and *then* reporting failure would leave the damage
+    behind the error message."""
+    _retire(machine)
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    before = target.read_text(encoding="utf-8")
+    (machine["projects_root"] / "GUID-1"
+     / project_features.CONFIG_NAME).unlink()
+    _retire(machine)
+    assert target.read_text(encoding="utf-8") == before
+
+
+def test_an_unreadable_configuration_is_still_refused(machine):
+    """Unchanged by FR-8, and re-pinned because the absent case now shares
+    its code path: the two must not collapse into one another in either
+    direction."""
+    config = (machine["projects_root"] / "GUID-1"
+              / project_features.CONFIG_NAME)
+    config.write_text("{ not json", encoding="utf-8")
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert "has not chosen its features" not in result.outcomes[0].detail
+
+
+def test_a_configured_project_renders_only_what_it_chose(machine):
+    config = (machine["projects_root"] / "GUID-1"
+              / project_features.CONFIG_NAME)
+    config.write_text(json.dumps(
+        {"version": 1, "features": {"session-handoff": project_features.ON}}),
+        encoding="utf-8")
+    _retire(machine)
+    text = (Path(machine["projects"][0]["path"])
+            / AGENTS_NAME).read_text(encoding="utf-8")
+    assert "## Session Handoff Protocol" in text
+    assert "## Parallel Agents" not in text
+
+
+# ---------------------------------------------------------------------------
+# FR-8 -- one platform's commands, chosen from the host
+# ---------------------------------------------------------------------------
+
+_TWO_PLATFORMS = (
+    "## Commands\n"
+    "\n"
+    "Run it:\n"
+    "\n"
+    "<!-- operator:platform posix -->\n"
+    "**bash**\n"
+    "```bash\n"
+    "touch marker\n"
+    "```\n"
+    "\n"
+    "<!-- operator:endplatform -->\n"
+    "<!-- operator:platform windows -->\n"
+    "**PowerShell**\n"
+    "```powershell\n"
+    "New-Item marker\n"
+    "```\n"
+    "\n"
+    "<!-- operator:endplatform -->\n"
+    "Then read it.\n"
+)
+
+
+@pytest.mark.parametrize("os_name, expected", [("nt", pi.WINDOWS),
+                                               ("posix", pi.POSIX),
+                                               ("java", pi.POSIX)])
+def test_the_host_names_one_of_two_vocabularies(os_name, expected):
+    assert pi.host_platform(os_name) == expected
+
+
+@pytest.mark.parametrize("platform, kept, dropped", [
+    (pi.POSIX, "touch marker", "New-Item marker"),
+    (pi.WINDOWS, "New-Item marker", "touch marker"),
+])
+def test_only_the_hosts_commands_survive(platform, kept, dropped):
+    out = pi.select_platform(_TWO_PLATFORMS, platform)
+    assert kept in out
+    assert dropped not in out
+
+
+def test_the_markers_themselves_never_reach_the_repository():
+    """Both branches, because only one of them is the deleting one.
+
+    A marker left on a *kept* block would be written into the repository, and
+    the next run could no longer tell the template's marker from one a user
+    had copied into their own text.
+    """
+    for platform in pi.PLATFORMS:
+        out = pi.select_platform(_TWO_PLATFORMS, platform)
+        assert "operator:platform" not in out
+        assert pi.PLATFORM_END not in out
+
+
+@pytest.mark.parametrize("platform", pi.PLATFORMS)
+def test_removing_a_block_does_not_double_a_blank_line(platform):
+    """The only visible difference a reader could catch between the two.
+
+    Both halves are checked: the seam collapse must not run where nothing was
+    removed either, or the prose loses paragraph breaks it meant to have.
+    """
+    out = pi.select_platform(_TWO_PLATFORMS, platform)
+    assert "\n\n\n" not in out
+    assert "Run it:\n\n" in out, "an ordinary paragraph break was eaten"
+    assert out.endswith("Then read it.\n")
+
+
+@pytest.mark.parametrize("platform", pi.PLATFORMS)
+def test_a_blank_run_away_from_the_seam_is_left_exactly_as_written(platform):
+    """The collapse is confined to the seam, and that has to be measured.
+
+    An unconditional collapse passes every test above -- the shipped template
+    happens to contain no doubled blank line today, so the two rules agree on
+    it. They stop agreeing the moment somebody writes one, and at that point
+    the renderer would be quietly editing prose it was only asked to select
+    from.
+    """
+    source = _TWO_PLATFORMS.replace("Run it:\n", "Run it:\n\n\nStill here.\n", 1)
+    assert "Run it:\n\n\nStill here.\n" in source
+    out = pi.select_platform(source, platform)
+    assert "Run it:\n\n\nStill here.\n" in out
+
+
+def test_a_platform_this_build_does_not_know_is_kept():
+    """The downgrade case, answered the same way as an unknown gate slug.
+
+    A newer template naming a platform this build has never heard of is the
+    only copy of that text. Dropping it would delete conventions purely by
+    being out of date -- and it would do it on every platform at once, since
+    the name matches none of them.
+    """
+    source = _TWO_PLATFORMS.replace("operator:platform posix",
+                                    "operator:platform plan9", 1)
+    for platform in pi.PLATFORMS:
+        out = pi.select_platform(source, platform)
+        assert "touch marker" in out
+
+
+def test_a_marker_inside_a_fence_is_not_a_marker():
+    """The same rule the managed-block finder lives by.
+
+    A repository's own conventions may document this mechanism, and the
+    documentation is written in a fence. Reading the sample as real would
+    delete everything after it on one of the two platforms.
+    """
+    source = ("## Docs\n"
+              "\n"
+              "```markdown\n"
+              "<!-- operator:platform windows -->\n"
+              "sample\n"
+              "<!-- operator:endplatform -->\n"
+              "```\n"
+              "\n"
+              "kept\n")
+    assert pi.select_platform(source, pi.POSIX) == source
+
+
+@pytest.mark.parametrize("broken, why", [
+    ("<!-- operator:platform posix -->\nx\n", "never closed"),
+    ("<!-- operator:endplatform -->\nx\n", "with no platform"),
+    ("<!-- operator:platform posix -->\n<!-- operator:platform windows -->\n"
+     "x\n<!-- operator:endplatform -->\n", "is still open"),
+])
+def test_unbalanced_markers_are_refused(broken, why):
+    """Never recovered from.
+
+    A stray begin marker deletes the whole rest of a section on one platform
+    and nothing at all on the other, so a run on either machine alone looks
+    fine. Raising is what makes the two agree.
+    """
+    with pytest.raises(pi.InstructionsError) as caught:
+        pi.select_platform(broken, pi.POSIX)
+    assert why in str(caught.value)
+
+
+def test_render_will_not_guess_the_platform():
+    """No default, deliberately.
+
+    A default would make every test that forgot the argument agree with the
+    machine it ran on, so the Windows legs and the POSIX legs would each
+    prove only their own half.
+    """
+    with pytest.raises(TypeError):
+        pi.render(source="## A\n\nbody\n",
+                  values=project_features.resolved_values(None),
+                  guid="G", project_path="/p", label="p",
+                  project_dir_path=Path("/d"), config_path=Path("/d/f.json"),
+                  version="1.0.0")
+
+
+def test_the_shipped_template_says_the_same_thing_in_both_vocabularies(template):
+    """Every platform block is paired, and neither rendering is empty.
+
+    A block bracketed for one platform and forgotten for the other is a file
+    that tells a Windows agent nothing where it told a POSIX agent what to
+    run, and nothing in the rendering can report that -- the section is simply
+    shorter.
+    """
+    names = [pi.PLATFORM_BEGIN.match(line.strip()).group("name")
+             for _index, line in pi.outside_fences(template)
+             if pi.PLATFORM_BEGIN.match(line.strip())]
+    assert names, "the template brackets no platform-specific commands at all"
+    assert names.count(pi.WINDOWS) == names.count(pi.POSIX), names
+    assert len(names) == template.count(pi.PLATFORM_END)
+    for platform in pi.PLATFORMS:
+        assert pi.select_platform(template, platform).strip()
+
+
+@pytest.mark.parametrize("platform, kept, dropped", [
+    (pi.WINDOWS, "New-Item -ItemType File", "touch ~/.operator/restart"),
+    (pi.POSIX, "touch ~/.operator/restart", "New-Item -ItemType File"),
+])
+def test_a_rendered_block_carries_one_platforms_commands(template, defaults,
+                                                          platform, kept,
+                                                          dropped):
+    out = _render(template, defaults, platform=platform)
+    assert kept in out
+    assert dropped not in out
+    assert "operator:platform" not in out
+    assert "\n\n\n" not in out
+
+
+# ---------------------------------------------------------------------------
+# FR-8 -- the CLAUDE.md import
+# ---------------------------------------------------------------------------
+
+def test_claude_imports_agents_rather_than_repeating_it():
+    out = pi.render_claude(label="app", version="1.2.3")
+    assert f"@{AGENTS_NAME}" in out
+    assert out.startswith(MANAGED_BEGIN)
+    assert out.rstrip("\n").endswith(pi.MANAGED_END)
+
+
+def test_claude_carries_none_of_the_conventions(template, defaults):
+    """Two texts that can disagree, read by one agent in one turn.
+
+    The import exists so there is one copy. A generated ``CLAUDE.md`` that
+    also carried a section would make the newer of the two files right, and
+    which one that is cannot be seen from either.
+    """
+    claude = pi.render_claude(label="app", version="1.2.3")
+    agents = _render(template, defaults)
+    for section in ("## Git Worktrees", "## Scratch Files"):
+        assert section in agents
+        assert section not in claude
+
+
+def test_every_project_gets_a_claude_file(machine):
+    _retire(machine)
+    for project in machine["projects"]:
+        text = (Path(project["path"]) / pi.CLAUDE_NAME).read_text(
+            encoding="utf-8")
+        assert f"@{AGENTS_NAME}" in text
+
+
+def test_a_second_run_leaves_the_claude_file_alone(machine):
+    _retire(machine)
+    first = [(Path(p["path"]) / pi.CLAUDE_NAME).read_text(encoding="utf-8")
+             for p in machine["projects"]]
+    _retire(machine)
+    second = [(Path(p["path"]) / pi.CLAUDE_NAME).read_text(encoding="utf-8")
+              for p in machine["projects"]]
+    assert first == second
+
+
+def test_a_users_own_claude_file_is_not_touched(machine):
+    """Left alone rather than merged into, and not a blocker either.
+
+    Its whole content is one import line, so a second consent prompt per
+    project would spend the operator's attention on the file that carries
+    none of the conventions.
+    """
+    target = Path(machine["projects"][0]["path"]) / pi.CLAUDE_NAME
+    target.write_text("# mine\n\nHands off.\n", encoding="utf-8")
+    result = _retire(machine)
+    assert target.read_text(encoding="utf-8") == "# mine\n\nHands off.\n"
+    assert [o.state for o in result.outcomes] == [WRITTEN, WRITTEN]
+
+
+def test_a_claude_file_with_a_managed_block_is_regenerated(machine):
+    """The half the "leave it alone" rule must not swallow.
+
+    A file this tool wrote is a file this tool keeps true. Only a file with
+    no block of ours in it is somebody else's.
+    """
+    target = Path(machine["projects"][0]["path"]) / pi.CLAUDE_NAME
+    target.write_text(
+        "# mine\n\nkept\n\n"
+        + pi.render_claude(label="app", version="0.0.1"),
+        encoding="utf-8")
+    _retire(machine)
+    out = target.read_text(encoding="utf-8")
+    assert "kept" in out, "content outside the block was destroyed"
+    assert "0.0.1" not in out, "the stale block was not regenerated"
+    assert f"@{AGENTS_NAME}" in out
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +1318,16 @@ SOURCE = (
 
 @pytest.fixture
 def machine(tmp_path):
-    """A home with a global instructions file and two registered projects."""
+    """A home with a global instructions file and two registered projects.
+
+    Every project carries a configuration with all the flags on. That is not
+    scenery: since FR-8 the flags default *off* and rendering refuses a
+    project that never chose, so a fixture without one would exercise the
+    refusal in every test rather than the thing each test is about. It also
+    keeps the section-visibility assertions below meaningful — a test that
+    a disabled feature drops its section proves nothing if the baseline is
+    everything-off.
+    """
     home = tmp_path / "home"
     copilot = home / ".copilot"
     projects_root = copilot / "projects"
@@ -962,6 +1340,12 @@ def machine(tmp_path):
         root = tmp_path / "repos" / name
         root.mkdir(parents=True)
         (projects_root / guid).mkdir()
+        (projects_root / guid / project_features.CONFIG_NAME).write_text(
+            json.dumps({"version": 1, "features": {
+                slug: project_features.ON
+                for slug in project_features.SLUGS
+                if slug != project_features.TRACKED_BACKLOG}}),
+            encoding="utf-8")
         projects.append({"guid": guid, "path": str(root), "label": name})
     return {
         "home": home,

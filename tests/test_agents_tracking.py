@@ -16,6 +16,7 @@ doubt.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -345,6 +346,11 @@ def test_retiring_for_real_leaves_every_file_committed(monkeypatch, tmp_path,
     monkeypatch.setattr(op, "instructions_archive_dir",
                         lambda: tmp_path / "archive")
     monkeypatch.setattr(op, "projects_root", lambda: tmp_path / "projects")
+    for guid in ("g1", "g2"):
+        path = tmp_path / "projects" / guid / "features.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"features": {"session-handoff": "on"}}),
+                        encoding="utf-8")
     monkeypatch.setattr(op.install_manifest, "load", lambda home: {})
     monkeypatch.setattr(op.project_instructions, "resolve_source",
                         lambda *a, **k: (global_path.read_text(encoding="utf-8"),
@@ -357,8 +363,12 @@ def test_retiring_for_real_leaves_every_file_committed(monkeypatch, tmp_path,
 
     for root in (repo, second):
         assert (root / pi.AGENTS_NAME).exists()
+        assert (root / pi.CLAUDE_NAME).exists()
         assert _is_tracked(root), f"{root} left its AGENTS.md untracked"
         head = _git(root, "show", "--name-only", "--format=", "HEAD").split()
-        assert head == [pi.AGENTS_NAME]
+        assert head == [pi.AGENTS_NAME, pi.CLAUDE_NAME], (
+            "both generated files belong in the one commit; a CLAUDE.md "
+            "left untracked imports a file the clone does have and is "
+            "invisible in `git status`")
     out = capsys.readouterr().out
     assert out.count(op.AGENTS_COMMITTED) >= 2

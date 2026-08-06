@@ -222,8 +222,11 @@ def test_skipped_rows_are_shown_above_the_list(catalog, monkeypatch, capsys):
 def test_the_list_summarises_how_many_features_are_on(catalog, monkeypatch,
                                                       capsys):
     catalog.write_text(f'"/a/one",{GUID}\n', encoding="utf-8")
-    project_features.write_config(project_features.config_path(GUID),
-                                  {"spec-driven": OFF})
+    project_features.write_config(
+        project_features.config_path(GUID),
+        {f.slug: next(v for v in f.values if v != f.off_value)
+         for f in FEATURES if f.slug != "spec-driven"}
+        | {"spec-driven": OFF})
     answers(monkeypatch, "")
     copilot_operator.browse_project_configurations()
     out = capsys.readouterr().out
@@ -269,16 +272,25 @@ def test_a_flag_is_toggled_and_written_immediately(home, monkeypatch):
     assert copilot_operator.show_project_config(_project()) == 0
     values = project_features.resolved_values(
         project_features.read_config(project_features.config_path(GUID)))
-    assert values["spec-driven"] == OFF
+    assert values["spec-driven"] == ON
+    assert values["spec-driven"] != (
+        project_features.FEATURES_BY_SLUG["spec-driven"].default), (
+        "one toggle has to move the flag off its default, or this test would "
+        "pass against a menu that wrote nothing")
 
 
 def test_toggling_twice_returns_a_flag_to_where_it_was(home, monkeypatch):
     index = [f.slug for f in FEATURES].index("spec-driven") + 1
     answers(monkeypatch, str(index), str(index), "")
     copilot_operator.show_project_config(_project())
-    values = project_features.resolved_values(
-        project_features.read_config(project_features.config_path(GUID)))
-    assert values["spec-driven"] == ON
+    document = project_features.read_config(project_features.config_path(GUID))
+    assert document is not None, "the menu wrote nothing at all"
+    assert "spec-driven" in document["features"], (
+        "the second toggle has to write the value back explicitly; letting it "
+        "fall through to the default would pass this test for the wrong "
+        "reason now that the default is off")
+    values = project_features.resolved_values(document)
+    assert values["spec-driven"] == OFF
 
 
 def test_a_choice_offers_its_backends_rather_than_toggling(home, monkeypatch,
@@ -344,7 +356,7 @@ def test_a_setting_from_a_newer_build_survives_a_toggle_here(home, monkeypatch):
 
     stored = project_features.read_config(path)["features"]
     assert stored["telepathy"] == "on"
-    assert stored["spec-driven"] == OFF
+    assert stored["spec-driven"] == ON
 
 
 def test_settings_from_a_newer_build_are_named_on_screen(home, monkeypatch,
@@ -697,6 +709,8 @@ def test_a_catalog_that_changes_mid_run_stops_the_removal(catalog, monkeypatch,
     repo = tmp_path / "one"
     repo.mkdir()
     catalog.write_text(f'"{repo}",{GUID}\n', encoding="utf-8")
+    project_features.write_config(project_features.config_path(GUID),
+                                  {"session-handoff": ON})
     monkeypatch.setattr(project_instructions, "resolve_source",
                         lambda *a, **k: ("# Conventions\n\n## A\n\nbody\n",
                                          "the repository template"))
@@ -726,6 +740,8 @@ def test_an_unchanged_catalog_is_not_mistaken_for_a_race(catalog, monkeypatch,
     repo = tmp_path / "one"
     repo.mkdir()
     catalog.write_text(f'"{repo}",{GUID}\n', encoding="utf-8")
+    project_features.write_config(project_features.config_path(GUID),
+                                  {"session-handoff": ON})
     monkeypatch.setattr(project_instructions, "resolve_source",
                         lambda *a, **k: ("# Conventions\n\n## A\n\nbody\n",
                                          "the repository template"))

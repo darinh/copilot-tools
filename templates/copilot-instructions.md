@@ -25,15 +25,20 @@ Inside a worktree, `git rev-parse --show-toplevel` returns the *worktree*, not t
 to locate the project. The first record of `git worktree list --porcelain` is always the primary
 checkout, from anywhere in the repo:
 
+<!-- operator:platform posix -->
 **bash (Linux/macOS/WSL)**
 ```bash
 repo_root=$(git worktree list --porcelain | head -1 | cut -d' ' -f2-)
 ```
 
+<!-- operator:endplatform -->
+<!-- operator:platform windows -->
 **PowerShell (Windows)**
 ```powershell
 $repoRoot = (git worktree list --porcelain | Select-Object -First 1) -replace '^worktree '
 ```
+
+<!-- operator:endplatform -->
 
 Use that path — never the worktree path — for anything that identifies the *project* rather than the
 checkout: the per-project directory, the handoff file, `.specify/` initialization. A worktree is a
@@ -78,12 +83,18 @@ made to try something out. A script with a relative path writes wherever the
 process happens to be, and for an agent that is almost always someone's
 checkout.
 
+<!-- operator:platform posix -->
 ```bash
-scratch=$(mktemp -d)                     # bash
+scratch=$(mktemp -d)
 ```
+
+<!-- operator:endplatform -->
+<!-- operator:platform windows -->
 ```powershell
 $scratch = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ([guid]::NewGuid()))
 ```
+
+<!-- operator:endplatform -->
 
 **Tell your subagents the same thing, by name.** They run their own shell in
 your checkout, and you never see the commands they issue — only the result. A
@@ -205,15 +216,20 @@ case-insensitively; on Linux and macOS compare case-sensitively.
    - **If spec-driven is selected and `.specify/` is missing**, initialize spec-kit using the script
      variant matching your platform — `ps` on Windows, `sh` on Linux/macOS/WSL:
 
+<!-- operator:platform windows -->
      **PowerShell (Windows)**
      ```powershell
      specify init --here --force --integration copilot --integration-options="--skills" --script ps
      ```
 
+<!-- operator:endplatform -->
+<!-- operator:platform posix -->
      **bash (Linux/macOS/WSL)**
      ```bash
      specify init --here --force --integration copilot --integration-options="--skills" --script sh
      ```
+
+<!-- operator:endplatform -->
 
 ### Feature Selection
 
@@ -314,15 +330,20 @@ If the `handoff` command is not available (e.g., not on PATH), fall back to writ
 `~/.operator/projects/{guid}/handoff/{instance}.md` manually and then creating the restart marker file using
 the form for your platform:
 
+<!-- operator:platform windows -->
 **PowerShell (Windows)**
 ```powershell
 New-Item -ItemType File -Force ~/.operator/restart/{instance-name}
 ```
 
+<!-- operator:endplatform -->
+<!-- operator:platform posix -->
 **bash (Linux/macOS/WSL)**
 ```bash
 touch ~/.operator/restart/{instance-name}
 ```
+
+<!-- operator:endplatform -->
 
 ### Handoff File Format
 ```markdown

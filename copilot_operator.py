@@ -5984,6 +5984,27 @@ def _commit_would_be_unsafe(root: Path) -> "str | None":
     return None
 
 
+def _managed_names(root) -> "list[str]":
+    """The generated files present in *root*, as pathspecs for git.
+
+    Built from what is on disk rather than from a fixed pair. ``git add`` and
+    ``git commit`` both treat a pathspec that matches nothing as fatal, so a
+    project that declined its ``AGENTS.md`` -- and therefore never got a
+    ``CLAUDE.md`` either -- would have its staging reported as a git failure
+    for naming a file that was correctly never written.
+    """
+    names = []
+    for name in (project_instructions.AGENTS_NAME,
+                 project_instructions.CLAUDE_NAME):
+        try:
+            present = (Path(root) / name).exists()
+        except OSError:
+            present = False
+        if present:
+            names.append(name)
+    return names
+
+
 def stage_agents_files(outcomes) -> "list[AgentsTracking]":
     """Stage every ``AGENTS.md`` that was just written.
 
@@ -5993,15 +6014,22 @@ def stage_agents_files(outcomes) -> "list[AgentsTracking]":
     hygiene exists to sweep away. Staged, it survives all three and reads in
     `git status` as something somebody meant to be there.
 
+    ``CLAUDE.md`` is staged with it, for exactly the same reason: an import
+    file that never reaches a clone is worse than no import file, because the
+    repository it was written into still reads as though Claude had been
+    catered for.
+
     Staging is unconditional because it creates no commit and destroys
     nothing; committing is the part that has to be asked about.
     """
-    name = project_instructions.AGENTS_NAME
     tracked: "list[AgentsTracking]" = []
     for outcome in outcomes:
         if outcome.agents_path is None:
             continue
         root = Path(outcome.path)
+        names = _managed_names(root)
+        if not names:
+            continue
         if _git_output(["rev-parse", "--git-dir"], root) is None:
             tracked.append(AgentsTracking(outcome.label, root, AGENTS_NO_REPO))
             continue
@@ -6010,12 +6038,12 @@ def stage_agents_files(outcomes) -> "list[AgentsTracking]":
         # apart from a file some .gitignore has swallowed, which reports
         # clean while being entirely absent from the repository.
         is_tracked = _git_output(
-            ["ls-files", "--error-unmatch", "--", name], root) is not None
-        pending = _git_output(["status", "--porcelain", "--", name], root)
+            ["ls-files", "--error-unmatch", "--", *names], root) is not None
+        pending = _git_output(["status", "--porcelain", "--", *names], root)
         if is_tracked and pending is not None and not pending.strip():
             tracked.append(AgentsTracking(outcome.label, root, AGENTS_TRACKED))
             continue
-        ok, why = _git_write(["add", "--", name], root)
+        ok, why = _git_write(["add", "--", *names], root)
         tracked.append(AgentsTracking(
             outcome.label, root,
             AGENTS_STAGED if ok else AGENTS_FAILED, "" if ok else why))
@@ -6047,7 +6075,11 @@ def commit_agents_files(tracked, origin: str) -> "list[AgentsTracking]":
             settled.append(AgentsTracking(entry.label, entry.root,
                                           AGENTS_STAGED, f"not committed — {unsafe}"))
             continue
-        ok, why = _git_write(["commit", "-m", message, "--", name], entry.root)
+        names = _managed_names(entry.root)
+        if not names:
+            settled.append(entry)
+            continue
+        ok, why = _git_write(["commit", "-m", message, "--", *names], entry.root)
         settled.append(AgentsTracking(
             entry.label, entry.root,
             AGENTS_COMMITTED if ok else AGENTS_STAGED,

@@ -135,6 +135,31 @@ budget set at the measured 500 would make the next legitimate line an
 emergency; one set at 1,500 would not be felt for two years, which is the same
 as not having one.
 
+### Measured again after G12
+
+Flipping the flags off is *not* what shrinks the block on this machine, and
+the measurement says why: all eight registered projects under
+`~/.operator/projects/` have no `features.json`, so every one of them is
+running on the defaults. "Default off" therefore changes what eight existing
+repositories get, not what a hypothetical new one gets — which is why
+`_values_for` refuses an unconfigured project rather than answering for it.
+
+Two G12 changes move the number in opposite directions and both are small:
+
+| | Words |
+|---|---|
+| Managed block with both platforms' commands | 4,358 |
+| Selecting Windows only | 4,332 (−26) |
+| Selecting POSIX only | 4,321 (−37) |
+| The `CLAUDE.md` block (a separate file, not the budget) | 60 |
+
+Selecting one platform is the first thing in this feature that removes words
+from the managed block without removing a rule. It is a small number today
+because the template brackets only four command pairs — the saving scales with
+how many commands survive G10 and G13, not with anything measured here. The
+700 recommendation stands; it was set on the all-on figure, and the platform
+cut only widens the headroom.
+
 ## What this changes for G3–G13
 
 - **G3 gains a second guard** — deny `task`/`agent` on a dirty worktree — from
