@@ -780,6 +780,31 @@ CLEAN_OVERRIDE = "--allow-dirty"
 #: than the agent was just shown.
 LEFTOVER_LIMIT = 20
 
+#: Control characters, escaped before a path is shown to anyone.
+_CONTROL_ESCAPES = {c: f"\\x{c:02x}" for c in range(0x20)}
+_CONTROL_ESCAPES[0x7F] = "\\x7f"
+
+
+def display_path(path: str) -> str:
+    """A leftover path, safe to put in a message.
+
+    ``-z`` gives paths unquoted and literal, which is the point -- a
+    line-based reader turns one newline-containing filename into two paths
+    that do not exist. But it means a filename is arbitrary bytes arriving
+    in a refusal on stderr and in a markdown blockquote in the published
+    handoff, and a newline there forges a whole line: another bullet in the
+    list, or an escape from the blockquote into text that reads like the
+    tool's own words. POSIX permits every byte but ``/`` and NUL in a
+    filename, so this is a real input, not a hypothetical one.
+
+    Escaping control characters closes the forgery, because every markdown
+    structure this text uses is line-initial. A backtick can still end its
+    code span early, which is a visual defect confined to one line and
+    cannot manufacture structure -- stated rather than silently accepted.
+    """
+    return path.translate(_CONTROL_ESCAPES)
+
+
 #: Refusing costs a session its context, so the bar for refusing has to be
 #: something the tool can *see*, not something it infers. These two are:
 #: uncommitted tracked changes, and untracked paths. Both are recoverable by
@@ -877,12 +902,26 @@ def scan_checkout(root) -> "list[str] | None":
     the blind spot that let this project's own agents leave nine artifacts in
     a shared checkout while `git status` said clean, and it is precisely the
     class of failure prose cannot close.
+
+    ``--ignored=matching`` is asked for so that the same single call supplies
+    the prune set for that pass: git reports an ignored directory collapsed
+    to its own name (``!! node_modules/``) without descending into it, and it
+    reports an ignored directory that is *empty* too. Deriving the prune set
+    any other way means one ``check-ignore`` per candidate, which is what
+    kept the empty-directory pass to the top level of the checkout. Old git
+    that does not know the option answers nothing, so the plain form is tried
+    after it -- losing the empty-directory half rather than the whole guard.
     """
-    answered, out = _git(root, "status", "--porcelain", "-uall", "-z")
+    answered, out = _git(root, "status", "--porcelain", "-uall",
+                         "--ignored=matching", "-z")
+    ignored_known = answered
+    if not answered:
+        answered, out = _git(root, "status", "--porcelain", "-uall", "-z")
     if not answered:
         return None
     records = [r for r in out.split("\0") if r]
     paths: "list[str]" = []
+    ignored: "list[str]" = []
     skip_next = False
     for record in records:
         if skip_next:            # the second half of a rename/copy record
@@ -906,56 +945,80 @@ def scan_checkout(root) -> "list[str] | None":
         # which is somebody's config away.
         if code[0] in "RC":
             skip_next = True
-        paths.append(path)
-    return paths + _empty_dir_strays(root, paths)
+        if code == "!!":
+            ignored.append(path)
+        else:
+            paths.append(path)
+    if not ignored_known:
+        return paths
+    return paths + _empty_dir_strays(root, ignored)
 
 
-def _empty_dir_strays(root, known: "list[str]") -> "list[str]":
+#: How many directories the candidate walk will visit before it gives up.
+#: Exceeding it costs findings, never invents them -- an unvisited subtree is
+#: never reported as empty.
+WALK_BUDGET = 4096
+
+
+def _empty_dir_strays(root, ignored: "list[str]") -> "list[str]":
     """Untracked directories holding no files, which git never reports.
 
-    Filtered through ``git check-ignore`` because an unfiltered candidate
-    list is not a rougher answer -- it is every ignored build directory in
-    the project, handed to an agent as litter. When check-ignore cannot
-    answer, this half is dropped rather than guessed: fewer findings, never
-    invented ones.
+    ``ignored`` is git's own collapsed answer (``!! node_modules/``), used to
+    prune. An unfiltered walk is not a rougher answer -- it is every ignored
+    build directory in the project, handed to an agent as litter, plus the
+    time to walk `node_modules`.
+
+    Only the *outermost* empty directory is reported. Naming ``a/``, ``a/b/``
+    and ``a/b/c/`` for one stray describes one mistake three times, and the
+    two inner entries vanish the moment the outer one is removed.
     """
     root = Path(root)
-    try:
-        # `.git` is excluded belt-and-braces. It cannot actually reach a
-        # finding: in an ordinary repository it holds files from the moment
-        # `git init` returns (HEAD, config, description), so `holds_no_files`
-        # rejects it, and in a linked worktree it is a *file* and never
-        # becomes a candidate at all. Mutation confirms it -- removing this
-        # clause changes no test. It stays because the cost is one comparison
-        # and the alternative is a reader having to re-derive both halves of
-        # that argument before touching the traversal.
-        candidates = [entry.name for entry in os.scandir(root)
-                      if entry.is_dir() and not entry.is_symlink()
-                      and entry.name != ".git"]
-    except OSError:
-        return []
-    known_tops = {p.split("/", 1)[0].rstrip("/") for p in known}
-    candidates = [c for c in candidates if c not in known_tops]
-    if not candidates:
-        return []
-    # `--stdin`, not paths as arguments: `-z` is refused outright without it
-    # ("fatal: -z only makes sense with --stdin"), and a git that refuses the
-    # command answers nothing, which drops the filter and reports every
-    # ignored directory in the project as litter. Measured, not reasoned --
-    # the first spelling here did exactly that and a test caught it.
-    #
-    # Exit 1 means "nothing matched", which is an answer, not a failure.
-    answered, out = _git(root, "check-ignore", "--stdin", "-z",
-                         stdin="\0".join(candidates), ok_codes=(0, 1))
-    if not answered:
-        # Drop this half rather than guess it. Reporting unfiltered would
-        # hand an agent every ignored build directory in the project; staying
-        # silent loses only the empty-directory findings, and `git status`
-        # has already spoken for everything it can see.
-        return []
-    ignored = {p.rstrip("/") for p in out.split("\0") if p}
-    return sorted(f"{c}/" for c in candidates
-                  if c not in ignored and holds_no_files(root / c))
+    prune = {p.rstrip("/") for p in ignored}
+    candidates: "list[str]" = []
+    visited = 0
+    stack = [""]
+    while stack:
+        rel = stack.pop()
+        visited += 1
+        if visited > WALK_BUDGET:
+            break
+        try:
+            entries = list(os.scandir(root / rel if rel else root))
+        except OSError:
+            # Unreadable is not empty. Its children are unknown, so it is not
+            # a candidate and neither is anything under it.
+            continue
+        for entry in entries:
+            # `.git` is excluded belt-and-braces. It cannot actually reach a
+            # finding: in an ordinary repository it holds files from the
+            # moment `git init` returns (HEAD, config, description), so
+            # `holds_no_files` rejects it, and in a linked worktree it is a
+            # *file* and never becomes a candidate at all.
+            if entry.name == ".git":
+                continue
+            try:
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+            except OSError:
+                continue
+            child = f"{rel}/{entry.name}" if rel else entry.name
+            if child in prune:
+                continue
+            candidates.append(child)
+            stack.append(child)
+    found: "list[str]" = []
+    for candidate in sorted(candidates):
+        # The walk already appends a directory before any of its descendants,
+        # so this sort is belt-and-braces rather than the thing that makes the
+        # dedupe below correct -- mutating it away changes no observable
+        # behaviour. It is kept because the invariant then lives on this line
+        # instead of in a property of the loop above, which a later edit to
+        # the traversal could quietly retire.
+        if any(candidate.startswith(f"{f.rstrip('/')}/") for f in found):
+            continue
+        if holds_no_files(root / candidate):
+            found.append(f"{candidate}/")
+    return found
 
 
 def checkout_complaints(root) -> "tuple[list[str], str]":
@@ -1081,7 +1144,8 @@ def main(argv: list[str] | None = None) -> int:
     leftovers, certainty = checkout_complaints(project_root)
     dirty_notice = ""
     if leftovers and not args.allow_dirty:
-        shown = "\n".join(f"    {p}" for p in leftovers[:LEFTOVER_LIMIT])
+        shown = "\n".join(f"    {display_path(p)}"
+                          for p in leftovers[:LEFTOVER_LIMIT])
         more = (f"\n    ... and {len(leftovers) - LEFTOVER_LIMIT} more"
                 if len(leftovers) > LEFTOVER_LIMIT else "")
         die(f"The checkout is not clean, so this handoff was not written.\n\n"
@@ -1096,7 +1160,8 @@ def main(argv: list[str] | None = None) -> int:
             f"  say so and list them, so the next session is told rather than "
             f"left to guess.")
     if leftovers:
-        listed = "\n".join(f"> - `{p}`" for p in leftovers[:LEFTOVER_LIMIT])
+        listed = "\n".join(f"> - `{display_path(p)}`"
+                           for p in leftovers[:LEFTOVER_LIMIT])
         if len(leftovers) > LEFTOVER_LIMIT:
             # The refusal text says "and N more"; this must too. A successor
             # handed twenty of sixty paths, with nothing saying so, will read
