@@ -344,6 +344,51 @@ thinking "I'll just have a reviewer glance at this".
 The budget number is set from what the residue measures, not guessed in advance,
 and then made to fail the build.
 
+**Delivered (G1, G2): `specs/004-operator-session/audit.md`.** Both predictions
+above turned out to be half right, and the half that was wrong is worth the
+paragraph.
+
+The residue *is* small: 4,364 words measured across 13 sections, ~500 of them
+classified guardrail or generated data. That is the number G13 sets the budget
+from, and the recommendation is 700 — enough headroom that one feature gaining
+a sentence is not an emergency, far too little for prose to re-accumulate. A
+budget of 1,500 would not be felt for two years, which is indistinguishable
+from not having one.
+
+But *commit before you delegate* is not irreducible, and neither is its
+companion. The argument for both was that a skill cannot cover them, because
+loading a skill requires already knowing you need it — which is true, and does
+not reach the conclusion. The trichotomy's third class is **check**, not skill,
+and an extension permission hook sees a tool call's arguments *before it runs*:
+it can deny `task` outright when `git status --porcelain` is non-empty, at
+exactly the moment described, with a message naming the fix. The same hook can
+refuse a subagent's `stash`, `reset --hard` or `checkout --` inside a worktree,
+which is better than asking the parent agent to remember to write the sentence.
+
+So the guardrail class is smaller than the spec's own example implied. What
+survives it is a short list with a shared shape: rules whose right and wrong
+readings produce **identical tool calls**. "Tell your subagents by name" —
+nothing can inspect a prompt the agent writes. "Never seed a backlog item you
+have not verified" — a rumour and a measurement are the same bytes. "Volunteer
+a field note" — the trigger is noticing. "An explanation that fits the evidence
+is not the explanation" — both readings run the same commands. Those cannot be
+checked at any of the five enforcement points, and that is the test, rather
+than whether a skill happens to fit.
+
+Three sections survive at **zero** words. Session History pastes DDL and two
+SQL statements that `operator session start`/`end` already executes. Parallel
+Agents pastes four more, including a `BEGIN IMMEDIATE` claim transaction that
+is a copy-paste error surface with no reader — it becomes one atomic `operator`
+subcommand, which removes the surface rather than relocating it to a skill.
+Common Pitfalls only restates rules above it, and under FR-6 a duplicate is
+"anything else".
+
+Git hooks were considered for G7 and rejected, recorded so it is not
+re-litigated: `.git/hooks` holds nothing but samples, a hook is per-clone, it
+does not travel with the repository, and `--no-verify` removes it. Mechanism 1
+is already installed, travels with `operator`, and cannot be turned off by a
+flag the agent controls.
+
 ## Risks
 
 | Risk | Mitigation |

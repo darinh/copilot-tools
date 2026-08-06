@@ -236,10 +236,25 @@ Status is tracked in SQL during execution; this file is the reconciled record.
 
 ## Phase G+H — enforcement paired with generation (FR-6 … FR-9)
 
-- [ ] G1 Establish what the harness can actually enforce before deleting any rule
-      that depends on it
-- [ ] G2 Audit table: every managed-block line classified guardrail / procedure /
-      checkable, naming the check for each deletion
+- [x] G1 Establish what the harness can actually enforce before deleting any rule
+      that depends on it — `specs/004-operator-session/audit.md`, five mechanisms
+      ordered by when they fire, each with a precedent already in this repository.
+      Two results change the plan. A permission hook sees a tool call's
+      *arguments* before it runs, so it can refuse `task` on a dirty worktree or
+      an `edit` resolving outside the assigned tree — both of which FR-6 had
+      classified as guardrails on the grounds that a skill cannot cover them,
+      which is true and irrelevant, because the third class is *check*, not
+      *skill*. And git hooks were considered and rejected for G7: `.git/hooks`
+      holds only samples, a hook is per-clone, does not travel with the
+      repository, and `--no-verify` removes it.
+- [x] G2 Audit table: every managed-block line classified guardrail / procedure /
+      checkable, naming the check for each deletion — 13 sections, 4,364 words
+      measured. Residue after classification is ~500 words, an ~89% cut, which
+      is the measured input G13 needs. Three sections (Session History, Parallel
+      Agents, Common Pitfalls) survive at zero words: the first is fully done by
+      `operator session start`/`end`, the second becomes one atomic `operator`
+      subcommand rather than four pasted SQL statements, the third only restates
+      rules above it.
 - [ ] G3 Block edits outside the assigned worktree (covers scratch-in-checkout)
 - [ ] G4 `/.worktrees/` written to tracked `.gitignore` at enroll
 - [ ] G5 Refuse to offer enrollment for an already-enrolled project
