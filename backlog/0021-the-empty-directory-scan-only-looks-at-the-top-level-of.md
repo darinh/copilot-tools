@@ -1,8 +1,10 @@
 ---
 id: 21
 title: The empty-directory scan only looks at the top level of the checkout
-status: proposed
+status: closed
 opened: 2026-08-06
+closed: 2026-08-06
+commit: 889cfe4a6cc8e69ed8fc95259371b4ef05597ab6
 spec: none
 ---
 
@@ -47,3 +49,33 @@ the budget the thing deciding what gets reported.
 Worth measuring first: how many directories deep does a real reproduction
 usually land? If it is always the root or one level down, a depth-2 scan buys
 most of the value for a bounded cost.
+
+## Resolution
+
+The "Notes" above assumed the prune had to be `git check-ignore` per candidate,
+which is what made a full walk look expensive. Measured instead:
+
+```
+git status --porcelain -uall --ignored=matching -z
+```
+
+returns the ordinary findings *and* the collapsed ignored set — `!! build/`,
+`!! node_modules/`, one record each, without descending into them — in the same
+single call the guard was already making. So the prune set costs nothing, and
+the walk never enters an ignored tree. `--ignored=traditional` does not do this;
+it lists ignored files individually under `-uall`.
+
+`_empty_dir_strays` now walks the full depth with that prune set, reports only
+the *outermost* empty directory of a nest, and carries its own `WALK_BUDGET` of
+4096 directories separate from the 512 in `holds_no_files`. Both budgets fail
+towards "not empty", so exhausting either costs a finding rather than inventing
+one — the failure direction the Notes were right to worry about.
+
+Old git (< 2.16) does not know `--ignored=matching`; the call falls back to
+plain `-uall -z` and the empty-directory half is dropped rather than run
+unpruned. Covered by
+`tests/test_handoff_checkout_guard.py::test_a_git_too_old_for_the_ignored_option_keeps_the_rest_of_the_guard`.
+
+The JS reference `extensions/checkout-guard/guard.mjs` is still top-level only;
+that divergence is now the remaining half of backlog item 0020's territory
+rather than this item's.
