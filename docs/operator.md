@@ -616,17 +616,31 @@ checkout three times in one evening — nine of them in a single review round.
 Prose describes; it does not prevent. `handoff` is the one command every agent
 runs on the way out, so it is where the check belongs.
 
-Three kinds of leftover are reported: uncommitted changes to tracked files,
+Four kinds of leftover are reported: uncommitted changes to tracked files,
 untracked files (individually — `-uall`, so a scratch directory holding fifty
-files is not one line saying "scratch/"), and **empty untracked directories**.
+files is not one line saying "scratch/"), **empty untracked directories**, and
+on Windows, **directory junctions**.
 
-That last one is the whole reason this is a tool and not a `git status` in a
-shell prompt. Git has nothing to report for an empty directory — there is no
-blob — so `git status` prints a clean tree while artifacts sit in its root.
-That is precisely what cost three agents an evening diagnosing a
+The empty directories are the whole reason this is a tool and not a `git
+status` in a shell prompt. Git has nothing to report for an empty directory —
+there is no blob — so `git status` prints a clean tree while artifacts sit in
+its root. That is precisely what cost three agents an evening diagnosing a
 working-directory bug that did not exist: the directories had been left by
 their own review subagents, and every explanation fitted the evidence equally
 well because the evidence had no provenance.
+
+Junctions are the same silence by a different route, and adversarial review
+found them. A junction is not a symlink — `is_symlink()` answers False and
+`is_dir()` answers True — so the walk descended one as though it were an
+ordinary directory. Point one at a directory and then delete the target, and
+git prints `warning: could not open directory` on **stderr** and nothing at
+all on stdout, so `git status` calls the tree clean; the walk then hit the
+same error and dropped it under "unreadable is not empty". Both halves agreed
+and neither had looked. Git cannot store a junction — there is no tree entry
+for one — so a junction inside a checkout is always something a process left
+behind, and it is now reported rather than walked into. One that is
+legitimate infrastructure (`node_modules` pointed at a shared cache) is in
+`.gitignore` and is pruned like any other ignored path.
 
 The check runs before the tool takes any lock, creates any directory or writes
 any file, so a refusal changes nothing and the same command works once you have

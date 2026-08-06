@@ -960,6 +960,28 @@ def scan_checkout(root) -> "list[str] | None":
 WALK_BUDGET = 4096
 
 
+def _is_junction(entry) -> bool:
+    """Whether a directory entry is a Windows junction.
+
+    ``is_symlink()`` answers False for one and ``is_dir()`` answers True, so
+    the walk descends a junction as though it were an ordinary directory --
+    which is how a *dangling* one became invisible. Git emits ``warning:
+    could not open directory`` on **stderr** and reports nothing on stdout, so
+    ``git status`` calls the tree clean; the walk then hit ``OSError`` and, by
+    the rule that unreadable is not empty, dropped it too. Both halves agreed,
+    and neither had looked.
+
+    ``os.DirEntry.is_junction()`` would say this in one call but arrived in
+    3.12, above this project's floor. ``st_reparse_tag`` is Windows-only and
+    3.8, so ``AttributeError`` is the POSIX answer, not a failure.
+    """
+    try:
+        tag = entry.stat(follow_symlinks=False).st_reparse_tag
+    except (OSError, AttributeError, ValueError):
+        return False
+    return tag == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", object())
+
+
 def _empty_dir_strays(root, ignored: "list[str]") -> "list[str]":
     """Untracked directories holding no files, which git never reports.
 
@@ -975,6 +997,7 @@ def _empty_dir_strays(root, ignored: "list[str]") -> "list[str]":
     root = Path(root)
     prune = {p.rstrip("/") for p in ignored}
     candidates: "list[str]" = []
+    links: "list[str]" = []
     visited = 0
     stack = [""]
     while stack:
@@ -1004,6 +1027,18 @@ def _empty_dir_strays(root, ignored: "list[str]") -> "list[str]":
             child = f"{rel}/{entry.name}" if rel else entry.name
             if child in prune:
                 continue
+            if _is_junction(entry):
+                # Reported, never descended. Git cannot store a junction --
+                # there is no tree entry for one -- so a junction inside a
+                # checkout is always something a process left behind, and it
+                # is the one artifact git can be silent about while the
+                # filesystem still holds it. Descending it would also walk
+                # out of the checkout, or round a cycle if it points at an
+                # ancestor. A junction that is legitimate infrastructure
+                # (`node_modules` pointed at a shared cache) is in
+                # `.gitignore`, so `prune` above has already dropped it.
+                links.append(child)
+                continue
             candidates.append(child)
             stack.append(child)
     found: "list[str]" = []
@@ -1018,7 +1053,7 @@ def _empty_dir_strays(root, ignored: "list[str]") -> "list[str]":
             continue
         if holds_no_files(root / candidate):
             found.append(f"{candidate}/")
-    return found
+    return found + links
 
 
 def checkout_complaints(root) -> "tuple[list[str], str]":

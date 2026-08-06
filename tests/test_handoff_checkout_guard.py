@@ -14,6 +14,8 @@ like success.
 from __future__ import annotations
 
 import subprocess
+import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,27 @@ def _can_symlink(root: Path) -> bool:
     except (OSError, NotImplementedError):
         return False
     probe.unlink()
+    return True
+
+
+def _junction(link: Path, target: Path) -> None:
+    subprocess.run(("cmd", "/c", "mklink", "/J", str(link), str(target)),
+                   capture_output=True, check=True)
+
+
+def _can_junction(root: Path) -> bool:
+    """Windows only, and it needs no elevation -- unlike ``os.symlink``."""
+    if sys.platform != "win32":
+        return False
+    probe, target = root / "_junc_probe", root / "_junc_target"
+    target.mkdir()
+    try:
+        _junction(probe, target)
+    except (OSError, subprocess.CalledProcessError):
+        target.rmdir()
+        return False
+    probe.rmdir()
+    target.rmdir()
     return True
 
 
@@ -247,6 +270,111 @@ def test_a_symlinked_directory_is_not_walked_or_reported(repo):
     assert sorted(found) == ["elsewhere/", "link"], (
         "the link is still an untracked path git reports by name -- what "
         "must not happen is the walk treating it as a directory of ours")
+
+
+def test_a_dangling_junction_is_reported_though_git_is_silent_about_it(repo):
+    """The case where git and the walk agreed, and neither had looked.
+
+    A junction whose target is gone makes ``git status`` print nothing on
+    stdout -- the ``could not open directory`` warning goes to *stderr*,
+    which this tool does not read -- and the walk then hits ``OSError`` and
+    drops it under "unreadable is not empty". Both halves say clean. Git
+    cannot store a junction at all, so one inside a checkout is always
+    something a process left behind.
+    """
+    if not _can_junction(repo):
+        pytest.skip("this platform does not have directory junctions")
+    (repo / "target").mkdir()
+    _junction(repo / "junc", repo / "target")
+    (repo / "target").rmdir()
+
+    assert _git(repo, "status", "--porcelain", "-uall") == "", (
+        "premise: git itself is silent about a dangling junction")
+    assert ho.scan_checkout(repo) == ["junc"]
+
+
+def test_a_live_junction_is_named_alongside_what_git_found_through_it(repo):
+    """Git descends a junction itself, so its contents arrive either way.
+
+    What this pins is that the *link* is named too. Measured, not assumed:
+    the first draft of this test asserted no `junc/...` path appeared and
+    failed, because those paths come from git's own `-uall` listing and not
+    from the walk. Asserting the exact list is what caught that.
+    """
+    if not _can_junction(repo):
+        pytest.skip("this platform does not have directory junctions")
+    (repo / "target").mkdir()
+    (repo / "target" / "deep.txt").write_text("z\n", encoding="utf-8")
+    _junction(repo / "junc", repo / "target")
+
+    assert sorted(ho.scan_checkout(repo)) == [
+        "junc", "junc/deep.txt", "target/deep.txt"]
+
+
+def test_a_junction_to_an_empty_directory_is_a_link_not_an_empty_stray(repo):
+    """The case where the walk alone decides.
+
+    Git is silent -- there is no blob for an empty directory, on either side
+    of the link -- so whatever the walk says is the whole answer. It must not
+    say `junc/`: that reads as "an empty directory you left", and the fix for
+    it would be to delete a link into somebody else's tree.
+    """
+    if not _can_junction(repo):
+        pytest.skip("this platform does not have directory junctions")
+    (repo / "target").mkdir()
+    _junction(repo / "junc", repo / "target")
+
+    found = ho.scan_checkout(repo)
+    assert "junc/" not in found, "a link is never an empty directory of ours"
+    assert sorted(found) == ["junc", "target/"]
+
+
+def test_an_ignored_junction_is_left_alone(repo):
+    """The legitimate case: `node_modules` pointed at a shared cache."""
+    if not _can_junction(repo):
+        pytest.skip("this platform does not have directory junctions")
+    (repo / ".gitignore").write_text("cache\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore cache")
+    (repo / "target").mkdir()
+    _junction(repo / "cache", repo / "target")
+
+    assert ho.scan_checkout(repo) == ["target/"], (
+        "an ignored junction is infrastructure, not litter")
+
+
+@pytest.mark.parametrize("tag, expected", [
+    (getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003), True),
+    (getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C), False),
+    (0xA000001F, False),  # IO_REPARSE_TAG_APPEXECLINK
+    (0, False),
+])
+def test_only_the_mount_point_tag_counts_as_a_junction(tag, expected):
+    """Runs on every platform, because the real junction tests cannot.
+
+    A POSIX leg has no junctions to make, so without this the comparison
+    itself is exercised nowhere but Windows -- and a rule enforced on one leg
+    is that leg's history, not a rule. Narrow to the mount-point tag on
+    purpose: a directory can be a reparse point for reasons that are not a
+    junction (a cloud-storage placeholder), and refusing to walk those would
+    cost findings in the ordinary case.
+    """
+    class _Entry:
+        def stat(self, follow_symlinks=True):
+            return type("S", (), {"st_reparse_tag": tag})()
+
+    assert ho._is_junction(_Entry()) is expected
+
+
+def test_a_platform_without_reparse_tags_answers_not_a_junction():
+    """``st_reparse_tag`` is Windows-only, so ``AttributeError`` is the POSIX
+    answer rather than a failure -- and it must not fail towards "junction",
+    which would stop the walk entering any directory at all."""
+    class _Entry:
+        def stat(self, follow_symlinks=True):
+            return type("S", (), {})()
+
+    assert ho._is_junction(_Entry()) is False
 
 
 def test_an_unwalkable_subtree_costs_a_finding_rather_than_inventing_one(
