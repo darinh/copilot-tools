@@ -602,6 +602,48 @@ one claim the preservation contract exists to deny.
 
 9 mutants killed, 0 survived, 0 never ran.
 
+### G9 — the marker rename, and why it needed migrating
+
+D3 renames the delimiter to `<!-- BEGIN operator:managed -->`. The rename
+itself is trivial; what makes it a task is that the old spelling must stay
+*readable*. A writer that knew only the new marker would find no block in a
+file carrying the old one, take the "no block here" path, and **append** a
+second block below it. The repository then holds two sets of conventions that
+disagree — and the disagreement is invisible to `compose`, the one function
+whose job is keeping them in step.
+
+So `MARKER_PAIRS` holds both spellings and only the new one is ever written.
+A file migrates the first time anything regenerates it and never migrates
+again, which is pinned by asserting the second run reports `unchanged`: a
+"migration" that runs forever shows a diff in every repository on every run,
+and a diff that is always there is a diff nobody reads.
+
+The consent question is not re-asked. A legacy block is one of ours, so
+`managed_block_present` must recognise it; otherwise `_place_one` treats a
+file this tool wrote as somebody else's, and a non-interactive caller
+answering "no" strands the repository on the old spelling permanently.
+
+Two refusals guard the mixed cases, and they catch different files:
+
+- **`spellings_present`** refuses a file carrying whole live blocks in both
+  spellings. Replacing one and leaving the other is the doubling the whole
+  mechanism exists to prevent, and choosing which to keep is a guess about
+  which set of conventions somebody meant.
+- **`_marker_offsets` reads through one pair at a time**, so a *legacy begin*
+  with a *current end* is not a block. This is the case the first guard does
+  not catch, and the reason it matters is that pooling both spellings'
+  offsets yields one begin and one end — exactly what well-formed looks like
+  — so the malformed check downstream is satisfied and the span is replaced
+  silently. Mutation found it; every other test in the file stayed green.
+
+The order of `MARKER_PAIRS` is a **provably equivalent mutant**: since at
+most one spelling survives `compose`'s check, reversing the tuple changes no
+result. The comment says so rather than implying the order is load-bearing —
+a claim in prose that no test can falsify is the same defect as a guard that
+cannot fire.
+
+6 mutants killed, 0 survived, 0 never ran.
+
 ## Risks
 
 | Risk | Mitigation |

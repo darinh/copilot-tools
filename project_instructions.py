@@ -79,8 +79,33 @@ class InstructionsError(RuntimeError):
 #: goes.
 AGENTS_NAME = "AGENTS.md"
 
-MANAGED_BEGIN = "<!-- BEGIN copilot-tools managed conventions -->"
-MANAGED_END = "<!-- END copilot-tools managed conventions -->"
+#: The markers that delimit the block. The old spelling is still *read*: a
+#: writer that knew only the new one would find no block in a file carrying
+#: the old, append a second block below it, and leave the repository holding
+#: two sets of conventions that disagree — with the disagreement invisible to
+#: the very function meant to keep them in step. So migration is not a
+#: convenience; it is what stops a rename from silently doubling the block.
+#:
+#: Only the new spelling is ever *written*, so a file migrates the first time
+#: anything regenerates it and never migrates twice.
+MANAGED_BEGIN = "<!-- BEGIN operator:managed -->"
+MANAGED_END = "<!-- END operator:managed -->"
+
+LEGACY_BEGIN = "<!-- BEGIN copilot-tools managed conventions -->"
+LEGACY_END = "<!-- END copilot-tools managed conventions -->"
+
+#: Begin/end pairs. A pair, not two flat lists, because the begin of one
+#: spelling and the end of another do not delimit anything: a file holding
+#: `LEGACY_BEGIN` and `MANAGED_END` has been hand-edited into a state no
+#: writer produces, and treating the two as a block would replace a span
+#: whose real boundaries nobody knows.
+#:
+#: The order is not load-bearing and no test asserts it is. `compose` refuses
+#: a file that uses more than one spelling, so at most one pair can match
+#: anything by the time the answer is used; reversing this tuple changes no
+#: result. It is written newest-first only because that is the order a reader
+#: expects.
+MARKER_PAIRS = ((MANAGED_BEGIN, MANAGED_END), (LEGACY_BEGIN, LEGACY_END))
 
 #: The template section that is *replaced* rather than copied. It is the
 #: enrollment machinery -- catalog lookup, "would you like to set this up",
@@ -352,7 +377,24 @@ def _marker_offsets(existing: str) -> "tuple[list[int], list[int]]":
 
     A marker must also be the whole line. ``MANAGED_BEGIN in existing`` is
     true of a sentence that merely mentions it, and prose is not a delimiter.
+
+    Both spellings are recognised, but a file is read through **one** pair:
+    the first pair that appears in it at all. Pooling the offsets of both
+    would let a legacy begin and a current end delimit a span no writer ever
+    produced — and the pooled counts would be one and one, so the malformed
+    check downstream would be satisfied and ``compose`` would replace it
+    silently. Which pair is tried first does not matter; that only one is
+    used does.
     """
+    for begin_marker, end_marker in MARKER_PAIRS:
+        begins, ends = _offsets_for(existing, begin_marker, end_marker)
+        if begins or ends:
+            return begins, ends
+    return [], []
+
+
+def _offsets_for(existing: str, begin_marker: str,
+                 end_marker: str) -> "tuple[list[int], list[int]]":
     begins: list[int] = []
     ends: list[int] = []
     offset = 0
@@ -361,12 +403,18 @@ def _marker_offsets(existing: str) -> "tuple[list[int], list[int]]":
     for index, line in enumerate(lines):
         if index in plain:
             stripped = line.strip()
-            if stripped == MANAGED_BEGIN:
+            if stripped == begin_marker:
                 begins.append(offset)
-            elif stripped == MANAGED_END:
+            elif stripped == end_marker:
                 ends.append(offset + len(line.rstrip("\r\n")))
         offset += len(line)
     return begins, ends
+
+
+def spellings_present(existing: str) -> "list[tuple[str, str]]":
+    """Every marker pair `existing` uses, whether or not it uses it well."""
+    return [pair for pair in MARKER_PAIRS
+            if any(_offsets_for(existing, *pair))]
 
 
 def managed_block_present(existing: str) -> bool:
@@ -382,6 +430,11 @@ def compose(existing: "str | None", managed: str) -> str:
     block is appended below whatever is there. A repository's ``AGENTS.md`` is
     its author's document; this only ever rents a paragraph of it.
 
+    A block written under the old marker spelling is *replaced*, so the file
+    migrates in place. Appending instead would leave the repository holding
+    two sets of conventions that disagree — which is the entire reason
+    migration is mandatory rather than nice to have.
+
     Malformed markers raise instead of being repaired. Appending a second
     block "because the first one looked wrong" is how a file ends up with two
     sets of conventions that disagree, and the disagreement would then be
@@ -389,13 +442,21 @@ def compose(existing: "str | None", managed: str) -> str:
     """
     if existing is None or not existing.strip():
         return managed
+    spellings = spellings_present(existing)
+    if len(spellings) > 1:
+        raise InstructionsError(
+            "this file carries managed-conventions markers in more than one "
+            "spelling. Replacing one and leaving the other would leave two "
+            "sets of conventions that disagree, and appending a third is "
+            "worse. Delete the block you do not want, by hand.")
     begins, ends = _marker_offsets(existing)
     if not begins and not ends:
         return existing.rstrip("\n") + "\n\n" + managed
     if len(begins) != 1 or len(ends) != 1:
+        begin_marker, end_marker = spellings[0]
         raise InstructionsError(
-            f"found {len(begins)} '{MANAGED_BEGIN}' and {len(ends)} "
-            f"'{MANAGED_END}' markers; expected one of each. Fix them by "
+            f"found {len(begins)} '{begin_marker}' and {len(ends)} "
+            f"'{end_marker}' markers; expected one of each. Fix them by "
             "hand — refusing to guess which block is the live one.")
     start = begins[0]
     stop = ends[0]

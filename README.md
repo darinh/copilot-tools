@@ -19,6 +19,7 @@ messaging, and spec-driven workflow conventions.
 | [`operator_session.py`](operator_session.py) | The session lifecycle: the assignment resolved on the way in, the handoff and claim disposal on the way out |
 | [`operator_work.py`](operator_work.py) | The policy over the claim store: `operator work`, and the reclaim that preserves a departed owner's work first |
 | [`operator_worktree.py`](operator_worktree.py) | The checkout a claim owns: `operator worktree new` / `finish` / `recover` |
+| [`operator_ownership.py`](operator_ownership.py) | Whether a branch stayed inside its subproject: `operator ownership check` |
 | [`operator_ingest.py`](operator_ingest.py) | Pure-Python log parser for copilot process logs |
 | [`handoff_tool.py`](docs/operator.md) | Atomic session handoff for agents |
 | [`backlog_tool.py`](backlog/README.md) | Reads and enforces the tracked `backlog/`; ships the `backlog` command |
@@ -391,6 +392,7 @@ copilot-tools/
 ├── operator_session.py            # Session lifecycle: assignment in, handoff out
 ├── operator_work.py               # `operator work`: request, release, list, heartbeat, reclaim
 ├── operator_worktree.py           # `operator worktree`: new, finish, recover
+├── operator_ownership.py          # `operator ownership check`: did this branch leave its subproject?
 ├── operator_console.py            # UTF-8 console output
 ├── project_paths.py               # Project identity: catalog and per-project dirs
 ├── project_features.py            # The feature vocabulary, and each project's choices

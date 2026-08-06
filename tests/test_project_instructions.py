@@ -304,6 +304,149 @@ def test_malformed_markers_raise_rather_than_being_repaired(broken):
 
 
 # ---------------------------------------------------------------------------
+# G9 / D3 -- migrating the marker spelling
+#
+# The rename is only safe because the old spelling is still *read*. A writer
+# that knew the new marker alone would find no block in a file carrying the
+# old one, append a second block below it, and leave the repository holding
+# two sets of conventions that disagree -- with the disagreement invisible to
+# the very function meant to keep them in step. That is the failure these
+# tests exist for; "the new marker is emitted" is the easy half.
+# ---------------------------------------------------------------------------
+
+LEGACY_BEGIN = pi.LEGACY_BEGIN
+LEGACY_END = pi.LEGACY_END
+
+
+def test_the_two_spellings_are_actually_different():
+    """Every test below is vacuous if the rename never happened -- they would
+    all be asserting that the current marker replaces itself, which the
+    idempotence tests already cover. This is the anchor."""
+    assert MANAGED_BEGIN != LEGACY_BEGIN
+    assert MANAGED_END != LEGACY_END
+    assert "operator:managed" in MANAGED_BEGIN
+
+
+def test_an_old_block_is_replaced_not_doubled():
+    existing = ("# Mine\n\nabove\n"
+                f"{LEGACY_BEGIN}\nold conventions\n{LEGACY_END}\n"
+                "\nbelow, written by hand\n")
+    out = pi.compose(existing, f"{MANAGED_BEGIN}\nnew\n{MANAGED_END}\n")
+    assert "old conventions" not in out
+    assert out.count(MANAGED_BEGIN) == 1
+    assert LEGACY_BEGIN not in out
+    assert LEGACY_END not in out
+    assert out.startswith("# Mine\n\nabove\n")
+    assert out.endswith("\nbelow, written by hand\n")
+
+
+def test_migration_happens_once(machine):
+    """A migrated file is an ordinary file. Regenerating it again must not
+    find anything left to migrate, or the "migration" is a rewrite that
+    happens forever and every repository shows a diff on every run."""
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    target.write_text(
+        "# theirs\n\n"
+        f"{LEGACY_BEGIN}\nancient\n{LEGACY_END}\n\ntrailing note\n",
+        encoding="utf-8")
+    _retire(machine)
+    first = target.read_text(encoding="utf-8")
+    assert LEGACY_BEGIN not in first
+    assert MANAGED_BEGIN in first
+    assert first.endswith("\ntrailing note\n")
+    result = _retire(machine)
+    assert target.read_text(encoding="utf-8") == first
+    assert result.outcomes[0].state == UNCHANGED
+
+
+def test_a_file_with_an_old_block_is_not_asked_for_consent_again(machine):
+    """The consent question is "may we write into a file we did not write".
+    A legacy block *is* ours; asking again would train the answer, and a
+    caller that answers no would strand the repository on the old spelling
+    forever."""
+    asked = []
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    target.write_text(f"{LEGACY_BEGIN}\nancient\n{LEGACY_END}\n",
+                      encoding="utf-8")
+    _retire(machine, decide=lambda project, existing: asked.append(project) or False)
+    assert asked == []
+    assert MANAGED_BEGIN in target.read_text(encoding="utf-8")
+
+
+def test_both_spellings_at_once_is_refused():
+    """No writer produces this, so it is a hand-edit or an interrupted
+    migration. Replacing one and leaving the other is the doubling this
+    whole mechanism exists to prevent, and picking which to keep is a guess
+    about which set of conventions somebody meant."""
+    existing = (f"{LEGACY_BEGIN}\nold\n{LEGACY_END}\n"
+                f"{MANAGED_BEGIN}\nnew\n{MANAGED_END}\n")
+    with pytest.raises(InstructionsError):
+        pi.compose(existing, f"{MANAGED_BEGIN}\nnewer\n{MANAGED_END}\n")
+
+
+def test_a_begin_of_one_spelling_and_an_end_of_the_other_delimit_nothing():
+    """Pooling both spellings' offsets into one pair of lists would make
+    these two look like a well-formed block, and `compose` would replace a
+    span whose real boundaries nobody knows -- silently, since the count
+    check would be satisfied."""
+    existing = f"{LEGACY_BEGIN}\nbody\n{MANAGED_END}\n"
+    with pytest.raises(InstructionsError):
+        pi.compose(existing, f"{MANAGED_BEGIN}\nnew\n{MANAGED_END}\n")
+
+
+def test_crossed_markers_are_not_a_block_to_the_finder_either():
+    """Driven at `_marker_offsets`, because `compose`'s two guards catch two
+    different files and the test above only proves one of them fired.
+
+    The mixed-spelling refusal covers a file with *whole blocks* in both
+    spellings. This covers a file with a begin from one and an end from the
+    other -- and only the per-pair discipline here catches it, because the
+    pooled counts would be one and one, which is exactly what well-formed
+    looks like. Mutation found this: pooling the pairs left every other test
+    in the file green.
+    """
+    begins, ends = pi._marker_offsets(f"{LEGACY_BEGIN}\nbody\n{MANAGED_END}\n")
+    assert (len(begins), len(ends)) != (1, 1)
+
+
+@pytest.mark.parametrize("broken", [
+    f"{LEGACY_BEGIN}\na\n{LEGACY_END}\n{LEGACY_BEGIN}\nb\n{LEGACY_END}\n",
+    f"{LEGACY_BEGIN}\nno end marker\n",
+    f"{LEGACY_END}\nno begin marker\n",
+    f"{LEGACY_END}\ninverted\n{LEGACY_BEGIN}\n",
+])
+def test_malformed_old_markers_raise_too(broken):
+    """The old spelling gets the same refusals, not a lenient path. A
+    migration that repaired what the current spelling refuses to repair
+    would be the one moment a file is least understood."""
+    with pytest.raises(InstructionsError):
+        pi.compose(broken, f"{MANAGED_BEGIN}\nnew\n{MANAGED_END}\n")
+
+
+def test_an_old_marker_quoted_in_a_fence_is_not_a_block():
+    """The fence narrowing applies to both spellings. A project documenting
+    the *previous* marker -- exactly what a migration note looks like --
+    would otherwise have its note replaced by the migration it describes."""
+    existing = ("# theirs\n\n```markdown\n"
+                f"{LEGACY_BEGIN}\n...\n{LEGACY_END}\n```\n")
+    out = pi.compose(existing, f"{MANAGED_BEGIN}\nnew\n{MANAGED_END}\n")
+    assert out.startswith(existing.rstrip("\n"))
+    assert LEGACY_BEGIN in out
+    assert MANAGED_BEGIN in out
+
+
+def test_a_rendered_block_carries_only_the_new_spelling(template):
+    rendered = pi.render(
+        source=template, values=project_features.resolved_values(None),
+        guid="GUID", project_path="/tmp/x", label="x",
+        project_dir_path=Path("/tmp/p"), config_path=Path("/tmp/p/f.json"),
+        version="1.0.0")
+    assert LEGACY_BEGIN not in rendered
+    assert LEGACY_END not in rendered
+    assert rendered.startswith(MANAGED_BEGIN)
+
+
+# ---------------------------------------------------------------------------
 # Writing and preserving
 # ---------------------------------------------------------------------------
 

@@ -327,7 +327,25 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       guard without that clause would block the workflow it exists to protect
       at the least convenient moment available.
 - [ ] G8 New root and subproject templates
-- [ ] G9 Marker migration — recognise both spellings, rewrite old→new
+- [x] G9 Marker migration — recognise both spellings, rewrite old→new.
+      `MANAGED_BEGIN`/`MANAGED_END` are now `<!-- BEGIN operator:managed -->`
+      (D3); the old spelling is still *read*, which is the whole point. A
+      writer knowing only the new marker finds no block in a file carrying the
+      old one, appends a second block below it, and leaves the repository
+      holding two sets of conventions that disagree — invisibly to the
+      function meant to keep them in step. Only the new spelling is written,
+      so a file migrates on first regeneration and never again (pinned:
+      the second run reports `unchanged`). A legacy block *is* ours, so the
+      consent question is not re-asked — asking would train the answer and a
+      caller answering no would strand the repository on the old spelling.
+      Two independent refusals, each catching a file the other does not:
+      `spellings_present` refuses whole blocks in both spellings, and
+      `_marker_offsets` reads through one pair at a time so a legacy begin
+      and a current end cannot delimit a span — pooled, those counts are one
+      and one, which is exactly what well-formed looks like. Mutation found
+      the second: pooling left every other test green. 6 mutants killed, 0
+      survived, 0 never ran; the order of `MARKER_PAIRS` is a provably
+      equivalent mutant and the code says so rather than claiming otherwise.
 - [ ] G10 Move build/test/lint out of the managed block (D11)
 - [x] G11 Test that appended project content survives regeneration (FR-7) —
       end-to-end through `retire` → `render` → `compose` → the atomic write,
