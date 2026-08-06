@@ -160,6 +160,21 @@ how many commands survive G10 and G13, not with anything measured here. The
 700 recommendation stands; it was set on the all-on figure, and the platform
 cut only widens the headroom.
 
+## Exit code 2 does not collide (audited after G6)
+
+Flagged as unaudited when `operator ownership check` was written; measured
+now. Every pre-existing `return 2` in `copilot_operator.py` is a usage error
+in which the command did not act at all — `_send_usage`, `_reply_usage`,
+`_inbox_usage`, each printed alongside "Nothing was sent." or "No mail was
+read." The convention is therefore **2 = no verdict was reached**, distinct
+from **1 = a verdict was reached and it is no**.
+
+The ownership guard uses 2 for an unreadable declaration or a failed `git
+diff` — cases where it could not decide — and 1 for an explicit refusal. That
+is the existing convention applied, not a new meaning for the same number,
+and it is the distinction a hook needs: a hook that treats "could not decide"
+as a pass is the failure mode the third code exists to prevent.
+
 ## What this changes for G3–G13
 
 - **G3 gains a second guard** — deny `task`/`agent` on a dirty worktree — from
