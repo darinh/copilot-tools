@@ -104,7 +104,7 @@ Delivered as `operator_work.py` (`agent_identity`, `preserve`, `request`,
 `release`, `heartbeat`, `listing`, `reclaim`) with `operator work` in
 `copilot_operator.py` (E1, E2), `operator backlog` delegating to
 `backlog_tool.main` (E3), and `operator worktree` as `operator_worktree.py`
-(E4). E5 remains.
+(E4). E5 is `operator reply` plus mail delivered by `operator session start`.
 
 Two properties are load-bearing rather than convenient.
 
@@ -253,6 +253,33 @@ ignored content, exactly as git's own `worktree remove` does, but it names
 what it is taking first — with a positive control asserting the note stays
 absent when there is nothing to report, because a note that appears either way
 trains its reader to skip it.
+
+E5 replaces the polling mailbox, which had two separate costs. The first was
+that receiving required the agent to remember `operator inbox`, and forgetting
+it produced no signal at all — an agent with unread mail behaved exactly like
+an agent with none. Delivery therefore moves to `operator session start`,
+which every session runs anyway; the supervisor loop had done this for its own
+launches since the mail module was written, so what E5 adds is the same
+guarantee for a session started any other way. The second cost was that
+answering meant restating both addresses, which is why the old hint was a
+`send` command. `operator reply` resolves them instead, and is deliberately
+sugar over `send_message` rather than a parallel implementation: the
+live-versus-queued decision, the unknown-recipient refusal and the archive
+record all carry earned comments, and a second copy is a second place for them
+to drift.
+
+Both new lookups refuse rather than default. That asymmetry is the design.
+`operator inbox` may fall back to the directory's name because a wrong guess
+there costs a peer's mail, which is recoverable from the archive; a reply
+carries an assertion its recipient will act on, so a wrong guess signs another
+agent's name to it or sends it somewhere it was never owed. For the same
+reason "nobody has written to you" and "your mailbox could not be read" are
+different messages with different exit codes — they license opposite actions,
+and collapsing them tells an agent its peer never wrote when the truth is that
+nothing could be read. The reply hint keeps naming `--to` even though the
+command would default it, because the hints are printed once per message and
+the default is wrong precisely when a batch arrives from several peers at
+once.
 
 ## Phase G+H — the audit
 

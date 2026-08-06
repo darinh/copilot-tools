@@ -796,13 +796,31 @@ operator inbox                    # only with no other instance live here
 operator inbox beta --peek        # leave them unread
 operator inbox beta --history     # already-delivered messages
 operator inbox beta --json        # machine-readable
+
+operator reply --instance beta "an answer"          # to whoever wrote last
+operator reply --instance beta --to alpha "to them" # to a named peer
 ```
 
-`--from` and `--to` are both required. The recipient cannot see who is running
-what, so an unattributed message is one it cannot answer; every delivered
-message carries a ready-made reply command. A `--to` naming no known instance
-is refused and the known names are listed, because a typo would otherwise queue
-a message into a mailbox nobody ever reads.
+`operator reply` is sugar over `send`: it resolves the two addresses and hands
+the rest straight to it. `--to` defaults to whoever most recently wrote to the
+instance, looking at read and unread mail together — a session start archives
+the inbox, so consulting only unread mail would make replying impossible in
+exactly the session a message was delivered to. `--instance` defaults to
+`$OPERATOR_INSTANCE`.
+
+Both lookups refuse rather than guess. A reply carries an assertion the
+recipient will act on, and signing it with the directory's name — which is what
+`operator inbox` does when given none — puts words in another agent's mouth.
+"Nobody wrote to you" and "your mailbox could not be read" are reported
+differently for the same reason: only the first means there is no reply to send.
+
+`--from` and `--to` are both required on `send`. The recipient cannot see who is
+running what, so an unattributed message is one it cannot answer; every
+delivered message carries a ready-made `operator reply` command naming its own
+sender, so a batch from several peers is answerable message by message rather
+than only as a whole. A `--to` naming no known instance is refused and the known
+names are listed, because a typo would otherwise queue a message into a mailbox
+nobody ever reads.
 
 **With no NAME the mailbox is named after the directory, which is nobody in
 particular.** The default comes from the same function that names a session you
@@ -857,6 +875,13 @@ is actually up, so a launch that fails and retries does not swallow it. Live
 delivery uses literal key input: without that, a message containing the word
 `Enter` would submit early and one containing `C-c` would interrupt the
 recipient.
+
+`operator session start` delivers queued mail too, printing it and marking it
+read in the same breath. That is the whole of what an agent has to do to
+receive mail — there is no command to remember, which is the point: an agent
+that never ran `operator inbox` was indistinguishable from one with no mail.
+A mailbox that cannot be read is reported as such rather than as an empty one,
+and does not stop the session starting.
 
 Messages live in `~/.operator/messages/<instance>/inbox/` and move to
 `../archive/` when read — read mail is archived rather than deleted, so

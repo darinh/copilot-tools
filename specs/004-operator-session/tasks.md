@@ -149,7 +149,34 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       force flag, so the boundary is stated instead — `finish` names the
       ignored paths it is about to remove, with a positive control asserting
       it stays quiet when there are none.
-- [ ] E5 `operator reply`, retiring the inbox-polling semantics
+- [x] E5 `operator reply`, retiring the inbox-polling semantics
+      Delivered as two halves, because polling had two costs and removing
+      only one leaves the model intact. Receiving: `operator session start`
+      now consumes queued mail and prints it in the same breath, so there is
+      no command to remember — an agent that never ran `operator inbox` was
+      indistinguishable from one with no mail, and that silence was the
+      actual defect. A mailbox that cannot be read is reported as such rather
+      than as an empty one, does not stop the session starting, and archives
+      nothing, so a jam is re-offered next session; mail already consumed
+      before a mid-batch fault is printed, since that is the only time it
+      will ever be offered. Answering: `operator reply [--instance NAME]
+      [--to NAME] "text"` resolves both addresses — `--to` from the most
+      recent correspondent across read *and* unread mail (session start
+      archives the inbox, so consulting only unread mail would make replying
+      impossible in exactly the session a message was delivered to),
+      `--instance` from `$OPERATOR_INSTANCE`. It is sugar over `send_message`
+      rather than a second delivery path, and passes the body after a `--` of
+      its own so a reply reading `--queue it for later` cannot be re-parsed
+      into a flag plus a shorter message. Both lookups refuse rather than
+      guess: a reply carries an assertion the recipient acts on, and signing
+      it with the directory's name — what `operator inbox` does when given
+      none — puts words in another agent's mouth. "Nobody wrote to you" and
+      "your mailbox could not be read" are reported separately, because only
+      the first means there is no reply to send. `reply_hint` now emits the
+      `operator reply` form and keeps naming `--to` explicitly: the default
+      is right for one conversation and wrong for a batch from several peers,
+      which is exactly when the hints are printed. 39 new tests; 20 mutants,
+      one per new guard, all applied and killed.
 
 ## Phase F — skills and rationale
 

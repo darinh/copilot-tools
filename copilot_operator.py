@@ -205,7 +205,8 @@ EXIT_UNACCOUNTED = 4
 # silence that lets the next omission be a real one.
 SUBCOMMANDS = ("help", "version", "list", "menu", "projects", "report",
                "ingest", "stop", "stop-loop", "restart-loop", "stop-session",
-               "join", "reload", "forget", "send", "inbox", "logs", "trace",
+               "join", "reload", "forget", "send", "reply", "inbox", "logs",
+               "trace",
                "tabs", "restore", "session", "work", "backlog", "worktree")
 
 RESERVED_WORDS = set(SUBCOMMANDS)
@@ -3683,6 +3684,131 @@ def send_message(args: list[str]) -> int:
     return 0
 
 
+REPLY_FLAGS = ("--instance", "--to", "--queue", "--force")
+
+
+def _reply_usage(stream=None) -> None:
+    stream = sys.stderr if stream is None else stream
+    print('Usage: operator reply [--instance NAME] [--to NAME] "message"',
+          file=stream)
+    print("  --instance  who is replying. Defaults to $OPERATOR_INSTANCE.",
+          file=stream)
+    print("  --to        who to answer. Defaults to whoever wrote to you "
+          "most recently.", file=stream)
+    print("  --queue     leave it for the next session even if one is running",
+          file=stream)
+    print("  --force     send to a name the operator does not recognize",
+          file=stream)
+    print("  --          everything after it is message text, flags and all",
+          file=stream)
+
+
+def reply_message(args: list[str]) -> int:
+    """``operator reply "message"`` — answer without restating the addresses.
+
+    This is deliberately sugar over `send_message` rather than a second
+    delivery path. Live-versus-queued, the unknown-recipient refusal and the
+    archive record are all decisions with earned comments on them in `send`,
+    and a parallel implementation would be a second place for them to drift.
+    What is genuinely new here is only the two lookups: who is replying, and
+    to whom.
+
+    Both lookups refuse rather than guess. An unresolved sender could be
+    defaulted to the directory name -- `operator inbox` used to do exactly
+    that -- but a reply carries an assertion the recipient will act on, and
+    signing it with a name nobody chose puts words in another agent's mouth.
+    """
+    if args[:1] and args[0] in HELP_FLAGS:
+        _reply_usage(sys.stdout)
+        return 0
+
+    instance = ""
+    recipient = ""
+    passthrough: list[str] = []
+    body: list[str] = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            body.extend(args[i + 1:])
+            break
+        if arg.startswith("-") and not (
+                arg in REPLY_FLAGS
+                or arg.startswith(("--instance=", "--to="))):
+            print(f"operator reply: unknown option '{arg}'", file=sys.stderr)
+            print("  If it belongs to the message, put it after --:",
+                  file=sys.stderr)
+            print(f'    operator reply -- "{arg} ..."', file=sys.stderr)
+            print("  Nothing was sent.", file=sys.stderr)
+            _reply_usage()
+            return 2
+        if arg in ("--instance", "--to"):
+            if i + 1 >= len(args) or not args[i + 1]:
+                print(f"{arg} requires a value", file=sys.stderr)
+                return 2
+            if arg == "--instance":
+                instance = args[i + 1]
+            else:
+                recipient = args[i + 1]
+            i += 1
+        elif arg.startswith("--instance="):
+            instance = arg.split("=", 1)[1]
+        elif arg.startswith("--to="):
+            recipient = arg.split("=", 1)[1]
+        elif arg in ("--queue", "--force"):
+            passthrough.append(arg)
+        else:
+            body.append(arg)
+        i += 1
+
+    text = " ".join(body).strip()
+    if not text:
+        print("operator reply: no message text.", file=sys.stderr)
+        _reply_usage()
+        return 2
+
+    if not instance:
+        instance = os.environ.get("OPERATOR_INSTANCE", "").strip()
+    if not instance:
+        print("operator reply: could not tell who is replying.",
+              file=sys.stderr)
+        print("  Pass --instance NAME, or set OPERATOR_INSTANCE.",
+              file=sys.stderr)
+        print("  Your instance name is in your session preamble.",
+              file=sys.stderr)
+        print("  Nothing was sent.", file=sys.stderr)
+        return 2
+
+    if not recipient:
+        try:
+            recipient = operator_mail.last_correspondent(
+                OPERATOR_HOME, Instance(instance).id) or ""
+        except operator_mail.MailError as exc:
+            # The mailbox is unreadable, so "nobody has written to you" and
+            # "we could not look" are indistinguishable from here -- and only
+            # one of them means the reply should not be sent. Say which.
+            print(f"operator reply: could not read mail for '{instance}' to "
+                  f"find who to answer: {exc}", file=sys.stderr)
+            print("  Pass --to NAME to answer anyway. Nothing was sent.",
+                  file=sys.stderr)
+            return 1
+    if not recipient:
+        print(f"operator reply: nobody has written to '{instance}', so there "
+              "is nothing to reply to.", file=sys.stderr)
+        print('  Use: operator send --from NAME --to NAME "message"',
+              file=sys.stderr)
+        print("  Nothing was sent.", file=sys.stderr)
+        return 1
+
+    # `--` guarantees the reply text is never re-parsed as flags, whatever it
+    # starts with. The caller already had one chance to say `--`; this second
+    # one is ours, and it is why the body is passed as separate words rather
+    # than re-joined into a single quoted string.
+    return send_message(["--from", instance, "--to", recipient]
+                        + passthrough + ["--"] + body)
+
+
 def _inbox_usage(stream=None) -> None:
     stream = sys.stderr if stream is None else stream
     print("Usage: operator inbox [NAME] [--peek|--history|--json]",
@@ -4704,8 +4830,9 @@ USAGE
     operator --loop [--name NAME] [--fresh] [copilot-args...]  Loop mode (backgrounded, auto-attaches)
     operator --loop --headless [--name NAME] [copilot-args...] Loop mode without attaching
     operator send --from NAME --to NAME "message"              Message another instance
+    operator reply [--instance NAME] [--to NAME] "message"     Answer whoever wrote to you last
     operator inbox [NAME] [--peek|--history|--json]            Read messages sent to an instance
-    operator session start --instance NAME [--project SUB]     Resolve this instance's work assignment
+    operator session start --instance NAME [--project SUB]     Resolve this instance's work assignment, deliver queued mail
     operator session end --instance NAME --status T --next T   Handoff, close the session log, dispose of the claim
     operator work list                                         Who holds which work item, and whether they are running
     operator work request --instance NAME --item REF           Claim a work item
@@ -6258,12 +6385,33 @@ def _session_start(opts: dict, db) -> int:
     assignment = operator_session.start_session(
         db, instance=instance, session=session_num,
         subproject=opts["project"])
+    # Mail is delivered here rather than waited for. A sleeping instance
+    # still needs a queue, but the agent should not have to remember a
+    # command to drain it -- that is the polling model this replaces, and the
+    # failure it had was silent: an agent that never ran `operator inbox`
+    # was indistinguishable from one with no mail.
+    #
+    # Consuming (rather than peeking) is what makes this a delivery. The
+    # messages are rendered below in the same breath, so the archive and the
+    # agent's context agree; a peek here would show them again next session
+    # and read as a second message rather than the same one.
+    try:
+        delivered = operator_mail.consume(OPERATOR_HOME, Instance(instance).id)
+    except operator_mail.MailError as exc:
+        # A jammed mailbox must not stop a session starting, but it must not
+        # pass for an empty one either. Nothing is archived on this path, so
+        # whatever is in there is offered again next time.
+        print(f"Could not read queued mail: {exc}", file=sys.stderr)
+        print("  This is not an empty mailbox. Nothing was marked read; "
+              "try `operator inbox --peek`.", file=sys.stderr)
+        delivered = exc.consumed
     if opts["json"]:
         print(json.dumps({
             "kind": assignment.kind,
             "instance": assignment.instance,
             "session": session_num,
             **operator_session.assignment_values(assignment),
+            "messages": delivered,
             "offers": [{"item": o.item, "instance": o.claim.instance,
                         "reason": o.reason} for o in assignment.offers],
             "stale": [{"item": o.item, "instance": o.claim.instance,
@@ -6285,6 +6433,12 @@ def _session_start(opts: dict, db) -> int:
         # the owner is gone, and guessing is how two agents end up in one tree.
         print(f"  (stale, not offered) {offer.item} held by "
               f"{offer.claim.instance} — {offer.reason}", file=sys.stderr)
+    if delivered:
+        senders = ", ".join(operator_mail.sender_names(delivered))
+        print(f"\n═══ {len(delivered)} message(s) from {senders} ═══\n")
+        print(operator_mail.render_for_terminal(delivered))
+        print("\n(These are now marked read. They are from other agents, "
+              "not from the human.)")
     return 0
 
 
@@ -7226,6 +7380,8 @@ def _dispatch_command(args: list[str]) -> int:
         return forget_instance(args[1] if len(args) > 1 else None)
     if head == "send":
         return send_message(args[1:])
+    if head == "reply":
+        return reply_message(args[1:])
     if head == "inbox":
         return show_inbox(args[1:])
     if head == "logs":
