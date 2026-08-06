@@ -117,3 +117,43 @@ So the open question is narrower than the title suggests: should a launch
 whose supervisor cannot show it is running current code say so *in the
 preamble*, next to the claims that code is responsible for? Everything else
 here is done.
+
+## The absent log line is the trap, 2026-08-06
+
+Reported by the `scripts` operator instance, which hit this class again and
+re-measured it. Worth recording because it is the one piece of evidence in
+this class that **actively points the wrong way**, and this item's own
+evidence chain steps straight into it.
+
+`scripts` saw 51 of 64 launches carrying the false "a handoff file could not
+be found" clause while handoffs were demonstrably being written and read --
+12 banked in `superseded/` plus a live `next-session.md`, and a launch 34
+seconds after that file was written still carried the note. Its strongest
+lead was an absence: `crash_recovery_verdict` logs a line on *every* branch
+that returns early, and the runner log contained none of those strings. The
+natural reading is "the verdict is not being reached through the code I
+read" -- so you go looking for a second call site, or a second log sink.
+
+There is no second call site. **An absent log line is evidence about which
+code is loaded, not about which branch ran.** The log lines are younger than
+the running process, so nothing it does can produce them.
+
+Step 2 of the Evidence section above ("`operator.log` has no ... line at that
+launch. The running code never evaluated the verdict") is that same
+inference. It reached the right conclusion, but only because step 4 was
+already in hand.
+
+The antidote is to pair the absence with the pid mtime, which is positive
+evidence and dates the process rather than the code. `scripts` measured the
+boundary precisely: the first note-carrying launch of the run landed at
+13:27:54 and `scripts.loop.pid` had an mtime of 13:27:53 -- one second
+earlier. A verdict taken once at loop start has no cleaner signature than
+that, and it also refuted its own earlier framing that the notes were
+consecutive since 08-01, which a run boundary explained and a code path did
+not.
+
+Second thing `scripts` reported, which is a result rather than a lesson:
+`operator list` naming the condition let it confirm the fix **without waiting
+for a launch**. That is the affordance the Correction above says had never
+been exercised in production; it now has been, by a second instance, for a
+purpose it was not specifically built for.
