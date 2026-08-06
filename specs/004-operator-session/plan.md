@@ -389,6 +389,87 @@ does not travel with the repository, and `--no-verify` removes it. Mechanism 1
 is already installed, travels with `operator`, and cannot be turned off by a
 flag the agent controls.
 
+**Delivered (G3, G7): three new denials in `checkout-guard`.**
+
+They went into the existing extension rather than a new one because the
+parsing they need already lives there — `gitInvocations` for "is this command
+really a commit", `primaryCheckoutRoot` for "where is the other checkout" —
+and a second copy of "which repository does this command actually address" is
+the duplication this repository has already paid for once.
+
+The tests found two defects before either rule shipped, and both are the shape
+worth recording. `outsideWorktreeDecision` resolved the *target* path but not
+the candidate roots, so a caller passing an unresolved root got `null` for
+everything: correct for today's only caller, which resolves them, and one
+refactor away from a guard that silently never fires. And it returned the
+first containing root rather than the most specific — but the convention nests
+worktrees at `<primary>/.worktrees/<name>`, so the primary contains every one
+of them, and every write into a peer's worktree was reported as landing in the
+primary. The path in the message would have been right and the tree named
+beside it wrong, which sends the reader to the wrong checkout to clean up.
+
+The delegation rule counts tracked changes only. Untracked files survive a
+`stash` or a `reset --hard`, they are already this guard's other subject, and
+counting them would make every session holding one scratch file undelegatable
+— a guard that cries wolf gets switched off, which is the failure mode that
+costs the most.
+
+Seventeen mutants, all killed. Five of them initially reported "never ran"
+rather than passing, because the driver's anchors were written with `\n`
+against a file checked out with CRLF. That is the whole reason the driver
+distinguishes *unanchored* from *killed*: five silent no-ops would have read
+as a clean sheet, and one of the two genuinely surviving mutants — a detached
+`HEAD` reported as a branch named `HEAD` — was only visible once they ran.
+
+**Delivered (G4): `/.worktrees/` at `operator worktree new`, not at enroll.**
+
+The plan said "at enroll" and there is no enroll. Nothing in first-party code
+writes a row to `~/.operator/projects/catalog.csv`; `operator projects` browses
+projects that are already registered, and registration is agent behaviour
+driven by instructions. So the trigger this task named does not exist as a code
+path, and the choice was between inventing one and finding an honest
+substitute.
+
+Worktree creation is the better trigger anyway, on two counts. It fires the
+moment the directory the rule protects first exists, rather than at some
+earlier point where the rule is a prediction. And it reaches every project that
+ever grows a worktree, including the eight already enrolled, where an
+enroll-time hook would have reached only projects enrolled after the change —
+which is to say, none of the ones with the problem.
+
+The rule goes in the *tracked* `.gitignore` rather than `.git/info/exclude`
+because a worktree is a checkout and not repository content, so the rule is
+true for every clone, and `info/exclude` is per-clone by construction.
+
+Three deliberate refusals in the implementation:
+
+*It never fails the call.* An unreadable or unwritable `.gitignore` is reported
+in `notes` and the checkout still happens. The command's job is creating a
+checkout; failing that because a tidiness improvement could not be applied
+trades the thing the agent asked for against the favour nobody asked for.
+
+*It never stages.* A generated line sitting in the index is one that gets
+committed inside somebody else's change without either of them noticing, and
+this edit's entire value is that a human saw it go by.
+
+*It has no comment-stripping branch,* and that absence is a finding rather than
+an omission. The first draft skipped lines beginning with `#`, with a docstring
+citing this repository's own dependency scan on reading comments as
+configuration. Mutation testing killed it: deleting the branch changed no
+answer, because the comparison is exact and a `#` prefix already fails it. The
+seven comment cases in the test table passed identically with comment handling
+removed — the precise shape AGENTS.md warns about, reproduced in a guard
+written by someone who had just read the warning. The branch is gone and the
+exactness that actually does the work is what the docstring now names.
+
+Eleven mutants, all killed, none unanchored.
+
+One process lesson, cheap and worth recording: the Phase F/G3 full suite was
+running while these edits landed, and reported three failures in
+`operator_worktree.py` and `copilot_operator.py` that do not exist. A suite
+reads the file as it finds it. Do not edit source while a six-minute suite is
+running, and re-run before believing a failure that arrives from one.
+
 ## Risks
 
 | Risk | Mitigation |

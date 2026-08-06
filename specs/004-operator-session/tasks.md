@@ -255,11 +255,48 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       `operator session start`/`end`, the second becomes one atomic `operator`
       subcommand rather than four pasted SQL statements, the third only restates
       rules above it.
-- [ ] G3 Block edits outside the assigned worktree (covers scratch-in-checkout)
-- [ ] G4 `/.worktrees/` written to tracked `.gitignore` at enroll
+- [x] G3 Block edits outside the assigned worktree (covers scratch-in-checkout) —
+      `checkout-guard` gained three denials, not one. A `create`/`edit` whose
+      path resolves into another checkout of the same repository is refused
+      (writes outside the repository never are — the temp directory is where
+      the guard sends everyone). Delegating to a subagent with uncommitted
+      changes in *tracked* files is refused, which is the 454-line incident
+      and the rule FR-6 had filed as un-checkable. Untracked files are
+      deliberately not counted: they survive a `stash` or `reset --hard`, and
+      counting them would make every session with one scratch file
+      undelegatable. Two real defects were found by the tests before either
+      rule shipped — the decision resolved the target but not the candidate
+      roots, so an unresolved root never matched; and the first containing
+      root won rather than the most specific, so the primary claimed every
+      write into a nested worktree and the message named the wrong tree.
+- [x] G4 `/.worktrees/` written to tracked `.gitignore` — at `operator
+      worktree new`, not "at enroll". Enrollment is not a code path:
+      nothing in first-party code writes a row to `catalog.csv`, so there
+      was no enroll hook to hang this on. Worktree creation is the honest
+      trigger and a better one — it fires the moment the directory it
+      protects first exists, and it fires in every project that ever grows
+      a worktree rather than only in ones enrolled after the change.
+      `worktree_ignore_missing` reads every spelling git accepts
+      (`.worktrees`, `/.worktrees`, either with a trailing slash, either
+      negated) as present, so a hand-written rule is never doubled. The
+      match is exact, so a commented-out rule reads as absent — and there
+      is deliberately **no** comment-stripping branch, because mutation
+      testing showed no input could tell one apart from its absence: a
+      `#` prefix already fails the exact match. Never fails the call: an
+      unreadable or unwritable `.gitignore` is reported in `notes` and the
+      checkout still happens. Never staged, because a generated line in
+      the index is one that gets committed inside somebody else's change.
+      11 mutants killed, 0 survived, 0 never ran.
 - [ ] G5 Refuse to offer enrollment for an already-enrolled project
 - [ ] G6 Subproject path-ownership check on push
-- [ ] G7 No-commit-to-`main` hook
+- [x] G7 No-commit-to-`main` hook — a permission hook, not a git hook.
+      `.git/hooks` holds only samples, a hook is per-clone, does not travel
+      with the repository, and `--no-verify` removes it. `git commit` on
+      `main`/`master` is refused unless a merge, cherry-pick or revert is
+      waiting to be concluded: merging a feature branch into `main` is how
+      work lands here, a conflicted merge is finished with `git commit`, and a
+      guard without that clause would block the workflow it exists to protect
+      at the least convenient moment available.
 - [ ] G8 New root and subproject templates
 - [ ] G9 Marker migration — recognise both spellings, rewrite old→new
 - [ ] G10 Move build/test/lint out of the managed block (D11)

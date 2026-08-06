@@ -36,6 +36,9 @@ the worktree's own tracked copy. Neither is the primary checkout.
 `<repoRoot>/.worktrees/<name>`, where `<name>` is the branch with `/` replaced by
 `-` (`feat/login` → `.worktrees/feat-login`). `/.worktrees/` must be in the
 **tracked** `.gitignore` — `.git/info/exclude` does not reach other clones.
+`operator worktree new` adds the rule if it is absent, reports that it did, and
+leaves it **unstaged** for you to commit deliberately. It recognises a rule you
+wrote yourself in any spelling git accepts and leaves it alone.
 
 ## Lifecycle
 

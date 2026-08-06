@@ -366,6 +366,7 @@ def new(db, root, *, item: str, instance: str, subproject: str = "",
         return undo(GIT_FAILED, str(exc))
     note = ((f"branch {branch} already existed and was checked out",)
             if existing else ())
+    note += ensure_worktree_ignored(root, runner=runner)
     return WorktreeResult(verb="new", ok=True, item=item, instance=instance,
                           path=str(target), branch=branch, claim=held,
                           notes=note)
@@ -393,6 +394,86 @@ def _merged_into(root, branch: str, into: str, runner=None) -> bool:
     except GitUnavailable:
         return False
     return True
+
+
+#: The rule that keeps developer checkouts out of the repository's content.
+#:
+#: Anchored with a leading slash so it names the directory at the repository
+#: root and nothing else. A bare ``.worktrees/`` would also ignore a
+#: ``docs/.worktrees/`` that somebody meant to track, and an ignore rule that
+#: is wider than its reason is the kind that gets deleted wholesale later.
+WORKTREE_IGNORE_RULE = "/.worktrees/"
+
+
+def worktree_ignore_missing(text: str) -> bool:
+    """Whether ``text`` -- a ``.gitignore`` -- lacks a rule for `.worktrees/`.
+
+    Deliberately generous about what counts as present. ``.worktrees``,
+    ``/.worktrees``, ``.worktrees/`` and the negated forms of those all mean
+    somebody has already thought about this directory, and appending a second
+    rule beneath a hand-written one is how a generated file starts arguing
+    with its owner. The failure this prevents is the *absent* case, and only
+    that one.
+
+    The comparison is exact, so a commented-out ``# .worktrees/`` reads as
+    absent -- a comment is not configuration. It is worth saying that the
+    exactness is what does that, because the obvious defence, skipping lines
+    beginning with ``#``, cannot change any answer here and would read as a
+    guard while being incapable of firing.
+
+    Exactness also means a rule that ignores this directory *incidentally* --
+    ``*``, or a glob -- reads as absent, and a redundant rule gets appended.
+    That is the direction to be wrong in: the cost is a duplicated line, and
+    the cost of the other direction is a checkout committed as content.
+    """
+    for line in text.splitlines():
+        bare = line.strip().lstrip("!").strip().rstrip("/")
+        if bare in (".worktrees", "/.worktrees"):
+            return False
+    return True
+
+
+def ensure_worktree_ignored(root, runner=None) -> tuple:
+    """Add ``/.worktrees/`` to ``root``'s ``.gitignore`` if it is not there.
+
+    Returns notes, never raises. This runs on the success path of a command
+    whose actual job is creating a checkout, and failing that call because a
+    file could not be appended to would trade the thing the agent asked for
+    against a tidiness improvement.
+
+    The rule belongs in the *tracked* ``.gitignore`` rather than
+    ``.git/info/exclude``: a worktree is a checkout and not repository
+    content, so every clone needs the rule, and ``info/exclude`` is per-clone
+    by construction. That is why this writes a file the agent will have to
+    commit rather than one it will not.
+
+    Staging is deliberately not attempted. A generated line appearing in an
+    agent's index without its having asked is the shape that gets committed
+    unnoticed inside somebody else's change, and this is exactly the sort of
+    edit whose whole value is that a human saw it go by.
+    """
+    path = Path(root) / ".gitignore"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        text = ""
+    except OSError as exc:
+        return (f"{path} could not be read, so /.worktrees/ was not added to "
+                f"it: {exc}",)
+    if not worktree_ignore_missing(text):
+        return ()
+    addition = WORKTREE_IGNORE_RULE + "\n"
+    if text and not text.endswith("\n"):
+        addition = "\n" + addition
+    try:
+        with open(path, "a", encoding="utf-8", newline="") as fh:
+            fh.write(addition)
+    except OSError as exc:
+        return (f"{path} could not be written, so /.worktrees/ is still "
+                f"untracked-but-unignored: {exc}",)
+    return (f"added {WORKTREE_IGNORE_RULE} to {path}; it is not staged, "
+            f"because a generated line committed inside somebody else's "
+            f"change is how a repository acquires rules nobody chose",)
 
 
 def _ignored_content(tree, runner=None) -> tuple:

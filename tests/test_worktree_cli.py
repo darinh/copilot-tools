@@ -402,6 +402,140 @@ def test_new_issues_no_mutating_verb(db: Path, repo: Path) -> None:
     assert not forbidden.intersection(git.verbs), git.calls
 
 
+# ── the .gitignore rule (G4) ────────────────────────────────────
+@pytest.mark.parametrize("existing", [
+    ".worktrees\n",
+    "/.worktrees\n",
+    ".worktrees/\n",
+    "/.worktrees/\n",
+    "!.worktrees/\n",
+    "build/\n.worktrees/\n*.log\n",
+    "  .worktrees/  \n",
+])
+def test_a_rule_that_is_already_there_is_left_alone(existing: str) -> None:
+    """Every spelling git accepts for this directory counts as present. A
+    second generated rule underneath a hand-written one is a generated file
+    arguing with the person who wrote the file."""
+    assert owt.worktree_ignore_missing(existing) is False
+
+
+@pytest.mark.parametrize("existing", [
+    "",
+    "build/\n*.log\n",
+    "# .worktrees/\n",
+    "#.worktrees\n",
+    "  # /.worktrees/  \n",
+    ".worktrees-old/\n",
+    "worktrees/\n",
+])
+def test_a_rule_that_is_absent_or_commented_out_is_missing(
+        existing: str) -> None:
+    """A commented-out rule is not a rule, and neither is a near miss. The
+    comparison is exact, which is what makes both true; there is deliberately
+    no separate comment-stripping branch, because no input could tell one
+    apart from its absence."""
+    assert owt.worktree_ignore_missing(existing) is True
+
+
+def test_new_adds_the_rule_when_the_repository_has_no_gitignore(
+        db: Path, repo: Path) -> None:
+    result = _new(db, repo)
+    assert result.ok is True
+    text = (repo / ".gitignore").read_text(encoding="utf-8")
+    assert text == "/.worktrees/\n"
+    assert any(".gitignore" in note for note in result.notes), result.notes
+
+
+def test_new_writes_the_rule_to_the_repository_not_the_worktree(
+        db: Path, repo: Path) -> None:
+    """The rule belongs to the project, so it goes in the primary checkout.
+    Written into the worktree it would vanish with the worktree, which is the
+    one place the file is guaranteed not to survive."""
+    tree = Path(_new(db, repo).path)
+    assert (repo / ".gitignore").exists() is True
+    assert (tree / ".gitignore").exists() is False
+
+
+def test_new_appends_the_rule_without_disturbing_what_was_there(
+        db: Path, repo: Path) -> None:
+    (repo / ".gitignore").write_text("build/\n*.log\n", encoding="utf-8")
+    _new(db, repo)
+    assert (repo / ".gitignore").read_text(encoding="utf-8") == (
+        "build/\n*.log\n/.worktrees/\n")
+
+
+def test_new_does_not_glue_the_rule_onto_an_unterminated_last_line(
+        db: Path, repo: Path) -> None:
+    """`build/` with no trailing newline plus `/.worktrees/` is
+    `build//.worktrees/` -- one rule that ignores neither directory, in a
+    file nothing reads back."""
+    (repo / ".gitignore").write_text("build/", encoding="utf-8")
+    _new(db, repo)
+    assert (repo / ".gitignore").read_text(encoding="utf-8") == (
+        "build/\n/.worktrees/\n")
+
+
+def test_new_leaves_an_existing_rule_and_says_nothing(db: Path,
+                                                      repo: Path) -> None:
+    (repo / ".gitignore").write_text(".worktrees/\n", encoding="utf-8")
+    result = _new(db, repo)
+    assert (repo / ".gitignore").read_text(encoding="utf-8") == ".worktrees/\n"
+    assert not [note for note in result.notes if ".gitignore" in note]
+
+
+def test_new_does_not_stage_the_rule_it_added(db: Path, repo: Path) -> None:
+    """A generated line sitting in the index is one that gets committed
+    inside somebody else's change without either of them noticing."""
+    _new(db, repo)
+    staged = _git(repo, "diff", "--cached", "--name-only")
+    assert ".gitignore" not in staged
+    assert ".gitignore" in _git(repo, "status", "--porcelain")
+
+
+def test_new_still_succeeds_when_the_rule_cannot_be_written(
+        db: Path, repo: Path, monkeypatch) -> None:
+    """Creating the checkout is what was asked for. Failing that because a
+    tidiness improvement could not be applied trades the request against the
+    favour."""
+    def refuse(*args, **kw):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(owt, "open", refuse, raising=False)
+    result = _new(db, repo)
+    assert result.ok is True
+    assert install_manifest.dir_present(Path(result.path)) is True
+    assert any("could not be written" in note for note in result.notes), \
+        result.notes
+
+
+def test_an_unreadable_gitignore_is_reported_and_not_overwritten(
+        tmp_path: Path, monkeypatch) -> None:
+    """Appending to a file that could not be read would be writing on top of
+    content nobody has seen."""
+    root = tmp_path / "checkout"
+    root.mkdir()
+    path = root / ".gitignore"
+    path.write_text("build/\n", encoding="utf-8")
+    real = Path.read_text
+
+    def refuse(self, *args, **kw):
+        if self == path:
+            raise OSError("permission denied")
+        return real(self, *args, **kw)
+
+    monkeypatch.setattr(Path, "read_text", refuse)
+    notes = owt.ensure_worktree_ignored(root)
+    monkeypatch.undo()
+    assert notes and "could not be read" in notes[0]
+    assert path.read_text(encoding="utf-8") == "build/\n"
+
+
+def test_the_rule_is_anchored_to_the_repository_root() -> None:
+    """A bare `.worktrees/` would also ignore `docs/.worktrees/`. An ignore
+    rule wider than its reason is the kind somebody deletes wholesale."""
+    assert owt.WORKTREE_IGNORE_RULE.startswith("/")
+
+
 # ── finish ──────────────────────────────────────────────────────
 def _finished(db: Path, repo: Path, **kw):
     return owt.finish(db, repo, item="0007", instance="alpha", cwd=repo, **kw)
