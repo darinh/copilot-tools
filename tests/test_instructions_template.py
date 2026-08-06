@@ -308,7 +308,7 @@ def test_the_documented_banked_slot_is_the_one_the_tool_writes(template):
 # --------------------------------------------------------------------------
 
 def test_documented_operator_send_flags_are_accepted(template):
-    section = _section(template, "Operator — Parallel Agents")
+    section = _section(template, "Operator — Peer Agents")
     sends = [
         line.strip()
         for block in _blocks(section, info="bash")
@@ -336,6 +336,40 @@ def test_documented_operator_send_flags_are_accepted(template):
         assert {"--from", "--to"} <= documented, (
             "operator send requires --from and --to, but this documented "
             f"line passes only {sorted(documented)}:\n  {line}"
+        )
+
+
+def test_documented_operator_reply_flags_are_accepted(template):
+    """The same check for `reply`, which the peer section now leads with.
+
+    Worth its own test rather than a parametrisation of the one above: the two
+    commands have different required flags, and `reply` is the one the
+    document tells an agent to run *from a hint it was handed*, so a wrong
+    flag here is followed rather than read.
+    """
+    section = _section(template, "Operator — Peer Agents")
+    replies = [
+        line.strip()
+        for block in _blocks(section, info="bash")
+        for line in block.splitlines()
+        if line.strip().startswith("operator reply ")
+    ]
+    assert replies, "no 'operator reply' example found in the Operator section"
+    for line in replies:
+        documented = {
+            tok.split("=")[0]
+            for tok in shlex.split(line, posix=False)
+            if tok.startswith("--")
+        }
+        unknown = sorted(documented - set(copilot_operator.REPLY_FLAGS))
+        assert not unknown, (
+            "this documented line passes flags that copilot_operator."
+            f"REPLY_FLAGS does not list: {unknown}\n  {line}"
+        )
+        assert "--instance" in documented, (
+            "operator reply cannot tell who is replying without --instance "
+            "(or $OPERATOR_INSTANCE, which nothing in this system sets), so "
+            f"a documented example must name it:\n  {line}"
         )
 
 

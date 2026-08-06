@@ -191,10 +191,48 @@ Status is tracked in SQL during execution; this file is the reconciled record.
 
 ## Phase F — skills and rationale
 
-- [ ] F1 Install `worktrees`, `backlog`, `spec-driven`, `peer-agents`,
+- [x] F1 Install `worktrees`, `backlog`, `spec-driven`, `peer-agents`,
       `field-notes`; `peer-agents` replaces `operator-agents` (D7)
-- [ ] F2 Add `docs/rationale.md` — linked from `AGENTS.md`, not loaded by it
-- [ ] F3 Conformance test: every `operator …` command a skill names must exist
+      Five skills under `skills/<name>/SKILL.md`; `skills/operator-agents/`
+      deleted. The skills were rewritten against this repository's actual
+      command surface rather than copied: `operator worktree new/finish/
+      recover` with the refusals it really makes, and the backlog's real
+      four-status vocabulary (`proposed → open → closed | rejected`) with the
+      approval gate `proposed` exists to express — the source draft described
+      a three-status backlog with no gate, which is a different product. The
+      earned content in the retired skill (mail delivery table, refusal rules,
+      etiquette, the worked example) was carried into `peer-agents` and
+      corrected for E5: messages are delivered and answered with `operator
+      reply`, and `operator inbox` is now described as an audit trail rather
+      than the receiving path. The skill's bare `operator reply "<text>"` was
+      corrected to name `--instance`/`$OPERATOR_INSTANCE`, since no ambient
+      instance name exists. The feature *flag* keeps the slug
+      `operator-agents`: it is persisted in every enrolled project's
+      `features.json`, and renaming it would read as unset and silently
+      re-enable the feature for anyone who had turned it off. References
+      updated in `README.md` (3), `docs/skills.md`, `docs/versioning.md`,
+      `templates/copilot-instructions.md`, `AGENTS.md`, `tests/test_setup.py`.
+- [x] F2 Add `docs/rationale.md` — linked from `AGENTS.md`, not loaded by it
+      The war stories and the ETH Zurich measurement behind the word budget,
+      linked from `README.md`'s component table. Deliberately not loaded: the
+      finding it records is that narrative content in a context file does not
+      change behaviour while instructions do, so the stories live here and the
+      imperatives live in the managed block.
+- [x] F3 Conformance test: every `operator …` command a skill names must exist
+      `tests/test_skill_conformance.py`. Every `operator <word>` in any skill,
+      the template or `AGENTS.md` must be a real subcommand; every skill's
+      front-matter name must match its directory and carry a description; every
+      `skills/<name>` path in the docs must resolve. Stated as a path rule
+      rather than a ban on the retired name, because the ban needs a prose
+      exemption for text that describes the retirement, and a rule with a
+      prose exemption stops being checkable. Carries a positive control (the
+      scan finds `send`, `reply`, `inbox`, `worktree`, `backlog`), a negative
+      control (an invented `operator teleport` is caught), a prose control
+      (`operator assigns your worktree` is not a command, while
+      `operator restart-loop` still is), and a non-empty control — without
+      that last one, deleting `skills/` turns every rule into a loop over an
+      empty list and the suite reports clean at the moment they stopped
+      existing.
 
 ## Phase G+H — enforcement paired with generation (FR-6 … FR-9)
 

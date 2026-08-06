@@ -24,8 +24,13 @@ messaging, and spec-driven workflow conventions.
 | [`backlog_tool.py`](backlog/README.md) | Reads and enforces the tracked `backlog/`; ships the `backlog` command |
 | [`operator.sh`](operator.sh), [`handoff.sh`](handoff.sh), [`operator-ingest.py`](operator-ingest.py) | Original bash implementation, retained on disk for rollback but no longer installed fresh by `setup.sh` |
 | [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | Roslyn-backed C# structural analysis |
-| [`skills/operator-agents`](skills/operator-agents/SKILL.md) | Starting parallel operator agents and messaging them |
+| [`skills/peer-agents`](skills/peer-agents/SKILL.md) | Starting peer operator agents and messaging them |
+| [`skills/worktrees`](skills/worktrees/SKILL.md) | Worktree lifecycle, scratch discipline, safe delegation |
+| [`skills/backlog`](skills/backlog/SKILL.md) | The tracked backlog format, the approval gate, and evidence |
+| [`skills/spec-driven`](skills/spec-driven/SKILL.md) | The spec-kit workflow and when a change needs a spec update |
+| [`skills/field-notes`](skills/field-notes/SKILL.md) | The cross-project journal about working with AI agents |
 | [`skills/operator-backlog-*`](docs/skills.md) | Filing, refining and checking in on the tracked backlog |
+| [`docs/rationale.md`](docs/rationale.md) | Why the rules exist — the incidents behind them. Linked, never loaded |
 | [`operator_mail.py`](docs/operator.md#parallel-agents-and-messaging) | Message store behind `operator send` / `operator inbox` |
 | [`operator_trace.py`](operator_trace.py) | Records who invoked the operator and how each invocation ended, for attributing incidents |
 | [`install_manifest.py`](docs/versioning.md) | Records what setup deployed and its hash, so upgrades know what's safe to replace |
@@ -236,10 +241,14 @@ See [Operator Documentation](docs/operator.md) for full details.
 | Skill | Type | Source |
 |-------|------|--------|
 | **code-intelligence** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
-| **operator-agents** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
 | **operator-backlog-newitem** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
 | **operator-backlog-refinement** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
 | **operator-backlog-scrum** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **peer-agents** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **worktrees** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **backlog** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **spec-driven** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **field-notes** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
 | **Anvil** | Installable plugin | [`burkeholland/anvil`](https://github.com/burkeholland/anvil) |
 | **frontend-design** | Built-in CLI skill | Ships with Copilot CLI |
 | **find-skills** | Built-in CLI skill | Ships with Copilot CLI |
@@ -407,8 +416,16 @@ copilot-tools/
 ├── skills/
 │   ├── code-intelligence/
 │   │   └── SKILL.md               # Roslyn routing
-│   ├── operator-agents/
-│   │   └── SKILL.md               # Parallel operator agents and mail
+│   ├── peer-agents/
+│   │   └── SKILL.md               # Peer operator agents and messaging
+│   ├── worktrees/
+│   │   └── SKILL.md               # Worktree lifecycle and safe delegation
+│   ├── backlog/
+│   │   └── SKILL.md               # Backlog format, approval gate, evidence
+│   ├── spec-driven/
+│   │   └── SKILL.md               # The spec-kit workflow
+│   ├── field-notes/
+│   │   └── SKILL.md               # The cross-project agent journal
 │   └── operator-backlog-*/
 │       └── SKILL.md               # Filing, refinement and the check-in
 ├── templates/

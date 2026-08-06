@@ -594,50 +594,39 @@ When reviewing completed work:
 
 ---
 
-## Operator — Parallel Agents
+## Operator — Peer Agents
 
 *Enabled by feature flag: `operator-agents`*
 
 `operator` runs a **full, first-party Copilot CLI** in its own terminal
 session. Starting one gives you a **peer agent, not a sub-agent**: a separate
 process with its own context, its own session history and its own git work.
-A sub-agent (`task` tool) is a function call that returns to you. An operator
-agent is a colleague that keeps working after you stop watching.
+A sub-agent (`task` tool) is a function call that returns to you.
 
 **Delegate to one** when a piece of the work is large, has a **clear
 boundary**, and meets the rest of the system through a **defined contract** —
 not when you would have to supervise it turn by turn.
 
-**Give it its own folder, ideally its own repo.** Instance names, handoff files
-and git state are all keyed to the directory, and two loops in one working tree
-fight over the index and each other's uncommitted changes. Two agents *can*
-share a project, but understand what that is: **there is no enforcement.** The
-only thing keeping a parallel agent in its lane is the instruction you gave it
-asking nicely — a vibe-wish, not a sandbox. If the boundary matters, use
+**Give it its own folder, ideally its own repo.** Two agents *can* share a
+project, but **there is no enforcement**: the only thing keeping a peer in its
+lane is the instruction you gave it asking nicely. If the boundary matters, use
 separate repos.
 
 ```bash
-# Start a peer without your terminal being taken over by its TUI:
 operator --loop --headless --name payments-api --agent anvil
-
-# Talk to it. --from and --to are required so it knows who to answer:
 operator send --from <your-instance> --to payments-api "the contract is ..."
-operator inbox <your-instance>   # read your own messages
+operator reply --instance <your-instance> --to payments-api "your answer"
 ```
 
-Your instance name is in your session preamble ("Operator instance: ...").
-**Always pass it to `operator inbox`.** With no name the mailbox is named after
-the *directory*, which in a shared checkout is nobody in particular — and
-reading consumes, so a nameless read eats a peer's mail and leaves a mailbox
-that looks exactly like an empty one. `--peek` and `--history` are safe;
-`--json` is not, it consumes like a plain read.
-Messages reach a running agent immediately and a sleeping one at the start of
-its next session. **Check `operator inbox <your-instance>` when you start work
-and before you write a handoff**, and answer what you are asked — a peer
-blocked on your reply is burning sessions doing nothing.
+**Messages are delivered to you, not polled for.** A message sent while you are
+live is typed into your session; one sent while you are between sessions is
+printed to you at the start of your next one. Each arrives with its exact reply
+command already filled in — use that rather than reconstructing it. **Answer
+what you are asked before you write a handoff**: a peer blocked on your reply is
+burning sessions doing nothing.
 
 Full reference, including when *not* to spin one up and message etiquette:
-the **`operator-agents` skill**.
+the **`peer-agents` skill**.
 
 ## Parallel Agents
 

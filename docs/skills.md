@@ -9,16 +9,58 @@ These skills install for the **user**, not for one project: `setup.ps1` /
 every project on the machine. Project-level skills (`.github/skills/`) are
 shared with everyone who clones that repo; user-level skills follow you.
 
-### operator-agents
+### peer-agents
 
-**Location**: `skills/operator-agents/SKILL.md`
+**Location**: `skills/peer-agents/SKILL.md`
 **Install**: automatic — `setup.ps1` / `setup.sh` install it to `~/.copilot/skills/`
 
-How to use `operator` to run **parallel peer agents** rather than sub-agents:
-when delegating a bounded piece of work is worth it, how to start a loop
-headlessly so your own terminal is not taken over, why each agent wants its own
-directory, and how agents message each other with `operator send` /
-`operator inbox`.
+How to use `operator` to run **peer agents** rather than sub-agents: when
+delegating a bounded piece of work is worth it, how to start a loop headlessly
+so your own terminal is not taken over, why each agent wants its own directory,
+and how agents message each other. Messages are delivered — live, or printed at
+the start of the recipient's next session — and answered with `operator reply`;
+there is no mailbox to poll. Replaces the former `operator-agents` skill, which
+described the polling model.
+
+### worktrees
+
+**Location**: `skills/worktrees/SKILL.md`
+**Install**: automatic — `setup.ps1` / `setup.sh` install it to `~/.copilot/skills/`
+
+Creating, finishing, recovering and safely delegating git worktrees: resolving
+the *primary* root from inside one, the `operator worktree new/finish/recover`
+lifecycle, why scratch files never go in a checkout, and what to do when a
+subagent has run a mutating git command in your tree.
+
+### backlog
+
+**Location**: `skills/backlog/SKILL.md`
+**Install**: automatic — `setup.ps1` / `setup.sh` install it to `~/.copilot/skills/`
+
+The tracked `backlog/` directory: one file per item, the
+`proposed → open → closed | rejected` vocabulary and the approval gate it
+exists to express, what counts as evidence, and when work belongs in a spec
+instead. The `operator-backlog-*` skills below are the slash-command
+procedures; this is the format and the reasoning behind it.
+
+### spec-driven
+
+**Location**: `skills/spec-driven/SKILL.md`
+**Install**: automatic — `setup.ps1` / `setup.sh` install it to `~/.copilot/skills/`
+
+The spec-kit workflow, what to read before writing code, and the rule that a
+code change without a spec update is unfinished. Includes what to do when a
+task's requirement is not in `spec.md` — go to the source the plan came from,
+rather than inventing an interpretation.
+
+### field-notes
+
+**Location**: `skills/field-notes/SKILL.md`
+**Install**: automatic — `setup.ps1` / `setup.sh` install it to `~/.copilot/skills/`
+
+The cross-project journal about working with AI agents: when an insight is
+transferable enough to write down, when it belongs in session history instead,
+and the format.
 
 ### code-intelligence
 

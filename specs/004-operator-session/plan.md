@@ -301,6 +301,38 @@ multiplexer with no live sessions, so the mail queues whether the flag is
 honoured or dropped entirely. It now asserts against a live recipient, with a
 flag-removed control beside it that must produce the opposite outcome.
 
+## Phase F — skills and rationale
+
+The five skills were rewritten against this repository rather than copied from
+the package. Two of them would have been wrong as delivered: the worktree skill
+named `operator worktree` commands without the refusals they actually make, and
+the backlog skill described a three-status vocabulary with no approval gate,
+where this repo has four statuses and the gate is the whole point of
+`proposed`. A skill is loaded at the moment an agent has decided to act, so it
+is the *worst* place for an aspirational description — the measurement in
+`docs/rationale.md` is that a tool named in context gets used, which makes
+naming a command that does not exist more expensive than saying nothing.
+
+`peer-agents` replaces `operator-agents` (D7), but it is not the package's
+64-line draft either. The retired skill carried a mail delivery table, the
+refusal rules for unknown recipients and unknown flags, the etiquette list and
+a worked example — all earned, all still true. Those moved across and were
+corrected for E5: mail is delivered rather than polled for, `operator inbox` is
+described as the audit trail it now is, and the draft's bare
+`operator reply "<text>"` became `--instance NAME`, because no ambient instance
+name exists anywhere in this system and the skill would otherwise name a form
+that only works in an environment nobody sets up.
+
+The feature *flag* keeps the slug `operator-agents`. It is persisted in every
+enrolled project's `features.json`, and a rename would read as unset — silently
+re-enabling the feature for anyone who had deliberately turned it off. D7 is
+about the skill; renaming persisted state is D2's deferred class.
+
+F3 is the check that keeps the rest honest, and it is stated as a path rule
+rather than a ban on the retired name. The ban was written first and needed an
+exemption for prose describing the retirement, at which point it is not a rule
+any more. `skills/<name>` either resolves or it does not.
+
 ## Phase G+H — the audit
 
 Before the template changes, produce a table classifying every candidate line as
