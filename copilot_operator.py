@@ -5758,10 +5758,21 @@ def show_project_config(project: dict) -> int:
             shown = project_features.describe_value(feature.slug,
                                                     values[feature.slug])
             print(f"  {i:>2}) {feature.name:<{width}}  {shown}")
-        print(f"  {len(features) + 1:>2}) Back")
+        # Offered only while nothing has been written, because that is exactly
+        # the state ``project_instructions._values_for`` refuses. The flags
+        # ship off, so answering that refusal by hand costs one toggle per
+        # feature per project; on a machine with eight registered projects
+        # that is dozens of keystrokes to record the answer somebody already
+        # has. A refusal is only defensible when saying "yes, these" is cheap.
+        record = len(features) + 1 if document is None else None
+        if record is not None:
+            print(f"  {record:>2}) Record these as chosen "
+                  f"(changes nothing; stops regeneration refusing)")
+        back = (record or len(features)) + 1
+        print(f"  {back:>2}) Back")
         print()
         choice = _prompt_line(
-            f"Choose a feature [1-{len(features) + 1}] (blank to go back): ")
+            f"Choose a feature [1-{back}] (blank to go back): ")
         if not choice:
             return 0
         try:
@@ -5769,8 +5780,18 @@ def show_project_config(project: dict) -> int:
         except ValueError:
             print("Not a number.", file=sys.stderr)
             continue
-        if index == len(features) + 1:
+        if index == back:
             return 0
+        if record is not None and index == record:
+            try:
+                project_features.write_config(
+                    path, {f.slug: values[f.slug] for f in features},
+                    document=document)
+            except project_features.FeatureConfigError as exc:
+                print(f"Not saved: {exc}", file=sys.stderr)
+                continue
+            print(f"  Recorded in {path}")
+            continue
         if not 1 <= index <= len(features):
             print("Out of range.", file=sys.stderr)
             continue
@@ -5985,22 +6006,35 @@ def _commit_would_be_unsafe(root: Path) -> "str | None":
 
 
 def _managed_names(root) -> "list[str]":
-    """The generated files present in *root*, as pathspecs for git.
+    """The generated files in *root* that this tool actually manages.
 
     Built from what is on disk rather than from a fixed pair. ``git add`` and
     ``git commit`` both treat a pathspec that matches nothing as fatal, so a
     project that declined its ``AGENTS.md`` -- and therefore never got a
     ``CLAUDE.md`` either -- would have its staging reported as a git failure
     for naming a file that was correctly never written.
+
+    Existence alone is not the test, and the difference is the whole point.
+    ``project_instructions._place_claude`` deliberately leaves a ``CLAUDE.md``
+    that carries no managed block alone: it is the user's own file, and
+    Claude Code users commonly keep one. Naming it here on the strength of
+    its existence would hand that file to ``git add`` and then to a commit
+    whose message says ``AGENTS.md`` and whose consent prompt never mentioned
+    it -- and if it was already tracked, its uncommitted working-tree edits
+    would go in too. That is precisely the failure ``commit_agents_files``
+    passes a pathspec to avoid; reading it off disk reintroduced it one
+    argument further down. A file is named here only when it carries a
+    managed block, which is the same rule that decides whether we may write
+    to it at all.
     """
     names = []
     for name in (project_instructions.AGENTS_NAME,
                  project_instructions.CLAUDE_NAME):
         try:
-            present = (Path(root) / name).exists()
-        except OSError:
-            present = False
-        if present:
+            text = (Path(root) / name).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if project_instructions.managed_block_present(text):
             names.append(name)
     return names
 

@@ -719,14 +719,50 @@ file carrying no conventions would spend the operator's attention on the
 least important thing in the run.
 
 Both files are staged and committed together, from a pathspec built out of
-what is on disk. `git add` and `git commit` both treat a pathspec that matches
-nothing as fatal, so a project that declined its `AGENTS.md` — and therefore
-never got a `CLAUDE.md` — would otherwise have its staging reported as a git
-failure for correctly not writing a file.
+what is on disk **and carrying a managed block**. `git add` and `git commit`
+both treat a pathspec that matches nothing as fatal, so a project that
+declined its `AGENTS.md` — and therefore never got a `CLAUDE.md` — would
+otherwise have its staging reported as a git failure for correctly not
+writing a file.
+
+Existence alone was the first rule and it was wrong. Two of the three
+adversarial reviewers independently reproduced the consequence: a repository
+where the user keeps their own `CLAUDE.md` — the common case for Claude Code
+users, and the one `_place_claude` deliberately leaves alone — had that file
+handed to `git add` and then to a commit whose message names only `AGENTS.md`
+and whose consent prompt never mentioned it. If it was already tracked, its
+uncommitted working-tree edits went in with it. That is the exact failure
+`commit_agents_files` passes a pathspec to avoid, reintroduced one argument
+further down. The rule is now the same one that decides whether the file may
+be written to at all: a name is handed to git only when the file carries a
+managed block.
 
 Mutation: 3 killed / 0 survived / 0 never ran on the defaults change; 11 / 0 /
 0 on the platform and `CLAUDE.md` work, after the one survivor named above was
-turned into a test.
+turned into a test; 3 / 0 / 0 on the staging rule after the review.
+
+### Answering the FR-8 refusal without answering for anybody
+
+`_values_for` refuses a project that never chose, and that refusal is only
+defensible if saying "yes, these" is cheap. It was not: the flags ship off, so
+recording the status quo by hand cost one toggle per feature per project —
+dozens of keystrokes on a machine with eight registered projects, to write
+down an answer somebody already had.
+
+`operator projects` now offers **Record these as chosen** on the feature
+screen, and only there — the entry appears when nothing has been written,
+which is exactly the state that gets refused, and disappears once a choice
+exists so the numbering a reader was taught stays put. It writes the values
+already on the screen, so it changes no behaviour at all; what it changes is
+that the answer is now somebody's rather than nobody's. Measured end to end:
+`_values_for` raises before, resolves after, and the resolved values are
+identical to the defaults it refused to assume.
+
+Mutation: 5 mutants, 4 killed, 1 provably equivalent — writing a single slug
+is indistinguishable from writing all of them because `write_config`
+completes the document from the resolved values either way. Left as prose
+rather than pinned with a test that would only assert `write_config`'s
+behaviour twice.
 
 ## Risks
 

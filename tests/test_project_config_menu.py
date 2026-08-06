@@ -319,10 +319,51 @@ def test_declining_a_choice_changes_nothing(home, monkeypatch):
 
 
 def test_the_back_entry_leaves_without_writing(home, monkeypatch):
-    answers(monkeypatch, str(len(FEATURES) + 1))
+    """Back is the last entry, and the "record these" entry shifts it.
+
+    Computed from the same rule the screen uses rather than pinned to a
+    number, because a pinned number would have gone on passing while the
+    reader pressed it and got "Record these as chosen" instead.
+    """
+    answers(monkeypatch, str(len(FEATURES) + 2))
     assert copilot_operator.show_project_config(_project()) == 0
     assert project_features.read_config(
         project_features.config_path(GUID)) is None
+
+
+def test_recording_the_shown_values_turns_defaults_into_a_choice(home,
+                                                                 monkeypatch):
+    """The way out of the FR-8 refusal that costs one keystroke.
+
+    Flags ship off, so ``_values_for`` refuses a project that never chose --
+    and answering that by toggling every feature in every project is dozens
+    of keystrokes to record an answer somebody already has.
+    """
+    answers(monkeypatch, str(len(FEATURES) + 1), "")
+    assert copilot_operator.show_project_config(_project()) == 0
+    document = project_features.read_config(project_features.config_path(GUID))
+    assert document is not None
+    assert set(document["features"]) == {f.slug for f in FEATURES}
+    values = project_features.resolved_values(document)
+    assert values == project_features.resolved_values(None), (
+        "recording must change no value; it only stops the answer being "
+        "'nobody chose'")
+
+
+def test_the_record_entry_is_gone_once_a_choice_exists(home, monkeypatch,
+                                                        capsys):
+    """Offered only in the state that needs it.
+
+    A project that has chosen already gets no such entry, so the numbering
+    the reader sees matches the numbering the previous screen taught them.
+    """
+    project_features.write_config(project_features.config_path(GUID),
+                                  {"spec-driven": ON})
+    answers(monkeypatch, "")
+    copilot_operator.show_project_config(_project())
+    out = capsys.readouterr().out
+    assert "Record these as chosen" not in out
+    assert f"{len(FEATURES) + 1:>2}) Back" in out
 
 
 def test_an_unreadable_configuration_refuses_rather_than_showing_defaults(

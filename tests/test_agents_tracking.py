@@ -48,9 +48,29 @@ def repo(tmp_path: Path) -> Path:
     return root
 
 
+def _managed(body: str) -> str:
+    """A file shaped like one this tool wrote: a managed block in it.
+
+    The fixtures carry a real block rather than bare prose because that is
+    what every file reaching the tracking step actually looks like -- and
+    because ``_managed_names`` decides what to hand git from exactly this
+    property. A fixture without markers would be a repository state the
+    writer cannot produce, and testing against it proved the staging path
+    for files that never exist.
+    """
+    return f"{pi.MANAGED_BEGIN}\n{body}{pi.MANAGED_END}\n"
+
+
 def _write_agents(root: Path, text: str = "# conventions\n") -> Path:
     target = root / pi.AGENTS_NAME
-    target.write_text(text, encoding="utf-8")
+    target.write_text(_managed(text), encoding="utf-8")
+    return target
+
+
+def _write_claude(root: Path, *, managed: bool,
+                  text: str = "@AGENTS.md\n") -> Path:
+    target = root / pi.CLAUDE_NAME
+    target.write_text(_managed(text) if managed else text, encoding="utf-8")
     return target
 
 
@@ -191,6 +211,67 @@ def test_a_commit_does_not_sweep_up_unrelated_staged_work(repo):
     committed = _git(repo, "show", "--name-only", "--format=", "HEAD").split()
     assert committed == [pi.AGENTS_NAME]
     assert "someones_work.txt" in _git(repo, "diff", "--cached", "--name-only")
+
+
+def test_the_users_own_claude_file_is_never_staged_or_committed(repo):
+    """The user's own CLAUDE.md is never staged and never committed.
+
+    ``_place_claude`` leaves a ``CLAUDE.md`` with no managed block alone --
+    it is the user's file, and Claude Code users commonly keep one. Deciding
+    what to hand git from what is on disk reintroduced, one argument further
+    down, the exact failure ``commit_agents_files`` passes a pathspec to
+    avoid: the file went into a commit whose message names only AGENTS.md
+    and whose consent prompt never mentioned it, carrying whatever
+    uncommitted edits happened to be in the working tree.
+    """
+    _write_claude(repo, managed=False, text="# my notes\nsecret-todo\n")
+    _git(repo, "add", pi.CLAUDE_NAME)
+    _git(repo, "commit", "-m", "my own notes")
+    (repo / pi.CLAUDE_NAME).write_text(
+        "# my notes\nsecret-todo\nWIP I have not committed\n",
+        encoding="utf-8")
+    _write_agents(repo)
+
+    tracking = op.stage_agents_files([_outcome(repo)])
+    op.commit_agents_files(tracking, "a template")
+
+    committed = _git(repo, "show", "--name-only", "--format=", "HEAD").split()
+    assert committed == [pi.AGENTS_NAME], (
+        "a CLAUDE.md we do not manage belongs to the user; staging it hands "
+        "their uncommitted work to a commit they never saw")
+    assert "WIP I have not committed" in _git(
+        repo, "diff", "--", pi.CLAUDE_NAME), (
+        "their edit must still be an uncommitted working-tree change")
+
+
+def test_a_managed_claude_file_is_staged_and_committed_with_agents(repo):
+    """The other half: one we did write travels with AGENTS.md.
+
+    Paired with the test above so neither rule can be satisfied by a
+    ``_managed_names`` that simply always answers the same way.
+    """
+    _write_agents(repo)
+    _write_claude(repo, managed=True)
+
+    tracking = op.stage_agents_files([_outcome(repo)])
+    op.commit_agents_files(tracking, "a template")
+
+    committed = _git(repo, "show", "--name-only", "--format=", "HEAD").split()
+    assert committed == [pi.AGENTS_NAME, pi.CLAUDE_NAME]
+
+
+def test_an_unmanaged_claude_file_alone_stages_nothing(repo):
+    """No managed file at all is a no-op, not a bare `git add`.
+
+    ``_managed_names`` returning nothing must reach the empty-list guard
+    rather than a git invocation with no pathspec, which would stage the
+    whole worktree.
+    """
+    _write_claude(repo, managed=False, text="# mine\n")
+    (repo / "unrelated.txt").write_text("not ours\n", encoding="utf-8")
+
+    assert op.stage_agents_files([_outcome(repo)]) == []
+    assert _git(repo, "diff", "--cached", "--name-only").split() == []
 
 
 def test_a_detached_head_is_staged_but_never_committed(repo):
