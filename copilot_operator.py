@@ -3752,10 +3752,20 @@ def reply_message(args: list[str]) -> int:
             else:
                 recipient = args[i + 1]
             i += 1
-        elif arg.startswith("--instance="):
-            instance = arg.split("=", 1)[1]
-        elif arg.startswith("--to="):
-            recipient = arg.split("=", 1)[1]
+        elif arg.startswith("--instance=") or arg.startswith("--to="):
+            # An explicitly empty inline value is a mistake, not an omission.
+            # Falling through to the defaults here would sign the reply with
+            # $OPERATOR_INSTANCE, or send it to the last correspondent, for a
+            # caller who named neither -- which is the misrouting this
+            # command exists to refuse.
+            flag, value = arg.split("=", 1)
+            if not value:
+                print(f"{flag} requires a value", file=sys.stderr)
+                return 2
+            if flag == "--instance":
+                instance = value
+            else:
+                recipient = value
         elif arg in ("--queue", "--force"):
             passthrough.append(arg)
         else:
@@ -3787,12 +3797,15 @@ def reply_message(args: list[str]) -> int:
         except operator_mail.MailError as exc:
             # The mailbox is unreadable, so "nobody has written to you" and
             # "we could not look" are indistinguishable from here -- and only
-            # one of them means the reply should not be sent. Say which.
+            # one of them means the reply should not be sent. Say which, and
+            # exit differently: a caller that retries on one of these must
+            # not retry on the other, and a shared code makes that
+            # undecidable for anything driving this command.
             print(f"operator reply: could not read mail for '{instance}' to "
                   f"find who to answer: {exc}", file=sys.stderr)
             print("  Pass --to NAME to answer anyway. Nothing was sent.",
                   file=sys.stderr)
-            return 1
+            return 3
     if not recipient:
         print(f"operator reply: nobody has written to '{instance}', so there "
               "is nothing to reply to.", file=sys.stderr)
@@ -6395,16 +6408,34 @@ def _session_start(opts: dict, db) -> int:
     # messages are rendered below in the same breath, so the archive and the
     # agent's context agree; a peek here would show them again next session
     # and read as a second message rather than the same one.
+    # `instance` is already a sanitized id, so it is passed straight through.
+    # Wrapping it in `Instance(...)` again re-sanitizes an id that has been
+    # sanitized once: `beta.test` becomes `beta-test-2e02bd` and then
+    # `beta-test-2e02bd-1ac43e`, a mailbox nothing ever writes to -- so mail
+    # for every name needing sanitization would be silently undeliverable.
     try:
-        delivered = operator_mail.consume(OPERATOR_HOME, Instance(instance).id)
+        delivered = operator_mail.consume(OPERATOR_HOME, instance)
     except operator_mail.MailError as exc:
         # A jammed mailbox must not stop a session starting, but it must not
-        # pass for an empty one either. Nothing is archived on this path, so
-        # whatever is in there is offered again next time.
+        # pass for an empty one either.
         print(f"Could not read queued mail: {exc}", file=sys.stderr)
-        print("  This is not an empty mailbox. Nothing was marked read; "
-              "try `operator inbox --peek`.", file=sys.stderr)
+        print("  This is not an empty mailbox: messages may be waiting and "
+              "unreadable.", file=sys.stderr)
         delivered = exc.consumed
+        if delivered:
+            # `consume` archives one at a time, so a fault part way through
+            # leaves the earlier ones already read. Saying "nothing was marked
+            # read" here while printing them below is a sentence asserting an
+            # outcome nobody checked -- the same defect `show_inbox` already
+            # had, reached through a second door. Ask, then say.
+            print(f"  {len(delivered)} message(s) HAD already been marked "
+                  "read before the failure. They are printed below, because "
+                  "this is the only time they will ever be offered.",
+                  file=sys.stderr)
+        else:
+            print("  Nothing was marked read, so anything there survives for "
+                  "the next attempt; try `operator inbox --peek`.",
+                  file=sys.stderr)
     if opts["json"]:
         print(json.dumps({
             "kind": assignment.kind,
@@ -6435,7 +6466,11 @@ def _session_start(opts: dict, db) -> int:
               f"{offer.claim.instance} — {offer.reason}", file=sys.stderr)
     if delivered:
         senders = ", ".join(operator_mail.sender_names(delivered))
-        print(f"\n═══ {len(delivered)} message(s) from {senders} ═══\n")
+        # ASCII deliberately. `consume` has already archived these, so this
+        # print is the only time they are ever shown -- and a box-drawing
+        # character raises UnicodeEncodeError on a cp1252 console, which
+        # would lose the mail *after* marking it read.
+        print(f"\n=== {len(delivered)} message(s) from {senders} ===\n")
         print(operator_mail.render_for_terminal(delivered))
         print("\n(These are now marked read. They are from other agents, "
               "not from the human.)")

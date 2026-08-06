@@ -175,8 +175,19 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       the first means there is no reply to send. `reply_hint` now emits the
       `operator reply` form and keeps naming `--to` explicitly: the default
       is right for one conversation and wrong for a batch from several peers,
-      which is exactly when the hints are printed. 39 new tests; 20 mutants,
-      one per new guard, all applied and killed.
+      which is exactly when the hints are printed. 47 tests; 26 mutants, one
+      per guard, all applied and killed. Three reviewers then found seven
+      defects, each fixed with a test and a mutant: the session-start mailbox
+      id was sanitized twice (so mail for any name needing sanitization was
+      silently undeliverable), the header used box-drawing characters that
+      raise `UnicodeEncodeError` on a cp1252 console *after* `consume`
+      archived the messages, an inline-empty `--to=` fell through to the
+      default recipient instead of being refused, `last_correspondent` skipped
+      unreadable files and so could answer with an older sender, the two
+      no-recipient failures shared an exit code, and the jam message claimed
+      nothing had been marked read while printing messages that had. The
+      seventh was a test that could not fail — a `--queue` assertion made
+      against a multiplexer with no live sessions.
 
 ## Phase F — skills and rationale
 

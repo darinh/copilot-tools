@@ -649,10 +649,30 @@ def last_correspondent(root: Path, instance_id: str) -> str | None:
     ``<sender>`` because a human reads it before running it; a resolved
     recipient goes straight to delivery, and a plausible-looking guess would
     send somebody's reply to an instance that never wrote to them.
+
+    Raises :class:`MailError` if any message file cannot be read, rather than
+    skipping it. An unreadable file may be the newest one, and skipping it
+    silently returns an older sender -- a wrong recipient manufactured by a
+    transient read failure.
     """
     msgs: list[dict] = []
     for directory in (archive_dir(root, instance_id), inbox_dir(root, instance_id)):
-        msgs.extend(msg for _, msg in _load_dir(directory))
+        for path in _message_files(directory):
+            data = _read_message(path)
+            if data is UNREADABLE:
+                # `_load_dir` skips these, which is right for listing -- a
+                # file that could not be read this time is simply still
+                # there next time, and nothing is destroyed. It is wrong
+                # here. The unreadable file may be the *newest* message, and
+                # skipping it silently answers with an older sender: the
+                # reply then goes to whoever wrote before, which is a wrong
+                # recipient produced by a transient read failure. Refusing
+                # costs the caller a `--to`; guessing costs them the reply.
+                raise MailError(
+                    f"could not read {path.name}, so the most recent sender "
+                    "cannot be established")
+            if isinstance(data, dict):
+                msgs.append(data)
     msgs.sort(key=lambda m: _field(m, "sent_at", ""))
     for msg in reversed(msgs):
         name = _field(msg, "from", "")

@@ -240,23 +240,115 @@ def test_reply_refuses_when_nobody_has_written(peers, capsys) -> None:
 def test_an_unreadable_mailbox_is_not_an_empty_one(peers, monkeypatch,
                                                    capsys) -> None:
     """The distinction that must survive: "nobody wrote" versus "we could not
-    look". Only the first means there is no reply to send, and answering the
-    second with the first's message would tell an agent its peer never wrote."""
+    look". Only the first means there is no reply to send.
+
+    The exit codes differ as well as the text. A caller that retries on one
+    of these must not retry on the other, and a shared code makes that
+    undecidable for anything driving the command.
+    """
     def boom(*_a, **_k):
         raise operator_mail.MailError("inbox is jammed")
 
     monkeypatch.setattr(operator_mail, "last_correspondent", boom)
-    assert op.reply_message(["--instance", "beta", "an answer"]) == 1
+    assert op.reply_message(["--instance", "beta", "an answer"]) == 3
     err = capsys.readouterr().err
     assert "jammed" in err
     assert "--to" in err
     assert "nothing to reply to" not in err
 
 
+def test_the_two_no_recipient_failures_do_not_share_an_exit_code(
+        peers, monkeypatch) -> None:
+    """Pinned against each other rather than against constants, so this
+    cannot pass by both codes drifting to the same new value."""
+    def boom(*_a, **_k):
+        raise operator_mail.MailError("inbox is jammed")
+
+    empty = op.reply_message(["--instance", "beta", "an answer"])
+    monkeypatch.setattr(operator_mail, "last_correspondent", boom)
+    unreadable = op.reply_message(["--instance", "beta", "an answer"])
+    assert empty != unreadable
+    assert empty and unreadable
+
+
+def test_an_unreadable_message_never_resolves_an_older_sender(
+        peers, monkeypatch) -> None:
+    """A transient read failure must not manufacture a wrong recipient.
+
+    `_load_dir` skips unreadable files, which is right for listing and wrong
+    here: the unreadable file may be the newest message, and skipping it
+    answers with whoever wrote *before* it. The fault is injected at
+    `read_text` because that is the only shape that reaches UNREADABLE -- a
+    directory or a dangling symlink is classified as "not a message" on
+    purpose, so neither can stand in for a locked file.
+    """
+    root = op.OPERATOR_HOME
+    beta = op.Instance("beta").id
+    older = operator_mail.new_message("alpha", "beta", beta, "older")
+    older["sent_at"] = "2026-01-01T00:00:00Z"
+    operator_mail.queue(root, older)
+    latest = operator_mail.new_message("gamma", "beta", beta, "newest")
+    latest["sent_at"] = "2026-06-01T00:00:00Z"
+    newest = operator_mail.queue(root, latest)
+
+    assert operator_mail.last_correspondent(root, beta) == "gamma"
+
+    real = Path.read_text
+
+    def locked(self, *a, **k):
+        if self == newest:
+            raise PermissionError("file is locked by another process")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", locked)
+    with pytest.raises(operator_mail.MailError):
+        operator_mail.last_correspondent(root, beta)
+
+
+def test_a_reply_is_refused_while_a_message_is_unreadable(
+        peers, monkeypatch, capsys) -> None:
+    """End to end: the refusal reaches the caller rather than a stale name."""
+    root = op.OPERATOR_HOME
+    beta = op.Instance("beta").id
+    older = operator_mail.new_message("alpha", "beta", beta, "older")
+    older["sent_at"] = "2026-01-01T00:00:00Z"
+    operator_mail.queue(root, older)
+    latest = operator_mail.new_message("gamma", "beta", beta, "newest")
+    latest["sent_at"] = "2026-06-01T00:00:00Z"
+    newest = operator_mail.queue(root, latest)
+
+    real = Path.read_text
+
+    def locked(self, *a, **k):
+        if self == newest:
+            raise PermissionError("file is locked by another process")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", locked)
+    assert op.reply_message(["--instance", "beta", "an answer"]) == 3
+    assert not _queued("alpha")
+    assert not _queued("gamma")
+
+
 # ── reply: argument handling ────────────────────────────────────
 def test_reply_requires_text(peers, capsys) -> None:
     assert op.reply_message(["--instance", "beta"]) == 2
     assert "no message text" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("arg", ["--instance=", "--to="])
+def test_an_explicitly_empty_inline_value_is_refused(peers, arg, capsys) -> None:
+    """An empty `--to=` is a mistake, not an omission.
+
+    Falling through to the defaults would send the reply to the last
+    correspondent for a caller who explicitly named a recipient -- the
+    misrouting this command exists to refuse. `send_message` refuses the
+    same shape, and the two must not disagree.
+    """
+    _wrote("alpha", "beta")
+    assert op.reply_message(["--instance", "beta", arg, "an answer"]) == 2
+    assert "requires a value" in capsys.readouterr().err
+    assert not _queued("alpha")
 
 
 def test_an_unknown_option_is_refused_not_sent_as_text(peers, capsys) -> None:
@@ -311,10 +403,40 @@ def test_help_prints_usage_and_succeeds(peers, capsys) -> None:
     assert "operator reply" in capsys.readouterr().out
 
 
-def test_queue_is_passed_through(peers) -> None:
+def test_queue_is_passed_through(peers, monkeypatch) -> None:
+    """Asserted against a LIVE recipient, which is the only setup that can
+    fail. The module's other tests use a mux with no sessions, so everything
+    queues whether `--queue` is honoured or not -- an assertion that mail was
+    queued would hold for an implementation that dropped the flag entirely.
+    """
     _wrote("alpha", "beta")
+    alpha = op.Instance("alpha")
+    live = QuietMux()
+    live.has_session = lambda name: name == alpha.session
+    live.pane_dead = lambda _name: False
+    monkeypatch.setattr(op, "MUX", live)
+    monkeypatch.setattr(op, "is_copilot_running", lambda _i: True)
+
     assert op.reply_message(["--instance", "beta", "--queue", "an answer"]) == 0
+    assert live.sent == []
     assert _queued("alpha")
+
+
+def test_without_queue_a_live_recipient_is_typed_into(peers, monkeypatch) -> None:
+    """The control for the test above: same setup, flag removed, opposite
+    outcome. Without this, `--queue` could be passed through by a code path
+    that never had a live delivery to suppress."""
+    _wrote("alpha", "beta")
+    alpha = op.Instance("alpha")
+    live = QuietMux()
+    live.has_session = lambda name: name == alpha.session
+    live.pane_dead = lambda _name: False
+    monkeypatch.setattr(op, "MUX", live)
+    monkeypatch.setattr(op, "is_copilot_running", lambda _i: True)
+
+    assert op.reply_message(["--instance", "beta", "an answer"]) == 0
+    assert [s for s, _ in live.sent] == [alpha.session]
+    assert not _queued("alpha")
 
 
 def test_reply_to_an_unknown_name_is_refused_without_force(peers, capsys) -> None:
@@ -431,13 +553,18 @@ def test_a_jammed_mailbox_does_not_stop_the_session_starting(
     err = capsys.readouterr().err
     assert "jammed" in err
     assert "not an empty mailbox" in err
+    assert "Nothing was marked read" in err
 
 
-def test_mail_consumed_before_a_jam_is_still_shown(peers, session_db,
-                                                   monkeypatch, capsys) -> None:
-    """`consume` archives one message at a time, so a fault part way through
-    leaves the earlier ones already marked read. This is the only time they
-    will ever be offered."""
+def test_a_jam_after_a_partial_read_does_not_claim_nothing_was_read(
+        peers, session_db, monkeypatch, capsys) -> None:
+    """The contradiction this must not print.
+
+    `consume` archives one message at a time, so a mid-batch fault leaves the
+    earlier ones already read. Printing "Nothing was marked read" while also
+    printing those messages is a sentence asserting an outcome nobody
+    checked -- and it is wrong in the direction that invites a resend.
+    """
     beta = op.Instance("beta").id
     already = operator_mail.new_message("alpha", "beta", beta, "seen once")
 
@@ -446,7 +573,49 @@ def test_mail_consumed_before_a_jam_is_still_shown(peers, session_db,
 
     monkeypatch.setattr(operator_mail, "consume", boom)
     assert op._session_start(_start(), session_db) == 0
-    assert "seen once" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "seen once" in captured.out
+    assert "Nothing was marked read" not in captured.err
+    assert "HAD already been marked read" in captured.err
+
+
+def test_mail_reaches_a_name_that_needed_sanitizing(peers, session_db,
+                                                     capsys) -> None:
+    """The mailbox id must be applied once, not twice.
+
+    `_session_start` already holds a sanitized id. Re-wrapping it in
+    `Instance(...)` sanitizes it again -- `beta.test` becomes
+    `beta-test-2e02bd` and then `beta-test-2e02bd-1ac43e` -- so the command
+    would look in a mailbox nothing ever writes to and report no mail, for
+    every name containing a character that needs sanitizing.
+    """
+    dotted = op.Instance("beta.test")
+    dotted.claim("tok")
+    assert op.send_message(
+        ["--from", "alpha", "--to", "beta.test", "for the dotted name"]) == 0
+    assert operator_mail.pending_count(op.OPERATOR_HOME, dotted.id) == 1
+
+    capsys.readouterr()
+    assert op._session_start(_start("beta.test"), session_db) == 0
+    assert "for the dotted name" in capsys.readouterr().out
+    assert operator_mail.pending_count(op.OPERATOR_HOME, dotted.id) == 0
+
+
+def test_delivery_survives_a_console_that_cannot_encode_box_drawing(
+        peers, session_db, monkeypatch, capsys) -> None:
+    """`consume` is destructive, so a print that raises loses the mail.
+
+    A cp1252 console cannot encode box-drawing characters, and these messages
+    have already been archived by the time the header is printed -- so a
+    UnicodeEncodeError here is the one crash that destroys what it was
+    reporting.
+    """
+    _wrote("alpha", "beta", "must survive cp1252")
+    capsys.readouterr()
+    op._session_start(_start(), session_db)
+    out = capsys.readouterr().out
+    assert "must survive cp1252" in out
+    out.encode("cp1252")
 
 
 # ── wiring ──────────────────────────────────────────────────────

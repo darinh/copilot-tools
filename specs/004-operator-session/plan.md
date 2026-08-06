@@ -281,6 +281,26 @@ command would default it, because the hints are printed once per message and
 the default is wrong precisely when a batch arrives from several peers at
 once.
 
+Three reviewers read the first commit and found seven defects between them,
+all now fixed with a test and a mutant each. Two are worth recording because
+they would have survived any amount of re-reading. The mailbox id was
+sanitized twice at session start — `instance` there is already a safe id, and
+wrapping it in `Instance(...)` again turned `beta.test` into
+`beta-test-2e02bd` and then `beta-test-2e02bd-1ac43e`, a mailbox nothing ever
+writes to: every name needing sanitization would have reported no mail, for
+ever, silently. And the session-start header used box-drawing characters,
+which raise `UnicodeEncodeError` on a cp1252 console — after `consume` has
+archived the messages, making it the one crash that destroys exactly what it
+was reporting. This repository already has a console-encoding conformance
+test; it did not cover this print, which is an argument for adversarial review
+rather than against the test.
+
+A third finding is a rule rather than a bug: a reviewer found a `--queue` test
+that could not fail, because every test in that file runs against a
+multiplexer with no live sessions, so the mail queues whether the flag is
+honoured or dropped entirely. It now asserts against a live recipient, with a
+flag-removed control beside it that must produce the opposite outcome.
+
 ## Phase G+H — the audit
 
 Before the template changes, produce a table classifying every candidate line as
