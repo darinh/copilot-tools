@@ -176,13 +176,37 @@ def test_offers_are_oldest_first(db: Path) -> None:
     assert [o.item for o in got.offers] == ["0007", "0009"]
 
 
-def test_offers_tied_on_timestamp_are_ordered_by_item(db: Path) -> None:
+def test_offers_tied_on_timestamp_are_ordered_by_item(db: Path, monkeypatch) -> None:
     """One-second resolution makes a tie ordinary, and an unstable order would
-    make two reads of an unchanged database disagree."""
+    make two reads of an unchanged database disagree.
+
+    The store is made to hand the claims back in the *wrong* order, because it
+    currently sorts by ``(claimed_at, item)`` itself -- so a test that took its
+    output as given would pass with the tiebreak deleted, and would be proving
+    a property of ``work_claims.claims`` rather than of this function.
+    """
     _claim(db, "0009", "gamma", pid=4243, when="2026-08-01T10:00:00Z")
     _claim(db, "0007", "beta", pid=4242, when="2026-08-01T10:00:00Z")
     probes = _probes(dead={"gone"})
     probes.by_pid[4242] = probes.by_pid[4243] = "gone"
+
+    real = wc.claims
+    monkeypatch.setattr(osess.work_claims, "claims",
+                        lambda path: list(reversed(real(path))))
+    got = osess.resolve_assignment(db, instance="alpha", probes=probes)
+    assert [o.item for o in got.offers] == ["0007", "0009"]
+
+
+def test_offers_are_ordered_by_this_function_not_by_the_store(
+        db: Path, monkeypatch) -> None:
+    """Same point for the timestamp, not the tiebreak."""
+    _claim(db, "0009", "gamma", pid=4243, when="2026-08-05T10:00:00Z")
+    _claim(db, "0007", "beta", pid=4242, when="2026-08-01T10:00:00Z")
+    probes = _probes(dead={"gone"})
+    probes.by_pid[4242] = probes.by_pid[4243] = "gone"
+    real = wc.claims
+    monkeypatch.setattr(osess.work_claims, "claims",
+                        lambda path: list(reversed(real(path))))
     got = osess.resolve_assignment(db, instance="alpha", probes=probes)
     assert [o.item for o in got.offers] == ["0007", "0009"]
 
@@ -298,10 +322,16 @@ def test_end_writes_the_handoff_closes_the_log_and_keeps_the_claim(db: Path) -> 
 
 def test_the_claim_is_kept_by_default_so_the_next_session_can_resume(db: Path) -> None:
     """Releasing on every end would empty the claim before FR-2's resume path
-    could ever fire."""
+    could ever fire.
+
+    ``release_claim`` is not passed at all: the default is the guarantee, and a
+    test that spells out ``release_claim=False`` proves nothing about it.
+    """
     _claim(db, "0007", "alpha")
     osess.start_session(db, instance="alpha", session=1, probes=_probes())
-    _end(db)
+    result = osess.end_session(db, instance="alpha", session=1,
+                              write_handoff=lambda: "/h/alpha.md")
+    assert result.ok and result.claim_retained and not result.claim_released
     again = osess.resolve_assignment(db, instance="alpha", probes=_probes())
     assert again.kind == osess.RESUME and again.item == "0007"
 
@@ -341,6 +371,17 @@ def test_end_only_closes_its_own_instances_row(db: Path) -> None:
     osess.start_session(db, instance="alpha", session=1, probes=_probes())
     _end(db)
     assert osess.open_session(db, instance="beta") is not None
+
+
+def test_end_only_closes_the_row_of_the_session_it_names(db: Path) -> None:
+    """A row belonging to a different session of the same instance is somebody
+    else's record of somebody else's work, and closing it would date-stamp an
+    end that did not happen."""
+    osess.start_session(db, instance="alpha", session=1, probes=_probes())
+    result, _ = _end(db, session=2)
+    assert result.ok and not result.log_closed
+    still = osess.open_session(db, instance="alpha")
+    assert still is not None and still["session"] == 1
 
 
 # ── FR-5: the combination that must be unreachable ──────────────
@@ -500,6 +541,35 @@ def test_runtime_identity_carries_every_field_the_cascade_reads(db: Path) -> Non
     assert set(got) == {"boot_id", "mux_session", "pid", "pid_start"}
     assert got["pid"] == 1234 and got["mux_session"] == "alpha"
     assert got["boot_id"] == "boot-1"
+    assert got["pid_start"] == "start-token"
+
+
+def test_runtime_identity_records_a_real_start_token_for_this_process(db: Path) -> None:
+    """Against the real probes, not a fake: a ``None`` start token silently
+    retires the pid-reuse half of step 2 of the cascade, and every claim
+    written after that would read LIVE against a recycled pid."""
+    assert osess.runtime_identity(mux_session=None)["pid_start"] is not None
+
+
+def test_the_recorded_start_token_is_what_detects_pid_reuse(db: Path) -> None:
+    ident = osess.runtime_identity(mux_session=None)
+    wc.claim(db, item="0007", instance="alpha", **ident)
+    held = wc.claim_for_item(db, "0007")
+
+    class Recycled:
+        def boot_identity(self):
+            return ident["boot_id"]
+
+        def process_present(self, pid):
+            return True
+
+        def process_start_token(self, pid):
+            return "somebody-else"
+
+        def session_present(self, session):
+            return True
+
+    assert live.assess(held, probes=Recycled()).verdict == live.DEAD
 
 
 def test_runtime_identity_defaults_to_this_process(db: Path) -> None:
