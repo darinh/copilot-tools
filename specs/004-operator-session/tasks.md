@@ -53,9 +53,31 @@ Status is tracked in SQL during execution; this file is the reconciled record.
 
 ## Phase E — commands
 
-- [ ] E1 `operator work request` / `release` / `list` / `heartbeat`
-- [ ] E2 `operator work reclaim` — refuses a live owner; commits uncommitted
-      changes to `wip/{item}-{deadInstance}` before reassigning (FR-4)
+- [x] E1 `operator work request` / `release` / `list` / `heartbeat` —
+      `manage_work` in `copilot_operator.py` over a new `operator_work.py`,
+      which is where the claim store and the liveness cascade meet.
+      `operator_work.agent_identity` probes every signal before recording it:
+      an unconfirmed pid or mux session is written `NULL`, because each field
+      is conclusive-for-DEAD in the cascade, so recording the short-lived
+      `operator` process's own pid would manufacture proof that the owner is
+      gone. `--item` is optional on `release`/`heartbeat` — an agent handed an
+      assignment need not know the item's name, so the claim is looked up by
+      instance. `list` is the one verb that does not require `--instance`.
+- [x] E2 `operator work reclaim` — refuses a live owner; commits uncommitted
+      changes to `wip/{item}-{deadInstance}` before reassigning (FR-4).
+      `operator_work.reclaim` orders its refusals so that no git work happens
+      for a reclaim that was going to be refused anyway: no-such-claim,
+      already-mine, instance-busy, then the cascade — only `DEAD` proceeds,
+      `STALE` is refused rather than auto-stolen. Preservation writes refs
+      only: the index is copied to a temp file and `GIT_INDEX_FILE` points
+      `git add` at the copy, so the branch is built with `write-tree` /
+      `commit-tree` / `branch` and the owner's working tree, `.git/index` and
+      `HEAD` are left byte-identical. `stash`, `reset`, `clean`, `checkout`,
+      `restore`, `rm` and `mv` are absent from the module by construction and
+      a source scan in `tests/test_work_cli.py` asserts it. A preservation
+      that fails refuses the reclaim (`preserve-failed`) rather than handing
+      on a tree nobody could read, and an existing `wip/` branch is never
+      moved — the second crash on one item is exactly when one exists.
 - [ ] E3 `operator backlog ready` / `close` — preserving the `proposed` gate
 - [ ] E4 `operator worktree new` / `finish` / `recover`
 - [ ] E5 `operator reply`, retiring the inbox-polling semantics

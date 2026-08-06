@@ -1294,7 +1294,7 @@ RESERVED_WORDS="$SUBCOMMANDS"
 # `python SUBCOMMANDS - shell SUBCOMMANDS` and fails when the two disagree. A
 # subcommand added to the Python operator is then a red test here rather than
 # a word that silently starts a session again.
-PYTHON_ONLY_SUBCOMMANDS="version menu projects stop-loop restart-loop stop-session forget send inbox session logs trace tabs restore"
+PYTHON_ONLY_SUBCOMMANDS="version menu projects stop-loop restart-loop stop-session forget send inbox session work logs trace tabs restore"
 
 #: Words that mean a subcommand here but are spelled for a different tool.
 #

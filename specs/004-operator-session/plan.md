@@ -94,6 +94,51 @@ loop learns of it through the restart marker it already watches, and a
 supervisor that ended sessions on the agent's behalf would be writing handoffs
 with nothing to say.
 
+## Phase E — commands
+
+The claim store judges nothing and the liveness cascade changes nothing. This
+phase is where the two meet, and it exists so that the decision to move a work
+item away from the instance holding it is made in exactly one place.
+
+Delivered as `operator_work.py` (`agent_identity`, `preserve`, `request`,
+`release`, `heartbeat`, `listing`, `reclaim`) with `operator work` in
+`copilot_operator.py` (E1, E2). E3–E5 remain.
+
+Two properties are load-bearing rather than convenient.
+
+**A claim records only signals confirmed true at the moment it is written.**
+Each of the four identity fields can conclude DEAD on its own, so writing a
+mux session that is not running — or the pid of the transient `operator`
+process that is about to exit — does not merely lose information, it
+manufactures proof that the owner is gone and the next sweep hands a live
+agent's worktree to somebody else. `agent_identity` probes each signal and
+writes `NULL` where it cannot confirm one, which the cascade reads as "no
+evidence" rather than "evidence of death"; the claim then rests on boot id and
+heartbeat, which is LIVE while fresh and STALE afterwards. This is why
+`operator_session.runtime_identity` is not reused here: its `pid=None` default
+means "use `os.getpid()`", which is the one value a CLI must never record.
+
+**Reclaim preserves before it reassigns and never issues a mutating git
+verb.** Preservation copies `.git/index` to a temp file, points `GIT_INDEX_FILE`
+at the copy, and builds the branch with `write-tree` / `commit-tree` /
+`branch` — so the working tree, the real index and `HEAD` are byte-identical
+afterwards and only a new ref appears. `stash`, `reset`, `clean`, `checkout`,
+`restore`, `rm` and `mv` are absent from the module by construction, asserted
+by a source scan beside the behavioural tests, because the behavioural ones
+can only cover the paths a test reached and FR-4's promise is about every path
+including tomorrow's. Failure to preserve refuses the reclaim rather than
+proceeding: the two unknowns are not symmetric, and reassigning a tree whose
+state could not be read hands somebody an unexplained diff — after which the
+first thing they reach for is one of the verbs this module never issues.
+
+Ordering follows from the same asymmetry: no-such-claim, already-mine,
+instance-busy, then the cascade, then preservation, then a compare-and-swap
+against the judged owner. Every refusal that can be decided from the database
+is decided before any git work, so a reclaim that was going to be refused
+never leaves a branch behind. STALE is refused, not stolen — the cascade's
+whole point is that "I could not confirm it is alive" and "I confirmed it is
+dead" are different answers.
+
 ## Phase G+H — the audit
 
 Before the template changes, produce a table classifying every candidate line as

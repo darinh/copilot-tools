@@ -52,6 +52,7 @@ import operator_ingest                                       # noqa: E402
 import operator_mail                                         # noqa: E402
 import operator_session                                      # noqa: E402
 import operator_trace                                        # noqa: E402
+import operator_work                                         # noqa: E402
 import work_claims                                           # noqa: E402
 import handoff_tool                                          # noqa: E402
 import install_manifest                                      # noqa: E402
@@ -203,7 +204,7 @@ EXIT_UNACCOUNTED = 4
 SUBCOMMANDS = ("help", "version", "list", "menu", "projects", "report",
                "ingest", "stop", "stop-loop", "restart-loop", "stop-session",
                "join", "reload", "forget", "send", "inbox", "logs", "trace",
-               "tabs", "restore", "session")
+               "tabs", "restore", "session", "work")
 
 RESERVED_WORDS = set(SUBCOMMANDS)
 
@@ -4704,6 +4705,9 @@ USAGE
     operator inbox [NAME] [--peek|--history|--json]            Read messages sent to an instance
     operator session start --instance NAME [--project SUB]     Resolve this instance's work assignment
     operator session end --instance NAME --status T --next T   Handoff, close the session log, dispose of the claim
+    operator work list                                         Who holds which work item, and whether they are running
+    operator work request --instance NAME --item REF           Claim a work item
+    operator work reclaim --instance NAME --item REF           Take an item whose owner is provably gone (preserves their work)
     operator NAME                                              Join a running instance
     operator join [NAME]                                       Join (explicit form)
     operator reload NAME                                       Hot-reload launch spec
@@ -6153,32 +6157,29 @@ def _session_db(cwd: Path):
     return operator_session.db_path(project_dir(found.guid))
 
 
-def _parse_session_args(args: list[str]) -> "dict | None":
-    """Options for ``session start``/``end``.
+def _parse_flagged_args(args: list[str], *, takes_value: dict,
+                        flags: dict) -> "dict | None":
+    """``--key value`` / ``--key=value`` / bare flags, or ``None`` on refusal.
 
-    An unrecognised option is refused rather than ignored, for the reason
-    ``send`` gives: a caller who typed ``--relase`` and saw a success message
-    believes an effect happened that did not.
+    Shared by ``session`` and ``work`` rather than written twice. The two
+    behaviours worth keeping identical are both ones a second copy would drift
+    on: an unrecognised option is *refused* rather than ignored -- a caller who
+    typed ``--relase`` and saw a success message believes an effect happened
+    that did not -- and a value that looks like an option is refused too.
+
+    That second rule was bought with a real defect. ``session end --status ok
+    --next --done`` bound ``next="--done"`` and left ``done`` false: the caller
+    asked for the claim to be released, was told the session ended, and it was
+    not. A value that genuinely starts with a dash is still expressible as
+    ``--next=-x``, which is unambiguous by construction.
+
+    ``flags`` is matched against the whole argument, not its ``=``-prefix, so
+    ``--json=true`` is an unknown option rather than a flag with a silently
+    discarded value.
     """
-    opts: dict = {"instance": "", "session": None, "project": None,
-                  "json": False, "done": False, "status": "", "next": "",
-                  "context": "", "prompt": "", "in_progress": ""}
-    takes_value = {"--instance": "instance", "--project": "project",
-                   "--status": "status", "--next": "next",
-                   "--context": "context", "--prompt": "prompt",
-                   "--in-progress": "in_progress"}
+    opts: dict = {}
 
     def separate_value(key: str, i: int) -> "str | None":
-        """The token after ``key``, refused when it is another option.
-
-        `operator session end --status ok --next --done` used to bind
-        ``next="--done"`` and leave ``done`` false -- the caller asked for the
-        claim to be released, was told the session ended, and it was not.
-        That is exactly the failure this parser refuses unknown options to
-        prevent, so a value that looks like an option is refused too. A value
-        that genuinely starts with a dash is still expressible as
-        ``--next=-x``, which is unambiguous by construction.
-        """
         if i + 1 >= len(args):
             print(f"Missing value for {key}", file=sys.stderr)
             return None
@@ -6194,7 +6195,9 @@ def _parse_session_args(args: list[str]) -> "dict | None":
     while i < len(args):
         arg = args[i]
         key, _, inline = arg.partition("=")
-        if key in takes_value:
+        if arg in flags:
+            opts[flags[arg]] = True
+        elif key in takes_value:
             if "=" in arg:
                 opts[takes_value[key]] = inline
             else:
@@ -6203,32 +6206,39 @@ def _parse_session_args(args: list[str]) -> "dict | None":
                     return None
                 opts[takes_value[key]] = value
                 i += 1
-        elif key == "--session":
-            if "=" in arg:
-                raw = inline
-            else:
-                got = separate_value("--session", i)
-                if got is None:
-                    return None
-                raw = got
-                i += 1
-            try:
-                opts["session"] = int(raw)
-            except ValueError:
-                print(f"--session takes a number, not {raw!r}", file=sys.stderr)
-                return None
-            if opts["session"] < 0:
-                print(f"--session takes a session number, not {raw!r}",
-                      file=sys.stderr)
-                return None
-        elif arg == "--json":
-            opts["json"] = True
-        elif arg in ("--done", "--release"):
-            opts["done"] = True
         else:
             print(f"Unknown option: {arg}", file=sys.stderr)
             return None
         i += 1
+    return opts
+
+
+def _parse_session_args(args: list[str]) -> "dict | None":
+    """Options for ``session start``/``end``."""
+    opts: dict = {"instance": "", "session": None, "project": None,
+                  "json": False, "done": False, "status": "", "next": "",
+                  "context": "", "prompt": "", "in_progress": ""}
+    parsed = _parse_flagged_args(
+        args,
+        takes_value={"--instance": "instance", "--project": "project",
+                     "--status": "status", "--next": "next",
+                     "--context": "context", "--prompt": "prompt",
+                     "--in-progress": "in_progress", "--session": "session"},
+        flags={"--json": "json", "--done": "done", "--release": "done"})
+    if parsed is None:
+        return None
+    raw = parsed.pop("session", None)
+    opts.update(parsed)
+    if raw is not None:
+        try:
+            opts["session"] = int(raw)
+        except ValueError:
+            print(f"--session takes a number, not {raw!r}", file=sys.stderr)
+            return None
+        if opts["session"] < 0:
+            print(f"--session takes a session number, not {raw!r}",
+                  file=sys.stderr)
+            return None
     if not opts["instance"]:
         print("Missing required: --instance NAME", file=sys.stderr)
         return None
@@ -6372,6 +6382,253 @@ def manage_session(args: list[str]) -> int:
     if db is None:
         return 1
     return _session_start(opts, db) if verb == "start" else _session_end(opts, db)
+
+
+WORK_VERBS = ("request", "release", "list", "heartbeat", "reclaim")
+
+
+def _work_usage(stream) -> None:
+    print("Usage:\n"
+          "  operator work request   --instance NAME --item REF "
+          "[--project SUB] [--worktree PATH] [--branch NAME] [--json]\n"
+          "  operator work release   --instance NAME [--item REF] [--json]\n"
+          "  operator work heartbeat --instance NAME [--item REF] [--json]\n"
+          "  operator work list      [--project SUB] [--json]\n"
+          "  operator work reclaim   --instance NAME --item REF [--json]\n"
+          "\n"
+          "One work item per instance, one owner per item.\n"
+          "reclaim refuses an owner that is live, and one the liveness\n"
+          "cascade could not decide about. It commits a dead owner's\n"
+          "uncommitted changes to wip/ITEM-INSTANCE before the item moves,\n"
+          "and never runs git stash, reset, clean, checkout or restore.",
+          file=stream)
+
+
+def _parse_work_args(args: list[str]) -> "dict | None":
+    """Options for the ``operator work`` verbs.
+
+    ``--instance`` is not required here as it is for ``session``: ``work
+    list`` is a question about the project, not about one agent, and demanding
+    a name to ask it would make the natural reading -- what is everybody
+    working on -- unavailable.
+    """
+    opts: dict = {"instance": "", "item": "", "project": None,
+                  "worktree": "", "branch": "", "json": False}
+    parsed = _parse_flagged_args(
+        args,
+        takes_value={"--instance": "instance", "--item": "item",
+                     "--project": "project", "--worktree": "worktree",
+                     "--branch": "branch"},
+        flags={"--json": "json"})
+    if parsed is None:
+        return None
+    opts.update(parsed)
+    return opts
+
+
+def _agent_pid(instance) -> "int | None":
+    """The pid that stands for this agent, or ``None`` when none is running.
+
+    Never this process. ``operator work request`` exits within a second of
+    writing the claim, so recording its own pid would leave a claim whose
+    second liveness signal says the owner is gone -- reclaimable by anyone,
+    immediately, and by the cascade's own evidence.
+
+    The copilot session is preferred over the supervisor because it is the
+    process actually doing the work; the supervisor is the fallback for a
+    session that has not started or has just ended between two of its own
+    restarts.
+    """
+    pid = instance.copilot_pid()
+    if pid and _pid_alive(pid):
+        return pid
+    return _running_loop_pid(instance)
+
+
+def _claimed_item(db, opts: dict, instance: str) -> "str | None":
+    """``--item`` if given, else whatever this instance already holds.
+
+    Defaulting is what makes ``release`` and ``heartbeat`` usable from an
+    agent that was handed its assignment rather than choosing it: FR-2's whole
+    point is that the agent does not have to know the item's name to work it.
+    """
+    if opts["item"]:
+        return opts["item"]
+    held = work_claims.claim_for_instance(db, instance)
+    return None if held is None else held.item
+
+
+def _work_request(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    if not opts["item"]:
+        print("Missing required: --item REF", file=sys.stderr)
+        return 1
+    worktree = opts["worktree"] or str(Path.cwd())
+    branch = opts["branch"] or operator_work.current_branch(worktree) or None
+    operator_session.init_db(db)
+    try:
+        held = operator_work.request(
+            db, item=opts["item"], instance=instance,
+            subproject=opts["project"] or "", worktree=worktree, branch=branch,
+            mux_session=Instance(opts["instance"]).session,
+            pid=_agent_pid(Instance(opts["instance"])))
+    except work_claims.ClaimRefused as exc:
+        if opts["json"]:
+            print(json.dumps({"ok": False, "reason": exc.reason,
+                              "item": exc.item, "instance": exc.instance,
+                              "held_by": (None if exc.holder is None
+                                          else exc.holder.instance),
+                              "detail": str(exc)}, indent=2))
+        else:
+            print(f"Refused: {exc}", file=sys.stderr)
+            if exc.reason == work_claims.ITEM_HELD:
+                print("Use `operator work list` to see whether its owner is "
+                      "still running, and `operator work reclaim` if it is "
+                      "provably gone.", file=sys.stderr)
+        return 1
+    if opts["json"]:
+        print(json.dumps(_claim_json(held), indent=2))
+    else:
+        print(f"{held.item} claimed by {held.instance} "
+              f"({held.worktree or 'no worktree'}"
+              f"{', ' + held.branch if held.branch else ''})")
+    return 0
+
+
+def _claim_json(held) -> dict:
+    return {"ok": True, "item": held.item, "instance": held.instance,
+            "subproject": held.subproject, "worktree": held.worktree,
+            "branch": held.branch, "claimed_at": held.claimed_at,
+            "heartbeat_at": held.heartbeat_at, "pid": held.pid,
+            "mux_session": held.mux_session}
+
+
+def _work_release(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    operator_session.init_db(db)
+    item = _claimed_item(db, opts, instance)
+    if item is None:
+        print(f"{instance} holds no work item.", file=sys.stderr)
+        return 1
+    ok = operator_work.release(db, item=item, instance=instance)
+    if opts["json"]:
+        print(json.dumps({"ok": ok, "item": item, "instance": instance},
+                         indent=2))
+    elif ok:
+        print(f"{item} released by {instance}.")
+    else:
+        print(f"{instance} does not hold {item}; nothing released.",
+              file=sys.stderr)
+    return 0 if ok else 1
+
+
+def _work_heartbeat(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    operator_session.init_db(db)
+    item = _claimed_item(db, opts, instance)
+    if item is None:
+        print(f"{instance} holds no work item.", file=sys.stderr)
+        return 1
+    ok = operator_work.heartbeat(db, item=item, instance=instance)
+    if opts["json"]:
+        print(json.dumps({"ok": ok, "item": item, "instance": instance},
+                         indent=2))
+    elif ok:
+        print(f"{item}: heartbeat refreshed.")
+    else:
+        print(f"{instance} does not hold {item}; heartbeat not refreshed.",
+              file=sys.stderr)
+    return 0 if ok else 1
+
+
+def _work_list(opts: dict, db) -> int:
+    operator_session.init_db(db)
+    rows = operator_work.listing(db, subproject=opts["project"])
+    if opts["json"]:
+        print(json.dumps([{**_claim_json(held), "verdict": verdict.verdict,
+                           "reason": verdict.reason,
+                           "reclaimable": verdict.reclaimable}
+                          for held, verdict in rows], indent=2))
+        return 0
+    if not rows:
+        print("No work items are claimed.")
+        return 0
+    for held, verdict in rows:
+        print(f"{held.item}  {held.instance}  {verdict.verdict}")
+        print(f"{'':4}{verdict.reason}")
+        if held.worktree:
+            print(f"{'':4}{held.worktree}"
+                  f"{' (' + held.branch + ')' if held.branch else ''}")
+    return 0
+
+
+def _work_reclaim(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    if not opts["item"]:
+        print("Missing required: --item REF", file=sys.stderr)
+        return 1
+    operator_session.init_db(db)
+    result = operator_work.reclaim(
+        db, item=opts["item"], to_instance=instance,
+        mux_session=Instance(opts["instance"]).session,
+        pid=_agent_pid(Instance(opts["instance"])))
+    preserved = result.preservation
+    if opts["json"]:
+        print(json.dumps({
+            "ok": result.ok, "item": result.item,
+            "instance": result.to_instance,
+            "refused": result.refused, "detail": result.detail,
+            "previous_owner": (None if result.previous is None
+                               else result.previous.instance),
+            "verdict": (None if result.liveness is None
+                        else result.liveness.verdict),
+            "preserved_branch": (None if preserved is None
+                                 else preserved.branch),
+            "preserved_commit": (None if preserved is None
+                                 else preserved.commit),
+            "notes": [] if preserved is None else list(preserved.notes),
+        }, indent=2))
+        return 0 if result.ok else 1
+    if not result.ok:
+        print(f"Refused: {result.detail}", file=sys.stderr)
+        if result.refused == operator_work.OWNER_STALE:
+            print("STALE is not a verdict this tool acts on. Confirm the "
+                  "agent has stopped, then release the claim from that "
+                  "instance.", file=sys.stderr)
+        return 1
+    previous = result.previous.instance if result.previous else "?"
+    print(f"{result.item}: {previous} -> {result.to_instance}")
+    if preserved is not None and preserved.branch:
+        print(f"  {previous}'s uncommitted work is on {preserved.branch} "
+              f"({(preserved.commit or '')[:12]}). The working tree was not "
+              f"touched.")
+    for note in (preserved.notes if preserved else ()):
+        print(f"  note: {note}")
+    return 0
+
+
+def manage_work(args: list[str]) -> int:
+    """``operator work request|release|list|heartbeat|reclaim`` (FR-3, FR-4)."""
+    if not args or args[0] in HELP_FLAGS:
+        _work_usage(sys.stdout if args else sys.stderr)
+        return 0 if args else 1
+    verb = args[0]
+    if verb not in WORK_VERBS:
+        print(f"Unknown subcommand: operator work {verb}", file=sys.stderr)
+        print(f"Expected one of: {', '.join(WORK_VERBS)}", file=sys.stderr)
+        return 1
+    opts = _parse_work_args(args[1:])
+    if opts is None:
+        return 1
+    if verb != "list" and not opts["instance"]:
+        print("Missing required: --instance NAME", file=sys.stderr)
+        return 1
+    db = _session_db(Path.cwd())
+    if db is None:
+        return 1
+    return {"request": _work_request, "release": _work_release,
+            "heartbeat": _work_heartbeat, "list": _work_list,
+            "reclaim": _work_reclaim}[verb](opts, db)
 
 
 def _record_session_exit(instance, session_num: int,
@@ -6778,6 +7035,8 @@ def _dispatch_command(args: list[str]) -> int:
         return restore_tabs(args[1:])
     if head == "session":
         return manage_session(args[1:])
+    if head == "work":
+        return manage_work(args[1:])
 
     # Positional shortcut: `operator foo` joins a running instance named foo.
     if len(args) == 1 and not head.startswith("-") and head not in RESERVED_WORDS:
