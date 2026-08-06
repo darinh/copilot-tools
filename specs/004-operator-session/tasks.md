@@ -461,5 +461,19 @@ and it should be somebody's decision rather than an agent's.
 
 ## Verification
 
-- [ ] V1 Full suite green (baseline 3383 passed, 10 skipped)
-- [ ] V2 Mutation-test every new guard: break it, watch it go red, restore
+- [x] V1 Full suite green (baseline 3383 passed, 10 skipped)
+      Measured 2026-08-06 on `feat/operator-session` at `036626c`:
+      **4158 passed, 9 skipped** in 406.77s
+      (`python -m pytest -q --no-header -p no:randomly`).
+      The skip count fell by one against the baseline and the pass count rose
+      by 775; no test that ran before is skipped now.
+- [x] V2 Mutation-test every new guard: break it, watch it go red, restore
+      Done per commit rather than in one pass at the end, which is the only
+      way it stays honest -- a guard mutated a fortnight after it was written
+      is scored against a suite that has moved. Every feature commit on this
+      branch records its own mutation result in its message; `git log
+      959c450..HEAD --grep=mutant -i` lists them, and `a5a6d1a` is
+      representative: *"Mutation: 3/0/0 on the staging rule, 4 killed and 1
+      provably equivalent on the record option."*
+      Surviving mutants are recorded where they survived, with the argument
+      for equivalence next to the code, not tallied here.
