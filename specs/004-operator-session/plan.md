@@ -78,6 +78,22 @@ FR-5 was amended during this phase: the claim is **retained** by default and
 released only with `--done`. See FR-5 for why an unconditional release
 contradicts FR-2's resume path.
 
+The supervisor loop resolves the assignment and opens the session log itself,
+before it builds the preamble (`_loop_work_db`, `_loop_start_session`), and
+refreshes the claim on a throttled poll while the session is up
+(`_loop_heartbeat`, `HEARTBEAT_INTERVAL`). Two things follow from putting it
+there rather than asking the agent to do it. The answer is in the agent's
+first token instead of being re-derived every session from rules that would
+have to stay in its context permanently — which is the whole point of the
+feature. And liveness is reported by the party that reads it from the process
+table: an agent asked to heartbeat itself does so right up to the moment it
+stops being able to, which is the only moment the answer mattered.
+
+The loop does *not* call `session end`. That is the agent's own last act — the
+loop learns of it through the restart marker it already watches, and a
+supervisor that ended sessions on the agent's behalf would be writing handoffs
+with nothing to say.
+
 ## Phase G+H — the audit
 
 Before the template changes, produce a table classifying every candidate line as

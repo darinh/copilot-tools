@@ -98,13 +98,18 @@ def test_init_db_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_session_log_is_keyed_by_instance_and_session(db: Path) -> None:
+    # One index over *both* columns, in that order -- not two single-column
+    # indexes, which would satisfy a union-of-names check while leaving the
+    # lookup this schema exists for unindexed.
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
         indexes = [r["name"] for r in conn.execute("PRAGMA index_list(session_log)")]
-        cols = set()
+        ordered = []
         for name in indexes:
-            cols |= {r["name"] for r in conn.execute(f"PRAGMA index_info({name})")}
-    assert {"instance", "session"} <= cols
+            rows = sorted(conn.execute(f"PRAGMA index_info({name})"),
+                          key=lambda r: r["seqno"])
+            ordered.append([r["name"] for r in rows])
+    assert ["instance", "session"] in ordered, ordered
 
 
 # ── FR-2: resolution order ──────────────────────────────────────
@@ -406,10 +411,12 @@ def test_a_database_failure_leaves_the_handoff_on_disk_and_the_claim_held(
     _claim(db, "0007", "alpha")
     osess.start_session(db, instance="alpha", session=1, probes=_probes())
 
-    @contextmanager
     def exploding(_path):
+        # A plain function, not a generator: `with connect(path)` fails at the
+        # call, which is what a connection failure actually looks like. The
+        # `@contextmanager` spelling needed a `yield` after the `raise` to stay
+        # a generator, and unreachable code is unreachable code.
         raise sqlite3.OperationalError("database is locked")
-        yield  # pragma: no cover - unreachable, keeps this a generator
 
     monkeypatch.setattr(osess, "connect", exploding)
     result, calls = _end(db, done=True)
@@ -472,10 +479,8 @@ def test_a_released_claim_never_exists_without_a_handoff(
 
     handoff = _boom if failure == "handoff" else None
     if failure == "database":
-        @contextmanager
         def exploding(_path):
             raise sqlite3.OperationalError("database is locked")
-            yield  # pragma: no cover - unreachable, keeps this a generator
         monkeypatch.setattr(osess, "connect", exploding)
 
     result, _ = _end(db, handoff=handoff, done=True)

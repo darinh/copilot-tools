@@ -49,6 +49,7 @@ py-modules = [
     "operator_ingest",
     "operator_liveness",
     "operator_mail",
+    "operator_session",
     "operator_trace",
     "operator_mux",
     "operator_runner",

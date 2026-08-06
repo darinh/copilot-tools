@@ -16,6 +16,7 @@ messaging, and spec-driven workflow conventions.
 | [`operator_mux.py`](docs/operator.md#platform-support) | Session-backend abstraction (tmux / psmux) |
 | [`work_claims.py`](work_claims.py) | One work item, one owner: the claim store behind `operator work` |
 | [`operator_liveness.py`](operator_liveness.py) | Whether a claim's owner is provably gone: LIVE / DEAD / STALE |
+| [`operator_session.py`](operator_session.py) | The session lifecycle: the assignment resolved on the way in, the handoff and claim disposal on the way out |
 | [`operator_ingest.py`](operator_ingest.py) | Pure-Python log parser for copilot process logs |
 | [`handoff_tool.py`](docs/operator.md) | Atomic session handoff for agents |
 | [`backlog_tool.py`](backlog/README.md) | Reads and enforces the tracked `backlog/`; ships the `backlog` command |
@@ -366,6 +367,7 @@ copilot-tools/
 ├── operator_mail.py               # Agent-to-agent mail, live and queued delivery
 ├── operator_trace.py              # Who invoked the operator, and how it ended
 ├── operator_liveness.py           # Is a claim's owner still there? LIVE / DEAD / STALE
+├── operator_session.py            # Session lifecycle: assignment in, handoff out
 ├── operator_console.py            # UTF-8 console output
 ├── project_paths.py               # Project identity: catalog and per-project dirs
 ├── project_features.py            # The feature vocabulary, and each project's choices

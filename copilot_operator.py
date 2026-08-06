@@ -52,6 +52,7 @@ import operator_ingest                                       # noqa: E402
 import operator_mail                                         # noqa: E402
 import operator_session                                      # noqa: E402
 import operator_trace                                        # noqa: E402
+import work_claims                                           # noqa: E402
 import handoff_tool                                          # noqa: E402
 import install_manifest                                      # noqa: E402
 import project_features                                      # noqa: E402
@@ -79,6 +80,12 @@ from project_paths import (                                   # noqa: E402
 __version__ = "1.0.0"
 
 POLL_INTERVAL = 10
+#: How often the supervisor refreshes the work claim of a running session.
+#:
+#: The claim's staleness window is measured in minutes and the poll interval
+#: in seconds, so writing on every poll would buy no extra evidence and cost
+#: a database write per tick for the lifetime of every loop on the machine.
+HEARTBEAT_INTERVAL = 60
 MAX_SESSIONS = 1000
 MAX_LAUNCH_FAILURES = 5
 LAUNCH_BACKOFF_BASE = 5
@@ -2055,6 +2062,72 @@ def crash_recovery_verdict(workdir: Path, instance_id: str = "") -> bool:
     log("  No handoff file found for this project — treating this as "
         "crash recovery")
     return True
+
+
+def _loop_work_db(workdir: Path):
+    """The claim/session database for the project being supervised, or ``None``.
+
+    Quiet and total, unlike its CLI equivalent ``_session_db``: the loop must
+    launch a session whether or not this project is registered, so every
+    failure here becomes ``None`` and a log line rather than an exception.
+    Resolved from the *primary* checkout so a loop running inside a worktree
+    finds the project's real entry instead of minting a second one.
+    """
+    try:
+        found = catalog_guid(primary_repo_root(workdir))
+        if found.guid is None:
+            return None
+        return operator_session.db_path(project_dir(found.guid))
+    except Exception as exc:                                # noqa: BLE001
+        log(f"  Could not resolve this project's work database ({exc})")
+        return None
+
+
+def _loop_start_session(db, instance: "Instance", session_num: int):
+    """Open the session log and settle what this instance is to work on.
+
+    FR-2 wants the assignment resolved before the agent's first token, and the
+    only party that can do that is the one launching it. An agent left to work
+    it out for itself pays for the reasoning on every session, can still get
+    it wrong, and needs the rules in its context permanently to get it right.
+    Here it is one query whose answer is already in the preamble.
+
+    Total for the same reason as :func:`_loop_work_db`: a missing assignment
+    costs the agent a hint, and must not cost it a session.
+    """
+    if db is None:
+        return None
+    try:
+        operator_session.init_db(db)
+        return operator_session.start_session(
+            db, instance=instance.id, session=session_num)
+    except Exception as exc:                                # noqa: BLE001
+        log(f"  Could not resolve this session's assignment ({exc})")
+        return None
+
+
+def _loop_heartbeat(db, instance_id: str) -> None:
+    """Refresh whatever claim this instance currently holds.
+
+    The supervisor heartbeats, not the agent. It is the only party that knows
+    the session is alive from the process table rather than from the agent's
+    opinion of its own progress -- an agent asked to report its own liveness
+    reports it right up to the moment it stops being able to, which is the
+    only moment the answer mattered.
+
+    The claim is re-read rather than remembered from the assignment, because
+    an agent can take one mid-session; caching the item resolved at launch
+    would leave exactly those claims un-refreshed until they went stale, and
+    the whole point of the cascade is that a stale claim gets taken away.
+    """
+    if db is None:
+        return
+    try:
+        held = work_claims.claim_for_instance(db, instance_id)
+        if held is not None:
+            work_claims.heartbeat(db, item=held.item, instance=instance_id)
+    except Exception as exc:                                # noqa: BLE001
+        log(f"  Could not refresh this instance's work claim ({exc})")
 
 
 def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = False,
@@ -4209,6 +4282,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
             f"{MAX_UNACCOUNTED_SESSIONS} consecutive sessions that change "
             f"nothing and end without a handoff or an observed exit "
             f"(currently {'unknown' if unaccounted is None else unaccounted})")
+    work_db = None
+    last_heartbeat = 0.0
     try:
         try:
             while session_num <= MAX_SESSIONS:
@@ -4224,6 +4299,13 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     # started now is the conservative reading: it can only
                     # delay the healthy-uptime reset, never trigger it early.
                     session_started_at = time.time()
+                    # An adopted session gets a log row and a heartbeat like
+                    # any other. What it does not get is a preamble: nothing
+                    # is being launched to read one, so the assignment is
+                    # resolved for the record and the claim, not to be said.
+                    work_db = _loop_work_db(workdir)
+                    _loop_start_session(work_db, instance, session_num)
+                    last_heartbeat = 0.0
                 else:
                     if marker_set(instance.stop_marker):
                         # A stop request that landed while this supervisor was
@@ -4264,11 +4346,19 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     # preamble is built per launch too, so mail that arrives
                     # during session #3 must still reach session #4.
                     # Read now, archive only once the session is really up.
+                    # The assignment is settled here, before the preamble is
+                    # built, so the agent's first token already knows whether
+                    # it is resuming an item, being offered one, or free.
+                    work_db = _loop_work_db(workdir)
+                    assignment = _loop_start_session(work_db, instance,
+                                                     session_num)
+                    last_heartbeat = 0.0
                     launch_preamble = build_preamble(
                         agent, instance,
                         crash_recovery=(had_predecessor
                                         and crash_recovery_verdict(
-                                            workdir, instance.id)))
+                                            workdir, instance.id)),
+                        assignment=assignment)
                     try:
                         waiting = operator_mail.pending(OPERATOR_HOME, instance.id)
                     except operator_mail.MailError as exc:
@@ -4461,6 +4551,13 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                                 return 1
                         restart_requested = True
                         break
+                    # Copilot is confirmed up, so the claim is provably still
+                    # being worked. Throttled: the poll interval is seconds and
+                    # the staleness window is minutes, so one write per minute
+                    # is as much evidence as the cascade can use.
+                    if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
+                        _loop_heartbeat(work_db, instance.id)
+                        last_heartbeat = time.time()
                     if marker_set(instance.restart_marker):
                         log(f"Session #{session_num}: restart signal detected!")
                         crash_failures = 0
@@ -6070,27 +6167,59 @@ def _parse_session_args(args: list[str]) -> "dict | None":
                    "--status": "status", "--next": "next",
                    "--context": "context", "--prompt": "prompt",
                    "--in-progress": "in_progress"}
+
+    def separate_value(key: str, i: int) -> "str | None":
+        """The token after ``key``, refused when it is another option.
+
+        `operator session end --status ok --next --done` used to bind
+        ``next="--done"`` and leave ``done`` false -- the caller asked for the
+        claim to be released, was told the session ended, and it was not.
+        That is exactly the failure this parser refuses unknown options to
+        prevent, so a value that looks like an option is refused too. A value
+        that genuinely starts with a dash is still expressible as
+        ``--next=-x``, which is unambiguous by construction.
+        """
+        if i + 1 >= len(args):
+            print(f"Missing value for {key}", file=sys.stderr)
+            return None
+        value = args[i + 1]
+        if value.startswith("-") and value != "-":
+            print(f"Missing value for {key}: {value!r} looks like an option. "
+                  f"Write {key}={value} if that really is the value.",
+                  file=sys.stderr)
+            return None
+        return value
+
     i = 0
     while i < len(args):
         arg = args[i]
         key, _, inline = arg.partition("=")
         if key in takes_value:
-            if inline or "=" in arg:
+            if "=" in arg:
                 opts[takes_value[key]] = inline
             else:
-                if i + 1 >= len(args):
-                    print(f"Missing value for {key}", file=sys.stderr)
+                value = separate_value(key, i)
+                if value is None:
                     return None
-                opts[takes_value[key]] = args[i + 1]
+                opts[takes_value[key]] = value
                 i += 1
         elif key == "--session":
-            raw = inline if "=" in arg else (args[i + 1] if i + 1 < len(args) else "")
-            if "=" not in arg:
+            if "=" in arg:
+                raw = inline
+            else:
+                got = separate_value("--session", i)
+                if got is None:
+                    return None
+                raw = got
                 i += 1
             try:
                 opts["session"] = int(raw)
             except ValueError:
                 print(f"--session takes a number, not {raw!r}", file=sys.stderr)
+                return None
+            if opts["session"] < 0:
+                print(f"--session takes a session number, not {raw!r}",
+                      file=sys.stderr)
                 return None
         elif arg == "--json":
             opts["json"] = True
@@ -6176,14 +6305,24 @@ def _session_end(opts: dict, db) -> int:
     operator_session.init_db(db)
 
     def write_handoff():
-        rc = handoff_tool.main([
-            "--instance", opts["instance"],
-            "--status", opts["status"],
-            "--next", opts["next"],
-            "--in-progress", opts["in_progress"],
-            "--context", opts["context"],
-            "--prompt", opts["prompt"],
-        ])
+        # `handoff_tool.die` exits the process rather than raising, and
+        # SystemExit is not an Exception -- so left alone it would escape
+        # `end_session` entirely, skipping the failure report and the trace
+        # record. The claim would still be safe (nothing after the handoff
+        # runs), but the caller would be told nothing at all. Converting it
+        # here, in the adapter that knows the tool's exit convention, keeps
+        # the failure inside the reporting path.
+        try:
+            rc = handoff_tool.main([
+                "--instance", opts["instance"],
+                "--status", opts["status"],
+                "--next", opts["next"],
+                "--in-progress", opts["in_progress"],
+                "--context", opts["context"],
+                "--prompt", opts["prompt"],
+            ])
+        except SystemExit as exc:
+            raise RuntimeError(f"handoff exited {exc.code}") from exc
         if rc != 0:
             raise RuntimeError(f"handoff exited {rc}")
         return None

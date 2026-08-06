@@ -39,8 +39,17 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       today to wire it into.
 - [x] D3 `operator session end` — handoff, then log close and claim disposal in
       one transaction; the claim is kept unless `--done` (FR-5, amended)
-- [ ] D4 Wire the supervisor loop to `session start` / `end`; the loop calls
-      `work heartbeat`, not the agent by its own judgement
+- [x] D4 Wire the supervisor loop to `session start`; the loop calls the work
+      heartbeat, not the agent by its own judgement — `_loop_work_db`,
+      `_loop_start_session` and `_loop_heartbeat` in `copilot_operator.py`.
+      The assignment is resolved and the session log opened before the
+      preamble is built, so FR-2's answer is in the agent's first token. The
+      claim is re-read on each heartbeat rather than remembered from the
+      assignment, so an item claimed mid-session is refreshed too. Every
+      failure on this path is a log line and a `None`: an unattended loop must
+      launch its agent whether or not the project is registered. `session end`
+      is not called by the loop — it is the agent's own last act, and the loop
+      learns of it through the restart marker it already watches.
 
 ## Phase E — commands
 
