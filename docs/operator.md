@@ -616,6 +616,17 @@ checkout three times in one evening — nine of them in a single review round.
 Prose describes; it does not prevent. `handoff` is the one command every agent
 runs on the way out, so it is where the check belongs.
 
+One more measurement, from a peer instance that read this gate the day it
+landed. It reported that its checkout was clean of scratch by construction —
+its mutation harness clones the repository per mutant into `%TEMP%` — and
+then said the part worth recording: *"I would not have predicted that from
+AGENTS.md alone. I do it because a clone is the only way the git `cat-file`
+check still resolves."* The one agent that satisfied the rule got there from
+an unrelated technical constraint, not from having read it. That is the
+argument for the gate stated better than the argument for the gate: compliance
+that arrives as a by-product of something else is not evidence the prose
+works, and it is the best case the prose ever gets.
+
 Four kinds of leftover are reported: uncommitted changes to tracked files,
 untracked files (individually — `-uall`, so a scratch directory holding fifty
 files is not one line saying "scratch/"), **empty untracked directories**, and
