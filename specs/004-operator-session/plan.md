@@ -144,19 +144,30 @@ name is the one thing that does not change when a dead-judged owner comes
 back: `work_claims.reassign` gained an optional `expect_claim`, compared
 inside the same `BEGIN IMMEDIATE` as the update, so a refreshed heartbeat, a
 new pid, a new boot id or a moved worktree all refuse. Adversarial review
-found that hole; the residual window is a refresh that leaves every column
-identical, which needs a heartbeat inside the same whole second as the one
-already stored and publishes no new evidence of life anyway.
+found that hole, then found the hole in the fix: `TS_FORMAT` has no
+sub-second field, so a refresh inside the same whole second as the stored
+stamp leaves a byte-identical row and a value comparison reads it as "nothing
+happened". `work_claims` therefore carries a monotonic `revision` column,
+bumped by `claim`, `heartbeat` and `reassign` alike, so a write is visible to
+the comparison whether or not it changed any value a reader would notice.
 
 A worktree recorded in the *other* platform's path syntax refuses too, and
 that one is worth naming because it fails silently in the dangerous
 direction: `Path(r"C:\repos\app")` on POSIX is a relative path — a backslash
 is an ordinary filename character there — so a presence probe reports the
 worktree absent, preservation concludes there is nothing to save, and the
-reclaim reassigns a tree it never looked at. `_foreign_path` asks `ntpath`,
-which is pure syntax and understands both spellings, and takes the platform
-as a parameter so both branches are exercised on every CI leg rather than
-each leg testing only its own half.
+reclaim reassigns a tree it never looked at. The primary defence is recorded
+evidence rather than inference: a claim stores the writer's `os.name` in a
+`platform` column, and `reclaim` refuses outright when that differs from the
+running one. Inference cannot be made to work at the overlaps — `/srv/app` is
+a legal spelling on both platforms, so no shape test can classify it — which
+is why the syntax test is the fallback for claims written before the column
+existed, not the rule. That fallback, `_foreign_path`, asks `ntpath`, which is
+pure syntax and understands both spellings, and takes the platform as a
+parameter so both branches are exercised on every CI leg rather than each leg
+testing only its own half. It answers "foreign" for a leading `/` on Windows
+before consulting the drive, because `ntpath.splitdrive("//home/dev")` reports
+the UNC share `//home` and a drive test alone would call a POSIX path native.
 
 ## Phase G+H — the audit
 

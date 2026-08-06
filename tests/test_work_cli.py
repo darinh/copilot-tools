@@ -573,6 +573,42 @@ def test_an_owner_that_stirs_between_the_verdict_and_the_write_keeps_its_item(
     assert result.preservation is not None and result.preservation.dirty
 
 
+def test_a_same_second_heartbeat_that_changes_no_value_still_refuses(
+        db: Path, repo: Path) -> None:
+    """The row-comparison CAS on its own is not enough, and this is the case
+    that proves it: a heartbeat written inside the same whole second as the
+    stored one leaves every column byte-identical, because `TS_FORMAT` has no
+    sub-second field. A comparison of values reads "nothing happened" at the
+    exact moment the owner published that it is alive. `Claim.revision` is
+    what makes that write visible.
+    """
+    _claim(db, worktree=repo)
+    _dirty(repo)
+    stored = wc.claim_for_item(db, "0007")
+    import operator_work as module
+    real = module.preserve
+
+    def stirring_preserve(*args, **kwargs):
+        result = real(*args, **kwargs)
+        assert wc.heartbeat(db, item="0007", instance="alpha",
+                            now=stored.heartbeat_at) is True
+        return result
+
+    module.preserve = stirring_preserve
+    try:
+        result = ow.reclaim(db, item="0007", to_instance="beta",
+                            probes=FakeProbes(pids={1000: False}))
+    finally:
+        module.preserve = real
+    refreshed = wc.claim_for_item(db, "0007")
+    assert refreshed.heartbeat_at == stored.heartbeat_at, (
+        "the injected refresh must leave the timestamp identical, or this "
+        "test proves nothing the previous one did not")
+    assert refreshed.revision == stored.revision + 1
+    assert result.ok is False and result.refused == ow.RACED
+    assert refreshed.instance == "alpha"
+
+
 def test_the_preserved_branch_survives_a_refused_reassign(
         db: Path, repo: Path) -> None:
     """A race loses the reclaim, not the work. The branch written before the
@@ -630,7 +666,9 @@ def test_a_native_path_is_not_mistaken_for_a_foreign_one(repo: Path) -> None:
     (False, "/home/dev/app", False),
     (False, "relative/dir", False),
     (True, "/home/dev/app", True),
+    (True, "//home/dev/app", True),
     (True, "C:\\repos\\app", False),
+    (True, "C:/repos/app", False),
     (True, "\\\\server\\share\\app", False),
     (True, "relative\\dir", False),
 ])
@@ -642,8 +680,49 @@ def test_foreign_paths_are_judged_in_both_syntaxes_on_any_platform(
     other half's verdict is decided by whichever platform happens to run the
     suite -- with the POSIX half mattering most, since that is where a Windows
     path reads as an ordinary relative name.
+
+    ``//home/dev/app`` is in the table because ``ntpath.splitdrive`` reads it
+    as the UNC share ``//home``: a drive test alone calls that POSIX path
+    native and sends Windows looking for ``\\\\home\\dev``.
     """
     assert ow._foreign_path(path, windows=windows) is foreign
+
+
+def test_a_worktree_from_another_kind_of_system_refuses_before_any_guessing(
+        db: Path) -> None:
+    """The syntax test is a fallback for claims older than the column. What
+    settles it is the claim saying which kind of system wrote the path --
+    evidence rather than inference, and the shapes overlap enough that
+    inference is wrong in one direction or the other.
+
+    The path here is a legal spelling on both kinds of system, so the syntax
+    test alone would call it native and reassign a worktree it never read.
+    """
+    other = "nt" if os.name != "nt" else "posix"
+    native_looking = "C:\\srv\\app" if os.name == "nt" else "/srv/agents/app"
+    _claim(db, worktree=native_looking)
+    with wc.connect(db) as conn:
+        conn.execute("UPDATE work_claims SET platform = ? WHERE item = ?",
+                     (other, "0007"))
+    held = wc.claim_for_item(db, "0007")
+    assert ow._foreign_path(held.worktree) is False, (
+        "the path must be one the syntax test calls native, or this proves "
+        "nothing the previous test did not")
+    result = ow.reclaim(db, item="0007", to_instance="beta",
+                        probes=FakeProbes(pids={1000: False}))
+    assert result.ok is False and result.refused == ow.PRESERVE_FAILED
+    assert wc.claim_for_item(db, "0007").instance == "alpha"
+
+
+def test_a_worktree_from_this_kind_of_system_is_reclaimed_normally(
+        db: Path, repo: Path) -> None:
+    """The negative control. A platform gate that refused every claim would
+    pass the test above and make reclaim useless."""
+    _claim(db, worktree=repo)
+    assert wc.claim_for_item(db, "0007").platform == os.name
+    result = ow.reclaim(db, item="0007", to_instance="beta",
+                        probes=FakeProbes(pids={1000: False}))
+    assert result.ok is True
 
 
 # ── the module issues no mutating verb, statically ──────────────

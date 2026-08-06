@@ -315,3 +315,69 @@ def test_the_heartbeat_of_a_long_running_claim_can_be_refreshed(store: Path) -> 
         stamp = (start + timedelta(minutes=minutes)).strftime(wc.TS_FORMAT)
         assert wc.heartbeat(store, item="0007", instance="alpha", now=stamp)
     assert wc.claim_for_item(store, "0007").heartbeat_at == "2026-01-01T00:30:00Z"
+
+
+# -- the revision counter and its migration ----------------------
+_PRE_REVISION_SCHEMA = """
+CREATE TABLE work_claims (
+    item         TEXT PRIMARY KEY,
+    subproject   TEXT NOT NULL DEFAULT '',
+    instance     TEXT NOT NULL UNIQUE,
+    worktree     TEXT,
+    branch       TEXT,
+    boot_id      TEXT,
+    mux_session  TEXT,
+    pid          INTEGER,
+    pid_start    TEXT,
+    claimed_at   TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL
+);
+"""
+
+
+def test_every_write_advances_the_revision(store: Path) -> None:
+    """A compare-and-swap needs one column that changes whatever else does
+    not. `heartbeat_at` cannot be it: `TS_FORMAT` has no sub-second field, so
+    two writes inside one second leave a byte-identical row."""
+    _claim(store)
+    first = wc.claim_for_item(store, "0007")
+    stamp = first.heartbeat_at
+    assert wc.heartbeat(store, item="0007", instance="alpha", now=stamp)
+    second = wc.claim_for_item(store, "0007")
+    assert second.heartbeat_at == first.heartbeat_at
+    assert second.revision == first.revision + 1
+    _claim(store)
+    assert wc.claim_for_item(store, "0007").revision == first.revision + 2
+    wc.reassign(store, item="0007", expect_owner="alpha", to_instance="beta")
+    assert wc.claim_for_item(store, "0007").revision == first.revision + 3
+
+
+def test_a_database_written_before_the_revision_column_is_migrated(
+        tmp_path: Path) -> None:
+    """`CREATE TABLE IF NOT EXISTS` is a no-op against a table an earlier
+    release wrote, so without the `ALTER` every read of that database raises
+    on a column that is not there. A claim database outlives its release."""
+    path = wc.db_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.executescript(_PRE_REVISION_SCHEMA)
+        conn.execute(
+            "INSERT INTO work_claims (item, instance, claimed_at,"
+            " heartbeat_at) VALUES ('0007', 'alpha', '2026-01-01T00:00:00Z',"
+            " '2026-01-01T00:00:00Z')")
+    wc.init_db(path)
+    held = wc.claim_for_item(path, "0007")
+    assert held.instance == "alpha" and held.revision == 0
+    assert wc.heartbeat(path, item="0007", instance="alpha")
+    assert wc.claim_for_item(path, "0007").revision == 1
+
+
+def test_the_migration_does_not_reset_an_existing_revision(store: Path) -> None:
+    """The negative control: `init_db` runs on every open, and an `ALTER` that
+    fired unconditionally would zero the counter each time — turning the CAS
+    into one that compares a constant."""
+    _claim(store)
+    assert wc.heartbeat(store, item="0007", instance="alpha")
+    before = wc.claim_for_item(store, "0007").revision
+    wc.init_db(store)
+    assert wc.claim_for_item(store, "0007").revision == before

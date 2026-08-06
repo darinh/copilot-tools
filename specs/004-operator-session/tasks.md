@@ -80,7 +80,12 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       moved — the second crash on one item is exactly when one exists. The
       final swap compares the whole claim row the verdict was computed from
       (`work_claims.reassign(expect_claim=…)`), not just the owner's name,
-      which does not change when a dead-judged owner comes back.
+      which does not change when a dead-judged owner comes back. A monotonic
+      `revision` column makes that comparison see a write that changed no
+      visible value, which a same-second heartbeat otherwise would not, and a
+      `platform` column recording the writer's `os.name` lets a reclaim refuse
+      a worktree from the other kind of system on recorded evidence instead of
+      guessing from the path's shape.
 - [ ] E3 `operator backlog ready` / `close` — preserving the `proposed` gate
 - [ ] E4 `operator worktree new` / `finish` / `recover`
 - [ ] E5 `operator reply`, retiring the inbox-polling semantics

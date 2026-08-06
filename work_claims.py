@@ -23,6 +23,7 @@ who that is and to have been right; the policy that decides -- and the
 """
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -54,7 +55,9 @@ CREATE TABLE IF NOT EXISTS work_claims (
     pid          INTEGER,
     pid_start    TEXT,
     claimed_at   TEXT NOT NULL,
-    heartbeat_at TEXT NOT NULL
+    heartbeat_at TEXT NOT NULL,
+    revision     INTEGER NOT NULL DEFAULT 0,
+    platform     TEXT
 );
 """
 
@@ -107,6 +110,21 @@ class Claim:
     pid_start: "str | None" = None
     claimed_at: str = ""
     heartbeat_at: str = ""
+    #: Bumped by every write that touches the row. A timestamp cannot do this
+    #: job: :data:`TS_FORMAT` has no sub-second field, so two writes inside one
+    #: second are indistinguishable, and a compare-and-swap that compares
+    #: values alone reads "nothing happened" at the exact moment something did.
+    #: The counter makes every refresh visible whatever the clock says.
+    revision: int = 0
+    #: ``os.name`` of the machine that wrote the claim. Recorded because
+    #: ``worktree`` is a path in *that* machine's syntax and nothing converts
+    #: it: read on the other kind of system the string is not invalid, merely
+    #: wrong, and a presence probe then reports somebody's live worktree as
+    #: absent. Inferring the platform from the path's shape is guesswork that
+    #: fails on the overlaps -- ``/temp/app`` is a legal spelling on both --
+    #: so the writer states it instead. ``None`` means a claim older than this
+    #: column, where the shape is all there is to go on.
+    platform: "str | None" = None
 
 
 def utcnow() -> str:
@@ -148,6 +166,16 @@ def db_path(project_dir) -> Path:
 def init_db(path) -> None:
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+        # `CREATE TABLE IF NOT EXISTS` is a no-op against a table written by an
+        # earlier version, so a column added later has to be added here too.
+        # A claim database outlives the release that made it.
+        columns = {row[1] for row in
+                   conn.execute("PRAGMA table_info(work_claims)")}
+        if "revision" not in columns:
+            conn.execute("ALTER TABLE work_claims ADD COLUMN revision"
+                         " INTEGER NOT NULL DEFAULT 0")
+        if "platform" not in columns:
+            conn.execute("ALTER TABLE work_claims ADD COLUMN platform TEXT")
 
 
 def _row_to_claim(row) -> Claim:
@@ -163,6 +191,8 @@ def _row_to_claim(row) -> Claim:
         pid_start=row["pid_start"],
         claimed_at=row["claimed_at"],
         heartbeat_at=row["heartbeat_at"],
+        revision=row["revision"],
+        platform=row["platform"],
     )
 
 
@@ -230,17 +260,19 @@ def claim(path, *, item: str, instance: str, subproject: str = "",
             conn.execute(
                 "INSERT INTO work_claims (item, subproject, instance, worktree,"
                 " branch, boot_id, mux_session, pid, pid_start, claimed_at,"
-                " heartbeat_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " heartbeat_at, platform) VALUES"
+                " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (item, subproject, instance, worktree, branch, boot_id,
-                 mux_session, pid, pid_start, stamp, stamp))
+                 mux_session, pid, pid_start, stamp, stamp, os.name))
         else:
             conn.execute(
                 "UPDATE work_claims SET subproject = ?, worktree = ?,"
                 " branch = ?, boot_id = ?, mux_session = ?, pid = ?,"
-                " pid_start = ?, heartbeat_at = ? WHERE item = ?"
-                " AND instance = ?",
+                " pid_start = ?, heartbeat_at = ?, platform = ?,"
+                " revision = revision + 1"
+                " WHERE item = ? AND instance = ?",
                 (subproject, worktree, branch, boot_id, mux_session, pid,
-                 pid_start, stamp, item, instance))
+                 pid_start, stamp, os.name, item, instance))
         return _claim_for_item(conn, item)
 
 
@@ -254,8 +286,8 @@ def heartbeat(path, *, item: str, instance: str, now=None) -> bool:
     stamp = now or utcnow()
     with connect(path) as conn:
         cur = conn.execute(
-            "UPDATE work_claims SET heartbeat_at = ? WHERE item = ?"
-            " AND instance = ?", (stamp, item, instance))
+            "UPDATE work_claims SET heartbeat_at = ?, revision = revision + 1"
+            " WHERE item = ? AND instance = ?", (stamp, item, instance))
         return cur.rowcount == 1
 
 
@@ -293,12 +325,13 @@ def reassign(path, *, item: str, expect_owner: str, to_instance: str,
     forced to invent one.
 
     The comparison is inside the same ``BEGIN IMMEDIATE`` as the update, so
-    nothing can slip between the check and the write. What it cannot see is a
-    refresh that leaves every column identical -- a heartbeat written inside
-    the same whole second as the one already stored, since
-    :data:`TS_FORMAT` has no sub-second field. That window is narrow and, more
-    to the point, it is a window in which the owner published no new evidence
-    of being alive.
+    nothing can slip between the check and the write, and it catches a refresh
+    that changed no visible value because :attr:`Claim.revision` advances on
+    every write. That counter is why the comparison is not on timestamps
+    alone: :data:`TS_FORMAT` has no sub-second field, so an owner heartbeating
+    inside the same whole second as the stored stamp leaves a byte-identical
+    row, and a value comparison reads "nothing happened" at the one moment it
+    most needed to read otherwise.
     """
     stamp = now or utcnow()
     with connect(path) as conn:
@@ -317,9 +350,11 @@ def reassign(path, *, item: str, expect_owner: str, to_instance: str,
         conn.execute(
             "UPDATE work_claims SET instance = ?, worktree = ?, branch = ?,"
             " boot_id = ?, mux_session = ?, pid = ?, pid_start = ?,"
-            " claimed_at = ?, heartbeat_at = ? WHERE item = ? AND instance = ?",
+            " claimed_at = ?, heartbeat_at = ?, platform = ?,"
+            " revision = revision + 1"
+            " WHERE item = ? AND instance = ?",
             (to_instance, worktree, branch, boot_id, mux_session, pid,
-             pid_start, stamp, stamp, item, expect_owner))
+             pid_start, stamp, stamp, os.name, item, expect_owner))
         return _claim_for_item(conn, item)
 
 

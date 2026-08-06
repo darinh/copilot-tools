@@ -155,7 +155,13 @@ def _foreign_path(raw, *, windows: "bool | None" = None) -> bool:
     if windows:
         # Rooted with no drive and no UNC share is POSIX syntax. Windows would
         # silently resolve it against whichever drive happens to be current.
-        return not drive and text[:1] in ("/", "\\")
+        # A leading forward slash decides it before `splitdrive` gets a say:
+        # `//home/dev` parses as the UNC share `//home`, so the drive test
+        # alone would call a POSIX path native and go looking for
+        # `\\home\dev`.
+        if text[:1] == "/":
+            return True
+        return not drive and text[:1] == "\\"
     return bool(drive) or "\\" in text
 
 
@@ -502,6 +508,20 @@ def reclaim(path, *, item: str, to_instance: str, probes=None, now=None,
                                     f"{verdict.reason}")
 
     if held.worktree:
+        # The claim states which kind of system wrote that path, and a path is
+        # only meaningful under the syntax it was written in. Refusing here
+        # rather than inferring from the string's shape, because the shapes
+        # overlap: `/temp/app` is a legal spelling on both, so a guess is
+        # wrong in whichever direction the guesser did not choose -- and one
+        # of those directions reports a live worktree as absent and reassigns
+        # it unpreserved.
+        if held.platform and held.platform != os.name:
+            return ReclaimResult(item=item, to_instance=to_instance,
+                                 previous=held, liveness=verdict,
+                                 refused=PRESERVE_FAILED,
+                                 detail=f"{held.worktree} was recorded on a "
+                                        f"{held.platform} system and cannot "
+                                        f"be examined from a {os.name} one")
         try:
             preserved = preserve(held.worktree, item=item,
                                  instance=held.instance, runner=runner)
