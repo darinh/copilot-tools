@@ -1,8 +1,10 @@
 ---
 id: 11
 title: A supervisor silently runs code that no longer exists in the tree
-status: proposed
+status: closed
 opened: 2026-08-05
+closed: 2026-08-07
+commit: a08bb2d2b5c0919cfe35cc7caff03fef573dc80c
 spec: none
 ---
 
@@ -208,3 +210,60 @@ which branch ran. It reached the right conclusion, but only because step 4
 was already in hand — which is exactly the condition under which this
 evidence is safe, and exactly the condition a reader diagnosing it fresh
 does not have.
+
+## Third confirmation, and the residue closed, 2026-08-07
+
+Reported by the `discord-invite-manager` operator instance, which supplied
+two things this item could not produce for itself.
+
+**It closed the discrimination the second confirmation left open.** That run
+proved the crash-recovery clause behaves correctly when a handoff is present,
+and flagged that it could not tell "the clause is gone entirely" from "the
+clause is now correctly conditional". `operator.log`, 2026-08-07 07:05:18:
+
+    No handoff at ...\handoff\discord-invite-manager.md, but an unmigrated
+    one is at ...\next-session.md -- not reporting this as crash recovery
+
+That is the genuinely-absent-at-the-canonical-path case, and the code did not
+merely stay silent: it reasoned about the alternate location and explicitly
+declined to claim a crash. The clause is conditional and the condition is
+correct.
+
+**An absent tag in `operator list` is ambiguous, and the digest is what
+settles it.** `CODE_UNKNOWN` prints nothing, exactly as `CODE_CURRENT`
+does, so "no tag" is not a verdict. That peer recomputed SHA-256 over all 19
+recorded files itself -- 19/19 matching, pid alive -- and only then concluded
+its supervisor was current. This instance did the same and reached the same
+answer. It is the same failure shape as the absent log line above: **a signal
+whose silence has two causes cannot distinguish them, and reads as the
+reassuring one.**
+
+**On the shape of the remedy**, that peer pushed on the wording rather than
+the placement, and was right to. "This supervisor cannot show it is current"
+is an epistemic state of the supervisor; "your predecessor crashed" is a claim
+about the previous session. If the caveat is phrased as the second it becomes
+a second confident-sounding sentence in the exact place the first one already
+misled. It has to read as *the supervisor declining to vouch for its own
+output*. Its own session is the evidence: its handoff instructed a restart on
+the assumption the supervisor was stale, and only independent verification
+avoided a pointless one. An agent that trusts its preamble does the wrong
+thing; an agent that distrusts it burns a session verifying. Both costs are
+paid in the preamble, which is the argument for putting the claim there.
+
+That peer also reported the same class from its own repository, in a domain
+with no supervisor in it: a "test suite is green" claim inherited through six
+consecutive verification-only sessions, where actually running the suite gave
+exit 1 on a real nondeterministic failure. **A claim cheap to check and
+expensive to inherit, with nothing in the loop forcing the check** -- the
+supervisor case is one instance of that, not the whole of it.
+
+## Resolution
+
+Closed by `a08bb2d`, recorded above. `build_preamble` now consults
+`_launch_code_state()` and appends a caveat for `CODE_STALE` and for the
+cannot-tell verdicts, worded per the argument above: scoped to this preamble's
+own claims rather than issued as a general warning, wording the two verdicts
+differently because one is an observed difference and the other an absence of
+evidence, naming `restart-loop` as information rather than as an
+instruction, and silent for `CODE_CURRENT` so the caveat does not become
+another always-present line that stops being read.
