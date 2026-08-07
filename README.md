@@ -375,6 +375,7 @@ copilot-tools/
 │   └── workflows/ci.yml           # 8 jobs: 3 OSes x 2 Pythons, shell syntax, extensions
 ├── .specify/                      # Spec Kit templates, scripts, and constitution
 ├── AGENTS.md                      # This repo's own conventions, written by `operator projects`
+├── CLAUDE.md                      # The same conventions for Claude Code; imports AGENTS.md
 ├── specs/                         # Feature specifications, plans, and tasks
 ├── backlog/                       # Open work, one file per item; see its README
 ├── .gitattributes                 # Shell scripts check out LF on every platform
