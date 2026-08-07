@@ -187,3 +187,56 @@ as a pass is the failure mode the third code exists to prevent.
   SQL the agents are told to paste. Under D10 the check moves with the rule, so
   the pin is replaced by a test of the new `operator` subcommand in the same
   commit — not deleted.
+
+## Measured after G8, G10 and G13
+
+The audit's estimate was that the block would land near 435 words of
+guardrail residue. It delivered at **674 of a 700-word budget**, every flag
+on, on both platforms — the template carries no platform brackets, so the two
+renderings are byte-identical and the earlier 4,332/4,321 split is gone.
+
+| | words | note |
+|---|---|---|
+| before (Windows) | 4,332 | measured after G12 |
+| after (either platform) | 674 | 84% cut |
+| of which generated | ~106 | `_header` ~30, `_configuration_section` ~76 |
+| budget | 700 | 26 words of headroom |
+| subproject block | 63 | of a 120-word budget |
+
+Three things the estimate got wrong, all recorded because the *direction* of
+the error is the useful part:
+
+1. **The residue was bigger than 435.** Guardrails do not compress to their
+   verbs; a rule with no procedure attached is a rule nobody can follow, so
+   "keep the guardrail, drop the rationale" keeps more than the guardrail's
+   own sentence. First honest draft was 756 words and had to be cut by 82.
+
+2. **26 words of headroom is thin, and that is a known cost.** The audit
+   warned that a too-tight budget makes the next legitimate line an
+   emergency. It stands as accepted: the three places a line can go instead
+   are named in the error message, so the emergency has an exit that is not
+   "raise the budget".
+
+3. **The generated content is a fixed tax.** ~106 of the 700 are written by
+   `render()` itself, so the template's real allowance is ~594. Trimming
+   `_configuration_section` was as productive per word as trimming prose.
+
+### The downgrade interaction, unresolved by design
+
+An older build meeting a newer template keeps sections gated behind slugs it
+does not know (`test_a_section_gated_behind_an_unknown_slug_is_kept`), so it
+can render *over* budget and then refuse to generate at all. FR-8 says error
+and that is what it does. The alternative — warn on a slug we cannot
+recognise — reintroduces the warning nobody acts on, in the one case where
+the block is provably wrong. Recorded here rather than fixed: the fix is to
+ship builds in order, and a version skew large enough to trigger this is
+already a problem the budget did not cause.
+
+### D11 was satisfied by accident
+
+Build/test/lint guidance never reached a rendered block, because it lived
+under the one heading `render()` replaces. Nothing tested that and nothing
+recorded it, so the property could have been removed by an edit to the
+*generated* section with no test objecting. G10 made it enforced, and gave
+the commands a home outside the markers (`VALIDATION_STUB`) so the rule is
+followable rather than merely true.

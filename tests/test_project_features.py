@@ -52,8 +52,6 @@ TEMPLATE = REPO / "templates" / "copilot-instructions.md"
 #: and negative controls for the pattern itself, so importing it does not cost
 #: an independent check of whether it matches anything.
 _GATE = project_instructions.GATE
-_TABLE_SEPARATOR = re.compile(r"^\|[\s:|-]+\|$")
-_EMPHASIS = re.compile(r"[*`]")
 
 
 @pytest.fixture
@@ -61,47 +59,46 @@ def template() -> str:
     return TEMPLATE.read_text(encoding="utf-8")
 
 
-def _table_names(text: str) -> list[str]:
-    """First-column names of the one table under ``### Feature Selection``.
+def _rendered(text: str, *, values: "dict | None" = None) -> str:
+    """The block a project actually receives, with every feature on.
 
-    A private copy of the table reader in ``test_instructions_template.py``
-    would be a second definition of "what the table says", which is the exact
-    duplication this module exists to forbid -- so this reads the table
-    structurally and asserts there is only one, and the *other* module keeps
-    checking the template's internal consistency. The two ask different
-    questions of the same bytes: that one asks whether the document agrees
-    with itself, this one asks whether it agrees with the code.
+    Measured against the *rendered* block, not the template, and that is the
+    correction this module needed. The predecessor read a `### Feature
+    Selection` table out of `## Project Configuration System` -- the one
+    section :func:`project_instructions.render` **replaces** wholesale. The
+    table therefore never reached a single agent, and a test reading it was
+    checking a document nobody was ever shown. The claim is the same one; the
+    bytes it is asked of are now the bytes that ship.
     """
-    start = text.index("### Feature Selection")
-    end = text.index("### What to write in a per-project file", start)
-    lines = [line.strip() for line in text[start:end].splitlines()]
-    separators = [i for i, line in enumerate(lines)
-                  if _TABLE_SEPARATOR.match(line)]
-    assert len(separators) == 1, (
-        f"expected exactly one table under '### Feature Selection', "
-        f"found {len(separators)}")
-    names = []
-    for line in lines[separators[0] + 1:]:
-        if not line.startswith("|"):
-            break
-        name = _EMPHASIS.sub("", line.strip("|").split("|")[0]).strip()
-        if name:
-            names.append(name)
-    return names
+    if values is None:
+        values = {**project_features.resolved_values(None),
+                  **{slug: ON for slug in SLUGS if slug != TRACKED_BACKLOG}}
+    return project_instructions.render(
+        source=text, values=values, guid="GUID-1", project_path="/repo/app",
+        label="app", project_dir_path="/home/.operator/projects/GUID-1",
+        config_path="/home/.operator/projects/GUID-1/features.json",
+        version="9.9.9", platform=project_instructions.POSIX)
+
+
+def _listed_slugs(block: str) -> list:
+    match = re.search(r"Enabled features: ([^.]+)\.", block)
+    assert match, "no 'Enabled features:' line in the generated block"
+    return [s.strip() for s in re.split(r",\s*", match.group(1)) if s.strip()]
 
 
 # ---------------------------------------------------------------------------
 # The vocabulary is the single owner
 # ---------------------------------------------------------------------------
 
-def test_the_template_offers_exactly_the_features_the_code_declares(template):
+def test_the_block_names_exactly_the_features_the_code_declares(template):
     """The assertion this module exists for.
 
-    If the menu enumerates features and the template enumerates features, the
-    two lists will disagree, and the disagreement surfaces as a menu option
-    that silently toggles nothing an agent ever reads.
+    If the menu enumerates features and the shipped block enumerates
+    features, the two lists will disagree, and the disagreement surfaces as a
+    menu option that silently toggles nothing an agent ever reads.
     """
-    assert _table_names(template) == [f.name for f in FEATURES]
+    listed = _listed_slugs(_rendered(template))
+    assert listed == [f.slug for f in FEATURES]
 
 
 def test_every_feature_gates_a_section_of_the_template(template):
@@ -120,40 +117,32 @@ def test_every_gated_section_names_a_feature_that_exists(template):
         f"vocabulary does not declare: {sorted(gated - set(SLUGS))}")
 
 
-def test_the_example_enabled_features_line_is_one_this_module_could_produce(template):
-    """The line a new project's instructions file is copied from.
+def test_the_enabled_features_line_is_one_this_module_could_produce(template):
+    """The line every project's own file carries.
 
-    It is the one place the slugs appear as a list, so it is the one place a
-    project's own file inherits verbatim -- and it must be a list this module
-    would actually produce.
-
-    It is deliberately *not* compared against the defaults. Since FR-8 those
-    are off, so pinning the example to them would force the sample line to
-    read "Enabled features: tracked-backlog." -- an example that teaches
-    nothing about the file it is an example of. What still has to hold is
-    that every slug in it is real and that the ordering is the one this
-    module emits, which is what a typo or a renamed feature breaks.
+    It is the one place the slugs appear as a list, and it is generated
+    rather than copied from an example now -- the example lived in the
+    section the renderer replaces, so no project ever inherited it. What has
+    to hold is that every slug in it is real and that the ordering is the one
+    this module emits, which is what a typo or a renamed feature breaks.
     """
-    section = template[template.index("### What to write in a per-project file"):]
-    match = re.search(r"Enabled features: ([^.]+)\.", section, re.DOTALL)
-    assert match, "no 'Enabled features:' line in the example project file"
-    listed = [s.strip() for s in re.split(r",\s*", match.group(1)) if s.strip()]
-    assert listed, "the example lists no features, so this proves nothing"
-    unknown = [slug for slug in listed if slug not in project_features.SLUGS]
+    values = {**project_features.resolved_values(None),
+              **{slug: ON for slug in SLUGS if slug != TRACKED_BACKLOG}}
+    listed = _listed_slugs(_rendered(template, values=values))
+    assert listed, "the line lists no features, so this proves nothing"
+    unknown = [slug for slug in listed if slug not in SLUGS]
     assert not unknown, unknown
-    values = {f.slug: (f.default if f.slug in listed else f.off_value)
-              for f in FEATURES}
-    values.update({slug: ON for slug in listed
-                   if slug != TRACKED_BACKLOG})
     assert listed == list(project_features.enabled_slugs(values))
 
 
-def test_a_feature_the_template_does_not_offer_is_reported(template):
-    """Positive control for the table check."""
-    mutated = template.replace(f"| **{FEATURES[0].name}** |", "| **Telepathy** |", 1)
-    assert mutated != template, "the substitution found nothing to replace"
-    with pytest.raises(AssertionError):
-        test_the_template_offers_exactly_the_features_the_code_declares(mutated)
+def test_a_feature_the_block_does_not_name_is_reported(template):
+    """Positive control for the enumeration check."""
+    with mock.patch.object(
+            project_features, "enabled_features_line",
+            lambda values: "Enabled features: telepathy."):
+        with pytest.raises(AssertionError):
+            test_the_block_names_exactly_the_features_the_code_declares(
+                template)
 
 
 def test_a_feature_gating_no_section_is_reported(template):
@@ -178,12 +167,21 @@ def test_a_gate_naming_no_feature_is_reported(template):
 
 
 def test_an_enabled_features_line_that_drifts_is_reported(template):
-    mutated = template.replace("Enabled features: session-handoff",
-                               "Enabled features: telepathy, session-handoff", 1)
-    assert mutated != template, "the substitution found nothing to replace"
-    with pytest.raises(AssertionError):
-        test_the_example_enabled_features_line_is_one_this_module_could_produce(
-            mutated)
+    """Positive control for the ordering check.
+
+    Reversed rather than adulterated: every slug is still real, so only the
+    ordering claim can catch it. A control that breaks two rules at once
+    proves neither.
+    """
+    reversed_line = ", ".join(reversed(list(project_features.enabled_slugs(
+        {**project_features.resolved_values(None),
+         **{slug: ON for slug in SLUGS if slug != TRACKED_BACKLOG}}))))
+    with mock.patch.object(
+            project_features, "enabled_features_line",
+            lambda values: f"Enabled features: {reversed_line}."):
+        with pytest.raises(AssertionError):
+            test_the_enabled_features_line_is_one_this_module_could_produce(
+                template)
 
 
 # ---------------------------------------------------------------------------

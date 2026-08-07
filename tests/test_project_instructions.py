@@ -223,7 +223,7 @@ def test_the_enrollment_instructions_are_replaced_not_copied(template, defaults)
     assert f"## {pi.CONFIGURATION_SECTION}" in rendered
     assert "isn't in the catalog yet" not in rendered
     assert "Would you like to set it up" not in rendered
-    assert "must not offer to enroll this directory" in rendered
+    assert "Do not offer to enroll this directory" in rendered
     assert "GUID-1" in rendered
 
 
@@ -267,12 +267,370 @@ def test_the_block_is_delimited_by_both_markers(template, defaults):
 
 
 # ---------------------------------------------------------------------------
+# FR-8 -- the word budget
+# ---------------------------------------------------------------------------
+
+def test_the_shipped_template_fits_the_budget_with_every_feature_on(
+        template, defaults):
+    """The binding case, and the only one worth measuring.
+
+    Features off make the block shorter, so a project with a few flags set is
+    never the rendering that overflows. Turning everything on is what the
+    budget is for -- and it is what the audit measured the predecessor at:
+    4,332 words, against 700 now.
+    """
+    values = {**defaults}
+    for feature in project_features.FEATURES:
+        values[feature.slug] = (feature.options[0].value
+                                if len(feature.options) > 2 else "on")
+    spent = pi.block_words(_render(template, values))
+    assert spent <= pi.WORD_BUDGET, (
+        f"the shipped template renders {spent} words, over the budget")
+
+
+def test_generation_refuses_a_block_over_the_budget(template, defaults):
+    """It errors. It does not warn, and there is no override.
+
+    A warning is a line of output nobody is obliged to act on, and the block
+    that produced it still ships -- which is how the predecessor reached 4,332
+    words with every one of them added for a reason. The refusal is the only
+    part of this that is a mechanism rather than an intention.
+    """
+    fat = template + "\n\n## Padding\n\n" + ("word " * pi.WORD_BUDGET)
+    with pytest.raises(pi.InstructionsError) as caught:
+        _render(fat, defaults)
+    message = str(caught.value)
+    assert str(pi.WORD_BUDGET) in message, (
+        "the error does not name the budget, so a reader cannot tell how much "
+        "has to come out")
+    assert "over" in message and "budget" in message
+
+
+def test_the_budget_error_says_what_to_do_about_it(template, defaults):
+    """An error that only reports a number gets satisfied by deleting a guardrail.
+
+    The whole design is that adding costs removing, so the message has to name
+    the three places a line can go instead -- skill, rationale, tool -- and
+    D10, which is the rule that stops the removal happening on its own.
+    """
+    fat = template + "\n\n## Padding\n\n" + ("word " * pi.WORD_BUDGET)
+    with pytest.raises(pi.InstructionsError) as caught:
+        _render(fat, defaults)
+    message = str(caught.value).lower()
+    for expected in ("skill", "rationale", "tool", "d10"):
+        assert expected in message, (
+            f"the budget error never mentions {expected!r}; it reports a "
+            "number and leaves the cheapest fix as deleting a rule")
+
+
+@pytest.mark.parametrize("over", [0, 1])
+def test_the_budget_binds_at_the_boundary_and_not_before(over):
+    """Exactly at the budget passes; one word past it does not.
+
+    Parametrised over both sides because an off-by-one here is invisible in
+    ordinary use -- the shipped block is 26 words clear -- and would only ever
+    be discovered by the edit that happened to land on the boundary.
+
+    The padding is measured rather than calculated: `render` adds a generated
+    header and an enrollment section of its own, and a test that assumed their
+    size would drift into checking a boundary several words off the real one
+    while still reporting both sides correctly.
+    """
+    values = project_features.resolved_values(None)
+    # Under a heading: `render` discards the preamble and replaces it with a
+    # generated header, so padding written above the first `##` never reaches
+    # the block -- which is how the first draft of this test measured a floor
+    # of 38 words for every input it tried.
+    base = "# T\n\n## A\n\nintro\n"
+    floor = pi.block_words(_render(base, values))
+    body = "intro " + "word " * (pi.WORD_BUDGET - floor + over)
+    source = f"# T\n\n## A\n\n{body}\n"
+    if over:
+        with pytest.raises(pi.InstructionsError):
+            _render(source, values)
+    else:
+        assert pi.block_words(_render(source, values)) == pi.WORD_BUDGET
+
+
+def test_the_budget_is_the_number_the_human_agreed(template, defaults):
+    """700 is a decision, not an implementation detail.
+
+    Mutation found this hole: every other budget test is written *relative*
+    to `WORD_BUDGET`, so raising the constant moves them all with it and the
+    suite stays green. That is precisely how a budget becomes a warning --
+    one justified exception at a time -- and it is the failure the whole of
+    FR-8 exists to prevent. The number is pinned here so that changing it is
+    a diff somebody has to argue for.
+
+    Also pinned: the delivered block is genuinely near the limit. A budget
+    with 4,000 words of headroom is not a budget, and this is what tells the
+    difference between "trimmed the block" and "raised the number".
+    """
+    assert pi.WORD_BUDGET == 700
+    spent = pi.block_words(_render(template, {
+        **defaults,
+        **{f.slug: (f.options[0].value if len(f.options) > 2 else "on")
+           for f in project_features.FEATURES}}))
+    assert pi.WORD_BUDGET - spent <= 100, (
+        f"the block spends {spent} of {pi.WORD_BUDGET}; a budget this loose "
+        "no longer binds")
+
+
+def test_the_subproject_budget_is_pinned_too():
+    """Same hole, same fix, one order of magnitude down."""
+    assert pi.SUBPROJECT_WORD_BUDGET == 120
+
+
+def test_the_count_includes_the_markers_and_the_fences():
+    """Over-counting is the safe direction and it is chosen deliberately.
+
+    A counter that excluded machinery could be satisfied by moving prose into
+    a fence, which is the one move that shortens the number without shortening
+    what an agent reads. Counting everything binds slightly early; the failure
+    it must never have is letting a block grow past its limit unnoticed.
+    """
+    assert pi.block_words("a b c") == 3
+    # `<!--`, `BEGIN`, `-->`, ```` ``` ````, `x`, `y`, ```` ``` ````.
+    assert pi.block_words("<!-- BEGIN -->\n```\nx y\n```\n") == 7
+    assert pi.block_words("  spaced   out \n\n words ") == 3
+    assert pi.block_words("") == 0
+
+
+# ---------------------------------------------------------------------------
+# FR-9 -- the subproject block is additive only
+# ---------------------------------------------------------------------------
+
+SUBPROJECT_TEMPLATE = REPO / "templates" / "subproject-instructions.md"
+
+#: Words that make a sentence a rule rather than a fact. A subproject file may
+#: carry neither, because a rule there is a rule stated twice under Claude Code
+#: and a rule stated *instead* under Codex.
+_DIRECTIVE_TELLS = ("must", "never", "always", "do not", "don't", "should")
+
+
+def _sentences(text: str) -> set:
+    """Normalised sentences of five words or more.
+
+    Shorter fragments are headings, list items and marker lines, which the two
+    blocks legitimately share; a five-word run of prose in both files is the
+    thing FR-9 forbids.
+    """
+    flat = " ".join(text.split())
+    out = set()
+    for piece in re.split(r"(?<=[.!?])\s+", flat):
+        words = piece.strip(" -*#`").lower().split()
+        if len(words) >= 5:
+            out.add(" ".join(words))
+    return out
+
+
+def _subproject(**kwargs) -> str:
+    args = {"name": "api", "owns": ["services/api"],
+            "contracts": ["specs/contracts"], "version": "9.9.9"}
+    args.update(kwargs)
+    return pi.render_subproject(**args)
+
+
+def test_the_subproject_block_names_what_the_root_block_cannot_know():
+    """The whole justification for a second file: resolved values.
+
+    Name, owned paths and contracts are per-directory facts, so the root file
+    physically cannot carry them. Everything else an agent needs is already in
+    the root file and is deliberately not repeated here.
+    """
+    block = _subproject()
+    assert "`api` subproject" in block
+    assert "`services/api`" in block
+    assert "`specs/contracts`" in block
+    assert "operator ownership check" in block
+
+
+def test_the_contract_waiver_is_spelled_the_way_the_command_accepts_it():
+    """A flag named wrongly is worse than a flag not named at all.
+
+    The reader tries it, it is rejected, and the file that told them is the
+    one place they had reason to trust. Measured against the dispatcher's own
+    flag table rather than a second copy of the spelling.
+    """
+    source = (REPO / "copilot_operator.py").read_text(encoding="utf-8")
+    assert '"--allow-contracts"' in source
+    assert "--allow-contracts" in _subproject()
+
+
+def test_the_contract_line_says_what_a_contract_is():
+    """Mutation found this: naming the paths is not the same as being right.
+
+    A block reading "Shared with nobody: `specs/contracts`" passed every
+    other check here -- the path was named, the flag was named, no directive
+    appeared. `operator_ownership.check` refuses a contract change from
+    *every* subproject, so a file telling one subproject the contracts are
+    theirs alone inverts the rule it is reporting, and inverts it in the file
+    the reader has most reason to trust.
+    """
+    block = _subproject(contracts=["specs/contracts"]).lower()
+    assert "shared with every subproject" in block
+
+
+def test_a_subproject_with_no_contracts_says_nothing_about_them():
+    """Absent facts are omitted, not rendered as an empty heading.
+
+    A "Contracts: (none)" line costs words in every subproject that has none,
+    and teaches a reader to skim a section that is usually empty -- which is
+    how the section that matters gets skimmed too.
+    """
+    assert "contract" not in _subproject(contracts=[]).lower()
+
+
+def test_a_subproject_that_owns_nothing_still_renders():
+    """A declaration can name a subproject and give it no paths.
+
+    That is a mistake in the declaration, and `operator ownership check`
+    reports it. Generation is not the place to refuse it: failing here stops
+    every *other* subproject's file being written over one bad entry.
+    """
+    assert "(none declared)" in _subproject(owns=[])
+
+
+def test_the_subproject_block_states_no_rules():
+    """FR-9, mechanically.
+
+    Claude Code concatenates parent and child; Codex lets the nearer file win.
+    A rule in both files therefore means two things depending on the harness,
+    and an identical copy is no safer -- copies drift, and the one that is
+    wrong is whichever was regenerated last, which is visible from neither
+    file. Facts cannot contradict rules, so the block carries only facts.
+    """
+    text = _subproject().lower()
+    found = [tell for tell in _DIRECTIVE_TELLS if tell in text]
+    assert not found, f"the subproject block gives directions: {found}"
+
+
+def test_the_directive_detector_would_fire():
+    """The control. An absence check that cannot fire reports every block
+    clean, including the one that broke the rule."""
+    text = "The api subproject must never write outside its own tree."
+    assert [t for t in _DIRECTIVE_TELLS if t in text.lower()]
+
+
+def test_the_subproject_block_repeats_no_sentence_of_the_root_block(
+        template, defaults):
+    """The other half of FR-9: not duplicated *content*, not just not rules.
+
+    Two texts saying the same thing are two texts to keep true, and nothing
+    compares them. Under Codex the child wins outright, so a stale copy here
+    silently replaces a current rule there.
+    """
+    root = _sentences(_render(template, defaults))
+    shared = root & _sentences(_subproject())
+    assert not shared, f"repeated from the root block: {sorted(shared)}"
+
+
+def test_the_repetition_detector_would_fire(template, defaults):
+    """The control for it, built from a real sentence of the real block."""
+    root = _sentences(_render(template, defaults))
+    borrowed = max(root, key=len)
+    assert root & _sentences(borrowed)
+
+
+def test_the_subproject_block_fits_its_own_budget():
+    """A subproject file is read *in addition to* the root one, in the same
+    turn, so the two are cumulative against one reader's attention."""
+    spent = pi.block_words(_subproject())
+    assert spent <= pi.SUBPROJECT_WORD_BUDGET, spent
+    assert pi.SUBPROJECT_WORD_BUDGET < pi.WORD_BUDGET
+
+
+def test_a_subproject_block_over_the_budget_is_refused():
+    """Same failure direction as FR-8: it errors, and there is no override.
+
+    The realistic way this overflows is a subproject owning a long list of
+    paths, so the budget is measured against the rendered list rather than
+    against the generator's prose.
+    """
+    owns = [f"services/{n}" for n in range(pi.SUBPROJECT_WORD_BUDGET)]
+    with pytest.raises(pi.InstructionsError) as caught:
+        _subproject(owns=owns)
+    message = str(caught.value).lower()
+    assert "budget" in message and "fr-9" in message
+
+
+def test_the_shipped_subproject_template_is_not_rendered():
+    """It documents the shape; it is not the source of a single word shipped.
+
+    Generation rather than templating is what makes "additive only"
+    enforceable -- there is no prose file for a rule to be written into. A
+    contributor who wires this file into the renderer has removed that
+    property, so the wiring is what the test watches for.
+    """
+    assert SUBPROJECT_TEMPLATE.exists()
+    assert "Not rendered" in SUBPROJECT_TEMPLATE.read_text(encoding="utf-8")
+    source = (REPO / "project_instructions.py").read_text(encoding="utf-8")
+    assert "subproject-instructions" not in source
+
+
+# ---------------------------------------------------------------------------
 # Composing it into a repository's own file
 # ---------------------------------------------------------------------------
 
-def test_composing_into_nothing_is_just_the_block():
-    assert pi.compose(None, "BLOCK\n") == "BLOCK\n"
-    assert pi.compose("   \n\n", "BLOCK\n") == "BLOCK\n"
+def test_composing_into_nothing_seeds_a_home_for_the_project_s_own_commands():
+    """A new file gets the block *and* a `## Validation` section below it.
+
+    This used to assert the file was the block alone. It changed with D11,
+    which keeps build, test and lint commands out of the generated block:
+    they are the three lines every project appends, and generating them puts
+    the tool and the project in a fight over the same text that regeneration
+    wins silently.
+
+    Keeping them out is only half of it. Somewhere has to hold them, or the
+    rule reads as "not here" and they come back inside the markers on the next
+    pass. The stub is that somewhere, and it is outside the markers, so
+    ``compose`` preserves whatever the project writes into it.
+    """
+    out = pi.compose(None, "BLOCK\n")
+    assert out.startswith("BLOCK\n")
+    assert pi.VALIDATION_STUB in out
+    assert pi.compose("   \n\n", "BLOCK\n") == out
+
+
+def test_the_seeded_section_is_outside_the_markers():
+    """Inside them it would be deleted by the very next regeneration.
+
+    The whole value of the stub is that it survives, so the thing to check is
+    not that it appears but *where*: a stub written between the markers reads
+    identically in the file and is gone on the next `operator projects`.
+    """
+    out = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n")
+    assert out.index(MANAGED_END) < out.index(pi.VALIDATION_STUB.strip())
+
+
+def test_a_project_that_deletes_the_stub_is_not_given_it_back():
+    """Seeding once is a suggestion; seeding every time is the fight again.
+
+    A project whose commands live in its README, or which has none, deletes
+    the section. Regenerating it would restore a heading somebody removed on
+    purpose -- the same silent overwrite D11 exists to prevent, arriving from
+    the other direction.
+    """
+    seeded = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n")
+    without = seeded.replace(pi.VALIDATION_STUB, "")
+    again = pi.compose(without, f"{MANAGED_BEGIN}\ny\n{MANAGED_END}\n")
+    assert "## Validation" not in again
+
+
+def test_the_seeded_section_survives_regeneration_and_is_not_doubled():
+    """What the project writes under the heading is the project's.
+
+    Checked with edited content rather than the pristine stub, because
+    ``compose`` preserving text it just wrote proves less than it preserving
+    text somebody replaced.
+    """
+    seeded = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n")
+    edited = seeded.replace(pi.VALIDATION_STUB,
+                            "## Validation\n\n`pytest -q`, then `ruff check`.\n")
+    again = pi.compose(edited, f"{MANAGED_BEGIN}\ny\n{MANAGED_END}\n")
+    assert again.count("## Validation") == 1
+    assert "`pytest -q`, then `ruff check`." in again
+    assert "y" in again and "x" not in again.split(MANAGED_END)[0]
 
 
 def test_an_existing_file_keeps_everything_it_had():
@@ -708,32 +1066,124 @@ def test_render_will_not_guess_the_platform():
                   version="1.0.0")
 
 
-def test_the_shipped_template_says_the_same_thing_in_both_vocabularies(template):
-    """Every platform block is paired, and neither rendering is empty.
+#: Spellings that only work on one platform, and the platform they work on.
+#:
+#: These are the tells a bracket exists for. Deliberately spelled as fragments
+#: rather than whole commands: what makes a line unportable is the syntax, and
+#: a check against whole commands would pass the moment somebody wrote a new
+#: one.
+_PLATFORM_TELLS = {
+    pi.WINDOWS: ("New-Item", "Get-ChildItem", "Select-Object", "$env:",
+                 "-ItemType", "```powershell"),
+    pi.POSIX: ("mktemp -d", "touch ~", "$(", "```bash", "```sh"),
+}
 
-    A block bracketed for one platform and forgotten for the other is a file
-    that tells a Windows agent nothing where it told a POSIX agent what to
-    run, and nothing in the rendering can report that -- the section is simply
-    shorter.
+
+def test_the_shipped_template_spells_no_command_for_one_platform_only(template):
+    """Every platform-specific command is bracketed, or there are none.
+
+    This used to assert the template brackets *at least one* command. The
+    block no longer brackets any: every command in it is now `operator ...`,
+    which is spelled identically on both platforms, and the two renderings are
+    byte-for-byte equal.
+
+    Asserting a non-empty bracket list would now be a rule that the document
+    must contain platform-specific text -- satisfiable only by adding some.
+    Inverting it is strictly stronger than the original, which could pass with
+    an unbracketed PowerShell snippet sitting in the template as long as one
+    *other* command happened to be bracketed correctly.
+    """
+    bracketed = {
+        index for start, end in _bracket_ranges(template)
+        for index in range(start, end + 1)
+    }
+    stray = [
+        (platform, tell, line.strip())
+        for index, line in pi.outside_fences(template)
+        if index not in bracketed
+        for platform, tells in _PLATFORM_TELLS.items()
+        for tell in tells
+        if tell in line
+    ]
+    assert not stray, (
+        "the block spells commands that only work on one platform, without "
+        "bracketing them:\n  "
+        + "\n  ".join(f"{p}: {tell!r} in {line}" for p, tell, line in stray)
+        + "\nAn agent on the other platform is handed a command that fails.")
+
+
+def test_the_platform_tell_scan_would_fire():
+    """The control. A scan that matched nothing would clear any document."""
+    stray = [
+        tell for _index, line in pi.outside_fences(
+            "## A\n\nRun `New-Item -ItemType File x` first.\n")
+        for tell in _PLATFORM_TELLS[pi.WINDOWS] if tell in line
+    ]
+    assert stray, "the tell list no longer matches a plainly PowerShell line"
+
+
+def test_brackets_in_the_shipped_template_are_paired(template):
+    """If the block ever brackets again, both halves must be there.
+
+    Vacuous today by construction -- there are no brackets -- so it says so
+    rather than passing quietly on an empty list. A guard that reports clean
+    on nothing is indistinguishable from one that works.
     """
     names = [pi.PLATFORM_BEGIN.match(line.strip()).group("name")
              for _index, line in pi.outside_fences(template)
              if pi.PLATFORM_BEGIN.match(line.strip())]
-    assert names, "the template brackets no platform-specific commands at all"
     assert names.count(pi.WINDOWS) == names.count(pi.POSIX), names
     assert len(names) == template.count(pi.PLATFORM_END)
     for platform in pi.PLATFORMS:
         assert pi.select_platform(template, platform).strip()
+    if not names:
+        # Both renderings identical is the *reason* there is nothing to pair,
+        # and checking it keeps this from being a test that proves nothing.
+        assert (pi.select_platform(template, pi.WINDOWS)
+                == pi.select_platform(template, pi.POSIX))
+
+
+def _bracket_ranges(text: str) -> list[tuple[int, int]]:
+    """Line-index spans covered by a platform bracket, ends included."""
+    ranges, open_at = [], None
+    for index, line in pi.outside_fences(text):
+        stripped = line.strip()
+        if pi.PLATFORM_BEGIN.match(stripped):
+            open_at = index
+        elif stripped == pi.PLATFORM_END and open_at is not None:
+            ranges.append((open_at, index))
+            open_at = None
+    return ranges
+
+
+#: A stand-in for what the shipped template used to contain.
+#:
+#: `select_platform` still has to work -- a project's own sections may bracket
+#: commands, and an older template still in a checkout certainly does -- so
+#: the mechanism is checked against a document written for the purpose rather
+#: than against whichever commands the block happens to spell this month.
+_BRACKETED = (
+    "# T\n\nintro\n\n## A\n\n"
+    "<!-- operator:platform windows -->\n"
+    "```powershell\n"
+    "New-Item -ItemType File -Force ~/.operator/restart/x\n"
+    "```\n"
+    "<!-- operator:endplatform -->\n"
+    "<!-- operator:platform posix -->\n"
+    "```bash\n"
+    "touch ~/.operator/restart/x\n"
+    "```\n"
+    "<!-- operator:endplatform -->\n"
+)
 
 
 @pytest.mark.parametrize("platform, kept, dropped", [
     (pi.WINDOWS, "New-Item -ItemType File", "touch ~/.operator/restart"),
     (pi.POSIX, "touch ~/.operator/restart", "New-Item -ItemType File"),
 ])
-def test_a_rendered_block_carries_one_platforms_commands(template, defaults,
-                                                          platform, kept,
-                                                          dropped):
-    out = _render(template, defaults, platform=platform)
+def test_a_rendered_block_carries_one_platforms_commands(defaults, platform,
+                                                         kept, dropped):
+    out = _render(_BRACKETED, defaults, platform=platform)
     assert kept in out
     assert dropped not in out
     assert "operator:platform" not in out
@@ -813,6 +1263,123 @@ def test_a_claude_file_with_a_managed_block_is_regenerated(machine):
     assert "kept" in out, "content outside the block was destroyed"
     assert "0.0.1" not in out, "the stale block was not regenerated"
     assert f"@{AGENTS_NAME}" in out
+
+
+def _declare(machine, mapping: dict, contracts=()) -> Path:
+    """Give the first project a subproject declaration and the directories."""
+    root = Path(machine["projects"][0]["path"])
+    for owned in mapping.values():
+        for path in owned:
+            (root / path).mkdir(parents=True, exist_ok=True)
+    declaration = root / ".operator" / "subprojects.json"
+    declaration.parent.mkdir(parents=True, exist_ok=True)
+    declaration.write_text(json.dumps(
+        {"subprojects": {name: {"owns": list(owned)}
+                         for name, owned in mapping.items()},
+         "contracts": list(contracts)}), encoding="utf-8")
+    return root
+
+
+def test_a_repository_that_declares_no_subprojects_gets_no_extra_files(machine):
+    """Every repository, until somebody draws a boundary.
+
+    The declaration being absent is not an error and not a prompt: it is the
+    normal shape of a repository, and generation must be silent about it.
+    """
+    _retire(machine)
+    root = Path(machine["projects"][0]["path"])
+    assert [p.name for p in root.rglob(AGENTS_NAME)] == [AGENTS_NAME]
+
+
+def test_each_declared_subproject_directory_gets_its_own_file(machine):
+    root = _declare(machine, {"api": ["services/api"],
+                              "web": ["clients/web"]},
+                    contracts=["specs/contracts"])
+    _retire(machine)
+    api = (root / "services" / "api" / AGENTS_NAME).read_text(encoding="utf-8")
+    web = (root / "clients" / "web" / AGENTS_NAME).read_text(encoding="utf-8")
+    assert "`api` subproject" in api and "`services/api`" in api
+    assert "`web` subproject" in web
+    assert "`specs/contracts`" in api
+
+
+def test_a_subproject_owning_two_trees_gets_a_file_in_each(machine):
+    """A nested file only helps an agent editing near it.
+
+    Both are generated in the same run from the same values, so this is not
+    the duplication FR-9 forbids -- there is no way for them to disagree.
+    """
+    root = _declare(machine, {"api": ["services/api", "clients/api-sdk"]})
+    _retire(machine)
+    for owned in ("services/api", "clients/api-sdk"):
+        text = (root / owned / AGENTS_NAME).read_text(encoding="utf-8")
+        assert "`services/api`" in text and "`clients/api-sdk`" in text
+
+
+def test_a_declared_directory_that_is_not_there_is_skipped(machine):
+    """A declaration can name a path before anyone creates it.
+
+    Creating the directory to hold the file would put the tool in the
+    business of inventing the tree it was asked to describe.
+    """
+    root = Path(machine["projects"][0]["path"])
+    (root / ".operator").mkdir(parents=True)
+    (root / ".operator" / "subprojects.json").write_text(
+        json.dumps({"subprojects": {"api": {"owns": ["services/api"]}}}),
+        encoding="utf-8")
+    result = _retire(machine)
+    assert [o.state for o in result.outcomes] == [WRITTEN, WRITTEN]
+    assert not (root / "services").exists()
+
+
+def test_an_unreadable_declaration_fails_the_project(machine):
+    """Not a silent skip.
+
+    `operator ownership check` refuses on an unreadable declaration, so
+    swallowing it here leaves a repository whose push gate is broken and
+    whose generation reported success.
+    """
+    root = Path(machine["projects"][0]["path"])
+    (root / ".operator").mkdir(parents=True)
+    (root / ".operator" / "subprojects.json").write_text(
+        "{not json", encoding="utf-8")
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert "subproject" in result.outcomes[0].detail.lower()
+
+
+def test_a_users_own_subproject_file_is_not_touched(machine):
+    root = _declare(machine, {"api": ["services/api"]})
+    target = root / "services" / "api" / AGENTS_NAME
+    target.write_text("# mine\n\nHands off.\n", encoding="utf-8")
+    result = _retire(machine)
+    assert target.read_text(encoding="utf-8") == "# mine\n\nHands off.\n"
+    assert [o.state for o in result.outcomes] == [WRITTEN, WRITTEN]
+
+
+def test_a_subproject_file_regenerates_and_keeps_what_is_outside_the_block(
+        machine):
+    root = _declare(machine, {"api": ["services/api"]})
+    target = root / "services" / "api" / AGENTS_NAME
+    target.write_text(
+        "# mine\n\nkept\n\n"
+        + pi.render_subproject(name="api", owns=["stale"], contracts=[],
+                               version="0.0.1"),
+        encoding="utf-8")
+    _retire(machine)
+    out = target.read_text(encoding="utf-8")
+    assert "kept" in out, "content outside the block was destroyed"
+    assert "0.0.1" not in out and "stale" not in out
+    assert "`services/api`" in out
+
+
+def test_a_second_run_leaves_the_subproject_files_alone(machine):
+    root = _declare(machine, {"api": ["services/api"]})
+    target = root / "services" / "api" / AGENTS_NAME
+    _retire(machine)
+    first = target.read_text(encoding="utf-8")
+    _retire(machine)
+    assert target.read_text(encoding="utf-8") == first
 
 
 # ---------------------------------------------------------------------------

@@ -764,6 +764,61 @@ completes the document from the resolved values either way. Left as prose
 rather than pinned with a test that would only assert `write_config`'s
 behaviour twice.
 
+## Phase G — the cut, as delivered
+
+G8, G10 and G13 were held for the human because all three delete rules from
+the managed block. They were released together and landed together, because
+each is load-bearing for the next: the budget is only reachable once the cut
+has happened, and the cut is only safe once the deleted lines have somewhere
+to go.
+
+**Root template.** 4,332 rendered words to **674**, an 84% cut, against a
+`WORD_BUDGET` of 700. Kept: guardrails, procedures, checks. Deleted: the
+prose explaining why, which moved to `docs/rationale.md` and the skills —
+read on demand instead of on every turn. The block now carries no platform
+brackets at all, so both renderings are byte-identical.
+
+**The budget is a mechanism, not an intention.** `render()` raises above 700.
+No warning, no override flag: a warning is a line of output nobody is obliged
+to act on and the block that produced it still ships, which is how the
+predecessor reached 4,332 words with every one of them added for a reason.
+The count includes markers and fences, so prose cannot be hidden from it by
+moving it into a fence. It fired on its own first run — 756 words — and the
+82-word cut that followed took no guardrail with it.
+
+**D10 held throughout.** Twenty-nine tests failed after the rewrite, and not
+one was deleted. Each was handled one of four ways: retargeted at the
+document that now carries the claim (`docs/operator.md`,
+`skills/peer-agents/SKILL.md`); rewritten to measure the *rendered* block
+rather than the template; replaced by an absence-check paired with a control
+proving the detector fires; or retired against a test asserting the named
+replacement suite still exists — because "it's covered elsewhere" is the
+sentence under which coverage disappears.
+
+The rewrite found one defect no reader had: the draft documented
+`operator work request|list|end`, and there is no `end` work verb. The
+replacement test measures every documented `(group, verb)` — in the template
+*and* in every `skills/*/SKILL.md` — against the dispatcher's own tables,
+which is why `SESSION_VERBS` and `OWNERSHIP_VERBS` now exist. A document
+checked against a second copy of the spelling is checked against nothing.
+
+**G10's real finding** is that build/test/lint guidance already never reached
+a rendered block: it lived under the one heading `render()` replaces. D11 was
+satisfied by accident, by a renderer detail nothing tested. G10 made it
+enforced and gave the commands a home — `compose()` seeds a `## Validation`
+heading below the block when creating a file from nothing, once, and never
+restores a deleted one.
+
+**Subprojects (FR-9)** are generated, not templated, and that is the whole
+enforcement: there is no prose file for a rule to be written into, so the
+file can only carry resolved facts — name, owned paths, contracts — and a
+fact cannot contradict a rule. `_place_subprojects` writes one into every
+declared, existing owned directory, after the root file for the same reason
+`CLAUDE.md` is written after it. An unreadable declaration fails the project
+rather than skipping quietly, because `operator ownership check` refuses on
+the same file: swallowing it would leave a repository whose push gate is
+broken and whose generation reported success. Budget 120, delivered 63.
+
 ## Risks
 
 | Risk | Mitigation |

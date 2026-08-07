@@ -6626,13 +6626,21 @@ def _session_end(opts: dict, db) -> int:
     return 0 if result.ok else 1
 
 
+#: The verbs ``operator session`` answers to.
+#:
+#: A named tuple rather than a literal in the dispatch, so the template
+#: conformance test can measure the document against the code instead of
+#: against a second copy of the vocabulary.
+SESSION_VERBS = ("start", "end")
+
+
 def manage_session(args: list[str]) -> int:
     """``operator session start|end`` — the two ends of one session (FR-2, FR-5)."""
     if not args or args[0] in HELP_FLAGS:
         _session_usage(sys.stdout if args else sys.stderr)
         return 0 if args else 1
     verb = args[0]
-    if verb not in ("start", "end"):
+    if verb not in SESSION_VERBS:
         print(f"Unknown subcommand: operator session {verb}", file=sys.stderr)
         print("Did you mean `operator session start` or "
               "`operator session end`?", file=sys.stderr)
@@ -7068,6 +7076,10 @@ def manage_worktree(args: list[str]) -> int:
             "recover": _worktree_recover}[verb](opts, db, root)
 
 
+#: The verbs ``operator ownership`` answers to. See :data:`SESSION_VERBS`.
+OWNERSHIP_VERBS = ("check",)
+
+
 def manage_ownership(args: list[str]) -> int:
     """``operator ownership check`` — may this branch be pushed?
 
@@ -7087,10 +7099,10 @@ def manage_ownership(args: list[str]) -> int:
     if not args or args[0] in HELP_FLAGS:
         _ownership_usage(sys.stdout if args else sys.stderr)
         return 0 if args else 1
-    if args[0] != "check":
+    if args[0] not in OWNERSHIP_VERBS:
         print(f"Unknown subcommand: operator ownership {args[0]}",
               file=sys.stderr)
-        print("Expected: check", file=sys.stderr)
+        print(f"Expected: {', '.join(OWNERSHIP_VERBS)}", file=sys.stderr)
         return 1
     opts: dict = {"project": None, "against": operator_worktree.
                   DEFAULT_INTEGRATION, "contracts": False, "json": False}

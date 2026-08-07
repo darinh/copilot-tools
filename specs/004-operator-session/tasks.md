@@ -326,7 +326,36 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       work lands here, a conflicted merge is finished with `git commit`, and a
       guard without that clause would block the workflow it exists to protect
       at the least convenient moment available.
-- [ ] G8 New root and subproject templates
+- [x] G8 New root and subproject templates.
+      The root template is rewritten wholesale: 4,332 rendered words → 674,
+      an 84% cut, keeping every line that is a guardrail, a procedure or a
+      check and deleting the prose that explained *why*. The rationale is not
+      lost — it moved to `docs/rationale.md` and the skills, which are read on
+      demand rather than on every turn. Three sections went entirely
+      (`Session History`'s and `Parallel Agents`' hand-pasted SQL, and
+      `Common Pitfalls`); the first two came back as two-line pointers to the
+      commands that replaced the SQL, because retiring their feature flags is
+      a migration problem and this task is not the place for it.
+      The rewrite itself found a defect that no reader had: the draft
+      documented `operator work request|list|end`, and there is no `end` work
+      verb. `test_documents_only_name_operator_commands_that_exist` now checks
+      every documented `(group, verb)` in the template *and* every
+      `skills/*/SKILL.md` against the dispatcher's own `SUBCOMMANDS` and
+      `*_VERBS` tables — which is why `SESSION_VERBS` and `OWNERSHIP_VERBS`
+      exist now, so the document is measured against the code rather than
+      against a second copy of the spelling.
+      The subproject half is `render_subproject()` (FR-9), placed by
+      `_place_subprojects` into every declared, existing owned directory.
+      It is **generated rather than templated**, and that is the enforcement:
+      there is no prose file for a rule to be written into, so the file can
+      only carry resolved facts — name, owned paths, contracts — and a fact
+      cannot contradict a rule. Claude Code concatenates parent and child
+      while Codex lets the nearer file win, so a rule in both places means two
+      things depending on the harness, and an *identical* copy is no safer
+      because copies drift. Two tests hold that line with firing controls: no
+      directive vocabulary, and no five-word run of prose shared with the root
+      block. `templates/subproject-instructions.md` documents the shape and
+      ships nothing; a test watches for anyone wiring it into the renderer.
 - [x] G9 Marker migration — recognise both spellings, rewrite old→new.
       `MANAGED_BEGIN`/`MANAGED_END` are now `<!-- BEGIN operator:managed -->`
       (D3); the old spelling is still *read*, which is the whole point. A
@@ -346,7 +375,20 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       the second: pooling left every other test green. 6 mutants killed, 0
       survived, 0 never ran; the order of `MARKER_PAIRS` is a provably
       equivalent mutant and the code says so rather than claiming otherwise.
-- [ ] G10 Move build/test/lint out of the managed block (D11)
+- [x] G10 Move build/test/lint out of the managed block (D11).
+      The measured finding first, because it changes what the task was: those
+      commands **already never reached a single agent**. They sat under
+      `## Project Configuration System`, which `render()` *replaces* wholesale
+      with `_configuration_section(...)`. D11 was satisfied by accident, by a
+      renderer detail nothing tested and nothing recorded. So the work was
+      (a) making the absence enforced rather than incidental, and (b) giving
+      the commands somewhere to live: `compose()` now seeds a `## Validation`
+      heading **below** the block when it is creating a file from nothing.
+      Written once and never again — a project that deletes the section is not
+      given it back, and an edited one survives regeneration undoubled. Before
+      this, `compose(None, managed)` returned the block alone, so a brand-new
+      `AGENTS.md` was told to keep its commands out of the block and given
+      nowhere to put them.
 - [x] G11 Test that appended project content survives regeneration (FR-7) —
       end-to-end through `retire` → `render` → `compose` → the atomic write,
       not `compose` alone, because every step between is somewhere the
@@ -421,35 +463,35 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       one agree on it and stop agreeing the moment somebody writes one.
       `test_a_blank_run_away_from_the_seam_is_left_exactly_as_written` is
       what tells them apart.
-- [ ] G13 Set the budget from measured residue and make generation error above it
+- [x] G13 Set the budget from measured residue and make generation error above it
+      `WORD_BUDGET = 700`, `block_words()` and a raise at the end of
+      `render()`. It **errors**; it does not warn, and there is deliberately
+      no override flag — a warning is a line of output nobody is obliged to
+      act on, and the block that produced it still ships, which is how the
+      predecessor reached 4,332 words with every one of them added for a
+      reason. The count includes the markers and the fences, so prose cannot
+      be hidden from it by moving it into a code block; over-counting binds
+      slightly early, which is the safe direction. The message names the
+      count, the budget, the overage and the three places a line can go
+      instead (a skill, `docs/rationale.md`, or the tool), because a refusal
+      that does not say what to do next is answered by deleting the check.
+      It fired on its first real run at 756 words and 82 words came out
+      without a guardrail going with them.
+      Subprojects get their own, an order of magnitude smaller:
+      `SUBPROJECT_WORD_BUDGET = 120`, delivered at 63. That file is read *in
+      addition to* the root one in the same turn, so the two are cumulative
+      against one reader's attention.
 
-## HELD — do not start G8, G10 or G13 without the human
+## Delivered — G8, G10, G13 (the held three)
 
-**Stop here.** These three are the only remaining implementation tasks, and
-all three **delete rules from the managed block**. The human explicitly
-reserved that conversation for themselves before any rule comes out:
+The human lifted the hold on 2026-08-06 and accepted all three
+recommendations, the 700-word figure, and deleting the emptied sections.
+Measured after: the block renders **674 words of 700** with every flag on,
+against 4,332 before — an **84% cut**. The subproject block renders 63 of
+120.
 
-- **G8** replaces the root template wholesale and adds a subproject one.
-- **G10** moves build/test/lint out of the block (D11).
-- **G13** sets a word budget and makes generation *error* above it, which is
-  only reachable once G8 and G10 have cut the block down. The measured
-  residue is in `audit.md`; the recommendation is **700 words**, set against
-  the all-on figure of 4,358. After G12's platform selection the block
-  measures 4,332 words on Windows and 4,321 on POSIX.
+## Still open for the human
 
-This note exists because the hold was, until now, recorded only in one
-agent's session context. That is a single point of failure of exactly the
-kind this feature is about: the next agent to pick the plan up would have
-found three unchecked boxes, no reason not to do them, and would have
-deleted conventions out of eight repositories on the strength of a tick-list.
-A constraint that lives only in a context window is not a constraint.
-
-`V1` and `V2` cannot be ticked while these are open — they are whole-feature
-gates, not per-task ones. Everything delivered so far is mutation-tested with
-zero survivors, and the suite is green (4158 passed, 9 skipped); neither fact
-closes them.
-
-Also open for the human, and the sharpest judgement call in the feature:
 FR-8 makes `_values_for` **refuse** a project that never chose its features.
 Every one of the eight registered projects on this machine is unconfigured,
 so every one of them fails regeneration until somebody opens
