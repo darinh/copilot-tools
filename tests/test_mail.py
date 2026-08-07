@@ -873,7 +873,7 @@ def test_renderers_survive_a_message_missing_its_addresses(tmp_path):
     assert "no addresses" in operator_mail.render_line(malformed)
     # The hint must not invent a recipient that would silently misdirect a
     # reply -- it has to be visibly a placeholder.
-    assert "operator send" in operator_mail.reply_hint(malformed)
+    assert "operator reply" in operator_mail.reply_hint(malformed)
 
 
 def test_renderers_survive_fields_that_are_json_null(tmp_path):
@@ -985,7 +985,7 @@ def test_rendered_line_names_sender_and_reply_command():
     msg = operator_mail.new_message("alpha", "beta", "beta", "ping")
     line = operator_mail.render_line(msg)
     assert '"alpha"' in line
-    assert "operator send --from beta --to alpha" in line
+    assert "operator reply --instance beta --to alpha" in line
 
 
 def test_rendered_line_is_bounded(monkeypatch):
@@ -1005,8 +1005,8 @@ def test_preamble_block_is_single_line_and_names_every_sender():
     assert "\n" not in block
     assert "'alpha'" in block and "'gamma'" in block
     assert "one two" in block
-    assert "operator send --from beta --to alpha" in block
-    assert "operator send --from beta --to gamma" in block
+    assert "operator reply --instance beta --to alpha" in block
+    assert "operator reply --instance beta --to gamma" in block
 
 
 def test_preamble_block_is_empty_without_messages():
@@ -1017,7 +1017,7 @@ def test_terminal_rendering_keeps_original_line_breaks():
     msg = operator_mail.new_message("alpha", "beta", "beta", "line1\nline2")
     out = operator_mail.render_for_terminal([msg])
     assert "line1" in out and "line2" in out
-    assert "reply: operator send --from beta --to alpha" in out
+    assert "reply: operator reply --instance beta --to alpha" in out
 
 
 def test_terminal_rendering_says_so_when_empty():

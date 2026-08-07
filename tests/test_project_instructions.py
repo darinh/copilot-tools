@@ -19,12 +19,14 @@ import ast
 import hashlib
 import json
 import re
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 import install_manifest
+import operator_ownership
 import project_features
 import project_instructions as pi
 from project_instructions import (
@@ -51,16 +53,33 @@ def template() -> str:
 
 @pytest.fixture
 def defaults() -> dict:
+    """Every flag on.
+
+    Named `defaults` for history; since FR-8 the *defaults* are off, and a
+    fixture that is everything-off makes every "turning this off drops its
+    section" test vacuous — the section was already gone. What these tests
+    need is a baseline where each section is present, so that removing one
+    is observable.
+    """
+    return {**project_features.resolved_values(None),
+            **{slug: project_features.ON
+               for slug in project_features.SLUGS
+               if slug != project_features.TRACKED_BACKLOG}}
+
+
+@pytest.fixture
+def shipped_defaults() -> dict:
     return project_features.resolved_values(None)
 
 
 def _render(source: str, values: dict, *, guid: str = "GUID-1",
-            path: str = "/repo/app", label: str = "app") -> str:
+            path: str = "/repo/app", label: str = "app",
+            platform: str = pi.POSIX) -> str:
     return pi.render(source=source, values=values, guid=guid,
                      project_path=path, label=label,
-                     project_dir_path=f"/home/.copilot/projects/{guid}",
-                     config_path=f"/home/.copilot/projects/{guid}/features.json",
-                     version="9.9.9")
+                     project_dir_path=f"/home/.operator/projects/{guid}",
+                     config_path=f"/home/.operator/projects/{guid}/features.json",
+                     version="9.9.9", platform=platform)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +225,7 @@ def test_the_enrollment_instructions_are_replaced_not_copied(template, defaults)
     assert f"## {pi.CONFIGURATION_SECTION}" in rendered
     assert "isn't in the catalog yet" not in rendered
     assert "Would you like to set it up" not in rendered
-    assert "must not offer to enroll this directory" in rendered
+    assert "Do not offer to enroll this directory" in rendered
     assert "GUID-1" in rendered
 
 
@@ -250,12 +269,402 @@ def test_the_block_is_delimited_by_both_markers(template, defaults):
 
 
 # ---------------------------------------------------------------------------
+# FR-8 -- the word budget
+# ---------------------------------------------------------------------------
+
+def test_the_shipped_template_fits_the_budget_with_every_feature_on(
+        template, defaults):
+    """The binding case, and the only one worth measuring.
+
+    Features off make the block shorter, so a project with a few flags set is
+    never the rendering that overflows. Turning everything on is what the
+    budget is for -- and it is what the audit measured the predecessor at:
+    4,332 words, against 700 now.
+    """
+    values = {**defaults}
+    for feature in project_features.FEATURES:
+        values[feature.slug] = (feature.options[0].value
+                                if len(feature.options) > 2 else "on")
+    spent = pi.block_words(_render(template, values))
+    assert spent <= pi.WORD_BUDGET, (
+        f"the shipped template renders {spent} words, over the budget")
+
+
+def test_generation_refuses_a_block_over_the_budget(template, defaults):
+    """It errors. It does not warn, and there is no override.
+
+    A warning is a line of output nobody is obliged to act on, and the block
+    that produced it still ships -- which is how the predecessor reached 4,332
+    words with every one of them added for a reason. The refusal is the only
+    part of this that is a mechanism rather than an intention.
+    """
+    fat = template + "\n\n## Padding\n\n" + ("word " * pi.WORD_BUDGET)
+    with pytest.raises(pi.InstructionsError) as caught:
+        _render(fat, defaults)
+    message = str(caught.value)
+    assert str(pi.WORD_BUDGET) in message, (
+        "the error does not name the budget, so a reader cannot tell how much "
+        "has to come out")
+    assert "over" in message and "budget" in message
+
+
+def test_the_budget_error_says_what_to_do_about_it(template, defaults):
+    """An error that only reports a number gets satisfied by deleting a guardrail.
+
+    The whole design is that adding costs removing, so the message has to name
+    the three places a line can go instead -- skill, rationale, tool -- and
+    D10, which is the rule that stops the removal happening on its own.
+    """
+    fat = template + "\n\n## Padding\n\n" + ("word " * pi.WORD_BUDGET)
+    with pytest.raises(pi.InstructionsError) as caught:
+        _render(fat, defaults)
+    message = str(caught.value).lower()
+    for expected in ("skill", "rationale", "tool", "d10"):
+        assert expected in message, (
+            f"the budget error never mentions {expected!r}; it reports a "
+            "number and leaves the cheapest fix as deleting a rule")
+
+
+@pytest.mark.parametrize("over", [0, 1])
+def test_the_budget_binds_at_the_boundary_and_not_before(over):
+    """Exactly at the budget passes; one word past it does not.
+
+    Parametrised over both sides because an off-by-one here is invisible in
+    ordinary use -- the shipped block is 26 words clear -- and would only ever
+    be discovered by the edit that happened to land on the boundary.
+
+    The padding is measured rather than calculated: `render` adds a generated
+    header and an enrollment section of its own, and a test that assumed their
+    size would drift into checking a boundary several words off the real one
+    while still reporting both sides correctly.
+    """
+    values = project_features.resolved_values(None)
+    # Under a heading: `render` discards the preamble and replaces it with a
+    # generated header, so padding written above the first `##` never reaches
+    # the block -- which is how the first draft of this test measured a floor
+    # of 38 words for every input it tried.
+    base = "# T\n\n## A\n\nintro\n"
+    floor = pi.block_words(_render(base, values))
+    body = "intro " + "word " * (pi.WORD_BUDGET - floor + over)
+    source = f"# T\n\n## A\n\n{body}\n"
+    if over:
+        with pytest.raises(pi.InstructionsError):
+            _render(source, values)
+    else:
+        assert pi.block_words(_render(source, values)) == pi.WORD_BUDGET
+
+
+def test_the_budget_is_the_number_the_human_agreed(template, defaults):
+    """700 is a decision, not an implementation detail.
+
+    Mutation found this hole: every other budget test is written *relative*
+    to `WORD_BUDGET`, so raising the constant moves them all with it and the
+    suite stays green. That is precisely how a budget becomes a warning --
+    one justified exception at a time -- and it is the failure the whole of
+    FR-8 exists to prevent. The number is pinned here so that changing it is
+    a diff somebody has to argue for.
+
+    Also pinned: the delivered block is genuinely near the limit. A budget
+    with 4,000 words of headroom is not a budget, and this is what tells the
+    difference between "trimmed the block" and "raised the number".
+    """
+    assert pi.WORD_BUDGET == 700
+    spent = pi.block_words(_render(template, {
+        **defaults,
+        **{f.slug: (f.options[0].value if len(f.options) > 2 else "on")
+           for f in project_features.FEATURES}}))
+    assert pi.WORD_BUDGET - spent <= 100, (
+        f"the block spends {spent} of {pi.WORD_BUDGET}; a budget this loose "
+        "no longer binds")
+
+
+def test_the_subproject_budget_is_pinned_too():
+    """Same hole, same fix, one order of magnitude down."""
+    assert pi.SUBPROJECT_WORD_BUDGET == 120
+
+
+def test_the_count_includes_the_markers_and_the_fences():
+    """Over-counting is the safe direction and it is chosen deliberately.
+
+    A counter that excluded machinery could be satisfied by moving prose into
+    a fence, which is the one move that shortens the number without shortening
+    what an agent reads. Counting everything binds slightly early; the failure
+    it must never have is letting a block grow past its limit unnoticed.
+    """
+    assert pi.block_words("a b c") == 3
+    # `<!--`, `BEGIN`, `-->`, ```` ``` ````, `x`, `y`, ```` ``` ````.
+    assert pi.block_words("<!-- BEGIN -->\n```\nx y\n```\n") == 7
+    assert pi.block_words("  spaced   out \n\n words ") == 3
+    assert pi.block_words("") == 0
+
+
+# ---------------------------------------------------------------------------
+# FR-9 -- the subproject block is additive only
+# ---------------------------------------------------------------------------
+
+SUBPROJECT_TEMPLATE = REPO / "templates" / "subproject-instructions.md"
+
+#: Words that make a sentence a rule rather than a fact. A subproject file may
+#: carry neither, because a rule there is a rule stated twice under Claude Code
+#: and a rule stated *instead* under Codex.
+_DIRECTIVE_TELLS = ("must", "never", "always", "do not", "don't", "should")
+
+
+def _sentences(text: str) -> set:
+    """Normalised sentences of five words or more.
+
+    Shorter fragments are headings, list items and marker lines, which the two
+    blocks legitimately share; a five-word run of prose in both files is the
+    thing FR-9 forbids.
+    """
+    flat = " ".join(text.split())
+    out = set()
+    for piece in re.split(r"(?<=[.!?])\s+", flat):
+        words = piece.strip(" -*#`").lower().split()
+        if len(words) >= 5:
+            out.add(" ".join(words))
+    return out
+
+
+def _subproject(**kwargs) -> str:
+    args = {"name": "api", "owns": ["services/api"],
+            "contracts": ["specs/contracts"], "version": "9.9.9"}
+    args.update(kwargs)
+    return pi.render_subproject(**args)
+
+
+def test_the_subproject_block_names_what_the_root_block_cannot_know():
+    """The whole justification for a second file: resolved values.
+
+    Name, owned paths and contracts are per-directory facts, so the root file
+    physically cannot carry them. Everything else an agent needs is already in
+    the root file and is deliberately not repeated here.
+    """
+    block = _subproject()
+    assert "`api` subproject" in block
+    assert "`services/api`" in block
+    assert "`specs/contracts`" in block
+
+
+def test_the_subproject_block_does_not_name_the_ownership_gate():
+    """Review caught this, and my own overlap check did not.
+
+    The first draft said "`operator ownership check` refuses a branch that
+    changed anything else" -- the root block's rule, in different words. The
+    sentence-overlap test could not see it precisely *because* the words
+    differed, which is the drift FR-9 exists to stop: neither file can see the
+    other, so the copy that goes stale is invisible from both.
+    """
+    block = _subproject()
+    assert "ownership check" not in block
+    assert "refuses" not in block
+
+
+def test_the_contract_waiver_is_spelled_the_way_the_command_accepts_it():
+    """A flag named wrongly is worse than a flag not named at all.
+
+    The reader tries it, it is rejected, and the file that told them is the
+    one place they had reason to trust. Measured against the dispatcher's own
+    flag table rather than a second copy of the spelling.
+    """
+    source = (REPO / "copilot_operator.py").read_text(encoding="utf-8")
+    assert '"--allow-contracts"' in source
+    assert "--allow-contracts" in _subproject()
+
+
+def test_the_contract_line_says_what_a_contract_is():
+    """Mutation found this: naming the paths is not the same as being right.
+
+    A block reading "Shared with nobody: `specs/contracts`" passed every
+    other check here -- the path was named, the flag was named, no directive
+    appeared. `operator_ownership.check` refuses a contract change from
+    *every* subproject, so a file telling one subproject the contracts are
+    theirs alone inverts the rule it is reporting, and inverts it in the file
+    the reader has most reason to trust.
+    """
+    block = _subproject(contracts=["specs/contracts"]).lower()
+    assert "shared with every subproject" in block
+
+
+def test_a_subproject_with_no_contracts_says_nothing_about_them():
+    """Absent facts are omitted, not rendered as an empty heading.
+
+    A "Contracts: (none)" line costs words in every subproject that has none,
+    and teaches a reader to skim a section that is usually empty -- which is
+    how the section that matters gets skimmed too.
+    """
+    assert "contract" not in _subproject(contracts=[]).lower()
+
+
+def test_a_subproject_that_owns_nothing_still_renders():
+    """A declaration can name a subproject and give it no paths.
+
+    That is a mistake in the declaration, and `operator ownership check`
+    reports it. Generation is not the place to refuse it: failing here stops
+    every *other* subproject's file being written over one bad entry.
+    """
+    assert "(none declared)" in _subproject(owns=[])
+
+
+def test_the_subproject_block_states_no_rules():
+    """FR-9, mechanically.
+
+    Claude Code concatenates parent and child; Codex lets the nearer file win.
+    A rule in both files therefore means two things depending on the harness,
+    and an identical copy is no safer -- copies drift, and the one that is
+    wrong is whichever was regenerated last, which is visible from neither
+    file. Facts cannot contradict rules, so the block carries only facts.
+    """
+    text = _subproject().lower()
+    found = [tell for tell in _DIRECTIVE_TELLS if tell in text]
+    assert not found, f"the subproject block gives directions: {found}"
+
+
+def test_the_directive_detector_would_fire():
+    """The control. An absence check that cannot fire reports every block
+    clean, including the one that broke the rule."""
+    text = "The api subproject must never write outside its own tree."
+    assert [t for t in _DIRECTIVE_TELLS if t in text.lower()]
+
+
+def test_the_subproject_block_repeats_no_sentence_of_the_root_block(
+        template, defaults):
+    """The other half of FR-9: not duplicated *content*, not just not rules.
+
+    Two texts saying the same thing are two texts to keep true, and nothing
+    compares them. Under Codex the child wins outright, so a stale copy here
+    silently replaces a current rule there.
+    """
+    root = _sentences(_render(template, defaults))
+    shared = root & _sentences(_subproject())
+    assert not shared, f"repeated from the root block: {sorted(shared)}"
+
+
+def test_the_repetition_detector_would_fire(template, defaults):
+    """The control for it, built from a real sentence of the real block."""
+    root = _sentences(_render(template, defaults))
+    borrowed = max(root, key=len)
+    assert root & _sentences(borrowed)
+
+
+def test_the_subproject_block_fits_its_own_budget():
+    """A subproject file is read *in addition to* the root one, in the same
+    turn, so the two are cumulative against one reader's attention."""
+    spent = pi.block_words(_subproject())
+    assert spent <= pi.SUBPROJECT_WORD_BUDGET, spent
+    assert pi.SUBPROJECT_WORD_BUDGET < pi.WORD_BUDGET
+
+
+def test_a_subproject_that_owns_many_paths_still_renders():
+    """Review found this, and it would have blocked real repositories.
+
+    The declared paths are data. Charging them to a word budget meant to stop
+    *writing* creeping back in means a subproject legitimately owning thirty
+    directories overflows, `operator projects` raises, and the repository
+    cannot be set up at all — a refusal with no action behind it, since the
+    only fix is to own fewer directories.
+    """
+    block = _subproject(owns=[f"services/s{n}" for n in range(200)])
+    assert "`services/s199`" in block
+    assert pi.block_words(block) > pi.SUBPROJECT_WORD_BUDGET
+
+
+def test_a_subproject_block_over_the_budget_is_refused():
+    """Same failure direction as FR-8: it errors, and there is no override.
+
+    What can overflow it now is prose added to the generator, which is the
+    only thing it was ever meant to catch. Forced with a lowered budget
+    rather than a long path list, because a long path list is exactly the
+    input that must *not* trip it.
+    """
+    with mock.patch.object(pi, "SUBPROJECT_WORD_BUDGET", 5):
+        with pytest.raises(pi.InstructionsError) as caught:
+            _subproject()
+    message = str(caught.value).lower()
+    assert "budget" in message and "fr-9" in message
+    assert "prose" in message
+
+
+def test_the_shipped_subproject_template_is_not_rendered():
+    """It documents the shape; it is not the source of a single word shipped.
+
+    Generation rather than templating is what makes "additive only"
+    enforceable -- there is no prose file for a rule to be written into. A
+    contributor who wires this file into the renderer has removed that
+    property, so the wiring is what the test watches for.
+    """
+    assert SUBPROJECT_TEMPLATE.exists()
+    assert "Not rendered" in SUBPROJECT_TEMPLATE.read_text(encoding="utf-8")
+    source = (REPO / "project_instructions.py").read_text(encoding="utf-8")
+    assert "subproject-instructions" not in source
+
+
+# ---------------------------------------------------------------------------
 # Composing it into a repository's own file
 # ---------------------------------------------------------------------------
 
-def test_composing_into_nothing_is_just_the_block():
-    assert pi.compose(None, "BLOCK\n") == "BLOCK\n"
-    assert pi.compose("   \n\n", "BLOCK\n") == "BLOCK\n"
+def test_composing_into_nothing_seeds_a_home_for_the_project_s_own_commands():
+    """A new file gets the block *and* a `## Validation` section below it.
+
+    This used to assert the file was the block alone. It changed with D11,
+    which keeps build, test and lint commands out of the generated block:
+    they are the three lines every project appends, and generating them puts
+    the tool and the project in a fight over the same text that regeneration
+    wins silently.
+
+    Keeping them out is only half of it. Somewhere has to hold them, or the
+    rule reads as "not here" and they come back inside the markers on the next
+    pass. The stub is that somewhere, and it is outside the markers, so
+    ``compose`` preserves whatever the project writes into it.
+    """
+    out = pi.compose(None, "BLOCK\n", seed_validation=True)
+    assert out.startswith("BLOCK\n")
+    assert pi.VALIDATION_STUB in out
+    assert pi.compose("   \n\n", "BLOCK\n", seed_validation=True) == out
+
+
+def test_the_seeded_section_is_outside_the_markers():
+    """Inside them it would be deleted by the very next regeneration.
+
+    The whole value of the stub is that it survives, so the thing to check is
+    not that it appears but *where*: a stub written between the markers reads
+    identically in the file and is gone on the next `operator projects`.
+    """
+    out = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n",
+                       seed_validation=True)
+    assert out.index(MANAGED_END) < out.index(pi.VALIDATION_STUB.strip())
+
+
+def test_a_project_that_deletes_the_stub_is_not_given_it_back():
+    """Seeding once is a suggestion; seeding every time is the fight again.
+
+    A project whose commands live in its README, or which has none, deletes
+    the section. Regenerating it would restore a heading somebody removed on
+    purpose -- the same silent overwrite D11 exists to prevent, arriving from
+    the other direction.
+    """
+    seeded = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n",
+                       seed_validation=True)
+    without = seeded.replace(pi.VALIDATION_STUB, "")
+    again = pi.compose(without, f"{MANAGED_BEGIN}\ny\n{MANAGED_END}\n")
+    assert "## Validation" not in again
+
+
+def test_the_seeded_section_survives_regeneration_and_is_not_doubled():
+    """What the project writes under the heading is the project's.
+
+    Checked with edited content rather than the pristine stub, because
+    ``compose`` preserving text it just wrote proves less than it preserving
+    text somebody replaced.
+    """
+    seeded = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n",
+                       seed_validation=True)
+    edited = seeded.replace(pi.VALIDATION_STUB,
+                            "## Validation\n\n`pytest -q`, then `ruff check`.\n")
+    again = pi.compose(edited, f"{MANAGED_BEGIN}\ny\n{MANAGED_END}\n")
+    assert again.count("## Validation") == 1
+    assert "`pytest -q`, then `ruff check`." in again
+    assert "y" in again and "x" not in again.split(MANAGED_END)[0]
 
 
 def test_an_existing_file_keeps_everything_it_had():
@@ -301,6 +710,890 @@ def test_malformed_markers_raise_rather_than_being_repaired(broken):
     to the function meant to keep them in step."""
     with pytest.raises(InstructionsError):
         pi.compose(broken, f"{MANAGED_BEGIN}\nnew\n{MANAGED_END}\n")
+
+
+# ---------------------------------------------------------------------------
+# G9 / D3 -- migrating the marker spelling
+#
+# The rename is only safe because the old spelling is still *read*. A writer
+# that knew the new marker alone would find no block in a file carrying the
+# old one, append a second block below it, and leave the repository holding
+# two sets of conventions that disagree -- with the disagreement invisible to
+# the very function meant to keep them in step. That is the failure these
+# tests exist for; "the new marker is emitted" is the easy half.
+# ---------------------------------------------------------------------------
+
+LEGACY_BEGIN = pi.LEGACY_BEGIN
+LEGACY_END = pi.LEGACY_END
+
+
+def test_the_two_spellings_are_actually_different():
+    """Every test below is vacuous if the rename never happened -- they would
+    all be asserting that the current marker replaces itself, which the
+    idempotence tests already cover. This is the anchor."""
+    assert MANAGED_BEGIN != LEGACY_BEGIN
+    assert MANAGED_END != LEGACY_END
+    assert "operator:managed" in MANAGED_BEGIN
+
+
+def test_an_old_block_is_replaced_not_doubled():
+    existing = ("# Mine\n\nabove\n"
+                f"{LEGACY_BEGIN}\nold conventions\n{LEGACY_END}\n"
+                "\nbelow, written by hand\n")
+    out = pi.compose(existing, f"{MANAGED_BEGIN}\nnew\n{MANAGED_END}\n")
+    assert "old conventions" not in out
+    assert out.count(MANAGED_BEGIN) == 1
+    assert LEGACY_BEGIN not in out
+    assert LEGACY_END not in out
+    assert out.startswith("# Mine\n\nabove\n")
+    assert out.endswith("\nbelow, written by hand\n")
+
+
+def test_migration_happens_once(machine):
+    """A migrated file is an ordinary file. Regenerating it again must not
+    find anything left to migrate, or the "migration" is a rewrite that
+    happens forever and every repository shows a diff on every run."""
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    target.write_text(
+        "# theirs\n\n"
+        f"{LEGACY_BEGIN}\nancient\n{LEGACY_END}\n\ntrailing note\n",
+        encoding="utf-8")
+    _retire(machine)
+    first = target.read_text(encoding="utf-8")
+    assert LEGACY_BEGIN not in first
+    assert MANAGED_BEGIN in first
+    assert first.endswith("\ntrailing note\n")
+    result = _retire(machine)
+    assert target.read_text(encoding="utf-8") == first
+    assert result.outcomes[0].state == UNCHANGED
+
+
+def test_a_file_with_an_old_block_is_not_asked_for_consent_again(machine):
+    """The consent question is "may we write into a file we did not write".
+    A legacy block *is* ours; asking again would train the answer, and a
+    caller that answers no would strand the repository on the old spelling
+    forever."""
+    asked = []
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    target.write_text(f"{LEGACY_BEGIN}\nancient\n{LEGACY_END}\n",
+                      encoding="utf-8")
+    _retire(machine, decide=lambda project, existing: asked.append(project) or False)
+    assert asked == []
+    assert MANAGED_BEGIN in target.read_text(encoding="utf-8")
+
+
+def test_both_spellings_at_once_is_refused():
+    """No writer produces this, so it is a hand-edit or an interrupted
+    migration. Replacing one and leaving the other is the doubling this
+    whole mechanism exists to prevent, and picking which to keep is a guess
+    about which set of conventions somebody meant."""
+    existing = (f"{LEGACY_BEGIN}\nold\n{LEGACY_END}\n"
+                f"{MANAGED_BEGIN}\nnew\n{MANAGED_END}\n")
+    with pytest.raises(InstructionsError):
+        pi.compose(existing, f"{MANAGED_BEGIN}\nnewer\n{MANAGED_END}\n")
+
+
+def test_a_begin_of_one_spelling_and_an_end_of_the_other_delimit_nothing():
+    """Pooling both spellings' offsets into one pair of lists would make
+    these two look like a well-formed block, and `compose` would replace a
+    span whose real boundaries nobody knows -- silently, since the count
+    check would be satisfied."""
+    existing = f"{LEGACY_BEGIN}\nbody\n{MANAGED_END}\n"
+    with pytest.raises(InstructionsError):
+        pi.compose(existing, f"{MANAGED_BEGIN}\nnew\n{MANAGED_END}\n")
+
+
+def test_crossed_markers_are_not_a_block_to_the_finder_either():
+    """Driven at `_marker_offsets`, because `compose`'s two guards catch two
+    different files and the test above only proves one of them fired.
+
+    The mixed-spelling refusal covers a file with *whole blocks* in both
+    spellings. This covers a file with a begin from one and an end from the
+    other -- and only the per-pair discipline here catches it, because the
+    pooled counts would be one and one, which is exactly what well-formed
+    looks like. Mutation found this: pooling the pairs left every other test
+    in the file green.
+    """
+    begins, ends = pi._marker_offsets(f"{LEGACY_BEGIN}\nbody\n{MANAGED_END}\n")
+    assert (len(begins), len(ends)) != (1, 1)
+
+
+@pytest.mark.parametrize("broken", [
+    f"{LEGACY_BEGIN}\na\n{LEGACY_END}\n{LEGACY_BEGIN}\nb\n{LEGACY_END}\n",
+    f"{LEGACY_BEGIN}\nno end marker\n",
+    f"{LEGACY_END}\nno begin marker\n",
+    f"{LEGACY_END}\ninverted\n{LEGACY_BEGIN}\n",
+])
+def test_malformed_old_markers_raise_too(broken):
+    """The old spelling gets the same refusals, not a lenient path. A
+    migration that repaired what the current spelling refuses to repair
+    would be the one moment a file is least understood."""
+    with pytest.raises(InstructionsError):
+        pi.compose(broken, f"{MANAGED_BEGIN}\nnew\n{MANAGED_END}\n")
+
+
+def test_an_old_marker_quoted_in_a_fence_is_not_a_block():
+    """The fence narrowing applies to both spellings. A project documenting
+    the *previous* marker -- exactly what a migration note looks like --
+    would otherwise have its note replaced by the migration it describes."""
+    existing = ("# theirs\n\n```markdown\n"
+                f"{LEGACY_BEGIN}\n...\n{LEGACY_END}\n```\n")
+    out = pi.compose(existing, f"{MANAGED_BEGIN}\nnew\n{MANAGED_END}\n")
+    assert out.startswith(existing.rstrip("\n"))
+    assert LEGACY_BEGIN in out
+    assert MANAGED_BEGIN in out
+
+
+def test_a_rendered_block_carries_only_the_new_spelling(template):
+    rendered = pi.render(
+        source=template, values=project_features.resolved_values(None),
+        guid="GUID", project_path="/tmp/x", label="x",
+        project_dir_path=Path("/tmp/p"), config_path=Path("/tmp/p/f.json"),
+        version="1.0.0", platform=pi.POSIX)
+    assert LEGACY_BEGIN not in rendered
+    assert LEGACY_END not in rendered
+    assert rendered.startswith(MANAGED_BEGIN)
+
+
+# ---------------------------------------------------------------------------
+# FR-8 -- flags default off, and what that must not silently do
+# ---------------------------------------------------------------------------
+
+def test_every_flag_ships_off(shipped_defaults):
+    """The requirement itself: a section is in a project's conventions
+    because somebody needs it, not because nobody chose."""
+    flags = [f for f in project_features.FEATURES
+             if f.slug != project_features.TRACKED_BACKLOG]
+    assert flags, "no flags left to check -- this test would pass vacuously"
+    for feature in flags:
+        assert feature.default == feature.off_value, feature.slug
+        assert not project_features.is_enabled(shipped_defaults, feature.slug)
+
+
+def test_the_backlog_choice_still_defaults_to_the_enforcing_answer():
+    """The one feature deliberately not flipped, and the reason is not
+    cosmetic. `tracked_backlog_backend` answers with this default under
+    every uncertainty -- no catalog in CI, an unreadable file, a project
+    nobody registered. Defaulting it to `none` stands three real guards
+    down on all eight legs while every one of them stays green."""
+    feature = project_features.FEATURES_BY_SLUG[project_features.TRACKED_BACKLOG]
+    assert feature.default == project_features.BACKLOG_FOLDER
+    assert feature.default != feature.off_value
+
+
+def test_a_project_that_never_chose_is_refused_not_answered_for(machine):
+    """"Default off" must not mean "quietly delete what they were using".
+
+    Every registered project on the machine this was written on had no
+    configuration file, so resolving an absent one would have stripped the
+    optional sections out of eight repositories at once on the next routine
+    regeneration -- with the diff attributed to a version bump. Refusing is
+    what makes an enabled section a live requirement rather than an
+    accident of who last ran the tool.
+    """
+    (machine["projects_root"] / "GUID-1"
+     / project_features.CONFIG_NAME).unlink()
+    result = _retire(machine)
+    outcome = result.outcomes[0]
+    assert outcome.state == FAILED
+    assert "has not chosen its features" in outcome.detail
+    assert "operator projects" in outcome.detail
+
+
+def test_the_refusal_keeps_the_global_file_where_it_is(machine):
+    """The safe direction: conventions in two places, never in none."""
+    (machine["projects_root"] / "GUID-1"
+     / project_features.CONFIG_NAME).unlink()
+    result = _retire(machine)
+    assert not result.removed
+    assert machine["global_path"].exists()
+
+
+def test_the_refusal_does_not_touch_that_project_s_file(machine):
+    """A project that has not chosen keeps whatever it already had. Writing
+    an all-off block and *then* reporting failure would leave the damage
+    behind the error message."""
+    _retire(machine)
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    before = target.read_text(encoding="utf-8")
+    (machine["projects_root"] / "GUID-1"
+     / project_features.CONFIG_NAME).unlink()
+    _retire(machine)
+    assert target.read_text(encoding="utf-8") == before
+
+
+def test_an_unreadable_configuration_is_still_refused(machine):
+    """Unchanged by FR-8, and re-pinned because the absent case now shares
+    its code path: the two must not collapse into one another in either
+    direction."""
+    config = (machine["projects_root"] / "GUID-1"
+              / project_features.CONFIG_NAME)
+    config.write_text("{ not json", encoding="utf-8")
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert "has not chosen its features" not in result.outcomes[0].detail
+
+
+def test_a_configured_project_renders_only_what_it_chose(machine):
+    config = (machine["projects_root"] / "GUID-1"
+              / project_features.CONFIG_NAME)
+    config.write_text(json.dumps(
+        {"version": 1, "features": {"session-handoff": project_features.ON}}),
+        encoding="utf-8")
+    _retire(machine)
+    text = (Path(machine["projects"][0]["path"])
+            / AGENTS_NAME).read_text(encoding="utf-8")
+    assert "## Session Handoff Protocol" in text
+    assert "## Parallel Agents" not in text
+
+
+# ---------------------------------------------------------------------------
+# FR-8 -- one platform's commands, chosen from the host
+# ---------------------------------------------------------------------------
+
+_TWO_PLATFORMS = (
+    "## Commands\n"
+    "\n"
+    "Run it:\n"
+    "\n"
+    "<!-- operator:platform posix -->\n"
+    "**bash**\n"
+    "```bash\n"
+    "touch marker\n"
+    "```\n"
+    "\n"
+    "<!-- operator:endplatform -->\n"
+    "<!-- operator:platform windows -->\n"
+    "**PowerShell**\n"
+    "```powershell\n"
+    "New-Item marker\n"
+    "```\n"
+    "\n"
+    "<!-- operator:endplatform -->\n"
+    "Then read it.\n"
+)
+
+
+@pytest.mark.parametrize("os_name, expected", [("nt", pi.WINDOWS),
+                                               ("posix", pi.POSIX),
+                                               ("java", pi.POSIX)])
+def test_the_host_names_one_of_two_vocabularies(os_name, expected):
+    assert pi.host_platform(os_name) == expected
+
+
+@pytest.mark.parametrize("platform, kept, dropped", [
+    (pi.POSIX, "touch marker", "New-Item marker"),
+    (pi.WINDOWS, "New-Item marker", "touch marker"),
+])
+def test_only_the_hosts_commands_survive(platform, kept, dropped):
+    out = pi.select_platform(_TWO_PLATFORMS, platform)
+    assert kept in out
+    assert dropped not in out
+
+
+def test_the_markers_themselves_never_reach_the_repository():
+    """Both branches, because only one of them is the deleting one.
+
+    A marker left on a *kept* block would be written into the repository, and
+    the next run could no longer tell the template's marker from one a user
+    had copied into their own text.
+    """
+    for platform in pi.PLATFORMS:
+        out = pi.select_platform(_TWO_PLATFORMS, platform)
+        assert "operator:platform" not in out
+        assert pi.PLATFORM_END not in out
+
+
+@pytest.mark.parametrize("platform", pi.PLATFORMS)
+def test_removing_a_block_does_not_double_a_blank_line(platform):
+    """The only visible difference a reader could catch between the two.
+
+    Both halves are checked: the seam collapse must not run where nothing was
+    removed either, or the prose loses paragraph breaks it meant to have.
+    """
+    out = pi.select_platform(_TWO_PLATFORMS, platform)
+    assert "\n\n\n" not in out
+    assert "Run it:\n\n" in out, "an ordinary paragraph break was eaten"
+    assert out.endswith("Then read it.\n")
+
+
+@pytest.mark.parametrize("platform", pi.PLATFORMS)
+def test_a_blank_run_away_from_the_seam_is_left_exactly_as_written(platform):
+    """The collapse is confined to the seam, and that has to be measured.
+
+    An unconditional collapse passes every test above -- the shipped template
+    happens to contain no doubled blank line today, so the two rules agree on
+    it. They stop agreeing the moment somebody writes one, and at that point
+    the renderer would be quietly editing prose it was only asked to select
+    from.
+    """
+    source = _TWO_PLATFORMS.replace("Run it:\n", "Run it:\n\n\nStill here.\n", 1)
+    assert "Run it:\n\n\nStill here.\n" in source
+    out = pi.select_platform(source, platform)
+    assert "Run it:\n\n\nStill here.\n" in out
+
+
+def test_a_platform_this_build_does_not_know_is_kept():
+    """The downgrade case, answered the same way as an unknown gate slug.
+
+    A newer template naming a platform this build has never heard of is the
+    only copy of that text. Dropping it would delete conventions purely by
+    being out of date -- and it would do it on every platform at once, since
+    the name matches none of them.
+    """
+    source = _TWO_PLATFORMS.replace("operator:platform posix",
+                                    "operator:platform plan9", 1)
+    for platform in pi.PLATFORMS:
+        out = pi.select_platform(source, platform)
+        assert "touch marker" in out
+
+
+def test_a_marker_inside_a_fence_is_not_a_marker():
+    """The same rule the managed-block finder lives by.
+
+    A repository's own conventions may document this mechanism, and the
+    documentation is written in a fence. Reading the sample as real would
+    delete everything after it on one of the two platforms.
+    """
+    source = ("## Docs\n"
+              "\n"
+              "```markdown\n"
+              "<!-- operator:platform windows -->\n"
+              "sample\n"
+              "<!-- operator:endplatform -->\n"
+              "```\n"
+              "\n"
+              "kept\n")
+    assert pi.select_platform(source, pi.POSIX) == source
+
+
+@pytest.mark.parametrize("broken, why", [
+    ("<!-- operator:platform posix -->\nx\n", "never closed"),
+    ("<!-- operator:endplatform -->\nx\n", "with no platform"),
+    ("<!-- operator:platform posix -->\n<!-- operator:platform windows -->\n"
+     "x\n<!-- operator:endplatform -->\n", "is still open"),
+])
+def test_unbalanced_markers_are_refused(broken, why):
+    """Never recovered from.
+
+    A stray begin marker deletes the whole rest of a section on one platform
+    and nothing at all on the other, so a run on either machine alone looks
+    fine. Raising is what makes the two agree.
+    """
+    with pytest.raises(pi.InstructionsError) as caught:
+        pi.select_platform(broken, pi.POSIX)
+    assert why in str(caught.value)
+
+
+def test_render_will_not_guess_the_platform():
+    """No default, deliberately.
+
+    A default would make every test that forgot the argument agree with the
+    machine it ran on, so the Windows legs and the POSIX legs would each
+    prove only their own half.
+    """
+    with pytest.raises(TypeError):
+        pi.render(source="## A\n\nbody\n",
+                  values=project_features.resolved_values(None),
+                  guid="G", project_path="/p", label="p",
+                  project_dir_path=Path("/d"), config_path=Path("/d/f.json"),
+                  version="1.0.0")
+
+
+#: Spellings that only work on one platform, and the platform they work on.
+#:
+#: These are the tells a bracket exists for. Deliberately spelled as fragments
+#: rather than whole commands: what makes a line unportable is the syntax, and
+#: a check against whole commands would pass the moment somebody wrote a new
+#: one.
+_PLATFORM_TELLS = {
+    pi.WINDOWS: ("New-Item", "Get-ChildItem", "Select-Object", "$env:",
+                 "-ItemType", "```powershell"),
+    pi.POSIX: ("mktemp -d", "touch ~", "$(", "```bash", "```sh"),
+}
+
+
+def test_the_shipped_template_spells_no_command_for_one_platform_only(template):
+    """Every platform-specific command is bracketed, or there are none.
+
+    This used to assert the template brackets *at least one* command. The
+    block no longer brackets any: every command in it is now `operator ...`,
+    which is spelled identically on both platforms, and the two renderings are
+    byte-for-byte equal.
+
+    Asserting a non-empty bracket list would now be a rule that the document
+    must contain platform-specific text -- satisfiable only by adding some.
+    Inverting it is strictly stronger than the original, which could pass with
+    an unbracketed PowerShell snippet sitting in the template as long as one
+    *other* command happened to be bracketed correctly.
+    """
+    bracketed = {
+        index for start, end in _bracket_ranges(template)
+        for index in range(start, end + 1)
+    }
+    stray = [
+        (platform, tell, line.strip())
+        for index, line in pi.outside_fences(template)
+        if index not in bracketed
+        for platform, tells in _PLATFORM_TELLS.items()
+        for tell in tells
+        if tell in line
+    ]
+    assert not stray, (
+        "the block spells commands that only work on one platform, without "
+        "bracketing them:\n  "
+        + "\n  ".join(f"{p}: {tell!r} in {line}" for p, tell, line in stray)
+        + "\nAn agent on the other platform is handed a command that fails.")
+
+
+def test_the_platform_tell_scan_would_fire():
+    """The control. A scan that matched nothing would clear any document."""
+    stray = [
+        tell for _index, line in pi.outside_fences(
+            "## A\n\nRun `New-Item -ItemType File x` first.\n")
+        for tell in _PLATFORM_TELLS[pi.WINDOWS] if tell in line
+    ]
+    assert stray, "the tell list no longer matches a plainly PowerShell line"
+
+
+def test_brackets_in_the_shipped_template_are_paired(template):
+    """If the block ever brackets again, both halves must be there.
+
+    Vacuous today by construction -- there are no brackets -- so it says so
+    rather than passing quietly on an empty list. A guard that reports clean
+    on nothing is indistinguishable from one that works.
+    """
+    names = [pi.PLATFORM_BEGIN.match(line.strip()).group("name")
+             for _index, line in pi.outside_fences(template)
+             if pi.PLATFORM_BEGIN.match(line.strip())]
+    assert names.count(pi.WINDOWS) == names.count(pi.POSIX), names
+    assert len(names) == template.count(pi.PLATFORM_END)
+    for platform in pi.PLATFORMS:
+        assert pi.select_platform(template, platform).strip()
+    if not names:
+        # Both renderings identical is the *reason* there is nothing to pair,
+        # and checking it keeps this from being a test that proves nothing.
+        assert (pi.select_platform(template, pi.WINDOWS)
+                == pi.select_platform(template, pi.POSIX))
+
+
+def _bracket_ranges(text: str) -> list[tuple[int, int]]:
+    """Line-index spans covered by a platform bracket, ends included."""
+    ranges, open_at = [], None
+    for index, line in pi.outside_fences(text):
+        stripped = line.strip()
+        if pi.PLATFORM_BEGIN.match(stripped):
+            open_at = index
+        elif stripped == pi.PLATFORM_END and open_at is not None:
+            ranges.append((open_at, index))
+            open_at = None
+    return ranges
+
+
+#: A stand-in for what the shipped template used to contain.
+#:
+#: `select_platform` still has to work -- a project's own sections may bracket
+#: commands, and an older template still in a checkout certainly does -- so
+#: the mechanism is checked against a document written for the purpose rather
+#: than against whichever commands the block happens to spell this month.
+_BRACKETED = (
+    "# T\n\nintro\n\n## A\n\n"
+    "<!-- operator:platform windows -->\n"
+    "```powershell\n"
+    "New-Item -ItemType File -Force ~/.operator/restart/x\n"
+    "```\n"
+    "<!-- operator:endplatform -->\n"
+    "<!-- operator:platform posix -->\n"
+    "```bash\n"
+    "touch ~/.operator/restart/x\n"
+    "```\n"
+    "<!-- operator:endplatform -->\n"
+)
+
+
+@pytest.mark.parametrize("platform, kept, dropped", [
+    (pi.WINDOWS, "New-Item -ItemType File", "touch ~/.operator/restart"),
+    (pi.POSIX, "touch ~/.operator/restart", "New-Item -ItemType File"),
+])
+def test_a_rendered_block_carries_one_platforms_commands(defaults, platform,
+                                                         kept, dropped):
+    out = _render(_BRACKETED, defaults, platform=platform)
+    assert kept in out
+    assert dropped not in out
+    assert "operator:platform" not in out
+    assert "\n\n\n" not in out
+
+
+# ---------------------------------------------------------------------------
+# FR-8 -- the CLAUDE.md import
+# ---------------------------------------------------------------------------
+
+def test_claude_imports_agents_rather_than_repeating_it():
+    out = pi.render_claude(label="app", version="1.2.3")
+    assert f"@{AGENTS_NAME}" in out
+    assert out.startswith(MANAGED_BEGIN)
+    assert out.rstrip("\n").endswith(pi.MANAGED_END)
+
+
+def test_claude_carries_none_of_the_conventions(template, defaults):
+    """Two texts that can disagree, read by one agent in one turn.
+
+    The import exists so there is one copy. A generated ``CLAUDE.md`` that
+    also carried a section would make the newer of the two files right, and
+    which one that is cannot be seen from either.
+    """
+    claude = pi.render_claude(label="app", version="1.2.3")
+    agents = _render(template, defaults)
+    for section in ("## Git Worktrees", "## Scratch Files"):
+        assert section in agents
+        assert section not in claude
+
+
+def test_every_project_gets_a_claude_file(machine):
+    _retire(machine)
+    for project in machine["projects"]:
+        text = (Path(project["path"]) / pi.CLAUDE_NAME).read_text(
+            encoding="utf-8")
+        assert f"@{AGENTS_NAME}" in text
+
+
+def test_a_second_run_leaves_the_claude_file_alone(machine):
+    _retire(machine)
+    first = [(Path(p["path"]) / pi.CLAUDE_NAME).read_text(encoding="utf-8")
+             for p in machine["projects"]]
+    _retire(machine)
+    second = [(Path(p["path"]) / pi.CLAUDE_NAME).read_text(encoding="utf-8")
+              for p in machine["projects"]]
+    assert first == second
+
+
+def test_a_users_own_claude_file_is_not_touched(machine):
+    """Left alone rather than merged into, and not a blocker either.
+
+    Its whole content is one import line, so a second consent prompt per
+    project would spend the operator's attention on the file that carries
+    none of the conventions.
+    """
+    target = Path(machine["projects"][0]["path"]) / pi.CLAUDE_NAME
+    target.write_text("# mine\n\nHands off.\n", encoding="utf-8")
+    result = _retire(machine)
+    assert target.read_text(encoding="utf-8") == "# mine\n\nHands off.\n"
+    assert [o.state for o in result.outcomes] == [WRITTEN, WRITTEN]
+
+
+def test_a_claude_file_with_a_managed_block_is_regenerated(machine):
+    """The half the "leave it alone" rule must not swallow.
+
+    A file this tool wrote is a file this tool keeps true. Only a file with
+    no block of ours in it is somebody else's.
+    """
+    target = Path(machine["projects"][0]["path"]) / pi.CLAUDE_NAME
+    target.write_text(
+        "# mine\n\nkept\n\n"
+        + pi.render_claude(label="app", version="0.0.1"),
+        encoding="utf-8")
+    _retire(machine)
+    out = target.read_text(encoding="utf-8")
+    assert "kept" in out, "content outside the block was destroyed"
+    assert "0.0.1" not in out, "the stale block was not regenerated"
+    assert f"@{AGENTS_NAME}" in out
+
+
+def _declare(machine, mapping: dict, contracts=()) -> Path:
+    """Give the first project a subproject declaration and the directories."""
+    root = Path(machine["projects"][0]["path"])
+    for owned in mapping.values():
+        for path in owned:
+            (root / path).mkdir(parents=True, exist_ok=True)
+    declaration = root / ".operator" / "subprojects.json"
+    declaration.parent.mkdir(parents=True, exist_ok=True)
+    declaration.write_text(json.dumps(
+        {"subprojects": {name: {"owns": list(owned)}
+                         for name, owned in mapping.items()},
+         "contracts": list(contracts)}), encoding="utf-8")
+    return root
+
+
+def test_a_repository_that_declares_no_subprojects_gets_no_extra_files(machine):
+    """Every repository, until somebody draws a boundary.
+
+    The declaration being absent is not an error and not a prompt: it is the
+    normal shape of a repository, and generation must be silent about it.
+    """
+    _retire(machine)
+    root = Path(machine["projects"][0]["path"])
+    assert [p.name for p in root.rglob(AGENTS_NAME)] == [AGENTS_NAME]
+
+
+def test_each_declared_subproject_directory_gets_its_own_file(machine):
+    root = _declare(machine, {"api": ["services/api"],
+                              "web": ["clients/web"]},
+                    contracts=["specs/contracts"])
+    _retire(machine)
+    api = (root / "services" / "api" / AGENTS_NAME).read_text(encoding="utf-8")
+    web = (root / "clients" / "web" / AGENTS_NAME).read_text(encoding="utf-8")
+    assert "`api` subproject" in api and "`services/api`" in api
+    assert "`web` subproject" in web
+    assert "`specs/contracts`" in api
+
+
+def test_a_subproject_owning_two_trees_gets_a_file_in_each(machine):
+    """A nested file only helps an agent editing near it.
+
+    Both are generated in the same run from the same values, so this is not
+    the duplication FR-9 forbids -- there is no way for them to disagree.
+    """
+    root = _declare(machine, {"api": ["services/api", "clients/api-sdk"]})
+    _retire(machine)
+    for owned in ("services/api", "clients/api-sdk"):
+        text = (root / owned / AGENTS_NAME).read_text(encoding="utf-8")
+        assert "`services/api`" in text and "`clients/api-sdk`" in text
+
+
+def test_a_declared_directory_that_is_not_there_is_skipped(machine):
+    """A declaration can name a path before anyone creates it.
+
+    Creating the directory to hold the file would put the tool in the
+    business of inventing the tree it was asked to describe.
+    """
+    root = Path(machine["projects"][0]["path"])
+    (root / ".operator").mkdir(parents=True)
+    (root / ".operator" / "subprojects.json").write_text(
+        json.dumps({"subprojects": {"api": {"owns": ["services/api"]}}}),
+        encoding="utf-8")
+    result = _retire(machine)
+    assert [o.state for o in result.outcomes] == [WRITTEN, WRITTEN]
+    assert not (root / "services").exists()
+
+
+def test_an_unreadable_declaration_fails_the_project(machine):
+    """Not a silent skip.
+
+    `operator ownership check` refuses on an unreadable declaration, so
+    swallowing it here leaves a repository whose push gate is broken and
+    whose generation reported success.
+    """
+    root = Path(machine["projects"][0]["path"])
+    (root / ".operator").mkdir(parents=True)
+    (root / ".operator" / "subprojects.json").write_text(
+        "{not json", encoding="utf-8")
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert "subproject" in result.outcomes[0].detail.lower()
+
+
+def test_a_users_own_subproject_file_is_not_touched(machine):
+    root = _declare(machine, {"api": ["services/api"]})
+    target = root / "services" / "api" / AGENTS_NAME
+    target.write_text("# mine\n\nHands off.\n", encoding="utf-8")
+    result = _retire(machine)
+    assert target.read_text(encoding="utf-8") == "# mine\n\nHands off.\n"
+    assert [o.state for o in result.outcomes] == [WRITTEN, WRITTEN]
+
+
+def test_a_subproject_file_regenerates_and_keeps_what_is_outside_the_block(
+        machine):
+    root = _declare(machine, {"api": ["services/api"]})
+    target = root / "services" / "api" / AGENTS_NAME
+    target.write_text(
+        "# mine\n\nkept\n\n"
+        + pi.render_subproject(name="api", owns=["stale"], contracts=[],
+                               version="0.0.1"),
+        encoding="utf-8")
+    _retire(machine)
+    out = target.read_text(encoding="utf-8")
+    assert "kept" in out, "content outside the block was destroyed"
+    assert "0.0.1" not in out and "stale" not in out
+    assert "`services/api`" in out
+
+
+def test_a_declared_prefix_that_climbs_out_of_the_repository_is_refused(
+        machine):
+    """Found by review, and it wrote a real file outside a real checkout.
+
+    `operator_ownership.normalize` drops `.` segments and empty ones but
+    keeps `..`, which is correct for the check it was written for -- git
+    never emits a `..` path, so the segment is inert there. It is not inert
+    here: this is the first code that turns a declared prefix into a
+    *destination*, and `root.joinpath("..", "..", "x")` is a write into
+    somebody else's repository.
+
+    Refused at the declaration, so every consumer gets it and the message
+    names the file a human can edit.
+    """
+    root = Path(machine["projects"][0]["path"])
+    (root / ".operator").mkdir(parents=True)
+    (root / ".operator" / "subprojects.json").write_text(
+        json.dumps({"subprojects": {"api": {"owns": ["../escaped"]}}}),
+        encoding="utf-8")
+    (root.parent / "escaped").mkdir(exist_ok=True)
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert not (root.parent / "escaped" / AGENTS_NAME).exists()
+
+
+def test_each_climbing_path_guard_is_separately_falsifiable(tmp_path):
+    """Mutation found this: the end-to-end tests could not tell them apart.
+
+    Two guards refuse a climbing path -- the declaration reader and the
+    resolved-containment check in `_place_subprojects`. Asserting only that
+    generation failed means either one alone satisfies the test, so deleting
+    the declaration refusal left the suite green. The containment check does
+    stop the write, so nothing unsafe shipped; what was lost was the *message*
+    naming `subprojects.json`, which is the whole reason for having the first
+    guard at all.
+
+    So this one goes at `read_declaration` directly, where only one guard can
+    answer.
+    """
+    (tmp_path / ".operator").mkdir(parents=True)
+    declaration = tmp_path / ".operator" / "subprojects.json"
+
+    for payload in (
+            {"subprojects": {"api": {"owns": ["../escaped"]}}},
+            {"subprojects": {"api": {"owns": ["services/api"]}},
+             "contracts": ["../elsewhere"]}):
+        declaration.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(operator_ownership.OwnershipError) as caught:
+            operator_ownership.read_declaration(tmp_path)
+        assert ".." in str(caught.value)
+
+
+def test_the_declaration_reader_admits_an_ordinary_path(tmp_path):
+    """The control for the pair above. A reader that refused every path would
+    pass both of them and ship a tool that can declare nothing."""
+    (tmp_path / ".operator").mkdir(parents=True)
+    (tmp_path / ".operator" / "subprojects.json").write_text(
+        json.dumps({"subprojects": {"api": {"owns": ["services/api"]}},
+                    "contracts": ["specs/contracts"]}),
+        encoding="utf-8")
+    declaration = operator_ownership.read_declaration(tmp_path)
+    assert declaration is not None
+    assert tuple(declaration.subprojects["api"]) == (("services", "api"),)
+
+
+def test_a_contract_path_that_climbs_out_of_the_repository_is_refused(machine):
+    """The same segment in the other list.
+
+    A guard written on one of two loops over the same JSON is a guard the
+    next edit walks around.
+    """
+    root = _declare(machine, {"api": ["services/api"]},
+                    contracts=["../elsewhere"])
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert not (root / "services" / "api" / AGENTS_NAME).exists()
+
+
+def test_a_symlinked_subproject_directory_that_escapes_is_refused(
+        machine, tmp_path):
+    """The half the declaration cannot express.
+
+    `..` is refusable in the file. A directory that *is* a symlink or a
+    junction pointing out of the tree is not: the declaration says
+    `services/api` and means it, and only the resolved path knows better.
+    Both checks are kept because each catches a case the other cannot.
+    """
+    root = Path(machine["projects"][0]["path"])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "services").mkdir(parents=True)
+    try:
+        (root / "services" / "api").symlink_to(outside,
+                                               target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this machine will not create a directory symlink")
+    (root / ".operator").mkdir(parents=True)
+    (root / ".operator" / "subprojects.json").write_text(
+        json.dumps({"subprojects": {"api": {"owns": ["services/api"]}}}),
+        encoding="utf-8")
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert not (outside / AGENTS_NAME).exists()
+
+
+def test_the_containment_check_admits_what_it_should():
+    """The control. A guard that refuses everything is the same defect
+    wearing a safer face -- it stops the writes it was meant to allow, and
+    the suite above cannot tell the difference."""
+    root = Path("/repo").resolve()
+    assert pi._within(root, root)
+    assert pi._within(root / "services" / "api", root)
+    assert not pi._within(root.parent / "repo-two", root)
+    assert not pi._within(root.parent, root)
+
+
+def test_a_target_that_cannot_be_resolved_is_refused_not_skipped(
+        machine, monkeypatch):
+    """Caught by `test_resolve_conformance`, which is the point of having it.
+
+    `Path.resolve` fails three ways -- `OSError` on a denial, `RuntimeError`
+    on a symlink loop, `ValueError` on an embedded NUL -- and the first draft
+    caught one of the three, so the other two left as tracebacks out of
+    `operator projects`.
+
+    The direction matters more than the coverage. `project_paths.resolved_str`
+    exists for exactly this and is *wrong* here: its fallback is a lexical
+    absolute path, which is less resolved than the truth, so a containment
+    gate using it admits the target it could not check. A write gate that
+    cannot see must say no.
+    """
+    root = _declare(machine, {"api": ["services/api"]})
+    real_resolve = Path.resolve
+
+    def exploding(self, *args, **kwargs):
+        if self.name == "api":
+            raise RuntimeError("symlink loop")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", exploding)
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert not (root / "services" / "api" / AGENTS_NAME).exists()
+
+
+def test_only_the_root_file_is_given_the_validation_stub(machine):
+    """Found by review: the stub was leaking into every new file.
+
+    `compose` seeds it when it is creating a file from nothing, and both
+    `CLAUDE.md` and the subproject files are usually created from nothing.
+    `CLAUDE.md`'s entire content is one import line, and a subproject file is
+    supposed to carry facts and nothing else -- neither is anybody's home for
+    build commands. The seed is off by default now and one caller asks for it.
+    """
+    root = _declare(machine, {"api": ["services/api"]})
+    _retire(machine)
+    stub_heading = pi.VALIDATION_STUB.splitlines()[0]
+    assert stub_heading in (root / AGENTS_NAME).read_text(encoding="utf-8")
+    assert stub_heading not in (root / pi.CLAUDE_NAME).read_text(
+        encoding="utf-8")
+    assert stub_heading not in (
+        root / "services" / "api" / AGENTS_NAME).read_text(encoding="utf-8")
+
+
+def test_the_shipped_subproject_file_states_no_rules(machine):
+    """FR-9 measured on the bytes that reach the disk.
+
+    The generator's output and the file's content are not the same thing --
+    `compose` sits between them, and it is what put the validation stub into
+    subproject files in the first place. Checking the generator alone is how
+    that went unnoticed.
+    """
+    root = _declare(machine, {"api": ["services/api"]})
+    _retire(machine)
+    shipped = (root / "services" / "api" / AGENTS_NAME).read_text(
+        encoding="utf-8")
+    found = [tell for tell in _DIRECTIVE_TELLS if tell in shipped.lower()]
+    assert not found, f"the shipped subproject file gives directions: {found}"
+
+
+def test_a_second_run_leaves_the_subproject_files_alone(machine):
+    root = _declare(machine, {"api": ["services/api"]})
+    target = root / "services" / "api" / AGENTS_NAME
+    _retire(machine)
+    first = target.read_text(encoding="utf-8")
+    _retire(machine)
+    assert target.read_text(encoding="utf-8") == first
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +2099,16 @@ SOURCE = (
 
 @pytest.fixture
 def machine(tmp_path):
-    """A home with a global instructions file and two registered projects."""
+    """A home with a global instructions file and two registered projects.
+
+    Every project carries a configuration with all the flags on. That is not
+    scenery: since FR-8 the flags default *off* and rendering refuses a
+    project that never chose, so a fixture without one would exercise the
+    refusal in every test rather than the thing each test is about. It also
+    keeps the section-visibility assertions below meaningful — a test that
+    a disabled feature drops its section proves nothing if the baseline is
+    everything-off.
+    """
     home = tmp_path / "home"
     copilot = home / ".copilot"
     projects_root = copilot / "projects"
@@ -819,6 +2121,12 @@ def machine(tmp_path):
         root = tmp_path / "repos" / name
         root.mkdir(parents=True)
         (projects_root / guid).mkdir()
+        (projects_root / guid / project_features.CONFIG_NAME).write_text(
+            json.dumps({"version": 1, "features": {
+                slug: project_features.ON
+                for slug in project_features.SLUGS
+                if slug != project_features.TRACKED_BACKLOG}}),
+            encoding="utf-8")
         projects.append({"guid": guid, "path": str(root), "label": name})
     return {
         "home": home,
@@ -953,6 +2261,146 @@ def test_a_second_run_is_idempotent(machine):
         encoding="utf-8") for p in machine["projects"]}
     assert before == after
     assert len(list(machine["archive"].iterdir())) == 1
+
+
+# ---------------------------------------------------------------------------
+# FR-7 -- a project's own content survives regeneration, byte for byte
+#
+# `test_a_second_run_is_idempotent` above is a weaker claim than it looks:
+# it regenerates the *same* block, so a `_place_one` that ignored the
+# existing file entirely and wrote the block alone would still pass it on
+# the second run. What FR-7 promises is that content survives a block that
+# genuinely changed -- a new toolkit version, a feature turned on, a section
+# rewritten -- because that is the only regeneration anyone will ever run.
+# These tests drive the whole path (`render` -> `compose` -> the atomic
+# write), not `compose` on its own, since every one of those steps is
+# somewhere the surrounding bytes could be dropped.
+# ---------------------------------------------------------------------------
+
+APPENDED_ABOVE = (
+    "# alpha\n"
+    "\n"
+    "Build: `make check`. Run one test with `pytest -k name`.\n"
+    "\n"
+)
+
+APPENDED_BELOW = (
+    "\n"
+    "## Notes we wrote ourselves\n"
+    "\n"
+    "Trailing whitespace matters here:   \n"
+    "So do blank lines.\n"
+    "\n"
+    "\n"
+    "And a tab\tin the middle.\n"
+)
+
+
+def _regenerate_around_project_content(machine, **second_run):
+    """Place, append the project's own prose above and below, regenerate.
+
+    Returns the block-stripped remainder before and after, plus the two
+    managed blocks, so a caller can assert both halves: what changed, and
+    what did not.
+    """
+    _retire(machine)
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    written = target.read_text(encoding="utf-8")
+    target.write_text(APPENDED_ABOVE + written.rstrip("\n") + "\n"
+                      + APPENDED_BELOW, encoding="utf-8")
+    before = target.read_text(encoding="utf-8")
+    result = _retire(machine, **second_run)
+    after = target.read_text(encoding="utf-8")
+    return before, after, result
+
+
+def _split_out_the_block(text: str) -> "tuple[str, str, str]":
+    """`text` as (above, the managed block, below)."""
+    assert text.count(MANAGED_BEGIN) == 1, text
+    assert text.count(MANAGED_END) == 1, text
+    head, rest = text.split(MANAGED_BEGIN, 1)
+    block, tail = rest.split(MANAGED_END, 1)
+    return head, block, tail
+
+
+def test_project_content_survives_a_block_that_actually_changed(machine):
+    """The regeneration FR-7 is about: the toolkit version moved on.
+
+    Everything outside the markers is compared byte for byte -- including
+    the trailing spaces, the doubled blank line and the tab, because a
+    "preserving" implementation that round-trips through a line list and
+    rejoins with `\\n` loses exactly those and nothing else, and no test
+    written with tidy fixture prose would see it.
+    """
+    before, after, result = _regenerate_around_project_content(
+        machine, version="10.0.0")
+    assert [o.state for o in result.outcomes] == [MERGED, MERGED]
+
+    old_head, old_block, old_tail = _split_out_the_block(before)
+    new_head, new_block, new_tail = _split_out_the_block(after)
+
+    assert old_block != new_block, (
+        "the block did not change, so this test proved only what the "
+        "idempotence test already proves")
+    assert "9.9.9" in old_block and "10.0.0" in new_block
+    assert (new_head, new_tail) == (old_head, old_tail)
+    assert new_head == APPENDED_ABOVE
+    assert new_tail.endswith(APPENDED_BELOW)
+
+
+def test_project_content_survives_a_feature_being_turned_off(machine):
+    """The other axis: the block shrinks. Content below it must not be
+    dragged up with the removed section."""
+    config = (machine["projects_root"] / "GUID-1"
+              / project_features.CONFIG_NAME)
+    _retire(machine)
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    target.write_text(
+        APPENDED_ABOVE + target.read_text(encoding="utf-8").rstrip("\n")
+        + "\n" + APPENDED_BELOW, encoding="utf-8")
+    before = target.read_text(encoding="utf-8")
+    config.write_text(json.dumps(
+        {"version": 1, "features": {"session-handoff": "off"}}),
+        encoding="utf-8")
+    _retire(machine)
+    after = target.read_text(encoding="utf-8")
+
+    old_head, old_block, old_tail = _split_out_the_block(before)
+    new_head, new_block, new_tail = _split_out_the_block(after)
+    assert "handoff prose" in old_block
+    assert "handoff prose" not in new_block
+    assert (new_head, new_tail) == (old_head, old_tail)
+
+
+def test_appended_content_that_quotes_the_markers_is_not_eaten(machine):
+    """A project documenting the managed block writes these lines into a
+    fenced sample. Read as live markers, the sample and everything between
+    it and the real block is what `compose` replaces -- so the file loses
+    the paragraph explaining the very thing that ate it."""
+    _retire(machine)
+    target = Path(machine["projects"][0]["path"]) / AGENTS_NAME
+    documented = (
+        target.read_text(encoding="utf-8").rstrip("\n") + "\n"
+        + "\n## How the managed block is delimited\n\n"
+        + "```markdown\n" + MANAGED_BEGIN + "\n...\n" + MANAGED_END
+        + "\n```\n\nKeep your own notes outside it.\n")
+    target.write_text(documented, encoding="utf-8")
+    _retire(machine, version="10.0.0")
+    after = target.read_text(encoding="utf-8")
+    assert "Keep your own notes outside it." in after
+    assert "## How the managed block is delimited" in after
+    assert after.count(MANAGED_BEGIN) == 2
+    assert "10.0.0" in after
+
+
+def test_regeneration_reports_merged_not_written(machine):
+    """The state is what a caller logs, and `written` over a file that
+    already held someone's prose reads as "we made this file" -- which is
+    the claim the whole preservation contract denies."""
+    _, _, result = _regenerate_around_project_content(machine,
+                                                      version="10.0.0")
+    assert result.outcomes[0].state == MERGED
+    assert result.outcomes[0].state != WRITTEN
 
 
 def test_no_projects_at_all_refuses_to_remove_anything(machine):

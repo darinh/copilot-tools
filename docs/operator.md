@@ -447,7 +447,7 @@ scripts and for a quick glance.
 ### Project configurations
 
 **Project configurations** — also reachable directly as `operator projects` —
-lists every project registered in `~/.copilot/projects/catalog.csv` and lets
+lists every project registered in `~/.operator/projects/catalog.csv` and lets
 you change which conventions it opted into:
 
 ```
@@ -467,7 +467,7 @@ Picking one shows the features and their current values:
 ═══ my-project ═══
 
   ~/repos/my-project
-  ~/.copilot/projects/{guid}/features.json
+  ~/.operator/projects/{guid}/features.json
 
    1) Session Handoff           on
    2) Session History           on
@@ -538,7 +538,7 @@ knows which project it is, so it has nothing to look up.
 The order is the contract:
 
 1. **Every** project is written first.
-2. The global file is copied to `~/.copilot/retired/`, named by timestamp and
+2. The global file is copied to `~/.operator/retired/`, named by timestamp and
    content digest, and the copy is read back and digest-compared.
 3. Only then is the original removed.
 
@@ -547,8 +547,7 @@ directory is not on this machine right now — an unplugged drive is a project
 that comes back, and removing the global file while it is away opens the gap on
 a delay. The resulting state is the conventions in two places, which costs a
 duplicate paragraph, rather than in none, which costs the machine its
-conventions. Nothing prunes `retired/`, for the same reason nothing prunes
-[`superseded/`](#superseded-handoffs).
+conventions. Nothing prunes `retired/`.
 
 Three more things it will not do:
 
@@ -589,81 +588,127 @@ Unnamed instances (no `--name`) are always ephemeral and don't persist state.
 
 Intentional operator handoffs still start a fresh Copilot CLI session and rely on the handoff file for context. The saved CLI session ID is only reused when the operator process itself is restarted.
 
-If a named loop resumes with a saved CLI session ID but finds **no handoff file** for the project (`~/.copilot/projects/{guid}/next-session.md`, resolved from `~/.copilot/projects/catalog.csv`), that almost always means the previous session ended without calling `handoff` — most likely a crash. The preamble gets an extra note in that case telling the agent this looks like crash recovery and, if it *did* mean to stop cleanly, to remember to write a handoff next time. Resuming after a clean `handoff`-triggered restart (or any run where the handoff file already exists) never adds this note.
+If a named loop resumes with a saved CLI session ID but finds **no handoff file** for the project (`~/.operator/projects/{guid}/handoff/{instance}.md`, resolved from `~/.operator/projects/catalog.csv`), that almost always means the previous session ended without calling `handoff` — most likely a crash. The preamble gets an extra note in that case telling the agent this looks like crash recovery and, if it *did* mean to stop cleanly, to remember to write a handoff next time. Resuming after a clean `handoff`-triggered restart (or any run where the handoff file already exists) never adds this note.
 
-### Superseded handoffs
+### A handoff will not leave the checkout dirty
 
-`handoff` does not silently replace an unread handoff. `os.replace` is atomic —
-a reader never sees half a file — but it says nothing about a file nobody ever
-read, and it will overwrite one without a trace. The protocol says the reader
-deletes `next-session.md` once it has consumed it, so a handoff still sitting
-there when the next one is written *means* unread, and the losing side would be
-a session that has already ended and cannot be asked to repeat itself.
+`handoff` asks git what is outstanding in the checkout before it writes
+anything, and refuses if the answer is not "nothing":
 
-So neither is discarded. The old file is copied (not moved — the original stays
-put until the copy has succeeded) into
-`~/.copilot/projects/{guid}/superseded/`, under a timestamped name created with
-`O_EXCL` so no archive can land on another one. Only then is the new handoff
-published. Both survive.
+```
+The checkout is not clean, so this handoff was not written.
 
-#### What this does not cover
+    probe.py
+    ntf_review_mutabc/
 
-Preserve-then-publish is serialised by a lock, so the guarantee holds between
-two handoffs that can both take it. When the lock cannot be taken at all, the
-tool writes anyway — refusing would discard the current session for certain, to
-protect one that might not exist — after *trying* to bank a copy of its own
-handoff into `superseded/`. Banking is best-effort: if that write also fails the
-tool says so on stderr and still publishes.
+  Handing off now makes these somebody else's problem, and they will have no way
+  to tell which of them matters. Commit what belongs to the repository, delete
+  what was scratch, and run the same command again.
 
-So there are two residual windows, not one. When the spare was banked, the
-writer that *held* the lock can publish in between the other writer's preserve
-and its rename, and be overwritten by it; the overwritten writer never banked a
-spare, because from inside the lock there was nothing to defend against, so its
-handoff is the one that is gone. When the spare could *not* be banked, the
-unlocked writer has no copy either, and whichever of the two loses the race
-leaves nothing behind.
+  If they genuinely must be left, re-run with --allow-dirty -- the handoff will
+  say so and list them, so the next session is told rather than left to guess.
+```
 
-The practical consequence is narrow but worth knowing, and the files now say so
-themselves rather than leaving it to a stderr warning that dies with the
-session that caused it. A handoff published without the lock carries a notice
-under its title saying it was written unserialised, that it may have
-overwritten a concurrent handoff or been overwritten by one since, and that
-`superseded/` should be read alongside it; the spare banked on that path
-carries a different notice saying those words may never have reached
-`next-session.md` at all. That is what makes a banked copy distinguishable from
-an unread predecessor, which is otherwise the same kind of file under the same
-kind of name — and only one of the two can be *newer* than the handoff beside
-it. Neither notice asserts an outcome, because both are written before their
-outcome is known: the published one is chosen before the bank is attempted and
-the banked one before the publish is attempted, and either can then fail. Nor
-does either name a cause: the lock is not taken when a peer holds it, when a
-lock left by a dead process has not yet aged out, and when the directory will
-not take a lock file at all, and from the stamp site those are the same fact.
+The rule this enforces was documented prose for months, with the story behind
+it and the reasoning, and agents who had read it left artifacts in a shared
+checkout three times in one evening — nine of them in a single review round.
+Prose describes; it does not prevent. `handoff` is the one command every agent
+runs on the way out, so it is where the check belongs.
 
-So: after a `Warning: could not take the handoff lock for this project`, the
-file at `next-session.md` is still not guaranteed to be the most recent
-handoff, and the other one may exist only in `superseded/`. Read both. The one
-case with nothing left to record it is the spare that could not be banked —
-there was no file to write the notice into — so that warning is still worth
-repeating by hand. Closing the windows properly means making the publish itself
-the exclusive operation rather than guarding it with a lock the tool is willing
-to proceed without.
+One more measurement, from a peer instance that read this gate the day it
+landed. It reported that its checkout was clean of scratch by construction —
+its mutation harness clones the repository per mutant into `%TEMP%` — and
+then said the part worth recording: *"I would not have predicted that from
+AGENTS.md alone. I do it because a clone is the only way the git `cat-file`
+check still resolves."* The one agent that satisfied the rule got there from
+an unrelated technical constraint, not from having read it. That is the
+argument for the gate stated better than the argument for the gate: compliance
+that arrives as a by-product of something else is not evidence the prose
+works, and it is the best case the prose ever gets.
 
-#### Never pruned
+Four kinds of leftover are reported: uncommitted changes to tracked files,
+untracked files (individually — `-uall`, so a scratch directory holding fifty
+files is not one line saying "scratch/"), **empty untracked directories**, and
+on Windows, **directory junctions**.
 
-**Nothing ever prunes `superseded/`.** That is a deliberate promise, not a
-missing feature. A reaper inside a fix for an unwanted delete is the same bug
-wearing the fix's clothes, and it would be reasoning about the age of files
-whose value it cannot judge. The directory only grows when a handoff went
-unread, which is already the anomaly — a full `superseded/` is a symptom worth
-reading, not a mess to clear.
+The empty directories are the whole reason this is a tool and not a `git
+status` in a shell prompt. Git has nothing to report for an empty directory —
+there is no blob — so `git status` prints a clean tree while artifacts sit in
+its root. That is precisely what cost three agents an evening diagnosing a
+working-directory bug that did not exist: the directories had been left by
+their own review subagents, and every explanation fitted the evidence equally
+well because the evidence had no provenance.
 
-The prohibition is on the tool and on agents acting unasked; it is not a lock on
-the user's own disk. Clearing it is a decision for the person who owns the
-context, so if it has grown, read what is in there before deciding it is noise:
+Junctions are the same silence by a different route, and adversarial review
+found them. A junction is not a symlink — `is_symlink()` answers False and
+`is_dir()` answers True — so the walk descended one as though it were an
+ordinary directory. Point one at a directory and then delete the target, and
+git prints `warning: could not open directory` on **stderr** and nothing at
+all on stdout, so `git status` calls the tree clean; the walk then hit the
+same error and dropped it under "unreadable is not empty". Both halves agreed
+and neither had looked. Git cannot store a junction — there is no tree entry
+for one — so a junction inside a checkout is always something a process left
+behind, and it is now reported rather than walked into. One that is
+legitimate infrastructure (`node_modules` pointed at a shared cache) is in
+`.gitignore` and is pruned like any other ignored path.
+
+The check runs before the tool creates any directory or writes any file, so a
+refusal changes nothing and the same command works once you have cleaned up.
+If git cannot answer at all — the project root is not a checkout, or git is
+not installed — the handoff proceeds with a warning. "No information" is never
+reported as "clean".
+
+`--allow-dirty` exists because refusing outright would be the worse failure:
+it destroys a live session's context to prevent a stray file. The override does
+not merely silence the check, it **records** what was left in the published
+handoff, under the title and above `## Status`, so the successor is told rather
+than left to work out which of the mess is load-bearing.
+
+Two limits worth knowing. The scan covers the checkout you are in — for an
+agent that is its worktree, not the primary checkout, because refusing your
+handoff on account of somebody else's dirty worktree would be wrong. And the
+legacy `handoff.sh` has no equivalent guard (backlog item 0020).
+
+The empty-directory pass walks the whole checkout, not just its root, so a
+scratch directory left under `tests/` is found. It is the one part of the guard
+that costs more than a single `git status`, and it is bounded twice over: the
+directories git reports as ignored (`node_modules/`, `.venv/`, build output)
+are pruned without being entered, and the walk stops after 4096 directories.
+Both bounds fail in the same direction — an unvisited subtree is never reported
+as empty. Exhausting the budget costs a finding; it cannot invent one.
+
+### An unread handoff
+
+`handoff` does not silently replace one. `os.replace` is atomic — a reader
+never sees half a file — but it says nothing about a file nobody ever read,
+and it will overwrite one without a trace. The protocol has the reader delete
+the handoff once it has consumed it, so a handoff still sitting at an
+instance's path when the next one is written *means* unread.
+
+So the old file is moved to `{instance}.prev.md` before the new one is
+published, and the tool says so on stderr. **That cannot happen in the ordinary
+flow**: a `.prev.md` means a session of that instance ended without picking up
+what the one before it left.
+
+There is nothing to serialise. Handoffs are keyed by instance and an instance
+is one session at a time, so a handoff file has exactly one writer — there is
+no concurrent handoff to race, and no lock, notice or timestamped archive is
+needed to arbitrate one.
+
+There is one banked slot and it is replaced each time, which is deliberate: a
+second consecutive miss means the read side is broken, and keeping the older of
+two undelivered handoffs would not fix it. The slot is bounded, so nothing has
+to promise never to prune it.
+
+Handoffs written before this layout existed are **moved, never deleted**, on
+the next write for their project: a `next-session.md` that names its author
+goes to that author's slot when the slot is free, and everything else —
+including the old `superseded/` archive — goes to
+`~/.operator/projects/{guid}/handoff/legacy/`. Nothing there is read
+automatically. Look, if a project has one:
 
 ```bash
-ls -la ~/.copilot/projects/*/superseded/
+ls -la ~/.operator/projects/*/handoff/legacy/
 ```
 
 ### Multi-Instance
@@ -838,13 +883,31 @@ operator inbox                    # only with no other instance live here
 operator inbox beta --peek        # leave them unread
 operator inbox beta --history     # already-delivered messages
 operator inbox beta --json        # machine-readable
+
+operator reply --instance beta "an answer"          # to whoever wrote last
+operator reply --instance beta --to alpha "to them" # to a named peer
 ```
 
-`--from` and `--to` are both required. The recipient cannot see who is running
-what, so an unattributed message is one it cannot answer; every delivered
-message carries a ready-made reply command. A `--to` naming no known instance
-is refused and the known names are listed, because a typo would otherwise queue
-a message into a mailbox nobody ever reads.
+`operator reply` is sugar over `send`: it resolves the two addresses and hands
+the rest straight to it. `--to` defaults to whoever most recently wrote to the
+instance, looking at read and unread mail together — a session start archives
+the inbox, so consulting only unread mail would make replying impossible in
+exactly the session a message was delivered to. `--instance` defaults to
+`$OPERATOR_INSTANCE`.
+
+Both lookups refuse rather than guess. A reply carries an assertion the
+recipient will act on, and signing it with the directory's name — which is what
+`operator inbox` does when given none — puts words in another agent's mouth.
+"Nobody wrote to you" and "your mailbox could not be read" are reported
+differently for the same reason: only the first means there is no reply to send.
+
+`--from` and `--to` are both required on `send`. The recipient cannot see who is
+running what, so an unattributed message is one it cannot answer; every
+delivered message carries a ready-made `operator reply` command naming its own
+sender, so a batch from several peers is answerable message by message rather
+than only as a whole. A `--to` naming no known instance is refused and the known
+names are listed, because a typo would otherwise queue a message into a mailbox
+nobody ever reads.
 
 **With no NAME the mailbox is named after the directory, which is nobody in
 particular.** The default comes from the same function that names a session you
@@ -900,6 +963,13 @@ delivery uses literal key input: without that, a message containing the word
 `Enter` would submit early and one containing `C-c` would interrupt the
 recipient.
 
+`operator session start` delivers queued mail too, printing it and marking it
+read in the same breath. That is the whole of what an agent has to do to
+receive mail — there is no command to remember, which is the point: an agent
+that never ran `operator inbox` was indistinguishable from one with no mail.
+A mailbox that cannot be read is reported as such rather than as an empty one,
+and does not stop the session starting.
+
 Messages live in `~/.operator/messages/<instance>/inbox/` and move to
 `../archive/` when read — read mail is archived rather than deleted, so
 `--history` is a genuine audit trail of what agents told each other.
@@ -951,10 +1021,11 @@ logs.
 | `~/.operator/messages/<id>/inbox/` | Undelivered messages for an instance |
 | `~/.operator/messages/<id>/archive/` | Messages already delivered, kept as an audit trail |
 | `~/.operator/backups/` | Historical backups of the operator script |
-| `~/.copilot/projects/catalog.csv` | Maps a project root to its `{guid}` |
-| `~/.copilot/projects/catalog.csv.pre-test-<timestamp>` | The catalog as it was before a test run overwrote it. Written by this repository's test suite, only when that happens, and [never removed automatically](#banked-catalog-copies) |
-| `~/.copilot/projects/{guid}/next-session.md` | Session handoff, written by `handoff`, deleted by the session that reads it |
-| `~/.copilot/projects/{guid}/superseded/` | Handoffs that were replaced before anyone read them. Timestamped, append-only, [never pruned](#superseded-handoffs) |
+| `~/.operator/projects/catalog.csv` | Maps a project root to its `{guid}` |
+| `~/.operator/projects/catalog.csv.pre-test-<timestamp>` | The catalog as it was before a test run overwrote it. Written by this repository's test suite, only when that happens, and [never removed automatically](#banked-catalog-copies) |
+| `~/.operator/projects/{guid}/handoff/{instance}.md` | Session handoff, written by `handoff`, deleted by the session that reads it |
+| `~/.operator/projects/{guid}/handoff/{instance}.prev.md` | The previous handoff, banked because [nobody read it](#an-unread-handoff) |
+| `~/.operator/projects/{guid}/handoff/legacy/` | Handoffs from before handoffs were keyed by instance, moved here on the next write |
 | `~/.copilot/logs/process-*.log` | Copilot process logs (override with `COPILOT_LOG_DIR`) |
 
 > **Note**: Operator state used to live under `~/.copilot/`, but the copilot CLI itself wholesale-deletes `~/.copilot/restart/` on every startup (confirmed via fatrace). State was moved to `~/.operator/` to eliminate the collision. On first run the operator automatically migrates any legacy state from `~/.copilot/` into `~/.operator/`.
@@ -994,11 +1065,8 @@ written*. Undoing a suspected clobber would destroy a real registration on a
 guess — a preserver that destroys, which is the failure the guard exists to
 catch. It preserves and reports; a human decides which of the two happened.
 
-Nothing removes the banked copies either, for the same reason the [superseded
-handoff archive](#superseded-handoffs) is never pruned — but the promise is a
-different shape here, and the difference matters. Superseded handoffs accumulate
-in normal use, so their growth is unbounded and expected. Banked catalogs should
-never appear at all. Each one is a marker that something wrote to your home
+Nothing removes the banked copies either. Banked catalogs should never appear
+at all. Each one is a marker that something wrote to your home
 during a test run, and deleting it before you have reconciled it against the
 live catalog throws away the only record of what was there first. Delete it once
 you have.

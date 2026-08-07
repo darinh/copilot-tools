@@ -53,7 +53,7 @@ _GUARDED_DIRS: tuple[tuple[Path, bool, bool], ...] = (
 # guard exists to prevent. Opt in only for a run with no other live agents,
 # which is also why opting in makes it fatal.
 if os.environ.get("COPILOT_TOOLS_GUARD_HOME") == "1":
-    _GUARDED_DIRS += ((Path.home() / ".copilot" / "projects", True, True),)
+    _GUARDED_DIRS += ((Path.home() / ".operator" / "projects", True, True),)
 
 # Churn that is not a test artifact: tooling caches and developer worktrees.
 _GUARD_IGNORED = frozenset({".git", ".pytest_cache", "__pycache__", ".worktrees"})
@@ -63,14 +63,14 @@ _GUARD_IGNORED = frozenset({".git", ".pytest_cache", "__pycache__", ".worktrees"
 # The directory guard above compares the set of names before and after a test,
 # which cannot see a file that is overwritten in place: the name is there both
 # times. That is precisely how this file was destroyed. A test suite rewrote
-# the real ~/.copilot/projects/catalog.csv with a single fixture row, six real
+# the real ~/.operator/projects/catalog.csv with a single fixture row, six real
 # project registrations were lost, and nothing failed. It surfaced only because
 # `handoff` refused to start minutes later, by which point nothing connected the
 # two events.
 #
 # It is watched even though the enclosing directory is not, and the reason the
 # directory is excluded does not fully apply here. That reason is concurrency:
-# peer agents write handoff files under ~/.copilot/projects constantly, so
+# peer agents write handoff files under ~/.operator/projects constantly, so
 # blaming the running test for a new name there would be a fabricated
 # accusation. Writes to the catalog itself are rare by comparison -- no
 # production code writes it at all; handoff_tool and copilot_operator only read
@@ -82,7 +82,7 @@ _GUARD_IGNORED = frozenset({".git", ".pytest_cache", "__pycache__", ".worktrees"
 # appended two recovered rows BY HAND while this was being written. Registration
 # is a manual act and it is not announced. So the guard reports and preserves;
 # it never puts anything back. See _catalog_complaint.
-_REAL_CATALOG = Path.home() / ".copilot" / "projects" / "catalog.csv"
+_REAL_CATALOG = Path.home() / ".operator" / "projects" / "catalog.csv"
 
 # Distinct from None, which means "checked, and the file is not there". A read
 # that fails establishes nothing at all, and the two must not be conflated:

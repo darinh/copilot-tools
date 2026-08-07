@@ -4,7 +4,7 @@
 All work happens in worktrees under ``<repoRoot>/.worktrees/``, so agents run
 with a working directory that is a *checkout* of a project rather than the
 project itself. Anything that identifies the project -- the catalog in
-``~/.copilot/projects/catalog.csv``, the per-project directory, the handoff
+``~/.operator/projects/catalog.csv``, the per-project directory, the handoff
 file -- must key off the primary checkout, or every worktree looks like an
 unregistered project and mints a duplicate GUID.
 """
@@ -19,10 +19,11 @@ from pathlib import Path
 
 from install_manifest import file_present
 
-__all__ = ["primary_repo_root", "guid_is_usable", "projects_root",
-           "project_dir", "resolved_str", "catalog_rows", "normalized_key",
-           "catalog_guid", "CatalogLookup", "CATALOG_MISSING",
-           "CATALOG_UNREADABLE", "CATALOG_NO_ENTRY", "CATALOG_UNUSABLE_ID"]
+__all__ = ["primary_repo_root", "guid_is_usable", "operator_home",
+           "projects_root", "project_dir", "resolved_str", "catalog_rows",
+           "normalized_key", "catalog_guid", "CatalogLookup",
+           "CATALOG_MISSING", "CATALOG_UNREADABLE", "CATALOG_NO_ENTRY",
+           "CATALOG_UNUSABLE_ID"]
 
 # A background supervisor with no console of its own would otherwise flash a
 # real console window for each of these calls on Windows.
@@ -131,14 +132,39 @@ def resolved_str(path) -> str:
         return os.path.abspath(str(path))
 
 
+def operator_home() -> Path:
+    """This toolkit's own state directory, ``~/.operator`` by default.
+
+    Lives here, rather than in ``copilot_operator``, because
+    :func:`projects_root` needs it and ``copilot_operator`` imports *this*
+    module -- so a definition up there is one this module cannot reach.
+    ``copilot_operator`` re-exports it under its old name.
+
+    ``COPILOT_OPERATOR_HOME`` overrides it, which is how the tests relocate
+    the whole tree without touching ``Path.home``.
+    """
+    override = os.environ.get("COPILOT_OPERATOR_HOME")
+    return Path(override) if override else Path.home() / ".operator"
+
+
 def projects_root() -> Path:
     """The directory holding one subdirectory per catalogued project.
+
+    Under ``~/.operator``, not ``~/.copilot``. ``~/.copilot`` is the Copilot
+    CLI's own configuration directory -- its extensions, skills, settings,
+    session store and logs are all in there -- so this toolkit keeping the
+    project catalog in it was squatting in another program's directory. Every
+    other piece of operator state had already moved out; the catalog and the
+    per-project directories had not, and they are the ones that matter most,
+    because the catalog is what maps a project to its id. Lose it and you have
+    not lost a preference, you have lost every project's identity and with it
+    every handoff and ``superseded/`` file keyed to that id.
 
     Resolved on each call rather than captured at import: the tests, and anyone
     who relocates a home directory, patch ``Path.home`` and expect the writer
     and the reader to follow it to the same place.
     """
-    return Path.home() / ".copilot" / "projects"
+    return operator_home() / "projects"
 
 
 def project_dir(guid: str) -> Path:

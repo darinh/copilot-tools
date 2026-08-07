@@ -15,6 +15,7 @@ permanently empty reads as a quiet backlog rather than a broken one.
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 from pathlib import Path
@@ -355,6 +356,288 @@ def test_approving_an_item_that_does_not_exist_is_refused(repo):
 
 
 # ---------------------------------------------------------------------------
+# Closing
+# ---------------------------------------------------------------------------
+
+def approved_one(root: Path, **kwargs) -> Path:
+    """One item, filed and approved -- the ordinary subject of a close."""
+    path = file_one(root, **kwargs)
+    return backlog_tool.approve_item(backlog_dir(root),
+                                     int(ITEM_FILENAME.match(path.name)
+                                         .group(1)))
+
+
+def test_a_close_records_the_commit_the_date_and_conforms(repo):
+    """The negative control for every refusal below.
+
+    A close must produce a document this project's own checker accepts. R7
+    wants a closing date, R8 wants a commit that resolves here, and a tool
+    that wrote one without the other would hand the caller a backlog its own
+    suite fails -- with nothing pointing back at the command that did it.
+    """
+    path = approved_one(repo)
+    head = git(repo, "rev-parse", "HEAD")
+    backlog_tool.close_item(backlog_dir(repo), 1, commit="HEAD",
+                            repo_root=repo)
+    item = backlog_tool.parse_item(path)
+    assert item.status == backlog_tool.CLOSED_STATUS
+    assert item.front["commit"] == head
+    assert item.front["closed"] == backlog_tool._today()
+    assert backlog_tool.check(repo) == []
+
+
+def test_a_close_writes_the_sha_not_the_revision_it_was_handed(repo):
+    """``HEAD`` names a different commit the moment anybody commits again.
+
+    Storing the word would leave a record that still passes every check and
+    points somewhere else tomorrow, which is worse than a broken reference:
+    a dangling SHA is reported by R8, and a drifting one never is.
+    """
+    approved_one(repo)
+    first = git(repo, "rev-parse", "HEAD")
+    path = backlog_tool.close_item(backlog_dir(repo), 1, commit="HEAD",
+                                   repo_root=repo)
+    git(repo, "commit", "-q", "--allow-empty", "-m", "later work")
+    assert git(repo, "rev-parse", "HEAD") != first
+    assert backlog_tool.parse_item(path).front["commit"] == first
+
+
+def test_a_close_touches_only_the_front_matter(repo):
+    """The same promise approval makes, over three fields instead of one."""
+    path = approved_one(repo, evidence="The file said\nstatus: open\nbefore.")
+    before = path.read_bytes()
+    backlog_tool.close_item(backlog_dir(repo), 1, commit="HEAD",
+                            repo_root=repo)
+    item = backlog_tool.parse_item(path)
+    assert "status: open" in item.body
+    assert item.body == backlog_tool.split_front_matter(
+        before.decode("utf-8"))[1]
+    assert item.front["title"] == backlog_tool.split_front_matter(
+        before.decode("utf-8"))[0]["title"]
+
+
+def test_the_closing_fields_land_beside_the_opening_one(repo):
+    """Dates read as a pair. Appended at the end of the block instead, they
+    land after ``spec`` and read as though somebody had added them by hand."""
+    path = approved_one(repo)
+    backlog_tool.close_item(backlog_dir(repo), 1, commit="HEAD",
+                            repo_root=repo)
+    keys = list(backlog_tool.parse_item(path).front)
+    assert keys == ["id", "title", "status", "opened", "closed", "commit",
+                    "spec"]
+
+
+def test_a_closing_field_already_present_is_replaced_not_duplicated(repo):
+    """The template in ``AGENTS.md`` shows ``closed:`` blank, and a blank
+    value is legal at rest -- R7 only objects to one that is set. Inserting a
+    second line would produce a duplicate key, which the parser refuses, so
+    the item would close and then stop loading at all."""
+    path = approved_one(repo)
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.replace("\nspec:", "\nclosed:\nspec:"),
+                    encoding="utf-8")
+    backlog_tool.close_item(backlog_dir(repo), 1, commit="HEAD",
+                            repo_root=repo)
+    item = backlog_tool.parse_item(path)
+    assert item.front["closed"] == backlog_tool._today()
+    assert backlog_tool.check(repo) == []
+
+
+@pytest.mark.parametrize("ending", ["\r\n", "\r"])
+def test_a_close_leaves_the_files_line_endings_as_it_found_them(repo, ending):
+    """Both the replaced lines and the inserted ones.
+
+    An inserted line is the new risk here: approval only ever rewrote a line
+    that already had an ending to copy, so a hard-coded ``\\n`` would have
+    shown up nowhere until the first close of a CRLF file.
+    """
+    path = approved_one(repo)
+    path.write_bytes(path.read_bytes().replace(b"\n", ending.encode("utf-8")))
+    backlog_tool.close_item(backlog_dir(repo), 1, commit="HEAD",
+                            repo_root=repo)
+    raw = path.read_bytes()
+    if ending == "\r":
+        assert b"\n" not in raw
+    else:
+        assert raw.replace(b"\r\n", b"").count(b"\n") == 0
+    assert backlog_tool.parse_item(path).status == backlog_tool.CLOSED_STATUS
+
+
+def test_a_close_preserves_a_missing_final_newline(repo):
+    path = approved_one(repo)
+    path.write_bytes(path.read_bytes().rstrip(b"\n"))
+    backlog_tool.close_item(backlog_dir(repo), 1, commit="HEAD",
+                            repo_root=repo)
+    assert not path.read_bytes().endswith(b"\n")
+
+
+# -- the gate ---------------------------------------------------------------
+
+def test_an_unapproved_item_cannot_be_closed(repo):
+    """The gate, enforced where it can actually be bypassed.
+
+    ``ready`` is a queue an agent can simply not consult. If ``close`` asked
+    nothing, an agent could file its own item and mark it shipped, and the
+    approval gate would hold only on the path nobody is obliged to take.
+    """
+    file_one(repo)
+    with pytest.raises(backlog_tool.BacklogFormatError) as exc:
+        backlog_tool.close_item(backlog_dir(repo), 1, commit="HEAD",
+                                repo_root=repo)
+    assert "awaiting approval" in str(exc.value)
+    assert backlog_tool.parse_item(
+        backlog_tool.item_paths(backlog_dir(repo))[0]).status \
+        == PROPOSED_STATUS
+
+
+def test_an_item_working_under_the_blocks_exception_can_be_closed(repo):
+    """The positive control for the refusal above, and the reason it is
+    written against ``why_not_workable`` rather than against the status.
+
+    An agent that finds a defect while working an approved item may file it
+    and carry on -- that is the recorded exception the gate depends on for its
+    own enforceability. An item lawfully worked that cannot then be lawfully
+    closed sends the same agent to edit the status field by hand.
+    """
+    approved_one(repo, title="Approved work")
+    file_one(repo, title="A defect found mid-task", blocks=1)
+    path = backlog_tool.close_item(backlog_dir(repo), 2, commit="HEAD",
+                                   repo_root=repo)
+    assert backlog_tool.parse_item(path).status == backlog_tool.CLOSED_STATUS
+    assert backlog_tool.check(repo) == []
+
+
+def test_an_unapproved_item_can_still_be_rejected(repo):
+    """Rejection is not gated on approval, and the asymmetry is the point: the
+    ordinary thing to decline is an unapproved proposal, so requiring approval
+    first would mean approving something in order to turn it down."""
+    file_one(repo)
+    path = backlog_tool.close_item(backlog_dir(repo), 1, reject=True,
+                                   repo_root=repo)
+    item = backlog_tool.parse_item(path)
+    assert item.status == backlog_tool.REJECTED_STATUS
+    assert item.front["closed"] == backlog_tool._today()
+    assert "commit" not in item.front
+    assert backlog_tool.check(repo) == []
+
+
+def test_a_rejection_refuses_a_commit(repo):
+    """Nothing shipped. A SHA recorded against a rejection reads as though
+    something had, and that is exactly the kind of wrong that looks like
+    evidence."""
+    file_one(repo)
+    with pytest.raises(backlog_tool.BacklogFormatError) as exc:
+        backlog_tool.close_item(backlog_dir(repo), 1, reject=True,
+                                commit="HEAD", repo_root=repo)
+    assert "nothing shipped" in str(exc.value)
+
+
+def test_a_rejection_clears_a_commit_the_item_was_already_carrying(repo):
+    """The refusal above guards the flag; this guards the field.
+
+    A commit is illegal only while an item is live, so rejecting one that
+    carries a SHA would move it into a status where nothing reports it -- the
+    record the refusal exists to prevent, arriving by the route nobody is
+    watching. Reachable by hand-editing, which is how the field gets there.
+    """
+    path = file_one(repo)
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.replace("\nspec:", "\ncommit: " + "a" * 40 + "\nspec:"),
+                    encoding="utf-8")
+    backlog_tool.close_item(backlog_dir(repo), 1, reject=True, repo_root=repo)
+    item = backlog_tool.parse_item(path)
+    assert item.status == backlog_tool.REJECTED_STATUS
+    assert item.front["commit"] == ""
+    assert backlog_tool.check(repo) == []
+
+
+def test_a_cleared_field_is_written_bare_rather_than_with_a_trailing_space(
+        repo):
+    """``commit:`` is how every hand-written item and the documented template
+    spell an empty field. ``commit: `` parses the same and differs from all of
+    them by one invisible byte, which costs a later reader a hex dump to
+    explain."""
+    path = file_one(repo)
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.replace("\nspec:", "\ncommit: " + "a" * 40 + "\nspec:"),
+                    encoding="utf-8")
+    backlog_tool.close_item(backlog_dir(repo), 1, reject=True, repo_root=repo)
+    assert "\ncommit:\n" in path.read_text(encoding="utf-8")
+
+
+def test_a_rejection_leaves_an_absent_commit_field_absent(repo):
+    """Clearing is a repair, not a normalisation. The ordinary rejection has
+    no commit to clear, and writing a blank field into every one of them would
+    put a line in the file that answers a question nobody asked."""
+    file_one(repo)
+    path = backlog_tool.close_item(backlog_dir(repo), 1, reject=True,
+                                   repo_root=repo)
+    assert "commit" not in backlog_tool.parse_item(path).front
+
+
+def test_a_close_with_no_commit_is_refused(repo):
+    approved_one(repo)
+    with pytest.raises(backlog_tool.BacklogFormatError) as exc:
+        backlog_tool.close_item(backlog_dir(repo), 1, repo_root=repo)
+    assert "--commit" in str(exc.value)
+
+
+def test_a_close_naming_a_commit_that_does_not_resolve_is_refused(repo):
+    approved_one(repo)
+    with pytest.raises(backlog_tool.BacklogFormatError) as exc:
+        backlog_tool.close_item(backlog_dir(repo), 1, commit="0" * 40,
+                                repo_root=repo)
+    assert "does not resolve" in str(exc.value)
+
+
+def test_a_close_naming_an_object_that_is_not_a_commit_is_refused(repo):
+    """``git rev-parse --verify`` alone resolves a blob or a tree.
+
+    Without ``^{commit}`` any object in the repository would certify a close,
+    and the item would name something that has no history, no author and no
+    date -- while looking exactly like a SHA that does.
+    """
+    approved_one(repo)
+    (repo / "note.txt").write_text("a blob", encoding="utf-8")
+    blob = git(repo, "hash-object", "-w", "note.txt")
+    assert len(blob) == 40
+    with pytest.raises(backlog_tool.BacklogFormatError) as exc:
+        backlog_tool.close_item(backlog_dir(repo), 1, commit=blob,
+                                repo_root=repo)
+    assert "does not resolve" in str(exc.value)
+
+
+@pytest.mark.parametrize("status", TERMINAL_STATUSES)
+def test_closing_an_item_whose_life_already_ended_is_refused(repo, status):
+    """A silent second close overwrites the date and the SHA of the first,
+    which is the one pair of fields nothing else records."""
+    path = approved_one(repo)
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        f"status: {OPEN_STATUS}", f"status: {status}"), encoding="utf-8")
+    with pytest.raises(backlog_tool.BacklogFormatError) as exc:
+        backlog_tool.close_item(backlog_dir(repo), 1, commit="HEAD",
+                                repo_root=repo)
+    assert "already" in str(exc.value)
+
+
+def test_closing_an_item_that_does_not_exist_is_refused(repo):
+    approved_one(repo)
+    with pytest.raises(backlog_tool.BacklogFormatError) as exc:
+        backlog_tool.close_item(backlog_dir(repo), 99, commit="HEAD",
+                                repo_root=repo)
+    assert "99" in str(exc.value)
+
+
+def test_a_closed_item_leaves_the_queue(repo):
+    approved_one(repo)
+    assert [i.filename_id for i in backlog_tool.workable(
+        backlog_tool.load(backlog_dir(repo))[0])] == [1]
+    backlog_tool.close_item(backlog_dir(repo), 1, commit="HEAD",
+                            repo_root=repo)
+    assert backlog_tool.workable(backlog_tool.load(backlog_dir(repo))[0]) == []
+
+
+# ---------------------------------------------------------------------------
 # The watermark
 # ---------------------------------------------------------------------------
 
@@ -362,22 +645,22 @@ def test_approving_an_item_that_does_not_exist_is_refused(repo):
 def home(tmp_path, monkeypatch) -> Path:
     """A relocated home, so no test can reach the real project catalog."""
     fake = tmp_path / "home"
-    (fake / ".copilot" / "projects").mkdir(parents=True)
+    (fake / ".operator" / "projects").mkdir(parents=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake))
     return fake
 
 
 def catalogue(home: Path, root: Path, guid: str = "test-guid") -> Path:
-    catalog = home / ".copilot" / "projects" / "catalog.csv"
+    catalog = home / ".operator" / "projects" / "catalog.csv"
     catalog.write_text(f'"{root.resolve()}",{guid}\n', encoding="utf-8")
-    (home / ".copilot" / "projects" / guid).mkdir(parents=True, exist_ok=True)
+    (home / ".operator" / "projects" / guid).mkdir(parents=True, exist_ok=True)
     return catalog
 
 
 def test_the_watermark_lives_in_the_per_project_directory(repo, home):
     catalogue(home, repo)
     path = backlog_tool.watermark_path(repo)
-    assert path.parent == home / ".copilot" / "projects" / "test-guid"
+    assert path.parent == home / ".operator" / "projects" / "test-guid"
     # The literal, not the module's own constant. Asserting
     # ``path.name == backlog_tool.WATERMARK_NAME`` compares the code's answer
     # against the code's input, and holds for any name at all -- including a
@@ -401,7 +684,7 @@ def test_every_worktree_of_a_project_shares_one_watermark(repo, home, tmp_path):
 
 def test_an_uncatalogued_project_is_told_what_to_add(repo, home):
     """Refusing is right; refusing without the fix is not."""
-    (home / ".copilot" / "projects" / "catalog.csv").write_text(
+    (home / ".operator" / "projects" / "catalog.csv").write_text(
         '"/somewhere/else",other\n', encoding="utf-8")
     with pytest.raises(WatermarkError) as exc:
         backlog_tool.watermark_path(repo)
@@ -773,6 +1056,113 @@ def test_the_approve_command_reports_a_refusal(repo, capsys):
     run(repo, "approve", "1")
     assert run(repo, "approve", "1") == 1
     assert "already" in capsys.readouterr().err
+
+
+def test_the_close_command_reports_the_transition(repo, capsys):
+    file_one(repo)
+    run(repo, "approve", "1")
+    assert run(repo, "close", "1") == 0
+    out = capsys.readouterr().out
+    assert backlog_tool.CLOSED_STATUS in out
+    assert git(repo, "rev-parse", "HEAD")[:12] in out
+
+
+def test_the_close_command_defaults_to_head(repo):
+    """The natural thing to pass straight after committing the work, and the
+    default exists so that not passing it is not a reason to hand-edit."""
+    file_one(repo)
+    run(repo, "approve", "1")
+    assert run(repo, "close", "1") == 0
+    item = backlog_tool.parse_item(backlog_tool.item_paths(backlog_dir(repo))[0])
+    assert item.front["commit"] == git(repo, "rev-parse", "HEAD")
+
+
+def test_the_close_command_refuses_an_unapproved_item(repo, capsys):
+    """The gate, from the command line. The item must be left where it was:
+    a refusal that half-wrote the file is a worse outcome than the close."""
+    file_one(repo)
+    assert run(repo, "close", "1") == 1
+    assert "awaiting approval" in capsys.readouterr().err
+    item = backlog_tool.parse_item(backlog_tool.item_paths(backlog_dir(repo))[0])
+    assert item.status == PROPOSED_STATUS
+    assert backlog_tool.check(repo) == []
+
+
+def test_the_close_command_rejects_without_a_commit(repo, capsys):
+    file_one(repo)
+    assert run(repo, "close", "1", "--reject") == 0
+    assert backlog_tool.REJECTED_STATUS in capsys.readouterr().out
+    item = backlog_tool.parse_item(backlog_tool.item_paths(backlog_dir(repo))[0])
+    assert "commit" not in item.front
+
+
+def test_the_close_command_refuses_a_commit_against_a_rejection(repo, capsys):
+    """``--commit`` defaults to HEAD, so the default and an explicit value
+    have to stay distinguishable. Defaulting in the parser instead makes them
+    the same string, and this refusal silently never fires."""
+    file_one(repo)
+    assert run(repo, "close", "1", "--reject", "--commit", "HEAD") == 1
+    assert "nothing shipped" in capsys.readouterr().err
+    item = backlog_tool.parse_item(backlog_tool.item_paths(backlog_dir(repo))[0])
+    assert item.status == PROPOSED_STATUS
+
+
+def test_the_close_command_offers_no_way_past_the_gate(repo):
+    """The shape of the bypass ``new --status open`` was: a documented option
+    that repeals the gate. ``close`` must not grow one either -- an agent
+    needs no cunning to find a flag that is in ``--help``."""
+    parser_flags = _close_flags()
+    assert parser_flags == {"-h", "--help", "--commit", "--reject"}, (
+        f"`backlog close` grew a flag: {sorted(parser_flags)}. If it can "
+        "close an item the approval gate would have refused, it is the "
+        "bypass in the tool's own --help.")
+
+
+def _close_flags() -> set:
+    """Every option string ``backlog close`` accepts."""
+    parser = backlog_tool.build_parser()
+    sub = [a for a in parser._actions
+           if isinstance(a, argparse._SubParsersAction)]
+    assert sub, "the parser no longer has subcommands, so this asserts nothing"
+    close = sub[0].choices["close"]
+    return {opt for action in close._actions for opt in action.option_strings}
+
+
+def test_the_operator_subcommand_is_this_tool(repo, capsys):
+    """``operator backlog`` delegates rather than reimplementing.
+
+    A second argument parser over there would be a second copy of the
+    vocabulary, the gate and every rule ``check`` enforces -- and the copy is
+    what drifts. The delegation is asserted by running a verb through it and
+    seeing this tool's own output.
+    """
+    import copilot_operator
+
+    file_one(repo, title="Approved work")
+    backlog_tool.approve_item(backlog_dir(repo), 1)
+    rc = copilot_operator.manage_backlog(["-C", str(repo), "ready"])
+    assert rc == 0
+    assert "Approved work" in capsys.readouterr().out
+
+
+def test_the_operator_subcommand_does_not_take_the_process_down(repo, capsys):
+    """``argparse`` exits rather than returning, and ``operator`` is a long
+    program with state of its own. A ``--help`` that raised out of a
+    subcommand would leave through a path that has nothing to do with it."""
+    import copilot_operator
+
+    assert copilot_operator.manage_backlog(["--help"]) == 0
+    assert "operator backlog" in capsys.readouterr().out
+    assert copilot_operator.manage_backlog(["-C", str(repo), "wat"]) != 0
+
+
+def test_the_operator_subcommand_is_dispatched_and_reserved():
+    """A word dispatched but missing from ``SUBCOMMANDS`` is a word the
+    positional shortcut will try to join as an instance name."""
+    import copilot_operator
+
+    assert "backlog" in copilot_operator.SUBCOMMANDS
+    assert "backlog" in copilot_operator.RESERVED_WORDS
 
 
 def test_the_scrum_command_advances_the_watermark(repo, home, capsys):

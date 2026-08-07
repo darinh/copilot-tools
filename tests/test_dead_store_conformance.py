@@ -5,7 +5,9 @@ contention notices: an edit that rewrote two of the three ``NOTICE_*``
 constants pasted the third one back in as well, so ``handoff_tool.py`` ended
 up with two identical, adjacent, unconditional definitions of
 ``NOTICE_BANKED_UNPUBLISHED``. The second won. The first could never be read
-by anything.
+by anything. (Those constants have since been deleted outright -- re-keying
+the handoff by instance removed the contention they described. The scan
+outlives them, because the shape it detects has nothing to do with handoffs.)
 
 It is the sibling of ``test_unreachable_code_conformance.py`` and it is here
 for the same reason, one scope up. Every property that made *that* bug
@@ -324,11 +326,22 @@ def test_the_defect_this_file_was_written_for_is_gone():
     detector was ever pointed at the thing it was written for, and a scan
     whose population silently excludes its own motivating case is the failure
     mode this repository keeps rediscovering.
+
+    The three ``NOTICE_*`` constants this originally pinned no longer exist:
+    re-keying the handoff by instance removed the contention they described,
+    and the notices with it. What that pin was really for was keeping this
+    assertion non-vacuous -- ``dead_stores`` returns nothing for a file with
+    no module-level bindings to examine, which reads exactly like a clean
+    one -- so the population is asserted directly instead, and now says what
+    it means.
     """
     source = (REPO / "handoff_tool.py").read_text(encoding="utf-8")
     assert not dead_stores(source)
-    # The constants are still all there and distinct -- a "fix" that deleted
-    # one of them would also satisfy the assertion above.
-    for constant in ("NOTICE_UNSERIALISED", "NOTICE_BANKED_UNSERIALISED",
-                     "NOTICE_BANKED_UNPUBLISHED"):
-        assert source.count(f"\n{constant} = (") == 1, constant
+    top_level_bindings = [
+        node for node in ast.parse(source).body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) for t in node.targets)
+    ]
+    assert len(top_level_bindings) >= 5, (
+        "handoff_tool.py no longer has module-level constants, so the scan "
+        "above passed without examining anything")

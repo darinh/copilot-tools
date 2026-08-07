@@ -42,8 +42,8 @@ def repo_with_worktree(tmp_path):
 
 def _catalog(tmp_path, monkeypatch, root: Path, guid: str) -> Path:
     home = tmp_path / "home"
-    (home / ".copilot" / "projects").mkdir(parents=True)
-    catalog = home / ".copilot" / "projects" / "catalog.csv"
+    (home / ".operator" / "projects").mkdir(parents=True)
+    catalog = home / ".operator" / "projects" / "catalog.csv"
     catalog.write_text(f'"{root.resolve()}",{guid}\n', encoding="utf-8")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     return catalog
@@ -167,8 +167,8 @@ def test_handoff_resolves_the_catalog_from_a_worktree(
     ])
 
     assert rc == 0
-    handoff = (Path.home() / ".copilot" / "projects" / "guid-wt"
-               / "next-session.md")
+    handoff = (Path.home() / ".operator" / "projects" / "guid-wt"
+               / "handoff" / "proj.md")
     assert handoff.is_file()
 
 
@@ -257,7 +257,7 @@ def test_a_catalogued_worktree_does_not_shadow_its_own_project(
 def test_the_writer_and_the_reader_share_one_guid_predicate():
     """Reader and writer must not hold separate ideas of a valid id.
 
-    `handoff_tool` creates ~/.copilot/projects/<guid>/next-session.md and
+    `handoff_tool` creates ~/.operator/projects/<guid>/handoff/<instance>.md and
     `copilot_operator` resolves it again to report on it. When those two
     disagreed, an id the writer refused to create was still one the reader
     would happily resolve -- and `../../elsewhere` resolved outside the

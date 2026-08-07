@@ -197,7 +197,7 @@ The schema itself is unchanged, so the legacy bash ingester's `ON CONFLICT(log_f
 
 ## Project catalog entry
 
-`~/.copilot/projects/catalog.csv` — two columns, optionally quoted:
+`~/.operator/projects/catalog.csv` — two columns, optionally quoted:
 
 ```csv
 "C:\Users\dev\repos\my-app",EXAMPLE1-1111-1111-1111-111111111111
@@ -212,11 +212,11 @@ Lookup normalizes the project root and compares. On Windows the comparison is **
 separator-normalized; on POSIX it is case-sensitive. A catalog written on one platform stores that
 platform's paths; cross-platform sharing is out of scope.
 
-Resolving a GUID yields `~/.copilot/projects/{guid}/`, where `next-session.md` is written.
+Resolving a GUID yields `~/.operator/projects/{guid}/`, where `next-session.md` is written.
 
 ## Handoff file
 
-`~/.copilot/projects/{guid}/next-session.md`, written with explicit UTF-8. Sections in fixed order;
+`~/.operator/projects/{guid}/next-session.md`, written with explicit UTF-8. Sections in fixed order;
 optional sections are omitted entirely rather than emitted empty:
 
 ```markdown

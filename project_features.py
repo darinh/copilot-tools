@@ -130,45 +130,60 @@ TRACKED_BACKLOG = "tracked-backlog"
 
 _FLAG = (Option(ON, "on"), Option(OFF, "off"))
 
+#: Flags default **off** (FR-8): a section in a project's conventions should
+#: be there because somebody needs it, not because nobody chose. Rendering
+#: refuses a project that has never chosen — see
+#: ``project_instructions._values_for`` — so "default off" never means a
+#: repository silently loses sections it was relying on.
+#:
+#: :data:`TRACKED_BACKLOG` is deliberately **not** flipped, and it is the one
+#: exception in the file. Its default is not a rendering preference: it is the
+#: answer :func:`tracked_backlog_backend` gives under every uncertainty, and
+#: that answer has to be the *enforcing* one. Defaulting it to
+#: ``BACKLOG_NONE`` would stand three real guards down on all eight CI legs
+#: while every one of them stayed green — a check that reads as evidence and
+#: is not. It is a choice rather than a flag, which is exactly why its default
+#: is load-bearing where the flags' defaults are not.
+
 
 FEATURES: tuple[Feature, ...] = (
     Feature(
         slug="session-handoff",
         name="Session Handoff",
-        description="`next-session.md` for cross-session continuity",
-        options=_FLAG, default=ON, off_value=OFF,
+        description="Per-instance handoff files for cross-session continuity",
+        options=_FLAG, default=OFF, off_value=OFF,
     ),
     Feature(
         slug="session-history",
         name="Session History",
         description="SQL `session_log` table for audit trail",
-        options=_FLAG, default=ON, off_value=OFF,
+        options=_FLAG, default=OFF, off_value=OFF,
     ),
     Feature(
         slug="spec-driven",
         name="Spec-Driven Development",
         description=("Spec as source of truth. Uses GitHub spec-kit. "
                      "Location: `.specify/` and `specs/`."),
-        options=_FLAG, default=ON, off_value=OFF,
+        options=_FLAG, default=OFF, off_value=OFF,
     ),
     Feature(
         slug="parallel-agents",
         name="Parallel Agents",
         description="SQL-coordinated parallel task execution via `todo_claims`.",
-        options=_FLAG, default=ON, off_value=OFF,
+        options=_FLAG, default=OFF, off_value=OFF,
     ),
     Feature(
         slug="operator-agents",
         name="Operator Agents",
         description="Peer Copilot sessions via `operator`, and mail between them",
-        options=_FLAG, default=ON, off_value=OFF,
+        options=_FLAG, default=OFF, off_value=OFF,
     ),
     Feature(
         slug="branching-strategy",
         name="Branching Strategy",
         description=("Feature branches in worktrees, merged to `main`, "
                      "conventional commits"),
-        options=_FLAG, default=ON, off_value=OFF,
+        options=_FLAG, default=OFF, off_value=OFF,
     ),
     Feature(
         slug=TRACKED_BACKLOG,

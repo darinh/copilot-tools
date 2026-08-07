@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 
 import copilot_operator as op
+import operator_session
+import work_claims
 
 
 @pytest.fixture(autouse=True)
@@ -272,6 +274,62 @@ def test_no_clause_number_is_used_twice():
     text = _preamble(crash_recovery=True, code_state=op.CODE_STALE)
     numbers = [f"({n})" for n in range(1, 8)]
     assert [text.count(n) for n in numbers] == [1] * 7
+
+
+def _resume_assignment():
+    """A real RESUME assignment, so `describe` renders from the code under
+    test rather than from a string this test invented."""
+    claim = work_claims.Claim(item="0011", instance="proj",
+                              worktree="C:/w/x", branch="fix/x")
+    return operator_session.Assignment(kind=operator_session.RESUME,
+                                       instance="proj", claim=claim)
+
+
+def test_the_assignment_clause_takes_the_next_free_number_too():
+    """The assignment clause was written as a literal "(7)" when it was the
+    only optional clause after the crash note. It is not any more, and a
+    literal is right for exactly one of the four combinations below.
+
+    Each case names the number the assignment must actually carry, so a
+    regression to a literal fails on three of them rather than being masked
+    by the one it was written for.
+    """
+    described = operator_session.describe(_resume_assignment())
+    assert described, "the fixture must produce a clause at all"
+
+    cases = {
+        (False, op.CODE_CURRENT): "(6)",
+        (True, op.CODE_CURRENT): "(7)",
+        (False, op.CODE_STALE): "(7)",
+        (True, op.CODE_STALE): "(8)",
+    }
+    for (crash, state), expected in cases.items():
+        text = _preamble(crash_recovery=crash, code_state=state,
+                         assignment=_resume_assignment())
+        assert f"{expected} {described}" in text, (
+            f"crash_recovery={crash}, code_state={state} should number the "
+            f"assignment {expected}")
+
+
+def test_every_clause_number_is_unique_when_all_of_them_are_present():
+    """The counter's whole job. Two clauses sharing a number is the failure
+    a literal produces, and it is invisible to any test that only checks the
+    clause it cares about is present somewhere."""
+    text = _preamble(crash_recovery=True, code_state=op.CODE_STALE,
+                     assignment=_resume_assignment())
+    counts = [text.count(f"({n})") for n in range(1, 9)]
+    assert counts == [1] * 8, f"clause numbers 1..8 appeared {counts} times"
+
+
+def test_an_unassigned_session_is_charged_nothing_for_it():
+    """Control. `describe` returns "" for NONE, and a clause number must not
+    be spent on a clause that renders empty -- that would leave a gap in the
+    numbering of every unassigned session, which is nearly all of them."""
+    none = operator_session.Assignment(kind=operator_session.NONE,
+                                       instance="proj")
+    assert operator_session.describe(none) == ""
+    assert _preamble(assignment=none) == _preamble(), \
+        "an empty assignment must leave the preamble byte for byte unchanged"
 
 
 def test_the_preamble_stays_platform_neutral_with_the_caveat():

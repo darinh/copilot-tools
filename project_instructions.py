@@ -49,14 +49,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import install_manifest
+import operator_ownership
 import project_features
 from install_manifest import file_digest, path_present
 
 __all__ = [
-    "InstructionsError", "AGENTS_NAME", "MANAGED_BEGIN", "MANAGED_END",
+    "InstructionsError", "AGENTS_NAME", "CLAUDE_NAME",
+    "MANAGED_BEGIN", "MANAGED_END",
     "CONFIGURATION_SECTION", "ARCHIVE_DIRNAME", "GATE", "Section",
     "TEMPLATE_KEY", "TEMPLATE_NAME", "GLOBAL_NAME",
-    "split_sections", "gate_slug", "render", "compose", "managed_block_present",
+    "WINDOWS", "POSIX", "PLATFORMS", "PLATFORM_BEGIN", "PLATFORM_END",
+    "host_platform", "select_platform",
+    "WORD_BUDGET", "block_words", "VALIDATION_STUB",
+    "split_sections", "gate_slug", "render", "render_claude",
+    "render_subproject", "SUBPROJECT_WORD_BUDGET",
+    "compose", "managed_block_present",
     "write_text_atomic", "preserve", "user_scope_agents_files", "resolve_source",
     "WRITTEN", "MERGED", "UNCHANGED", "DECLINED", "MISSING", "FAILED",
     "BLOCKING_STATES", "ProjectOutcome", "RetirementResult", "retire",
@@ -79,8 +86,42 @@ class InstructionsError(RuntimeError):
 #: goes.
 AGENTS_NAME = "AGENTS.md"
 
-MANAGED_BEGIN = "<!-- BEGIN copilot-tools managed conventions -->"
-MANAGED_END = "<!-- END copilot-tools managed conventions -->"
+#: The Claude-facing file. Reports on whether Claude Code reads ``AGENTS.md``
+#: natively conflict, and an import costs one line, so the import is written
+#: rather than the question being resolved. It holds ``@AGENTS.md`` and
+#: nothing else that duplicates the conventions -- two copies of the same
+#: rules is the failure this whole feature exists to stop, and it would be a
+#: particularly bad one here because the two files are read by the same agent
+#: in the same turn.
+CLAUDE_NAME = "CLAUDE.md"
+
+#: The markers that delimit the block. The old spelling is still *read*: a
+#: writer that knew only the new one would find no block in a file carrying
+#: the old, append a second block below it, and leave the repository holding
+#: two sets of conventions that disagree — with the disagreement invisible to
+#: the very function meant to keep them in step. So migration is not a
+#: convenience; it is what stops a rename from silently doubling the block.
+#:
+#: Only the new spelling is ever *written*, so a file migrates the first time
+#: anything regenerates it and never migrates twice.
+MANAGED_BEGIN = "<!-- BEGIN operator:managed -->"
+MANAGED_END = "<!-- END operator:managed -->"
+
+LEGACY_BEGIN = "<!-- BEGIN copilot-tools managed conventions -->"
+LEGACY_END = "<!-- END copilot-tools managed conventions -->"
+
+#: Begin/end pairs. A pair, not two flat lists, because the begin of one
+#: spelling and the end of another do not delimit anything: a file holding
+#: `LEGACY_BEGIN` and `MANAGED_END` has been hand-edited into a state no
+#: writer produces, and treating the two as a block would replace a span
+#: whose real boundaries nobody knows.
+#:
+#: The order is not load-bearing and no test asserts it is. `compose` refuses
+#: a file that uses more than one spelling, so at most one pair can match
+#: anything by the time the answer is used; reversing this tuple changes no
+#: result. It is written newest-first only because that is the order a reader
+#: expects.
+MARKER_PAIRS = ((MANAGED_BEGIN, MANAGED_END), (LEGACY_BEGIN, LEGACY_END))
 
 #: The template section that is *replaced* rather than copied. It is the
 #: enrollment machinery -- catalog lookup, "would you like to set this up",
@@ -102,6 +143,26 @@ ARCHIVE_DIRNAME = "retired"
 #: checks it.
 GATE = re.compile(r"^\*Enabled by feature flag: `(?P<slug>[a-z0-9-]+)`\*\s*$",
                   re.MULTILINE)
+
+#: The two platform vocabularies a command can be written in. A generated
+#: block carries **one** of them, chosen from the machine doing the
+#: generating, because a file that shows both makes the reader choose and the
+#: reader is an agent that will sometimes choose wrong. Every incident of that
+#: shape costs a wrong command run against a real repository.
+WINDOWS = "windows"
+POSIX = "posix"
+PLATFORMS = (WINDOWS, POSIX)
+
+#: The markers that bracket a platform-specific run of lines in the template.
+#: An HTML comment rather than the ``**PowerShell (Windows)**`` label above
+#: the fence: the label is prose, it is spelled three different ways in the
+#: template already, and a renderer that matched on prose would silently keep
+#: both variants the first time somebody rewrote a heading. These markers are
+#: invisible in every Markdown renderer and are checked by a conformance
+#: test, so drift is a failing build rather than a doubled block.
+PLATFORM_BEGIN = re.compile(r"^<!-- operator:platform (?P<name>[a-z0-9-]+) -->$")
+PLATFORM_END = "<!-- operator:endplatform -->"
+
 
 _H2 = re.compile(r"^## (?P<title>.+?)\s*$")
 
@@ -256,6 +317,83 @@ def gate_slug(body: str) -> "str | None":
     return match.group("slug") if match else None
 
 
+def host_platform(os_name: "str | None" = None) -> str:
+    """Which vocabulary this machine's commands are written in.
+
+    ``os.name`` rather than ``sys.platform`` or a path separator: the only
+    question being asked is which shell the reader will paste into, and
+    ``nt``/``posix`` is exactly that split. It is a parameter so the tests can
+    ask for the other one without patching a module they do not own.
+    """
+    return WINDOWS if (os.name if os_name is None else os_name) == "nt" else POSIX
+
+
+def select_platform(body: str, platform: str) -> str:
+    """*body* with every other platform's bracketed lines removed.
+
+    The markers themselves come out too, on both branches -- a kept block that
+    still carried them would put them in the repository, where the next run
+    would read them again and the *user's* own text could not be told from
+    the template's.
+
+    A name outside :data:`PLATFORMS` is **kept**, for the same reason
+    :func:`render` keeps a section gated behind a slug it does not know: the
+    block is the older build's only copy of that text, and a build that
+    dropped everything it did not recognise would delete conventions purely
+    by being out of date.
+
+    Unbalanced markers raise. Silently recovering would mean a stray begin
+    marker deletes the entire rest of a section on one platform and nothing
+    at all on the other -- a difference no single-platform test run can see.
+    """
+    lines = body.splitlines(keepends=True)
+    eligible = {index for index, _line in outside_fences(body)}
+    kept: list[str] = []
+    current: "str | None" = None
+    opened_at = 0
+    # Set whenever a line is removed -- a marker or a whole block. Removing a
+    # span joins the blank line above it to the blank line below it, and a
+    # doubled blank is the one difference a reader *does* see, in a file whose
+    # whole claim is that it looks the same on both platforms. Collapsing is
+    # confined to the seam: a blank run anywhere a removal did not happen is
+    # the template's own and is left alone.
+    seam = False
+    for index, line in enumerate(lines):
+        if index in eligible:
+            stripped = line.strip()
+            match = PLATFORM_BEGIN.match(stripped)
+            if match is not None:
+                if current is not None:
+                    raise InstructionsError(
+                        f"line {index + 1}: a platform block for {current!r} "
+                        f"opened at line {opened_at + 1} is still open")
+                current = match.group("name")
+                opened_at = index
+                seam = True
+                continue
+            if stripped == PLATFORM_END:
+                if current is None:
+                    raise InstructionsError(
+                        f"line {index + 1}: {PLATFORM_END} with no platform "
+                        f"block open")
+                current = None
+                seam = True
+                continue
+        if current is not None and current in PLATFORMS and current != platform:
+            seam = True
+            continue
+        if (seam and not line.strip() and kept and not kept[-1].strip()):
+            seam = False
+            continue
+        seam = False
+        kept.append(line)
+    if current is not None:
+        raise InstructionsError(
+            f"line {opened_at + 1}: a platform block for {current!r} was "
+            f"never closed")
+    return "".join(kept)
+
+
 # --------------------------------------------------------------------------
 # Rendering one project's conventions
 # --------------------------------------------------------------------------
@@ -271,25 +409,18 @@ def _configuration_section(guid: str, project_dir_path, config_path) -> str:
     return (
         f"## {CONFIGURATION_SECTION}\n"
         "\n"
-        "This project is already registered. Nothing here needs setting up, and\n"
-        "**you must not offer to enroll this directory or write to the project\n"
-        "catalog** — that has been done.\n"
+        "**Do not offer to enroll this directory or write to the project\n"
+        "catalog.** This project is already registered.\n"
         "\n"
         f"- Project id: `{guid}`\n"
         f"- Project directory: `{project_dir_path}`\n"
         f"- Feature settings: `{config_path}`\n"
         "\n"
-        "The project directory holds this project's session handoff and any other\n"
-        "state that must persist outside the repository. Read or change the\n"
-        "feature settings with:\n"
+        "Handoff and other state live there. Change features:\n"
         "\n"
         "```\n"
         "operator projects\n"
         "```\n"
-        "\n"
-        "The sections below are the ones this project's features turned on;\n"
-        "sections for features that are off were left out when this block was\n"
-        "generated rather than being gated in prose.\n"
     )
 
 
@@ -305,14 +436,75 @@ def _header(label: str, project_path: str, values: dict, version: str) -> str:
     )
 
 
+#: Seeded below the block when this tool creates a file from nothing, and
+#: never written again.
+#:
+#: D11 keeps build, test and lint commands *out* of the managed block. They
+#: are the thing every project appends, and generating them puts the tool and
+#: the project in a fight over the same three lines that regeneration wins
+#: silently -- the project's correction is reverted with no diff, no warning
+#: and nothing read back, because no code here consumes them.
+#:
+#: Keeping them out is only half of it. Somewhere has to *hold* them, or the
+#: rule reads as "not here" and the commands end up back inside the markers on
+#: the next pass. This is that somewhere: outside the block, so
+#: :func:`compose` preserves it byte-for-byte, and empty, because the tool
+#: cannot know a project's commands and a guessed command is worse than an
+#: absent one.
+VALIDATION_STUB = """\
+## Validation
+
+The exact commands that prove a change works here, with expected results, and
+what CI runs. Yours to write and yours to keep -- everything outside the
+managed block above survives regeneration.
+"""
+
+#:
+#: Generation **errors** above this rather than warning. Without a hard number
+#: the file only grows: every incident adds a paragraph and nothing has ever
+#: been a force in the other direction. A warning is not that force -- it is a
+#: line of output nobody is obliged to act on, and the block that produced it
+#: still ships.
+#:
+#: 700 is set from measurement, not taste. ``specs/004-operator-session/
+#: audit.md`` classified all 4,364 words of the predecessor as guardrail,
+#: procedure or check; the guardrail residue -- the part no tool can enforce --
+#: measured ~435, and the block that ships today measures 673 with every
+#: feature on. The headroom is deliberately small. A budget at the measured
+#: figure would make the next legitimate sentence an emergency; one at 1,500
+#: would not be felt for two years, which is the same as not having one.
+#:
+#: There is no override flag, deliberately. An override is how a budget becomes
+#: a warning again, one justified exception at a time.
+WORD_BUDGET = 700
+
+
+def block_words(block: str) -> int:
+    """How many words *block* spends, for :data:`WORD_BUDGET`.
+
+    Whitespace-separated tokens, counting the markers and every fenced
+    command. That over-counts prose slightly, and the direction is the point:
+    a counter that excluded machinery would let the budget be met by moving
+    words into a fence, and the failure it must never have is under-counting a
+    block that has quietly grown past its limit.
+    """
+    return len(block.split())
+
+
 def render(*, source: str, values: dict, guid: str, project_path: str,
-           label: str, project_dir_path, config_path, version: str) -> str:
+           label: str, project_dir_path, config_path, version: str,
+           platform: str) -> str:
     """The managed block for one project, markers included.
 
     Deterministic: the same inputs produce the same bytes, with no timestamp
     anywhere in it. A block that embedded the time it was written would show
     up as a diff in every repository every time anything regenerated it, and
     a diff that is always there is a diff nobody reads.
+
+    *platform* is required rather than defaulted to the host. A default would
+    make every test that forgot it agree with the machine it ran on, so the
+    Windows legs and the POSIX legs would each prove only their own half and
+    the suite would look complete.
     """
     _preamble, sections = split_sections(source)
     parts = [_header(label, project_path, values, version)]
@@ -331,9 +523,123 @@ def render(*, source: str, values: dict, guid: str, project_path: str,
             # ``project_features.write_config`` refuses.
             if feature is not None and not project_features.is_enabled(values, slug):
                 continue
-        parts.append(f"## {section.title}\n{section.body}")
+        parts.append(f"## {section.title}\n"
+                     f"{select_platform(section.body, platform)}")
     body = "\n".join(part.rstrip("\n") + "\n" for part in parts)
-    return f"{MANAGED_BEGIN}\n\n{body}\n{MANAGED_END}\n"
+    block = f"{MANAGED_BEGIN}\n\n{body}\n{MANAGED_END}\n"
+    spent = block_words(block)
+    if spent > WORD_BUDGET:
+        raise InstructionsError(
+            f"the generated block is {spent} words, over the {WORD_BUDGET}-word "
+            f"budget by {spent - WORD_BUDGET}. Something has to come out "
+            "before anything else goes in.\n"
+            "Every line in it is exactly one of guardrail, procedure or check "
+            "(FR-6). A procedure belongs in a skill, a rationale in "
+            "docs/rationale.md, and a rule a tool can enforce belongs in the "
+            "tool -- with its check landing in the same commit that deletes "
+            "it (D10). Only what no tool can check earns a place here.")
+    return block
+
+
+def render_claude(*, label: str, version: str) -> str:
+    """The managed block for ``CLAUDE.md``: an import and the reason for it.
+
+    Deliberately not a second copy of the conventions. Claude Code reads both
+    files in the same turn, so duplicating them would put two texts that can
+    disagree in front of one reader -- and the one that is wrong would be
+    whichever was regenerated last, which is not visible from either file.
+    """
+    return (
+        f"{MANAGED_BEGIN}\n"
+        "\n"
+        f"# {label} — working conventions\n"
+        "\n"
+        f"@{AGENTS_NAME}\n"
+        "\n"
+        f"The conventions live in `{AGENTS_NAME}`, which every agent tool "
+        "reads. This\n"
+        "file imports it rather than repeating it, so there is one text to "
+        "keep true.\n"
+        "\n"
+        f"Generated by copilot-tools {version}. Everything between the "
+        "markers is\n"
+        "regenerated by `operator projects`; write anything of your own "
+        "outside them.\n"
+        "\n"
+        f"{MANAGED_END}\n"
+    )
+
+
+#: The most words a generated *subproject* block may contain.
+#:
+#: An order of magnitude under :data:`WORD_BUDGET` because a subproject file
+#: is read *in addition to* the root one, in the same turn, and the two are
+#: cumulative against the same attention. It carries resolved facts and no
+#: rules (FR-9), and facts are short.
+SUBPROJECT_WORD_BUDGET = 120
+
+
+def render_subproject(*, name: str, owns: "list[str]", contracts: "list[str]",
+                      version: str) -> str:
+    """The managed block for one subproject's ``AGENTS.md`` (FR-9).
+
+    Additive only, and enforced by being **generated rather than templated**:
+    there is no prose file for a rule to be written into. Everything here is a
+    value the root file cannot know -- which subproject this is, what it owns,
+    what it shares -- and a value cannot contradict a rule.
+
+    That constraint is not stylistic. Claude Code concatenates the parent and
+    child files; Codex lets the nearer one win. A rule stated in both places
+    therefore means two different things depending on which harness read it,
+    and an *identical* copy is no safer, because the copies drift and the one
+    that is wrong is whichever was regenerated last -- which is visible from
+    neither file.
+
+    The ownership gate is **not** named here. Review caught it: the first
+    draft said "`operator ownership check` refuses a branch that changed
+    anything else", which is the root block's rule in different words -- and
+    different words is the drift FR-9 exists to stop, since neither file can
+    see the other. What is missing from the root block, and only available
+    here, is which paths this directory owns. That is all this says.
+    """
+    listed = "\n".join(f"- `{path}`" for path in owns) or "- (none declared)"
+    body = (
+        f"# {name} — subproject\n"
+        "\n"
+        f"This directory is the `{name}` subproject. It owns:\n"
+        "\n"
+        f"{listed}\n"
+    )
+    if contracts:
+        shared = ", ".join(f"`{path}`" for path in contracts)
+        body += (
+            "\n"
+            f"Shared with every subproject: {shared}. Changing a contract "
+            "needs `--allow-contracts`.\n"
+        )
+    body += (
+        "\n"
+        f"Generated by copilot-tools {version}; regenerated by "
+        "`operator projects`.\n"
+        "Conventions are in the repository root's file — this one adds facts "
+        "only.\n"
+    )
+    block = f"{MANAGED_BEGIN}\n\n{body}\n{MANAGED_END}\n"
+    # The declared paths are data, not prose, and are not charged to the
+    # budget. Review found the alternative: a subproject legitimately owning
+    # thirty directories overflowed a budget meant to stop *writing* creeping
+    # back in, and `operator projects` then refused to set the repository up
+    # at all. Two words per owned line, one per contract named inline.
+    spent = block_words(block) - 2 * len(owns) - len(contracts)
+    if spent > SUBPROJECT_WORD_BUDGET:
+        raise InstructionsError(
+            f"the {name!r} subproject block is {spent} words of prose, over "
+            f"the {SUBPROJECT_WORD_BUDGET}-word budget by "
+            f"{spent - SUBPROJECT_WORD_BUDGET}. The declared paths are not "
+            "counted, so this is writing that was added to the generator. A "
+            "subproject file carries resolved facts and no rules (FR-9); if "
+            "it needs prose, the prose belongs in the root file or a skill.")
+    return block
 
 
 # --------------------------------------------------------------------------
@@ -352,7 +658,24 @@ def _marker_offsets(existing: str) -> "tuple[list[int], list[int]]":
 
     A marker must also be the whole line. ``MANAGED_BEGIN in existing`` is
     true of a sentence that merely mentions it, and prose is not a delimiter.
+
+    Both spellings are recognised, but a file is read through **one** pair:
+    the first pair that appears in it at all. Pooling the offsets of both
+    would let a legacy begin and a current end delimit a span no writer ever
+    produced — and the pooled counts would be one and one, so the malformed
+    check downstream would be satisfied and ``compose`` would replace it
+    silently. Which pair is tried first does not matter; that only one is
+    used does.
     """
+    for begin_marker, end_marker in MARKER_PAIRS:
+        begins, ends = _offsets_for(existing, begin_marker, end_marker)
+        if begins or ends:
+            return begins, ends
+    return [], []
+
+
+def _offsets_for(existing: str, begin_marker: str,
+                 end_marker: str) -> "tuple[list[int], list[int]]":
     begins: list[int] = []
     ends: list[int] = []
     offset = 0
@@ -361,12 +684,18 @@ def _marker_offsets(existing: str) -> "tuple[list[int], list[int]]":
     for index, line in enumerate(lines):
         if index in plain:
             stripped = line.strip()
-            if stripped == MANAGED_BEGIN:
+            if stripped == begin_marker:
                 begins.append(offset)
-            elif stripped == MANAGED_END:
+            elif stripped == end_marker:
                 ends.append(offset + len(line.rstrip("\r\n")))
         offset += len(line)
     return begins, ends
+
+
+def spellings_present(existing: str) -> "list[tuple[str, str]]":
+    """Every marker pair `existing` uses, whether or not it uses it well."""
+    return [pair for pair in MARKER_PAIRS
+            if any(_offsets_for(existing, *pair))]
 
 
 def managed_block_present(existing: str) -> bool:
@@ -374,7 +703,8 @@ def managed_block_present(existing: str) -> bool:
     return bool(begins) or bool(ends)
 
 
-def compose(existing: "str | None", managed: str) -> str:
+def compose(existing: "str | None", managed: str, *,
+            seed_validation: bool = False) -> str:
     """``existing`` with ``managed`` put in it, keeping everything else.
 
     An existing file is never replaced. Either it already carries a managed
@@ -382,20 +712,50 @@ def compose(existing: "str | None", managed: str) -> str:
     block is appended below whatever is there. A repository's ``AGENTS.md`` is
     its author's document; this only ever rents a paragraph of it.
 
+    A block written under the old marker spelling is *replaced*, so the file
+    migrates in place. Appending instead would leave the repository holding
+    two sets of conventions that disagree — which is the entire reason
+    migration is mandatory rather than nice to have.
+
     Malformed markers raise instead of being repaired. Appending a second
     block "because the first one looked wrong" is how a file ends up with two
     sets of conventions that disagree, and the disagreement would then be
     invisible to the very function meant to keep them in step.
+
+    With ``seed_validation``, a file created from nothing is seeded with
+    :data:`VALIDATION_STUB` below the block. That is where a project's build,
+    test and lint commands live (D11), and it is written *once*: the seed only
+    happens when there is no file, so a project that deletes the section is
+    not given it back on the next regeneration. Handing it back would be the
+    same fight over the same three lines that keeping the commands out of the
+    block exists to end.
+
+    It defaults to **off**, and one caller turns it on. Review caught the
+    other arrangement: a default of on put the stub into every brand-new
+    ``CLAUDE.md`` -- a file whose entire content is one import line -- and
+    into every subproject file, which is supposed to carry facts and nothing
+    else. Only the repository's root ``AGENTS.md`` is anybody's home for build
+    commands, so only ``_place_one`` asks for it.
     """
     if existing is None or not existing.strip():
+        if seed_validation:
+            return managed.rstrip("\n") + "\n\n" + VALIDATION_STUB
         return managed
+    spellings = spellings_present(existing)
+    if len(spellings) > 1:
+        raise InstructionsError(
+            "this file carries managed-conventions markers in more than one "
+            "spelling. Replacing one and leaving the other would leave two "
+            "sets of conventions that disagree, and appending a third is "
+            "worse. Delete the block you do not want, by hand.")
     begins, ends = _marker_offsets(existing)
     if not begins and not ends:
         return existing.rstrip("\n") + "\n\n" + managed
     if len(begins) != 1 or len(ends) != 1:
+        begin_marker, end_marker = spellings[0]
         raise InstructionsError(
-            f"found {len(begins)} '{MANAGED_BEGIN}' and {len(ends)} "
-            f"'{MANAGED_END}' markers; expected one of each. Fix them by "
+            f"found {len(begins)} '{begin_marker}' and {len(ends)} "
+            f"'{end_marker}' markers; expected one of each. Fix them by "
             "hand — refusing to guess which block is the live one.")
     start = begins[0]
     stop = ends[0]
@@ -723,7 +1083,7 @@ class RetirementResult:
 
 
 def _place_one(project: dict, *, source: str, version: str, projects_root,
-               decide) -> ProjectOutcome:
+               decide, platform: str) -> ProjectOutcome:
     guid = project["guid"]
     root = Path(project["path"])
     label = project.get("label") or _basename(project["path"]) or project["path"]
@@ -744,6 +1104,7 @@ def _place_one(project: dict, *, source: str, version: str, projects_root,
         project_dir_path=project_dir_path,
         config_path=project_dir_path / project_features.CONFIG_NAME,
         version=version,
+        platform=platform,
     )
     target = root / AGENTS_NAME
     exists = path_present(target)
@@ -762,40 +1123,232 @@ def _place_one(project: dict, *, source: str, version: str, projects_root,
                 guid, project["path"], label, DECLINED,
                 f"{target} already exists and was left alone", target)
     try:
-        combined = compose(existing, managed)
+        combined = compose(existing, managed, seed_validation=True)
     except InstructionsError as exc:
         return ProjectOutcome(guid, project["path"], label, FAILED,
                               str(exc), target)
     if existing is not None and combined == existing:
-        return ProjectOutcome(guid, project["path"], label, UNCHANGED,
-                              "already up to date", target)
+        state, detail = UNCHANGED, "already up to date"
+    else:
+        try:
+            write_text_atomic(target, combined)
+        except InstructionsError as exc:
+            return ProjectOutcome(guid, project["path"], label, FAILED,
+                                  str(exc), target)
+        state = MERGED if existing is not None else WRITTEN
+        detail = ""
+    # After ``AGENTS.md``, never before: ``CLAUDE.md`` is an import of it, and
+    # a repository holding an import of a file that was never written is a
+    # worse state than one holding neither.
+    trouble = _place_claude(root, label=label, version=version)
+    if trouble is not None:
+        return ProjectOutcome(guid, project["path"], label, FAILED,
+                              trouble, target)
+    trouble = _place_subprojects(root, version=version)
+    if trouble is not None:
+        return ProjectOutcome(guid, project["path"], label, FAILED,
+                              trouble, target)
+    return ProjectOutcome(guid, project["path"], label, state, detail, target)
+
+
+def _place_claude(root, *, label: str, version: str) -> "str | None":
+    """Write the project's ``CLAUDE.md``. Returns a message, or ``None``.
+
+    A file already there *without* a managed block is left alone, and that is
+    not a blocker. It is the user's own, the whole of what this would write
+    is one import line, and asking a second consent question per project --
+    for the file that contains none of the conventions -- would spend the
+    operator's attention on the least important thing in the run. The
+    ``AGENTS.md`` prompt is where consent belongs, because that is where the
+    content is.
+    """
+    target = Path(root) / CLAUDE_NAME
+    exists = path_present(target)
+    if exists is None:
+        return f"{target} could not be examined"
+    existing: "str | None" = None
+    if exists:
+        try:
+            existing = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            return f"{target} could not be read: {exc}"
+        if not managed_block_present(existing):
+            return None
+    try:
+        combined = compose(existing,
+                           render_claude(label=label, version=version))
+    except InstructionsError as exc:
+        return str(exc)
+    if existing is not None and combined == existing:
+        return None
     try:
         write_text_atomic(target, combined)
     except InstructionsError as exc:
-        return ProjectOutcome(guid, project["path"], label, FAILED,
-                              str(exc), target)
-    state = MERGED if existing is not None else WRITTEN
-    return ProjectOutcome(guid, project["path"], label, state, "", target)
+        return str(exc)
+    return None
+
+
+def _within(candidate: Path, root: Path) -> bool:
+    """Whether `candidate` is `root` or sits beneath it.
+
+    Hand-rolled rather than ``Path.is_relative_to``, which arrived in 3.9 and
+    is fine, but whose failure mode on a mixed-case Windows path is a `False`
+    that reads like an escape. Comparing ``parts`` after ``resolve()`` asks
+    the one question that matters -- is this path inside that tree -- with no
+    string prefix arithmetic, so ``/repo-two`` is not inside ``/repo``.
+    """
+    return candidate == root or root in candidate.parents
+
+
+def _place_subprojects(root, *, version: str) -> "str | None":
+    """Write an ``AGENTS.md`` into each declared subproject directory.
+
+    Runs after the root file for the same reason ``CLAUDE.md`` does: the child
+    file says its conventions are in the root one, and a repository holding
+    that claim without the file it names is worse than one holding neither.
+
+    A repository with no ``.operator/subprojects.json`` gets nothing, which is
+    every repository until someone declares a boundary. A declaration that
+    cannot be *read* is a failure rather than a silent skip: an unreadable
+    declaration is also what `operator ownership check` refuses on, so
+    swallowing it here would leave a repository whose push gate is broken and
+    whose generation reported success.
+
+    One file per owned prefix, not one per subproject. A nested file only
+    helps an agent editing near it, and a subproject owning two trees needs
+    both; they are generated from the same values in the same run, so the
+    copies cannot drift the way hand-written ones would.
+    """
+    root = Path(root)
+    try:
+        declaration = operator_ownership.read_declaration(root)
+    except operator_ownership.OwnershipError as exc:
+        return f"{root} declares subprojects and they could not be read: {exc}"
+    if declaration is None:
+        return None
+    try:
+        resolved_root = root.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return f"{root} could not be resolved: {exc}"
+    for name in declaration.names():
+        owns = ["/".join(p) for p in declaration.subprojects[name]]
+        contracts = ["/".join(p) for p in declaration.contracts]
+        for prefix in declaration.subprojects[name]:
+            if not prefix:
+                continue
+            target_dir = root.joinpath(*prefix)
+            if path_present(target_dir) is not True:
+                continue
+            try:
+                a_directory = target_dir.is_dir()
+                resolved = target_dir.resolve()
+            except (OSError, RuntimeError, ValueError) as exc:
+                # Refusing, not skipping. `resolve` fails three ways -- denial,
+                # symlink loop, embedded NUL -- and the two that are not
+                # `OSError` are exactly the shapes an attacker-controlled
+                # declaration can produce. `project_paths.resolved_str` is
+                # wrong here because its lexical fallback is *less* resolved,
+                # which for a containment gate means it admits what it could
+                # not check. A write gate that cannot see must say no.
+                return f"{target_dir} could not be examined: {exc}"
+            if not a_directory:
+                continue
+            # `read_declaration` refuses a `..` prefix, so the only way a
+            # target lands outside the repository is a symlink or junction on
+            # the path -- which the declaration cannot express and therefore
+            # cannot be refused there. Both checks are kept: the declaration
+            # one names the mistake in the file somebody can edit, and this
+            # one is what stops the write.
+            if not _within(resolved, resolved_root):
+                return (f"{target_dir} resolves to {resolved}, outside the "
+                        f"repository. Refusing to write a subproject's "
+                        f"instructions into a directory this repository does "
+                        f"not contain.")
+            trouble = _place_subproject_file(
+                target_dir, name=name, owns=owns, contracts=contracts,
+                version=version)
+            if trouble is not None:
+                return trouble
+    return None
+
+
+def _place_subproject_file(target_dir, *, name: str, owns: "list[str]",
+                           contracts: "list[str]",
+                           version: str) -> "str | None":
+    """One subproject file. Same consent rule as ``CLAUDE.md``.
+
+    A file already there without a managed block is left alone and is not a
+    blocker: it is the user's own, and the whole of what this writes is a
+    handful of facts they can read off the declaration anyway.
+    """
+    target = Path(target_dir) / AGENTS_NAME
+    exists = path_present(target)
+    if exists is None:
+        return f"{target} could not be examined"
+    existing: "str | None" = None
+    if exists:
+        try:
+            existing = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            return f"{target} could not be read: {exc}"
+        if not managed_block_present(existing):
+            return None
+    try:
+        combined = compose(existing,
+                           render_subproject(name=name, owns=owns,
+                                             contracts=contracts,
+                                             version=version))
+    except InstructionsError as exc:
+        return str(exc)
+    if existing is not None and combined == existing:
+        return None
+    try:
+        write_text_atomic(target, combined)
+    except InstructionsError as exc:
+        return str(exc)
+    return None
 
 
 def _values_for(guid: str, projects_root) -> dict:
-    """The project's feature values, defaults when it has never chosen.
+    """The project's feature values. Refuses a project that never chose.
 
     An *unreadable* configuration raises rather than resolving to the
     defaults. Rendering a project's conventions from invented values would
     write a confident document about choices nobody managed to read, and then
     put it in the repository.
+
+    An *absent* one raises too, and that is the half FR-8 forces. Flags
+    default off, so resolving an absent configuration would render a block
+    with every optional section removed — and on the machine this was written
+    on, every registered project was relying on the defaults, so a routine
+    version bump would have stripped the conventions out of eight
+    repositories at once, with the diff attributed to the version bump.
+
+    "Default off" is meant to make an enabled section a live requirement.
+    Refusing here is what makes that true: a section is present because
+    somebody chose it, and a project that has not chosen is told so instead
+    of being answered for. ``retire`` turns this into a per-project failure
+    that blocks removal of the global file, which is the safe direction — the
+    conventions end up in two places rather than none.
     """
     path = Path(projects_root) / guid / project_features.CONFIG_NAME
     try:
         document = project_features.read_config(path)
     except project_features.FeatureConfigError as exc:
         raise InstructionsError(str(exc)) from exc
+    if document is None:
+        raise InstructionsError(
+            f"{path} has never been written, so this project has not chosen "
+            f"its features. Run `operator projects` to choose them. Refusing "
+            f"to render a block from the defaults: they are all off, and "
+            f"answering for a project that never chose would quietly delete "
+            f"the conventions it is using today.")
     return project_features.resolved_values(document)
 
 
 def retire(projects, *, source: str, source_origin: str, global_path,
            archive_dir, projects_root, home, version: str,
+           platform: "str | None" = None,
            decide=lambda project, existing: False,
            log=lambda message: None,
            recheck=lambda: None,
@@ -819,13 +1372,20 @@ def retire(projects, *, source: str, source_origin: str, global_path,
     after the snapshot would never be written to, and removing the global file
     anyway is the gap this whole function exists to prevent. Returning a
     message aborts; returning ``None`` proceeds.
+
+    ``platform`` is which shell's commands the blocks are written in, and
+    defaults to this machine's. It is resolved once here rather than per
+    project so that one run cannot produce files that disagree.
     """
+    if platform is None:
+        platform = host_platform()
     result = RetirementResult(source_origin=source_origin)
     result.user_agents = user_scope_agents_files(home)
     for project in projects:
         try:
             outcome = _place_one(project, source=source, version=version,
-                                 projects_root=projects_root, decide=decide)
+                                 projects_root=projects_root, decide=decide,
+                                 platform=platform)
         except InstructionsError as exc:
             outcome = ProjectOutcome(project["guid"], project["path"],
                                      project.get("label") or project["path"],

@@ -831,10 +831,10 @@ def test_remove_file_reports_success_for_an_absent_path():
 @pytest.fixture
 def handoff_env(tmp_path, monkeypatch):
     home = tmp_path / "ho_home"
-    (home / ".copilot" / "projects").mkdir(parents=True)
+    (home / ".operator" / "projects").mkdir(parents=True)
     restart = tmp_path / "ho_operator" / "restart"
     restart.mkdir(parents=True)
-    catalog = home / ".copilot" / "projects" / "catalog.csv"
+    catalog = home / ".operator" / "projects" / "catalog.csv"
     monkeypatch.setattr(ho, "CATALOG", catalog)
     monkeypatch.setattr(ho, "state_dir", lambda: restart)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
@@ -1033,8 +1033,8 @@ def test_a_project_root_it_cannot_examine_still_gets_its_handoff_written(
                       "--project-root", str(handoff_env["project"])])
     assert seen["n"], "the denial never fired; the test proves nothing"
     assert rc == 0
-    written = (handoff_env["home"] / ".copilot" / "projects" / "guid-root"
-               / "next-session.md")
+    written = (handoff_env["home"] / ".operator" / "projects" / "guid-root"
+               / "handoff" / "proj.md")
     assert "## Status" in written.read_text(encoding="utf-8")
 
 

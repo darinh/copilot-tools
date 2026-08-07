@@ -50,7 +50,14 @@ if _HERE not in sys.path:
 
 import operator_ingest                                       # noqa: E402
 import operator_mail                                         # noqa: E402
+import operator_session                                      # noqa: E402
 import operator_trace                                        # noqa: E402
+import operator_work                                         # noqa: E402
+import operator_worktree                                     # noqa: E402
+import operator_ownership                                    # noqa: E402
+import work_claims                                           # noqa: E402
+import backlog_tool                                          # noqa: E402
+import handoff_tool                                          # noqa: E402
 import install_manifest                                      # noqa: E402
 import project_features                                      # noqa: E402
 import project_instructions                                  # noqa: E402
@@ -65,8 +72,10 @@ from operator_mux import (                                    # noqa: E402
     Mux, MuxError, MuxNotFoundError, safe_instance_id,
 )
 from project_paths import (                                   # noqa: E402
+    catalog_guid,
     catalog_rows,
     guid_is_usable,
+    operator_home as _operator_home,
     primary_repo_root,
     project_dir,
     projects_root,
@@ -75,6 +84,12 @@ from project_paths import (                                   # noqa: E402
 __version__ = "1.0.0"
 
 POLL_INTERVAL = 10
+#: How often the supervisor refreshes the work claim of a running session.
+#:
+#: The claim's staleness window is measured in minutes and the poll interval
+#: in seconds, so writing on every poll would buy no extra evidence and cost
+#: a database write per tick for the lifetime of every loop on the machine.
+HEARTBEAT_INTERVAL = 60
 MAX_SESSIONS = 1000
 MAX_LAUNCH_FAILURES = 5
 LAUNCH_BACKOFF_BASE = 5
@@ -191,8 +206,10 @@ EXIT_UNACCOUNTED = 4
 # silence that lets the next omission be a real one.
 SUBCOMMANDS = ("help", "version", "list", "menu", "projects", "report",
                "ingest", "stop", "stop-loop", "restart-loop", "stop-session",
-               "join", "reload", "forget", "send", "inbox", "logs", "trace",
-               "tabs", "restore")
+               "join", "reload", "forget", "send", "reply", "inbox", "logs",
+               "trace",
+               "tabs", "restore", "session", "work", "backlog", "worktree",
+               "ownership")
 
 RESERVED_WORDS = set(SUBCOMMANDS)
 
@@ -279,8 +296,15 @@ def is_wsl() -> bool:
 
 # ── paths ───────────────────────────────────────────────────────
 def operator_home() -> Path:
-    override = os.environ.get("COPILOT_OPERATOR_HOME")
-    return Path(override) if override else Path.home() / ".operator"
+    """This toolkit's own state directory.
+
+    Defined in ``project_paths`` and re-exported here. It used to live in this
+    module, which meant :func:`projects_root` -- one import away, in a module
+    this one depends on -- could not reach it and spelled its own parent
+    directory out by hand instead. That is how the project catalog ended up
+    somewhere the rest of the toolkit's state had already left.
+    """
+    return _operator_home()
 
 
 HOME = Path.home()
@@ -298,6 +322,15 @@ LEGACY_RESTART_DIR = HOME / ".copilot" / "restart"
 LEGACY_LOG_FILE = HOME / ".copilot" / "operator.log"
 LEGACY_METRICS_DB = HOME / ".copilot" / "operator-metrics.db"
 LEGACY_BACKUPS_DIR = HOME / ".copilot" / "operator-backups"
+#: The project catalog and the retired-instructions archive were this
+#: toolkit's own state kept in the Copilot CLI's configuration directory.
+#: ``~/.copilot`` belongs to the CLI -- it is where the CLI keeps its
+#: extensions, skills, settings and session store -- so anything of ours in
+#: there is squatting, and is subject to whatever the CLI does to its own
+#: directory. The catalog is the file that maps a project to its id; losing
+#: it does not lose a preference, it loses every project's identity and with
+#: it every handoff and `superseded/` file keyed to that id.
+LEGACY_PROJECTS_DIR = HOME / ".copilot" / "projects"
 
 MUX = Mux()
 
@@ -599,8 +632,55 @@ def migrate_legacy_state() -> None:
                 f"not migrated")
         elif backups:
             moved += _move_legacy(LEGACY_BACKUPS_DIR, BACKUPS_DIR)
+        moved += _migrate_legacy_projects()
         if moved:
             log(f"Migrated {moved} legacy state item(s) into {OPERATOR_HOME}")
+
+
+def _migrate_legacy_projects() -> int:
+    """Move the project catalog and per-project directories out of ~/.copilot.
+
+    Merged entry by entry rather than moved as a directory. The destination
+    can already exist -- a project registered after this version shipped
+    writes straight to the new location -- and moving a directory onto an
+    existing one either fails or, on POSIX, nests it inside itself. Entry by
+    entry also means a single unreadable project does not strand the other
+    seven.
+
+    An entry already present at the destination is left alone rather than
+    overwritten. The new location is the live one by the time this runs, so
+    its copy is the newer of the two; a legacy `next-session.md` written
+    before the move must not be allowed to overwrite a handoff written after
+    it.
+    """
+    legacy = projects_root()
+    if LEGACY_PROJECTS_DIR == legacy:
+        return 0
+    present = dir_present(LEGACY_PROJECTS_DIR)
+    if present is None:
+        log(f"  Could not examine {LEGACY_PROJECTS_DIR} — the project catalog "
+            f"there has been left in place, not migrated")
+        return 0
+    if not present:
+        return 0
+    try:
+        entries = list(LEGACY_PROJECTS_DIR.iterdir())
+    except OSError as exc:
+        log(f"  Could not list {LEGACY_PROJECTS_DIR}: {exc}")
+        return 0
+    legacy.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for src in entries:
+        dest = legacy / src.name
+        occupied = path_present(dest)
+        if occupied is None:
+            log(f"  Could not examine {dest} — {src} left in place")
+            continue
+        if occupied:
+            log(f"  {dest} already exists — {src} left in place, not merged")
+            continue
+        moved += _move_legacy(src, dest)
+    return moved
 
 
 # ── instance ────────────────────────────────────────────────────
@@ -1841,15 +1921,21 @@ def project_catalog_path() -> Path:
     return projects_root() / "catalog.csv"
 
 
-def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
-    """Resolve the handoff (``next-session.md``) path for a project directory.
+def project_handoff_file(cwd: Path,
+                         instance_id: str = "") -> "Path | None | _CatalogUnreadable":
+    """Resolve the handoff path for a project directory.
 
-    Looks the directory up in ``~/.copilot/projects/catalog.csv`` (the same
+    Looks the directory up in ``~/.operator/projects/catalog.csv`` (the same
     catalog ``handoff``/``handoff_tool.py`` use) and returns the path the
     handoff file *would* live at, regardless of whether it currently exists.
     Returns None if the directory has no catalog entry at all, and
     :data:`CATALOG_UNREADABLE` if the catalog could not be read, which is a
     different answer and must not share a return value with the first.
+
+    Handoffs are keyed by **instance**: ``handoff/{instance_id}.md``. An empty
+    ``instance_id`` yields the project directory's legacy ``next-session.md``,
+    which is what a pre-migration project still has on disk and what a caller
+    with no instance in hand can meaningfully ask about.
 
     The lookup is keyed on the primary checkout, so running from a worktree
     finds the project's real entry instead of reporting it unregistered.
@@ -1912,13 +1998,16 @@ def project_handoff_file(cwd: Path) -> "Path | None | _CatalogUnreadable":
                 if IS_WINDOWS:
                     resolved = resolved.lower()
                 if resolved == target:
-                    return project_dir(guid) / "next-session.md"
+                    base = project_dir(guid)
+                    if instance_id:
+                        return base / "handoff" / f"{instance_id}.md"
+                    return base / "next-session.md"
     except OSError:
         return CATALOG_UNREADABLE
     return CATALOG_UNREADABLE if undecided else None
 
 
-def crash_recovery_verdict(workdir: Path) -> bool:
+def crash_recovery_verdict(workdir: Path, instance_id: str = "") -> bool:
     """Did the session before this launch end without leaving a handoff?
 
     A missing handoff file means the previous session never reached `handoff`
@@ -1942,8 +2031,17 @@ def crash_recovery_verdict(workdir: Path) -> bool:
     An *unregistered* project is a different situation entirely: no catalog
     entry means no handoff file could ever have been written there, so the
     absence proves nothing and must not be reported to the agent as a crash.
+
+    The project-keyed ``next-session.md`` is consulted as a fallback because
+    it is what a project that has not yet been through
+    ``handoff_tool.migrate_project_handoff`` still has on disk. Migration
+    happens on the next *write*, so between this change shipping and this
+    instance's next handoff, the instance file legitimately does not exist
+    while a real handoff sits beside it. Reporting that as a crash would tell
+    the agent its predecessor died in the one situation where the predecessor
+    demonstrably did not.
     """
-    handoff_file = project_handoff_file(workdir)
+    handoff_file = project_handoff_file(workdir, instance_id)
     if handoff_file is CATALOG_UNREADABLE:
         # The catalog would not open. That establishes nothing about whether
         # this project is registered, so it must not be reported as either a
@@ -1958,20 +2056,98 @@ def crash_recovery_verdict(workdir: Path) -> bool:
     # Probed once and held: asking twice invites the two answers to disagree,
     # and the tri-state exists so the unknown case can be decided deliberately.
     present = path_present(handoff_file)
-    if present is False:
-        log("  No handoff file found for this project — treating this as "
-            "crash recovery")
-        return True
     if present is None:
         # Telling the agent a handoff is missing is a claim about the last
         # session. A probe that failed has not established anything.
         log(f"  Could not examine {handoff_file} — not reporting this as "
             f"crash recovery")
-    return False
+        return False
+    if present:
+        return False
+    if instance_id:
+        legacy = handoff_file.parent.parent / "next-session.md"
+        legacy_present = path_present(legacy)
+        if legacy_present is None:
+            log(f"  Could not examine {legacy} — not reporting this as "
+                f"crash recovery")
+            return False
+        if legacy_present:
+            log(f"  No handoff at {handoff_file}, but an unmigrated one is "
+                f"at {legacy} — not reporting this as crash recovery")
+            return False
+    log("  No handoff file found for this project — treating this as "
+        "crash recovery")
+    return True
+
+
+def _loop_work_db(workdir: Path):
+    """The claim/session database for the project being supervised, or ``None``.
+
+    Quiet and total, unlike its CLI equivalent ``_session_db``: the loop must
+    launch a session whether or not this project is registered, so every
+    failure here becomes ``None`` and a log line rather than an exception.
+    Resolved from the *primary* checkout so a loop running inside a worktree
+    finds the project's real entry instead of minting a second one.
+    """
+    try:
+        found = catalog_guid(primary_repo_root(workdir))
+        if found.guid is None:
+            return None
+        return operator_session.db_path(project_dir(found.guid))
+    except Exception as exc:                                # noqa: BLE001
+        log(f"  Could not resolve this project's work database ({exc})")
+        return None
+
+
+def _loop_start_session(db, instance: "Instance", session_num: int):
+    """Open the session log and settle what this instance is to work on.
+
+    FR-2 wants the assignment resolved before the agent's first token, and the
+    only party that can do that is the one launching it. An agent left to work
+    it out for itself pays for the reasoning on every session, can still get
+    it wrong, and needs the rules in its context permanently to get it right.
+    Here it is one query whose answer is already in the preamble.
+
+    Total for the same reason as :func:`_loop_work_db`: a missing assignment
+    costs the agent a hint, and must not cost it a session.
+    """
+    if db is None:
+        return None
+    try:
+        operator_session.init_db(db)
+        return operator_session.start_session(
+            db, instance=instance.id, session=session_num)
+    except Exception as exc:                                # noqa: BLE001
+        log(f"  Could not resolve this session's assignment ({exc})")
+        return None
+
+
+def _loop_heartbeat(db, instance_id: str) -> None:
+    """Refresh whatever claim this instance currently holds.
+
+    The supervisor heartbeats, not the agent. It is the only party that knows
+    the session is alive from the process table rather than from the agent's
+    opinion of its own progress -- an agent asked to report its own liveness
+    reports it right up to the moment it stops being able to, which is the
+    only moment the answer mattered.
+
+    The claim is re-read rather than remembered from the assignment, because
+    an agent can take one mid-session; caching the item resolved at launch
+    would leave exactly those claims un-refreshed until they went stale, and
+    the whole point of the cascade is that a stale claim gets taken away.
+    """
+    if db is None:
+        return
+    try:
+        held = work_claims.claim_for_instance(db, instance_id)
+        if held is not None:
+            work_claims.heartbeat(db, item=held.item, instance=instance_id)
+    except Exception as exc:                                # noqa: BLE001
+        log(f"  Could not refresh this instance's work claim ({exc})")
 
 
 def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = False,
-                   code_state: str = CODE_CURRENT) -> str:
+                   assignment=None, code_state: str = CODE_CURRENT) -> str:
     text = (
         "You are running under an automated operator wrapper that a human set up. "
         "Key facts: (1) You have blanket human approval for ALL decisions — tool calls, "
@@ -2001,6 +2177,21 @@ def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = F
     if notice:
         clause += 1
         text += f" ({clause}) {notice}"
+    # The assignment is resolved by `operator session start` before the agent's
+    # first token (FR-2), and reaches it here. Nothing is said when there is
+    # nothing to say: `describe` returns "" for an unassigned session, and an
+    # always-present line reading "you have no assignment" would be paid for on
+    # every token of every session that has none.
+    #
+    # Numbered from the running counter rather than a literal, because the two
+    # clauses above it are both conditional: a hardcoded "(7)" here is correct
+    # only for the session that happens to have had both of them, and reads as
+    # (5) (7) for every session that had neither.
+    if assignment is not None:
+        described = operator_session.describe(assignment)
+        if described:
+            clause += 1
+            text += f" ({clause}) {described}"
     return text
 
 
@@ -3634,6 +3825,144 @@ def send_message(args: list[str]) -> int:
     return 0
 
 
+REPLY_FLAGS = ("--instance", "--to", "--queue", "--force")
+
+
+def _reply_usage(stream=None) -> None:
+    stream = sys.stderr if stream is None else stream
+    print('Usage: operator reply [--instance NAME] [--to NAME] "message"',
+          file=stream)
+    print("  --instance  who is replying. Defaults to $OPERATOR_INSTANCE.",
+          file=stream)
+    print("  --to        who to answer. Defaults to whoever wrote to you "
+          "most recently.", file=stream)
+    print("  --queue     leave it for the next session even if one is running",
+          file=stream)
+    print("  --force     send to a name the operator does not recognize",
+          file=stream)
+    print("  --          everything after it is message text, flags and all",
+          file=stream)
+
+
+def reply_message(args: list[str]) -> int:
+    """``operator reply "message"`` — answer without restating the addresses.
+
+    This is deliberately sugar over `send_message` rather than a second
+    delivery path. Live-versus-queued, the unknown-recipient refusal and the
+    archive record are all decisions with earned comments on them in `send`,
+    and a parallel implementation would be a second place for them to drift.
+    What is genuinely new here is only the two lookups: who is replying, and
+    to whom.
+
+    Both lookups refuse rather than guess. An unresolved sender could be
+    defaulted to the directory name -- `operator inbox` used to do exactly
+    that -- but a reply carries an assertion the recipient will act on, and
+    signing it with a name nobody chose puts words in another agent's mouth.
+    """
+    if args[:1] and args[0] in HELP_FLAGS:
+        _reply_usage(sys.stdout)
+        return 0
+
+    instance = ""
+    recipient = ""
+    passthrough: list[str] = []
+    body: list[str] = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            body.extend(args[i + 1:])
+            break
+        if arg.startswith("-") and not (
+                arg in REPLY_FLAGS
+                or arg.startswith(("--instance=", "--to="))):
+            print(f"operator reply: unknown option '{arg}'", file=sys.stderr)
+            print("  If it belongs to the message, put it after --:",
+                  file=sys.stderr)
+            print(f'    operator reply -- "{arg} ..."', file=sys.stderr)
+            print("  Nothing was sent.", file=sys.stderr)
+            _reply_usage()
+            return 2
+        if arg in ("--instance", "--to"):
+            if i + 1 >= len(args) or not args[i + 1]:
+                print(f"{arg} requires a value", file=sys.stderr)
+                return 2
+            if arg == "--instance":
+                instance = args[i + 1]
+            else:
+                recipient = args[i + 1]
+            i += 1
+        elif arg.startswith("--instance=") or arg.startswith("--to="):
+            # An explicitly empty inline value is a mistake, not an omission.
+            # Falling through to the defaults here would sign the reply with
+            # $OPERATOR_INSTANCE, or send it to the last correspondent, for a
+            # caller who named neither -- which is the misrouting this
+            # command exists to refuse.
+            flag, value = arg.split("=", 1)
+            if not value:
+                print(f"{flag} requires a value", file=sys.stderr)
+                return 2
+            if flag == "--instance":
+                instance = value
+            else:
+                recipient = value
+        elif arg in ("--queue", "--force"):
+            passthrough.append(arg)
+        else:
+            body.append(arg)
+        i += 1
+
+    text = " ".join(body).strip()
+    if not text:
+        print("operator reply: no message text.", file=sys.stderr)
+        _reply_usage()
+        return 2
+
+    if not instance:
+        instance = os.environ.get("OPERATOR_INSTANCE", "").strip()
+    if not instance:
+        print("operator reply: could not tell who is replying.",
+              file=sys.stderr)
+        print("  Pass --instance NAME, or set OPERATOR_INSTANCE.",
+              file=sys.stderr)
+        print("  Your instance name is in your session preamble.",
+              file=sys.stderr)
+        print("  Nothing was sent.", file=sys.stderr)
+        return 2
+
+    if not recipient:
+        try:
+            recipient = operator_mail.last_correspondent(
+                OPERATOR_HOME, Instance(instance).id) or ""
+        except operator_mail.MailError as exc:
+            # The mailbox is unreadable, so "nobody has written to you" and
+            # "we could not look" are indistinguishable from here -- and only
+            # one of them means the reply should not be sent. Say which, and
+            # exit differently: a caller that retries on one of these must
+            # not retry on the other, and a shared code makes that
+            # undecidable for anything driving this command.
+            print(f"operator reply: could not read mail for '{instance}' to "
+                  f"find who to answer: {exc}", file=sys.stderr)
+            print("  Pass --to NAME to answer anyway. Nothing was sent.",
+                  file=sys.stderr)
+            return 3
+    if not recipient:
+        print(f"operator reply: nobody has written to '{instance}', so there "
+              "is nothing to reply to.", file=sys.stderr)
+        print('  Use: operator send --from NAME --to NAME "message"',
+              file=sys.stderr)
+        print("  Nothing was sent.", file=sys.stderr)
+        return 1
+
+    # `--` guarantees the reply text is never re-parsed as flags, whatever it
+    # starts with. The caller already had one chance to say `--`; this second
+    # one is ours, and it is why the body is passed as separate words rather
+    # than re-joined into a single quoted string.
+    return send_message(["--from", instance, "--to", recipient]
+                        + passthrough + ["--"] + body)
+
+
 def _inbox_usage(stream=None) -> None:
     stream = sys.stderr if stream is None else stream
     print("Usage: operator inbox [NAME] [--peek|--history|--json]",
@@ -4236,6 +4565,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
             f"{MAX_UNACCOUNTED_SESSIONS} consecutive sessions that change "
             f"nothing and end without a handoff or an observed exit "
             f"(currently {'unknown' if unaccounted is None else unaccounted})")
+    work_db = None
+    last_heartbeat = 0.0
     try:
         try:
             while session_num <= MAX_SESSIONS:
@@ -4251,6 +4582,13 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     # started now is the conservative reading: it can only
                     # delay the healthy-uptime reset, never trigger it early.
                     session_started_at = time.time()
+                    # An adopted session gets a log row and a heartbeat like
+                    # any other. What it does not get is a preamble: nothing
+                    # is being launched to read one, so the assignment is
+                    # resolved for the record and the claim, not to be said.
+                    work_db = _loop_work_db(workdir)
+                    _loop_start_session(work_db, instance, session_num)
+                    last_heartbeat = 0.0
                 else:
                     if marker_set(instance.stop_marker):
                         # A stop request that landed while this supervisor was
@@ -4291,10 +4629,19 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                     # preamble is built per launch too, so mail that arrives
                     # during session #3 must still reach session #4.
                     # Read now, archive only once the session is really up.
+                    # The assignment is settled here, before the preamble is
+                    # built, so the agent's first token already knows whether
+                    # it is resuming an item, being offered one, or free.
+                    work_db = _loop_work_db(workdir)
+                    assignment = _loop_start_session(work_db, instance,
+                                                     session_num)
+                    last_heartbeat = 0.0
                     launch_preamble = build_preamble(
                         agent, instance,
                         crash_recovery=(had_predecessor
-                                        and crash_recovery_verdict(workdir)),
+                                        and crash_recovery_verdict(
+                                            workdir, instance.id)),
+                        assignment=assignment,
                         code_state=_launch_code_state())
                     try:
                         waiting = operator_mail.pending(OPERATOR_HOME, instance.id)
@@ -4488,6 +4835,13 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                                 return 1
                         restart_requested = True
                         break
+                    # Copilot is confirmed up, so the claim is provably still
+                    # being worked. Throttled: the poll interval is seconds and
+                    # the staleness window is minutes, so one write per minute
+                    # is as much evidence as the cascade can use.
+                    if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
+                        _loop_heartbeat(work_db, instance.id)
+                        last_heartbeat = time.time()
                     if marker_set(instance.restart_marker):
                         log(f"Session #{session_num}: restart signal detected!")
                         crash_failures = 0
@@ -4631,7 +4985,16 @@ USAGE
     operator --loop [--name NAME] [--fresh] [copilot-args...]  Loop mode (backgrounded, auto-attaches)
     operator --loop --headless [--name NAME] [copilot-args...] Loop mode without attaching
     operator send --from NAME --to NAME "message"              Message another instance
+    operator reply [--instance NAME] [--to NAME] "message"     Answer whoever wrote to you last
     operator inbox [NAME] [--peek|--history|--json]            Read messages sent to an instance
+    operator session start --instance NAME [--project SUB]     Resolve this instance's work assignment, deliver queued mail
+    operator session end --instance NAME --status T --next T   Handoff, close the session log, dispose of the claim
+    operator work list                                         Who holds which work item, and whether they are running
+    operator work request --instance NAME --item REF           Claim a work item
+    operator work reclaim --instance NAME --item REF           Take an item whose owner is provably gone (preserves their work)
+    operator backlog ready [--explain]                         The items an agent may work, and why the rest are not
+    operator backlog close ID [--commit REV|--reject]          End an item's life: shipped, or considered and declined
+    operator ownership check [--project SUB]                   Refuse a branch that changed files outside its subproject
     operator NAME                                              Join a running instance
     operator join [NAME]                                       Join (explicit form)
     operator reload NAME                                       Hot-reload launch spec
@@ -5535,10 +5898,21 @@ def show_project_config(project: dict) -> int:
             shown = project_features.describe_value(feature.slug,
                                                     values[feature.slug])
             print(f"  {i:>2}) {feature.name:<{width}}  {shown}")
-        print(f"  {len(features) + 1:>2}) Back")
+        # Offered only while nothing has been written, because that is exactly
+        # the state ``project_instructions._values_for`` refuses. The flags
+        # ship off, so answering that refusal by hand costs one toggle per
+        # feature per project; on a machine with eight registered projects
+        # that is dozens of keystrokes to record the answer somebody already
+        # has. A refusal is only defensible when saying "yes, these" is cheap.
+        record = len(features) + 1 if document is None else None
+        if record is not None:
+            print(f"  {record:>2}) Record these as chosen "
+                  f"(changes nothing; stops regeneration refusing)")
+        back = (record or len(features)) + 1
+        print(f"  {back:>2}) Back")
         print()
         choice = _prompt_line(
-            f"Choose a feature [1-{len(features) + 1}] (blank to go back): ")
+            f"Choose a feature [1-{back}] (blank to go back): ")
         if not choice:
             return 0
         try:
@@ -5546,8 +5920,18 @@ def show_project_config(project: dict) -> int:
         except ValueError:
             print("Not a number.", file=sys.stderr)
             continue
-        if index == len(features) + 1:
+        if index == back:
             return 0
+        if record is not None and index == record:
+            try:
+                project_features.write_config(
+                    path, {f.slug: values[f.slug] for f in features},
+                    document=document)
+            except project_features.FeatureConfigError as exc:
+                print(f"Not saved: {exc}", file=sys.stderr)
+                continue
+            print(f"  Recorded in {path}")
+            continue
         if not 1 <= index <= len(features):
             print("Out of range.", file=sys.stderr)
             continue
@@ -5605,7 +5989,13 @@ def global_instructions_path() -> Path:
 
 
 def instructions_archive_dir() -> Path:
-    return HOME / ".copilot" / project_instructions.ARCHIVE_DIRNAME
+    """Where a retired user-scope instructions file is kept.
+
+    Under ``~/.operator`` for the reason :func:`projects_root` is: archiving a
+    file into the directory whose contents this toolkit does not own is not
+    archiving it.
+    """
+    return operator_home() / project_instructions.ARCHIVE_DIRNAME
 
 
 def _repo_template_path() -> Path:
@@ -5658,6 +6048,217 @@ def _catalog_fingerprint():
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except OSError as exc:
         return f"unreadable: {exc}"
+
+
+# ── telling git about the AGENTS.md files retirement writes ──────
+#: What happened to one repository's ``AGENTS.md`` once git was told about it.
+AGENTS_COMMITTED = "committed"
+AGENTS_STAGED = "staged"
+AGENTS_TRACKED = "already tracked"
+AGENTS_NO_REPO = "not a git repository"
+AGENTS_FAILED = "could not be staged"
+
+
+class AgentsTracking:
+    """One repository's ``AGENTS.md``, and what git was told about it.
+
+    A plain class rather than a ``@dataclass``, which is what this was until
+    `tests/test_entry_points.py` objected. That test executes this module
+    straight from its path, with no entry in ``sys.modules`` -- the way the
+    installed console script is loaded -- and ``@dataclass`` resolves its
+    field annotations through ``sys.modules[cls.__module__]``, which is
+    ``None`` there. It raises at import time, so the cost is not a broken
+    dataclass but a `operator` command that cannot start at all.
+    """
+    __slots__ = ("label", "root", "state", "detail")
+
+    def __init__(self, label: str, root: Path, state: str, detail: str = ""):
+        self.label = label
+        self.root = root
+        self.state = state
+        self.detail = detail
+
+    def __repr__(self) -> str:
+        return (f"AgentsTracking({self.label!r}, {self.root!r}, "
+                f"{self.state!r}, {self.detail!r})")
+
+
+
+def _git_write(args: list[str], cwd: Path) -> "tuple[bool, str]":
+    """Run a git command that changes state. ``(succeeded, why not)``.
+
+    Unlike :func:`_git_output` the failure text is kept rather than collapsed
+    into ``None``. Every caller here has to name the repository that refused
+    and say why: a write whose failure is indistinguishable from success
+    leaves somebody believing a file is staged when it is not, which is the
+    exact belief this feature exists to stop being wrong.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=GIT_PROBE_TIMEOUT, **NO_WINDOW_KWARGS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        text = (proc.stderr or proc.stdout).strip()
+        lines = text.splitlines()
+        return False, (lines[-1] if lines else f"git exited {proc.returncode}")
+    return True, ""
+
+
+def _commit_would_be_unsafe(root: Path) -> "str | None":
+    """Why a commit in ``root`` must not be attempted, or ``None``.
+
+    A commit is refused wherever it would land somewhere nobody is looking.
+    A detached HEAD takes the commit and leaves no branch pointing at it. An
+    interrupted merge, rebase, cherry-pick or revert has a half-built tree
+    whose next git command expects to *finish* that operation, not to find an
+    unrelated commit on top of it.
+
+    Staging stays correct in every one of these -- only the commit is
+    refused -- which is why this answers about the commit alone.
+    """
+    if _git_output(["symbolic-ref", "-q", "HEAD"], root) is None:
+        return "HEAD is detached"
+    for name, why in (
+            ("MERGE_HEAD", "a merge is in progress"),
+            ("CHERRY_PICK_HEAD", "a cherry-pick is in progress"),
+            ("REVERT_HEAD", "a revert is in progress"),
+            ("rebase-merge", "a rebase is in progress"),
+            ("rebase-apply", "a rebase is in progress")):
+        located = _git_output(["rev-parse", "--git-path", name], root)
+        if located is None:
+            return "the git directory could not be examined"
+        # `.exists()` answers False for a path that is there but unexaminable,
+        # and raises on a permission denial. Both wrong answers here say "no
+        # operation in progress" and let a commit land in a half-built tree,
+        # so an unexaminable git directory refuses the commit rather than
+        # assuming the best of it.
+        try:
+            interrupted = (root / located.strip()).exists()
+        except OSError as exc:
+            return f"the git directory could not be examined ({exc})"
+        if interrupted:
+            return why
+    return None
+
+
+def _managed_names(root) -> "list[str]":
+    """The generated files in *root* that this tool actually manages.
+
+    Built from what is on disk rather than from a fixed pair. ``git add`` and
+    ``git commit`` both treat a pathspec that matches nothing as fatal, so a
+    project that declined its ``AGENTS.md`` -- and therefore never got a
+    ``CLAUDE.md`` either -- would have its staging reported as a git failure
+    for naming a file that was correctly never written.
+
+    Existence alone is not the test, and the difference is the whole point.
+    ``project_instructions._place_claude`` deliberately leaves a ``CLAUDE.md``
+    that carries no managed block alone: it is the user's own file, and
+    Claude Code users commonly keep one. Naming it here on the strength of
+    its existence would hand that file to ``git add`` and then to a commit
+    whose message says ``AGENTS.md`` and whose consent prompt never mentioned
+    it -- and if it was already tracked, its uncommitted working-tree edits
+    would go in too. That is precisely the failure ``commit_agents_files``
+    passes a pathspec to avoid; reading it off disk reintroduced it one
+    argument further down. A file is named here only when it carries a
+    managed block, which is the same rule that decides whether we may write
+    to it at all.
+    """
+    names = []
+    for name in (project_instructions.AGENTS_NAME,
+                 project_instructions.CLAUDE_NAME):
+        try:
+            text = (Path(root) / name).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if project_instructions.managed_block_present(text):
+            names.append(name)
+    return names
+
+
+def stage_agents_files(outcomes) -> "list[AgentsTracking]":
+    """Stage every ``AGENTS.md`` that was just written.
+
+    Writing the file and saying nothing to git leaves a repository's own
+    conventions in the one state that `git clean -fd` deletes, that never
+    reaches a clone, and that is indistinguishable from the scratch checkout
+    hygiene exists to sweep away. Staged, it survives all three and reads in
+    `git status` as something somebody meant to be there.
+
+    ``CLAUDE.md`` is staged with it, for exactly the same reason: an import
+    file that never reaches a clone is worse than no import file, because the
+    repository it was written into still reads as though Claude had been
+    catered for.
+
+    Staging is unconditional because it creates no commit and destroys
+    nothing; committing is the part that has to be asked about.
+    """
+    tracked: "list[AgentsTracking]" = []
+    for outcome in outcomes:
+        if outcome.agents_path is None:
+            continue
+        root = Path(outcome.path)
+        names = _managed_names(root)
+        if not names:
+            continue
+        if _git_output(["rev-parse", "--git-dir"], root) is None:
+            tracked.append(AgentsTracking(outcome.label, root, AGENTS_NO_REPO))
+            continue
+        # Tracked-and-unmodified is the one case with nothing to do. It is
+        # asked as two questions because `git status` alone cannot tell it
+        # apart from a file some .gitignore has swallowed, which reports
+        # clean while being entirely absent from the repository.
+        is_tracked = _git_output(
+            ["ls-files", "--error-unmatch", "--", *names], root) is not None
+        pending = _git_output(["status", "--porcelain", "--", *names], root)
+        if is_tracked and pending is not None and not pending.strip():
+            tracked.append(AgentsTracking(outcome.label, root, AGENTS_TRACKED))
+            continue
+        ok, why = _git_write(["add", "--", *names], root)
+        tracked.append(AgentsTracking(
+            outcome.label, root,
+            AGENTS_STAGED if ok else AGENTS_FAILED, "" if ok else why))
+    return tracked
+
+
+def commit_agents_files(tracked, origin: str) -> "list[AgentsTracking]":
+    """Commit the staged ``AGENTS.md`` files, one commit per repository.
+
+    ``git commit -- <path>`` rather than a bare ``git commit``, so a
+    repository carrying unrelated staged work contributes only this file.
+    Sweeping somebody's in-progress index into a commit they did not write is
+    the failure this feature must not become, and it is the reason a bare
+    commit is wrong here even though it is shorter.
+
+    Anything that was not staged is passed through untouched, so the returned
+    list still describes every repository.
+    """
+    name = project_instructions.AGENTS_NAME
+    message = (f"docs: add {name} project conventions\n\n"
+               f"Written by `operator projects retire` from {origin}.")
+    settled: "list[AgentsTracking]" = []
+    for entry in tracked:
+        if entry.state != AGENTS_STAGED:
+            settled.append(entry)
+            continue
+        unsafe = _commit_would_be_unsafe(entry.root)
+        if unsafe:
+            settled.append(AgentsTracking(entry.label, entry.root,
+                                          AGENTS_STAGED, f"not committed — {unsafe}"))
+            continue
+        names = _managed_names(entry.root)
+        if not names:
+            settled.append(entry)
+            continue
+        ok, why = _git_write(["commit", "-m", message, "--", *names], entry.root)
+        settled.append(AgentsTracking(
+            entry.label, entry.root,
+            AGENTS_COMMITTED if ok else AGENTS_STAGED,
+            "" if ok else f"not committed — {why}"))
+    return settled
 
 
 def retire_user_instructions(assume_yes: bool = False) -> int:
@@ -5736,11 +6337,32 @@ def retire_user_instructions(assume_yes: bool = False) -> int:
         log=print,
         recheck=recheck,
     )
-    return _report_retirement(result, global_path)
+    tracking = stage_agents_files(result.placed)
+    staged = [entry for entry in tracking if entry.state == AGENTS_STAGED]
+    # `--yes` answers "write into my repositories", which is not the same
+    # consent as "make commits in them". Unattended, the conservative half is
+    # taken: everything is staged and nothing is committed.
+    if staged and not assume_yes:
+        suffix = "y" if len(staged) == 1 else "ies"
+        if _prompt_line(
+                f"\n  Commit {project_instructions.AGENTS_NAME} in "
+                f"{len(staged)} repositor{suffix}? [y/N]: "
+                ).lower() in ("y", "yes"):
+            tracking = commit_agents_files(tracking, result.source_origin)
+    return _report_retirement(result, global_path, tracking)
 
 
-def _report_retirement(result, global_path: Path) -> int:
+def _report_retirement(result, global_path: Path, tracking=()) -> int:
     print()
+    if tracking:
+        print(f"  {project_instructions.AGENTS_NAME} in each repository:")
+        for entry in tracking:
+            print(f"    {entry.label}: {entry.state}"
+                  + (f" — {entry.detail}" if entry.detail else ""))
+        if any(entry.state == AGENTS_STAGED for entry in tracking):
+            print("    Staged, not committed — commit them or they are one "
+                  "`git clean -fd` from gone.")
+        print()
     if result.user_agents:
         print("  ! A user-scope AGENTS.md is also loaded into every session:")
         for path in result.user_agents:
@@ -5856,6 +6478,884 @@ def ending_was_observed(instance) -> bool:
     if not instance.exit_file_cleared:
         return False
     return read_exit_code(instance) is not None
+
+
+def _session_usage(stream) -> None:
+    print("Usage:\n"
+          "  operator session start --instance NAME [--session N] "
+          "[--project SUB] [--json]\n"
+          "  operator session end   --instance NAME [--session N] "
+          "--status TEXT --next TEXT [--done] [--json]\n"
+          "\n"
+          "start  resolves this instance's assignment before its first token:\n"
+          "       a claim it already holds (resume), else claims whose owners\n"
+          "       are provably gone (offered, oldest first), else nothing.\n"
+          "end    writes the handoff, closes the session log and disposes of\n"
+          "       the claim in one call. The claim is kept unless --done.",
+          file=stream)
+
+
+def _session_db(cwd: Path):
+    """The claim/session database for the project ``cwd`` belongs to.
+
+    Resolved from the *primary* checkout, so a session started inside a
+    worktree finds the project's real entry instead of minting a second one.
+    """
+    root = primary_repo_root(cwd)
+    found = catalog_guid(root)
+    if found.guid is None:
+        print(f"No catalog entry for {root} — this project is not registered.",
+              file=sys.stderr)
+        return None
+    return operator_session.db_path(project_dir(found.guid))
+
+
+def _parse_flagged_args(args: list[str], *, takes_value: dict,
+                        flags: dict) -> "dict | None":
+    """``--key value`` / ``--key=value`` / bare flags, or ``None`` on refusal.
+
+    Shared by ``session`` and ``work`` rather than written twice. The two
+    behaviours worth keeping identical are both ones a second copy would drift
+    on: an unrecognised option is *refused* rather than ignored -- a caller who
+    typed ``--relase`` and saw a success message believes an effect happened
+    that did not -- and a value that looks like an option is refused too.
+
+    That second rule was bought with a real defect. ``session end --status ok
+    --next --done`` bound ``next="--done"`` and left ``done`` false: the caller
+    asked for the claim to be released, was told the session ended, and it was
+    not. A value that genuinely starts with a dash is still expressible as
+    ``--next=-x``, which is unambiguous by construction.
+
+    ``flags`` is matched against the whole argument, not its ``=``-prefix, so
+    ``--json=true`` is an unknown option rather than a flag with a silently
+    discarded value.
+    """
+    opts: dict = {}
+
+    def separate_value(key: str, i: int) -> "str | None":
+        if i + 1 >= len(args):
+            print(f"Missing value for {key}", file=sys.stderr)
+            return None
+        value = args[i + 1]
+        if value.startswith("-") and value != "-":
+            print(f"Missing value for {key}: {value!r} looks like an option. "
+                  f"Write {key}={value} if that really is the value.",
+                  file=sys.stderr)
+            return None
+        return value
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        key, _, inline = arg.partition("=")
+        if arg in flags:
+            opts[flags[arg]] = True
+        elif key in takes_value:
+            if "=" in arg:
+                opts[takes_value[key]] = inline
+            else:
+                value = separate_value(key, i)
+                if value is None:
+                    return None
+                opts[takes_value[key]] = value
+                i += 1
+        else:
+            print(f"Unknown option: {arg}", file=sys.stderr)
+            return None
+        i += 1
+    return opts
+
+
+def _parse_session_args(args: list[str]) -> "dict | None":
+    """Options for ``session start``/``end``."""
+    opts: dict = {"instance": "", "session": None, "project": None,
+                  "json": False, "done": False, "status": "", "next": "",
+                  "context": "", "prompt": "", "in_progress": ""}
+    parsed = _parse_flagged_args(
+        args,
+        takes_value={"--instance": "instance", "--project": "project",
+                     "--status": "status", "--next": "next",
+                     "--context": "context", "--prompt": "prompt",
+                     "--in-progress": "in_progress", "--session": "session"},
+        flags={"--json": "json", "--done": "done", "--release": "done"})
+    if parsed is None:
+        return None
+    raw = parsed.pop("session", None)
+    opts.update(parsed)
+    if raw is not None:
+        try:
+            opts["session"] = int(raw)
+        except ValueError:
+            print(f"--session takes a number, not {raw!r}", file=sys.stderr)
+            return None
+        if opts["session"] < 0:
+            print(f"--session takes a session number, not {raw!r}",
+                  file=sys.stderr)
+            return None
+    if not opts["instance"]:
+        print("Missing required: --instance NAME", file=sys.stderr)
+        return None
+    return opts
+
+
+def _session_start(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    session_num = opts["session"]
+    if session_num is None:
+        session_num = _read_session_number(instance)
+    operator_session.init_db(db)
+    assignment = operator_session.start_session(
+        db, instance=instance, session=session_num,
+        subproject=opts["project"])
+    # Mail is delivered here rather than waited for. A sleeping instance
+    # still needs a queue, but the agent should not have to remember a
+    # command to drain it -- that is the polling model this replaces, and the
+    # failure it had was silent: an agent that never ran `operator inbox`
+    # was indistinguishable from one with no mail.
+    #
+    # Consuming (rather than peeking) is what makes this a delivery. The
+    # messages are rendered below in the same breath, so the archive and the
+    # agent's context agree; a peek here would show them again next session
+    # and read as a second message rather than the same one.
+    # `instance` is already a sanitized id, so it is passed straight through.
+    # Wrapping it in `Instance(...)` again re-sanitizes an id that has been
+    # sanitized once: `beta.test` becomes `beta-test-2e02bd` and then
+    # `beta-test-2e02bd-1ac43e`, a mailbox nothing ever writes to -- so mail
+    # for every name needing sanitization would be silently undeliverable.
+    try:
+        delivered = operator_mail.consume(OPERATOR_HOME, instance)
+    except operator_mail.MailError as exc:
+        # A jammed mailbox must not stop a session starting, but it must not
+        # pass for an empty one either.
+        print(f"Could not read queued mail: {exc}", file=sys.stderr)
+        print("  This is not an empty mailbox: messages may be waiting and "
+              "unreadable.", file=sys.stderr)
+        delivered = exc.consumed
+        if delivered:
+            # `consume` archives one at a time, so a fault part way through
+            # leaves the earlier ones already read. Saying "nothing was marked
+            # read" here while printing them below is a sentence asserting an
+            # outcome nobody checked -- the same defect `show_inbox` already
+            # had, reached through a second door. Ask, then say.
+            print(f"  {len(delivered)} message(s) HAD already been marked "
+                  "read before the failure. They are printed below, because "
+                  "this is the only time they will ever be offered.",
+                  file=sys.stderr)
+        else:
+            print("  Nothing was marked read, so anything there survives for "
+                  "the next attempt; try `operator inbox --peek`.",
+                  file=sys.stderr)
+    if opts["json"]:
+        print(json.dumps({
+            "kind": assignment.kind,
+            "instance": assignment.instance,
+            "session": session_num,
+            **operator_session.assignment_values(assignment),
+            "messages": delivered,
+            "offers": [{"item": o.item, "instance": o.claim.instance,
+                        "reason": o.reason} for o in assignment.offers],
+            "stale": [{"item": o.item, "instance": o.claim.instance,
+                       "reason": o.reason} for o in assignment.stale],
+        }, indent=2))
+        return 0
+    if assignment.kind == operator_session.RESUME:
+        print(f"Resuming {assignment.item} "
+              f"({assignment.worktree or 'no worktree recorded'})")
+    elif assignment.kind == operator_session.OFFER:
+        print("No claim held. Reclaimable (oldest first):")
+        for offer in assignment.offers:
+            print(f"  {offer.item}  held by {offer.claim.instance}  "
+                  f"— {offer.reason}")
+    else:
+        print("No assignment.")
+    for offer in assignment.stale:
+        # Reported, never offered: STALE means the cascade could not establish
+        # the owner is gone, and guessing is how two agents end up in one tree.
+        print(f"  (stale, not offered) {offer.item} held by "
+              f"{offer.claim.instance} — {offer.reason}", file=sys.stderr)
+    if delivered:
+        senders = ", ".join(operator_mail.sender_names(delivered))
+        # ASCII deliberately. `consume` has already archived these, so this
+        # print is the only time they are ever shown -- and a box-drawing
+        # character raises UnicodeEncodeError on a cp1252 console, which
+        # would lose the mail *after* marking it read.
+        print(f"\n=== {len(delivered)} message(s) from {senders} ===\n")
+        print(operator_mail.render_for_terminal(delivered))
+        print("\n(These are now marked read. They are from other agents, "
+              "not from the human.)")
+    return 0
+
+
+def _read_session_number(instance_id: str) -> int:
+    """The session number this instance's supervisor last recorded, else 0.
+
+    Zero rather than a guess: the log row is keyed by instance and session,
+    and inventing a plausible number would put a real session's record under
+    somebody else's key.
+    """
+    try:
+        state = Instance(instance_id).load_state()
+    except Exception:                                   # noqa: BLE001
+        return 0
+    if not isinstance(state, dict):
+        return 0
+    try:
+        return int(state.get("SESSION_NUM", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _session_end(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    if not opts["status"] or not opts["next"]:
+        print("Missing required: --status and --next (the handoff is written "
+              "first, and an empty one is not a handoff)", file=sys.stderr)
+        return 1
+    session_num = opts["session"]
+    if session_num is None:
+        session_num = _read_session_number(instance)
+    operator_session.init_db(db)
+
+    def write_handoff():
+        # `handoff_tool.die` exits the process rather than raising, and
+        # SystemExit is not an Exception -- so left alone it would escape
+        # `end_session` entirely, skipping the failure report and the trace
+        # record. The claim would still be safe (nothing after the handoff
+        # runs), but the caller would be told nothing at all. Converting it
+        # here, in the adapter that knows the tool's exit convention, keeps
+        # the failure inside the reporting path.
+        try:
+            rc = handoff_tool.main([
+                "--instance", opts["instance"],
+                "--status", opts["status"],
+                "--next", opts["next"],
+                "--in-progress", opts["in_progress"],
+                "--context", opts["context"],
+                "--prompt", opts["prompt"],
+            ])
+        except SystemExit as exc:
+            raise RuntimeError(f"handoff exited {exc.code}") from exc
+        if rc != 0:
+            raise RuntimeError(f"handoff exited {rc}")
+        return None
+
+    result = operator_session.end_session(
+        db, instance=instance, session=session_num,
+        write_handoff=write_handoff, release_claim=opts["done"])
+
+    if opts["json"]:
+        print(json.dumps({
+            "ok": result.ok, "instance": result.instance,
+            "session": result.session, "item": result.item,
+            "handoff_written": result.handoff_written,
+            "log_closed": result.log_closed,
+            "claim_released": result.claim_released,
+            "claim_retained": result.claim_retained,
+            "failure": result.failure, "notes": list(result.notes),
+        }, indent=2))
+    else:
+        if result.failure:
+            print(f"session end incomplete: {result.failure}", file=sys.stderr)
+        else:
+            kept = (f"claim {result.item} kept" if result.claim_retained
+                    else (f"claim {result.item} released" if result.claim_released
+                          else "no claim held"))
+            print(f"Handoff written, session log closed, {kept}.")
+        for note in result.notes:
+            print(f"  note: {note}", file=sys.stderr)
+    return 0 if result.ok else 1
+
+
+#: The verbs ``operator session`` answers to.
+#:
+#: A named tuple rather than a literal in the dispatch, so the template
+#: conformance test can measure the document against the code instead of
+#: against a second copy of the vocabulary.
+SESSION_VERBS = ("start", "end")
+
+
+def manage_session(args: list[str]) -> int:
+    """``operator session start|end`` — the two ends of one session (FR-2, FR-5)."""
+    if not args or args[0] in HELP_FLAGS:
+        _session_usage(sys.stdout if args else sys.stderr)
+        return 0 if args else 1
+    verb = args[0]
+    if verb not in SESSION_VERBS:
+        print(f"Unknown subcommand: operator session {verb}", file=sys.stderr)
+        print("Did you mean `operator session start` or "
+              "`operator session end`?", file=sys.stderr)
+        return 1
+    opts = _parse_session_args(args[1:])
+    if opts is None:
+        return 1
+    db = _session_db(Path.cwd())
+    if db is None:
+        return 1
+    return _session_start(opts, db) if verb == "start" else _session_end(opts, db)
+
+
+WORK_VERBS = ("request", "release", "list", "heartbeat", "reclaim")
+
+
+def _work_usage(stream) -> None:
+    print("Usage:\n"
+          "  operator work request   --instance NAME --item REF "
+          "[--project SUB] [--worktree PATH] [--branch NAME] [--json]\n"
+          "  operator work release   --instance NAME [--item REF] [--json]\n"
+          "  operator work heartbeat --instance NAME [--item REF] [--json]\n"
+          "  operator work list      [--project SUB] [--json]\n"
+          "  operator work reclaim   --instance NAME --item REF [--json]\n"
+          "\n"
+          "One work item per instance, one owner per item.\n"
+          "reclaim refuses an owner that is live, and one the liveness\n"
+          "cascade could not decide about. It commits a dead owner's\n"
+          "uncommitted changes to wip/ITEM-INSTANCE before the item moves,\n"
+          "and never runs git stash, reset, clean, checkout or restore.",
+          file=stream)
+
+
+def _parse_work_args(args: list[str]) -> "dict | None":
+    """Options for the ``operator work`` verbs.
+
+    ``--instance`` is not required here as it is for ``session``: ``work
+    list`` is a question about the project, not about one agent, and demanding
+    a name to ask it would make the natural reading -- what is everybody
+    working on -- unavailable.
+    """
+    opts: dict = {"instance": "", "item": "", "project": None,
+                  "worktree": "", "branch": "", "json": False}
+    parsed = _parse_flagged_args(
+        args,
+        takes_value={"--instance": "instance", "--item": "item",
+                     "--project": "project", "--worktree": "worktree",
+                     "--branch": "branch"},
+        flags={"--json": "json"})
+    if parsed is None:
+        return None
+    opts.update(parsed)
+    return opts
+
+
+def _agent_pid(instance) -> "int | None":
+    """The pid that stands for this agent, or ``None`` when none is running.
+
+    Never this process. ``operator work request`` exits within a second of
+    writing the claim, so recording its own pid would leave a claim whose
+    second liveness signal says the owner is gone -- reclaimable by anyone,
+    immediately, and by the cascade's own evidence.
+
+    The copilot session is preferred over the supervisor because it is the
+    process actually doing the work; the supervisor is the fallback for a
+    session that has not started or has just ended between two of its own
+    restarts.
+    """
+    pid = instance.copilot_pid()
+    if pid and _pid_alive(pid):
+        return pid
+    return _running_loop_pid(instance)
+
+
+def _claimed_item(db, opts: dict, instance: str) -> "str | None":
+    """``--item`` if given, else whatever this instance already holds.
+
+    Defaulting is what makes ``release`` and ``heartbeat`` usable from an
+    agent that was handed its assignment rather than choosing it: FR-2's whole
+    point is that the agent does not have to know the item's name to work it.
+    """
+    if opts["item"]:
+        return opts["item"]
+    held = work_claims.claim_for_instance(db, instance)
+    return None if held is None else held.item
+
+
+def _work_request(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    if not opts["item"]:
+        print("Missing required: --item REF", file=sys.stderr)
+        return 1
+    worktree = opts["worktree"] or str(Path.cwd())
+    branch = opts["branch"] or operator_work.current_branch(worktree) or None
+    operator_session.init_db(db)
+    try:
+        held = operator_work.request(
+            db, item=opts["item"], instance=instance,
+            subproject=opts["project"] or "", worktree=worktree, branch=branch,
+            mux_session=Instance(opts["instance"]).session,
+            pid=_agent_pid(Instance(opts["instance"])))
+    except work_claims.ClaimRefused as exc:
+        if opts["json"]:
+            print(json.dumps({"ok": False, "reason": exc.reason,
+                              "item": exc.item, "instance": exc.instance,
+                              "held_by": (None if exc.holder is None
+                                          else exc.holder.instance),
+                              "detail": str(exc)}, indent=2))
+        else:
+            print(f"Refused: {exc}", file=sys.stderr)
+            if exc.reason == work_claims.ITEM_HELD:
+                print("Use `operator work list` to see whether its owner is "
+                      "still running, and `operator work reclaim` if it is "
+                      "provably gone.", file=sys.stderr)
+        return 1
+    if opts["json"]:
+        print(json.dumps(_claim_json(held), indent=2))
+    else:
+        print(f"{held.item} claimed by {held.instance} "
+              f"({held.worktree or 'no worktree'}"
+              f"{', ' + held.branch if held.branch else ''})")
+    return 0
+
+
+def _claim_json(held) -> dict:
+    return {"ok": True, "item": held.item, "instance": held.instance,
+            "subproject": held.subproject, "worktree": held.worktree,
+            "branch": held.branch, "claimed_at": held.claimed_at,
+            "heartbeat_at": held.heartbeat_at, "pid": held.pid,
+            "mux_session": held.mux_session}
+
+
+def _work_release(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    operator_session.init_db(db)
+    item = _claimed_item(db, opts, instance)
+    if item is None:
+        print(f"{instance} holds no work item.", file=sys.stderr)
+        return 1
+    ok = operator_work.release(db, item=item, instance=instance)
+    if opts["json"]:
+        print(json.dumps({"ok": ok, "item": item, "instance": instance},
+                         indent=2))
+    elif ok:
+        print(f"{item} released by {instance}.")
+    else:
+        print(f"{instance} does not hold {item}; nothing released.",
+              file=sys.stderr)
+    return 0 if ok else 1
+
+
+def _work_heartbeat(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    operator_session.init_db(db)
+    item = _claimed_item(db, opts, instance)
+    if item is None:
+        print(f"{instance} holds no work item.", file=sys.stderr)
+        return 1
+    ok = operator_work.heartbeat(db, item=item, instance=instance)
+    if opts["json"]:
+        print(json.dumps({"ok": ok, "item": item, "instance": instance},
+                         indent=2))
+    elif ok:
+        print(f"{item}: heartbeat refreshed.")
+    else:
+        print(f"{instance} does not hold {item}; heartbeat not refreshed.",
+              file=sys.stderr)
+    return 0 if ok else 1
+
+
+def _work_list(opts: dict, db) -> int:
+    operator_session.init_db(db)
+    rows = operator_work.listing(db, subproject=opts["project"])
+    if opts["json"]:
+        print(json.dumps([{**_claim_json(held), "verdict": verdict.verdict,
+                           "reason": verdict.reason,
+                           "reclaimable": verdict.reclaimable}
+                          for held, verdict in rows], indent=2))
+        return 0
+    if not rows:
+        print("No work items are claimed.")
+        return 0
+    for held, verdict in rows:
+        print(f"{held.item}  {held.instance}  {verdict.verdict}")
+        print(f"{'':4}{verdict.reason}")
+        if held.worktree:
+            print(f"{'':4}{held.worktree}"
+                  f"{' (' + held.branch + ')' if held.branch else ''}")
+    return 0
+
+
+def _work_reclaim(opts: dict, db) -> int:
+    instance = safe_instance_id(opts["instance"])
+    if not opts["item"]:
+        print("Missing required: --item REF", file=sys.stderr)
+        return 1
+    operator_session.init_db(db)
+    result = operator_work.reclaim(
+        db, item=opts["item"], to_instance=instance,
+        mux_session=Instance(opts["instance"]).session,
+        pid=_agent_pid(Instance(opts["instance"])))
+    preserved = result.preservation
+    if opts["json"]:
+        print(json.dumps({
+            "ok": result.ok, "item": result.item,
+            "instance": result.to_instance,
+            "refused": result.refused, "detail": result.detail,
+            "previous_owner": (None if result.previous is None
+                               else result.previous.instance),
+            "verdict": (None if result.liveness is None
+                        else result.liveness.verdict),
+            "preserved_branch": (None if preserved is None
+                                 else preserved.branch),
+            "preserved_commit": (None if preserved is None
+                                 else preserved.commit),
+            "notes": [] if preserved is None else list(preserved.notes),
+        }, indent=2))
+        return 0 if result.ok else 1
+    if not result.ok:
+        print(f"Refused: {result.detail}", file=sys.stderr)
+        if result.refused == operator_work.OWNER_STALE:
+            print("STALE is not a verdict this tool acts on. Confirm the "
+                  "agent has stopped, then release the claim from that "
+                  "instance.", file=sys.stderr)
+        return 1
+    previous = result.previous.instance if result.previous else "?"
+    print(f"{result.item}: {previous} -> {result.to_instance}")
+    if preserved is not None and preserved.branch:
+        print(f"  {previous}'s uncommitted work is on {preserved.branch} "
+              f"({(preserved.commit or '')[:12]}). The working tree was not "
+              f"touched.")
+    for note in (preserved.notes if preserved else ()):
+        print(f"  note: {note}")
+    return 0
+
+
+def manage_work(args: list[str]) -> int:
+    """``operator work request|release|list|heartbeat|reclaim`` (FR-3, FR-4)."""
+    if not args or args[0] in HELP_FLAGS:
+        _work_usage(sys.stdout if args else sys.stderr)
+        return 0 if args else 1
+    verb = args[0]
+    if verb not in WORK_VERBS:
+        print(f"Unknown subcommand: operator work {verb}", file=sys.stderr)
+        print(f"Expected one of: {', '.join(WORK_VERBS)}", file=sys.stderr)
+        return 1
+    opts = _parse_work_args(args[1:])
+    if opts is None:
+        return 1
+    if verb != "list" and not opts["instance"]:
+        print("Missing required: --instance NAME", file=sys.stderr)
+        return 1
+    db = _session_db(Path.cwd())
+    if db is None:
+        return 1
+    return {"request": _work_request, "release": _work_release,
+            "heartbeat": _work_heartbeat, "list": _work_list,
+            "reclaim": _work_reclaim}[verb](opts, db)
+
+
+WORKTREE_VERBS = ("new", "finish", "recover")
+
+
+def _worktree_usage(stream) -> None:
+    print("Usage:\n"
+          "  operator worktree new     --instance NAME --item REF "
+          "[--project SUB] [--branch NAME] [--path PATH] [--json]\n"
+          "  operator worktree finish  --instance NAME [--item REF] "
+          "[--into REF] [--json]\n"
+          "  operator worktree recover [--preserve] [--json]\n"
+          "\n"
+          "A checkout is 1:1 with a work item: `new` takes the claim and\n"
+          "creates the tree together, and releases the claim again if the\n"
+          "tree cannot be made.\n"
+          "`finish` refuses a tree with uncommitted changes rather than\n"
+          "tidying it, and deletes the branch only when --into already\n"
+          "contains it.\n"
+          "`recover` reports; it removes nothing. --preserve commits the\n"
+          "uncommitted work of an unclaimed tree, or one whose owner is\n"
+          "provably gone, to a wip/ branch.",
+          file=stream)
+
+
+def _parse_worktree_args(args: list[str]) -> "dict | None":
+    opts: dict = {"instance": "", "item": "", "project": None, "branch": "",
+                  "path": "", "into": operator_worktree.DEFAULT_INTEGRATION,
+                  "preserve": False, "json": False}
+    parsed = _parse_flagged_args(
+        args,
+        takes_value={"--instance": "instance", "--item": "item",
+                     "--project": "project", "--branch": "branch",
+                     "--path": "path", "--into": "into"},
+        flags={"--preserve": "preserve", "--json": "json"})
+    if parsed is None:
+        return None
+    opts.update(parsed)
+    return opts
+
+
+def _worktree_new(opts: dict, db, root) -> int:
+    instance = safe_instance_id(opts["instance"])
+    if not opts["item"]:
+        print("Missing required: --item REF", file=sys.stderr)
+        return 1
+    operator_session.init_db(db)
+    result = operator_worktree.new(
+        db, root, item=opts["item"], instance=instance,
+        subproject=opts["project"] or "", branch=opts["branch"] or None,
+        path=opts["path"] or None,
+        mux_session=Instance(opts["instance"]).session,
+        pid=_agent_pid(Instance(opts["instance"])))
+    if opts["json"]:
+        print(json.dumps(_worktree_json(result), indent=2))
+        return 0 if result.ok else 1
+    if not result.ok:
+        print(f"Refused: {result.detail}", file=sys.stderr)
+        for note in result.notes:
+            print(f"  note: {note}", file=sys.stderr)
+        return 1
+    print(f"{result.item}: {result.path} ({result.branch})")
+    for note in result.notes:
+        print(f"  note: {note}")
+    return 0
+
+
+def _worktree_json(result) -> dict:
+    return {"ok": result.ok, "verb": result.verb, "item": result.item,
+            "instance": result.instance, "path": result.path,
+            "branch": result.branch, "branch_deleted": result.branch_deleted,
+            "refused": result.refused, "detail": result.detail,
+            "notes": list(result.notes)}
+
+
+def _worktree_finish(opts: dict, db, root) -> int:
+    instance = safe_instance_id(opts["instance"])
+    operator_session.init_db(db)
+    item = _claimed_item(db, opts, instance)
+    if item is None:
+        print(f"{instance} holds no work item.", file=sys.stderr)
+        return 1
+    result = operator_worktree.finish(db, root, item=item, instance=instance,
+                                      into=opts["into"])
+    if opts["json"]:
+        print(json.dumps(_worktree_json(result), indent=2))
+        return 0 if result.ok else 1
+    if not result.ok:
+        print(f"Refused: {result.detail}", file=sys.stderr)
+        if result.refused == operator_worktree.WORKTREE_DIRTY:
+            print("Nothing here commits, stages or discards them for you: "
+                  "that is the one thing this command must never be a faster "
+                  "way to do.", file=sys.stderr)
+        return 1
+    print(f"{result.item}: {result.path} removed, claim released"
+          f"{', branch ' + result.branch + ' deleted' if result.branch_deleted else ''}.")
+    for note in result.notes:
+        print(f"  note: {note}")
+    return 0
+
+
+def _worktree_recover(opts: dict, db, root) -> int:
+    operator_session.init_db(db)
+    try:
+        rows = operator_worktree.survey(db, root, preserve=opts["preserve"])
+    except operator_work.GitUnavailable as exc:
+        print(f"Refused: {exc}", file=sys.stderr)
+        return 1
+    if opts["json"]:
+        print(json.dumps([{
+            "path": row.path, "branch": row.branch, "state": row.state,
+            "item": None if row.claim is None else row.claim.item,
+            "instance": None if row.claim is None else row.claim.instance,
+            "verdict": None if row.liveness is None else row.liveness.verdict,
+            "reason": None if row.liveness is None else row.liveness.reason,
+            "preserved_branch": (None if row.preserved is None
+                                 else row.preserved.branch),
+            "preserved_commit": (None if row.preserved is None
+                                 else row.preserved.commit),
+            "note": row.note,
+        } for row in rows], indent=2))
+        return 0
+    for row in rows:
+        owner = f"  {row.claim.instance} ({row.claim.item})" if row.claim else ""
+        print(f"{row.state:<12}{row.path}{owner}")
+        if row.branch:
+            print(f"{'':4}{row.branch}")
+        if row.liveness is not None:
+            print(f"{'':4}{row.liveness.reason}")
+        if row.note:
+            print(f"{'':4}{row.note}")
+        if row.preserved is not None and row.preserved.branch:
+            print(f"{'':4}uncommitted work preserved on "
+                  f"{row.preserved.branch} "
+                  f"({(row.preserved.commit or '')[:12]})")
+    if not opts["preserve"] and any(
+            row.state in (operator_worktree.UNCLAIMED, operator_worktree.DEAD)
+            for row in rows):
+        print("\nRe-run with --preserve to commit the uncommitted work in "
+              "those trees to a wip/ branch. Nothing is removed either way.")
+    return 0
+
+
+def manage_worktree(args: list[str]) -> int:
+    """``operator worktree new|finish|recover`` — the checkout of a work item.
+
+    The verbs are asymmetric on purpose. ``new`` and ``finish`` both write on
+    the assumption that the agent running them knows what is in the tree;
+    ``recover`` is what runs when nobody does, so it reports and preserves and
+    removes nothing at all.
+    """
+    if not args or args[0] in HELP_FLAGS:
+        _worktree_usage(sys.stdout if args else sys.stderr)
+        return 0 if args else 1
+    verb = args[0]
+    if verb not in WORKTREE_VERBS:
+        print(f"Unknown subcommand: operator worktree {verb}", file=sys.stderr)
+        print(f"Expected one of: {', '.join(WORKTREE_VERBS)}", file=sys.stderr)
+        return 1
+    opts = _parse_worktree_args(args[1:])
+    if opts is None:
+        return 1
+    if verb != "recover" and not opts["instance"]:
+        print("Missing required: --instance NAME", file=sys.stderr)
+        return 1
+    db = _session_db(Path.cwd())
+    if db is None:
+        return 1
+    # The *primary* checkout, never `Path.cwd()`: every one of these verbs
+    # runs from inside a worktree at least half the time, and git's worktree
+    # commands addressed at a linked worktree operate on the same repository
+    # but the layout is anchored on the primary checkout's `.worktrees/`.
+    root = primary_repo_root(Path.cwd())
+    return {"new": _worktree_new, "finish": _worktree_finish,
+            "recover": _worktree_recover}[verb](opts, db, root)
+
+
+#: The verbs ``operator ownership`` answers to. See :data:`SESSION_VERBS`.
+OWNERSHIP_VERBS = ("check",)
+
+
+def manage_ownership(args: list[str]) -> int:
+    """``operator ownership check`` — may this branch be pushed?
+
+    The gate the peer-agents skill calls the only isolation that can fail a
+    build. The decision lives in :mod:`operator_ownership`, which touches
+    neither git nor the filesystem beyond reading the declaration; this
+    function is the part that has to talk to git, and it is deliberately the
+    only part that does.
+
+    Exit codes are the interface, because the caller is a pre-push hook or a
+    CI step and neither reads prose. ``0`` allowed, ``1`` refused, ``2``
+    could not tell. The third is not folded into the second: a hook that
+    treats "the declaration would not parse" as "this branch is fine" is the
+    failure this whole module is written against, and a hook author who
+    wants that has to write ``|| true`` where somebody can see it.
+    """
+    if not args or args[0] in HELP_FLAGS:
+        _ownership_usage(sys.stdout if args else sys.stderr)
+        return 0 if args else 1
+    if args[0] not in OWNERSHIP_VERBS:
+        print(f"Unknown subcommand: operator ownership {args[0]}",
+              file=sys.stderr)
+        print(f"Expected: {', '.join(OWNERSHIP_VERBS)}", file=sys.stderr)
+        return 1
+    opts: dict = {"project": None, "against": operator_worktree.
+                  DEFAULT_INTEGRATION, "contracts": False, "json": False}
+    parsed = _parse_flagged_args(
+        args[1:],
+        takes_value={"--project": "project", "--against": "against"},
+        flags={"--allow-contracts": "contracts", "--json": "json"})
+    if parsed is None:
+        return 1
+    opts.update(parsed)
+    root = primary_repo_root(Path.cwd())
+    try:
+        declaration = operator_ownership.read_declaration(root)
+    except operator_ownership.OwnershipError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    changed = _changed_paths(opts["against"])
+    if changed is None:
+        print(f"Could not list the files this branch changed against "
+              f"{opts['against']}. Refusing rather than reporting it clean.",
+              file=sys.stderr)
+        return 2
+    verdict = operator_ownership.check(
+        declaration, changed, subproject=opts["project"],
+        allow_contracts=opts["contracts"])
+    if opts["json"]:
+        print(json.dumps({"ok": verdict.ok, "code": verdict.code,
+                          "subproject": verdict.subproject,
+                          "offending": list(verdict.offending),
+                          "candidates": list(verdict.candidates),
+                          "detail": verdict.detail}, indent=2))
+    else:
+        stream = sys.stdout if verdict.ok else sys.stderr
+        print(f"{verdict.code}: {verdict.detail}"
+              if verdict.detail else verdict.code, file=stream)
+        for path in verdict.offending:
+            print(f"  {path}", file=stream)
+        if verdict.candidates and not verdict.ok:
+            print(f"  declared subprojects: "
+                  f"{', '.join(verdict.candidates)}", file=stream)
+    return 0 if verdict.ok else 1
+
+
+def _ownership_usage(stream) -> None:
+    print("Usage:\n"
+          "  operator ownership check [--project SUB] [--against REF] "
+          "[--allow-contracts] [--json]\n"
+          "\n"
+          "Refuses a branch that changed files outside the subproject it is\n"
+          "working. --project names it; left out, the branch must resolve to\n"
+          "exactly one. Contract paths are refused even to a subproject that\n"
+          "owns them, because they are the interface between subprojects --\n"
+          "--allow-contracts waives that one rule and nothing else.\n"
+          "\n"
+          "Exit 0 allowed, 1 refused, 2 could not tell. The third is not the\n"
+          "second: a hook treating 'the declaration would not parse' as\n"
+          "'this branch is fine' is what this check exists to prevent.\n"
+          "\n"
+          "Declared in .operator/subprojects.json at the repository root:\n"
+          '  {"subprojects": {"api": {"owns": ["services/api"]}},\n'
+          '   "contracts": ["specs/contracts"]}',
+          file=stream)
+
+
+def _changed_paths(against: str) -> "list | None":
+    """Repository-relative paths this branch changed, or None if git refused.
+
+    ``main...HEAD`` -- three dots -- is the merge base, so a branch that has
+    not been rebased is not blamed for what landed on ``main`` behind it.
+    Two dots would report every file changed on the integration branch since
+    the fork as though this branch had touched them, and the check would
+    then refuse work nobody did.
+
+    ``None`` on failure, never ``[]``. An empty list is a real answer -- a
+    branch with no changes passes -- and returning it for "git would not
+    run" is the collapse that turns this gate into a decoration.
+    """
+    proc = _run_git(["diff", "--name-only", f"{against}...HEAD"])
+    if proc is None or proc.returncode != 0:
+        return None
+    return [line for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _run_git(args: list[str]):
+    try:
+        return subprocess.run(["git", *args], capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def manage_backlog(args: list[str]) -> int:
+    """``operator backlog …`` — the tracked backlog, from the operator CLI.
+
+    A delegation and not a reimplementation. ``backlog_tool`` already owns the
+    vocabulary, the approval gate and every rule ``check`` enforces; a second
+    argument parser here would be a second copy of all three, and the copy is
+    the thing that drifts. What this adds is discoverability: an agent reads
+    ``operator …`` in its instructions, and a verb reachable only through a
+    separate console script is a verb it will not find -- and an agent that
+    cannot find `close` edits the status field by hand.
+
+    ``argparse`` exits rather than returning, so ``--help`` and a malformed
+    argument arrive here as :class:`SystemExit`. Letting one escape would take
+    the operator down through a path that has nothing to do with operator
+    state; its code is the exit code, which is what this call would have
+    returned anyway.
+    """
+    try:
+        return backlog_tool.main(args, prog="operator backlog")
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else (0 if not exc.code
+                                                           else 1)
 
 
 def _record_session_exit(instance, session_num: int,
@@ -6250,6 +7750,8 @@ def _dispatch_command(args: list[str]) -> int:
         return forget_instance(args[1] if len(args) > 1 else None)
     if head == "send":
         return send_message(args[1:])
+    if head == "reply":
+        return reply_message(args[1:])
     if head == "inbox":
         return show_inbox(args[1:])
     if head == "logs":
@@ -6260,6 +7762,16 @@ def _dispatch_command(args: list[str]) -> int:
         return manage_tabs(args[1:])
     if head == "restore":
         return restore_tabs(args[1:])
+    if head == "session":
+        return manage_session(args[1:])
+    if head == "work":
+        return manage_work(args[1:])
+    if head == "backlog":
+        return manage_backlog(args[1:])
+    if head == "worktree":
+        return manage_worktree(args[1:])
+    if head == "ownership":
+        return manage_ownership(args[1:])
 
     # Positional shortcut: `operator foo` joins a running instance named foo.
     if len(args) == 1 and not head.startswith("-") and head not in RESERVED_WORDS:

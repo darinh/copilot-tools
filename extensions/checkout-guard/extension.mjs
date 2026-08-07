@@ -29,6 +29,19 @@
 //      always allowed: the aim is to stop artifacts being committed
 //      *unnoticed*, not to stop them being committed.
 //
+// Three further rules arrived from the G1/G2 audit of the managed instruction
+// block, each replacing a sentence an agent had to be holding in mind at the
+// moment it mattered:
+//
+//   4. A `create` or `edit` aimed at ANOTHER checkout of this repository is
+//      DENIED. Writes outside the repository are never blocked -- the temp
+//      directory is where this guard tells everyone to put scratch work.
+//   5. Delegating to a subagent with uncommitted changes in TRACKED files is
+//      DENIED. That is the state a subagent's `git stash` destroys without
+//      trace; untracked files survive it and are rule 3's subject anyway.
+//   6. `git commit` on `main`/`master` is DENIED, unless a merge is waiting to
+//      be concluded -- merging a feature branch into `main` is how work lands.
+//
 // Files written with the create/edit tools are never treated as strays. Those
 // are the sanctioned way to author content, and the distinction between "a
 // file the agent decided to write" and "a shell command's side effect" is
