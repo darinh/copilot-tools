@@ -1,5 +1,5 @@
 ---
-id: 20
+id: 23
 title: MSBuild node reuse leaks worker processes across agent worktrees
 status: proposed
 opened: 2026-08-05

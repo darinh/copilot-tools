@@ -34,6 +34,8 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import stat
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -496,19 +498,325 @@ def infer_instance(project_root, mux: Mux) -> str | None:
     return None
 
 
+CLEAN_OVERRIDE = "--allow-dirty"
+
+#: How many leftover paths either message names before it starts counting.
+#: One constant, not two literals: the refusal and the recorded notice must
+#: truncate at the same point, or the handoff quietly claims a shorter mess
+#: than the agent was just shown.
+LEFTOVER_LIMIT = 20
+
+#: Control characters, escaped before a path is shown to anyone.
+_CONTROL_ESCAPES = {c: f"\\x{c:02x}" for c in range(0x20)}
+_CONTROL_ESCAPES[0x7F] = "\\x7f"
+
+
+def display_path(path: str) -> str:
+    """A leftover path, safe to put in a message.
+
+    ``-z`` gives paths unquoted and literal, which is the point -- a
+    line-based reader turns one newline-containing filename into two paths
+    that do not exist. But it means a filename is arbitrary bytes arriving
+    in a refusal on stderr and in a markdown blockquote in the published
+    handoff, and a newline there forges a whole line: another bullet in the
+    list, or an escape from the blockquote into text that reads like the
+    tool's own words. POSIX permits every byte but ``/`` and NUL in a
+    filename, so this is a real input, not a hypothetical one.
+
+    Escaping control characters closes the forgery, because every markdown
+    structure this text uses is line-initial. A backtick can still end its
+    code span early, which is a visual defect confined to one line and
+    cannot manufacture structure -- stated rather than silently accepted.
+    """
+    return path.translate(_CONTROL_ESCAPES)
+
+
+#: Refusing costs a session its context, so the bar for refusing has to be
+#: something the tool can *see*, not something it infers. These two are:
+#: uncommitted tracked changes, and untracked paths. Both are recoverable by
+#: the agent in the seconds before it hands off, and neither is recoverable
+#: afterwards -- the successor inherits a tree it did not create, cannot tell
+#: which of the mess is load-bearing, and (measured, twice, in this project's
+#: own history) either commits somebody else's work or stashes it away.
+NOTICE_DIRTY = (
+    "> **This handoff was written with `--allow-dirty`.** The checkout was "
+    "not clean when the session ended, and the paths below were left behind "
+    "by the previous agent rather than by you. Nothing here is necessarily "
+    "safe to delete, commit or stash -- ask before you act on any of it."
+)
+
+
+def _git(root, *args: str, stdin: str = "",
+         ok_codes: "tuple[int, ...]" = (0,)) -> "tuple[bool, str]":
+    """Run git in ``root``. Returns (it answered, stdout).
+
+    A git that could not answer is never reported as a clean tree. "No
+    information" and "nothing to report" are the same string to a caller that
+    only looks at the length of a list, and they are opposite facts.
+
+    ``ok_codes`` exists because a non-zero exit is not always a failure:
+    ``git check-ignore`` exits 1 to mean "nothing matched", which is a real
+    answer with empty output, and treating it as a failure is how the ignore
+    filter silently stops filtering.
+    """
+    try:
+        proc = subprocess.run(("git", *args), cwd=str(root),
+                              input=stdin, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return False, ""
+    if proc.returncode not in ok_codes:
+        return False, ""
+    return True, proc.stdout
+
+
+def holds_no_files(directory: Path, budget: int = 512) -> bool:
+    """True when ``directory`` contains directories and nothing else.
+
+    Ported deliberately from ``extensions/checkout-guard/guard.mjs``
+    (``holdsNoFiles``), including the traversal budget and the decision that
+    an *unreadable* directory is not an empty one. The extension is loaded
+    per CLI session, so it speaks only for agents whose runtime happened to
+    load it; this tool is the choke point every agent passes through on the
+    way out. If the two ever disagree the extension is the reference.
+    """
+    stack = [directory]
+    visited = 0
+    while stack:
+        visited += 1
+        if visited > budget:
+            return False
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            # Unreadable is not empty, and guessing either way would be a
+            # claim the filesystem declined to support.
+            return False
+        for entry in entries:
+            try:
+                # `entry.is_symlink() or not entry.is_dir()` rather than
+                # `is_dir(follow_symlinks=False)`: identical on every input
+                # (a symlink, dangling or not, is never descended), and the
+                # kwarg spelling is 3.13+ on `pathlib.Path`. The floor scan
+                # is keyword-gated on the method name alone, so it cannot
+                # tell this `os.DirEntry` -- where the kwarg has been legal
+                # since 3.6 -- from a `Path`. Narrowing the scan to let this
+                # through would cost it every `Path` bound to a variable,
+                # which is the shape it exists to catch.
+                if entry.is_symlink() or not entry.is_dir():
+                    return False
+            except OSError:
+                return False
+            stack.append(Path(entry.path))
+    return True
+
+
+def scan_checkout(root) -> "list[str] | None":
+    """Every path in ``root`` that the next session should not inherit.
+
+    ``None`` means git could not answer, which a caller must treat as "no
+    information" rather than "clean".
+
+    ``-uall`` matters: the default collapses an untracked directory to its
+    name, so a scratch directory holding fifty files reports as one entry and
+    a *reproduction* holding none reports identically to a typo. ``-z``
+    matters because a filename may contain a newline, and a line-based reader
+    turns one such path into two paths that do not exist.
+
+    Empty directories are handled separately because **git does not report
+    them at all** -- there is no blob, so there is nothing to report. That is
+    the blind spot that let this project's own agents leave nine artifacts in
+    a shared checkout while `git status` said clean, and it is precisely the
+    class of failure prose cannot close.
+
+    ``--ignored=matching`` is asked for so that the same single call supplies
+    the prune set for that pass: git reports an ignored directory collapsed
+    to its own name (``!! node_modules/``) without descending into it, and it
+    reports an ignored directory that is *empty* too. Deriving the prune set
+    any other way means one ``check-ignore`` per candidate, which is what
+    kept the empty-directory pass to the top level of the checkout. Old git
+    that does not know the option answers nothing, so the plain form is tried
+    after it -- losing the empty-directory half rather than the whole guard.
+    """
+    answered, out = _git(root, "status", "--porcelain", "-uall",
+                         "--ignored=matching", "-z")
+    ignored_known = answered
+    if not answered:
+        answered, out = _git(root, "status", "--porcelain", "-uall", "-z")
+    if not answered:
+        return None
+    records = [r for r in out.split("\0") if r]
+    paths: "list[str]" = []
+    ignored: "list[str]" = []
+    skip_next = False
+    for record in records:
+        if skip_next:            # the second half of a rename/copy record
+            skip_next = False
+            continue
+        if len(record) < 4:
+            continue
+        code, path = record[:2], record[3:]
+        # `R` and `C` are the two status letters whose record occupies *two*
+        # NUL-separated fields, and the second arrives bare -- no status
+        # prefix. Slicing three characters off it reports `name.txt` for
+        # `oldname.txt`: a path that never existed, handed to an agent as
+        # litter to go and remove.
+        #
+        # The index column only, measured rather than assumed: an *unstaged*
+        # rename is not detected as one, it is reported as ` D old` plus
+        # `?? new`, two ordinary one-field records. Testing the worktree
+        # column as well looks like defence and is the opposite -- a stray
+        # `R` there would consume the following real record, turning a
+        # false positive into a silent miss. `C` needs `status.renames=copies`,
+        # which is somebody's config away.
+        if code[0] in "RC":
+            skip_next = True
+        if code == "!!":
+            ignored.append(path)
+        else:
+            paths.append(path)
+    if not ignored_known:
+        return paths
+    return paths + _empty_dir_strays(root, ignored)
+
+
+#: How many directories the candidate walk will visit before it gives up.
+#: Exceeding it costs findings, never invents them -- an unvisited subtree is
+#: never reported as empty.
+WALK_BUDGET = 4096
+
+
+def _is_junction(entry) -> bool:
+    """Whether a directory entry is a Windows junction.
+
+    ``is_symlink()`` answers False for one and ``is_dir()`` answers True, so
+    the walk descends a junction as though it were an ordinary directory --
+    which is how a *dangling* one became invisible. Git emits ``warning:
+    could not open directory`` on **stderr** and reports nothing on stdout, so
+    ``git status`` calls the tree clean; the walk then hit ``OSError`` and, by
+    the rule that unreadable is not empty, dropped it too. Both halves agreed,
+    and neither had looked.
+
+    ``os.DirEntry.is_junction()`` would say this in one call but arrived in
+    3.12, above this project's floor. ``st_reparse_tag`` is Windows-only and
+    3.8, so ``AttributeError`` is the POSIX answer, not a failure.
+    """
+    try:
+        tag = entry.stat(follow_symlinks=False).st_reparse_tag
+    except (OSError, AttributeError, ValueError):
+        return False
+    return tag == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", object())
+
+
+def _empty_dir_strays(root, ignored: "list[str]") -> "list[str]":
+    """Untracked directories holding no files, which git never reports.
+
+    ``ignored`` is git's own collapsed answer (``!! node_modules/``), used to
+    prune. An unfiltered walk is not a rougher answer -- it is every ignored
+    build directory in the project, handed to an agent as litter, plus the
+    time to walk `node_modules`.
+
+    Only the *outermost* empty directory is reported. Naming ``a/``, ``a/b/``
+    and ``a/b/c/`` for one stray describes one mistake three times, and the
+    two inner entries vanish the moment the outer one is removed.
+    """
+    root = Path(root)
+    prune = {p.rstrip("/") for p in ignored}
+    candidates: "list[str]" = []
+    links: "list[str]" = []
+    visited = 0
+    stack = [""]
+    while stack:
+        rel = stack.pop()
+        visited += 1
+        if visited > WALK_BUDGET:
+            break
+        try:
+            entries = list(os.scandir(root / rel if rel else root))
+        except OSError:
+            # Unreadable is not empty. Its children are unknown, so it is not
+            # a candidate and neither is anything under it.
+            continue
+        for entry in entries:
+            # `.git` is excluded belt-and-braces. It cannot actually reach a
+            # finding: in an ordinary repository it holds files from the
+            # moment `git init` returns (HEAD, config, description), so
+            # `holds_no_files` rejects it, and in a linked worktree it is a
+            # *file* and never becomes a candidate at all.
+            if entry.name == ".git":
+                continue
+            try:
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+            except OSError:
+                continue
+            child = f"{rel}/{entry.name}" if rel else entry.name
+            if child in prune:
+                continue
+            if _is_junction(entry):
+                # Reported, never descended. Git cannot store a junction --
+                # there is no tree entry for one -- so a junction inside a
+                # checkout is always something a process left behind, and it
+                # is the one artifact git can be silent about while the
+                # filesystem still holds it. Descending it would also walk
+                # out of the checkout, or round a cycle if it points at an
+                # ancestor. A junction that is legitimate infrastructure
+                # (`node_modules` pointed at a shared cache) is in
+                # `.gitignore`, so `prune` above has already dropped it.
+                links.append(child)
+                continue
+            candidates.append(child)
+            stack.append(child)
+    found: "list[str]" = []
+    for candidate in sorted(candidates):
+        # The walk already appends a directory before any of its descendants,
+        # so this sort is belt-and-braces rather than the thing that makes the
+        # dedupe below correct -- mutating it away changes no observable
+        # behaviour. It is kept because the invariant then lives on this line
+        # instead of in a property of the loop above, which a later edit to
+        # the traversal could quietly retire.
+        if any(candidate.startswith(f"{f.rstrip('/')}/") for f in found):
+            continue
+        if holds_no_files(root / candidate):
+            found.append(f"{candidate}/")
+    return found + links
+
+
+def checkout_complaints(root) -> "tuple[list[str], str]":
+    """What is wrong with ``root``, and a one-line summary of how sure we are.
+
+    Separated from the refusal so the refusal text, the override notice and
+    the tests all read the same list rather than three re-derivations of it.
+    """
+    found = scan_checkout(root)
+    if found is None:
+        return [], "unknown"
+    return sorted(found), "measured"
+
+
 def render(status: str, in_progress: str, next_steps: str,
-           context: str, prompt: str, instance: str = "") -> str:
+           context: str, prompt: str, notice: str = "",
+           instance: str = "") -> str:
     """The handoff document.
 
-    ``instance`` is stamped under the title rather than above it, so the file
-    is still a handoff document to anything that keys on the
-    ``# Session Handoff`` header, and above ``## Status`` so a reader learns
-    whose session this was before reading a document written throughout in
-    the first person. An empty ``instance`` emits no stamp at all rather than
-    an empty one -- see :func:`authoring_instance` on why "does not say" must
-    stay distinct from a name.
+    ``notice`` is a block the *tool* has to say about the circumstances of the
+    write -- currently only :data:`NOTICE_DIRTY`, since instance keying
+    removed the lock whose contended paths used to have their own. It sits
+    under the title rather than above it so the file is still a handoff
+    document to anything that keys on the ``# Session Handoff`` header, and
+    above ``## Status`` so a reader meets it before the content it qualifies.
+
+    ``instance`` is stamped in the same band, below the notice: the notice is
+    about *this write* and may change what the reader does next, while the
+    stamp qualifies every word in the file. Both are above ``## Status``, so a
+    reader learns whose session this was before reading a document written
+    throughout in the first person. An empty ``instance`` emits no stamp at
+    all rather than an empty one -- see :func:`authoring_instance` on why
+    "does not say" must stay distinct from a name.
     """
     parts = ["# Session Handoff", ""]
+    if notice:
+        parts += [notice, ""]
     if instance:
         parts += [author_line(instance), ""]
     parts += ["## Status", status, ""]
@@ -540,6 +848,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Ready-to-execute prompt for the next session")
     parser.add_argument("--project-root", dest="project_root", default=None,
                         help="Project root (default: cwd), used for GUID lookup")
+    parser.add_argument("--allow-dirty", dest="allow_dirty",
+                        action="store_true",
+                        help="Hand off even though the checkout is not clean. "
+                             "Records the leftover paths in the handoff.")
     return parser
 
 
@@ -586,6 +898,42 @@ def main(argv: list[str] | None = None) -> int:
               "Handoff file will be written but restart may not trigger.",
               file=sys.stderr)
 
+    # Checked here: after the arguments are known to be good and the instance
+    # is named, and before anything at all has been written or locked. A
+    # refusal at this point has cost nothing and changed nothing, so the
+    # session that hits it can still fix the tree and run the same command
+    # again.
+    leftovers, certainty = checkout_complaints(project_root)
+    dirty_notice = ""
+    if leftovers and not args.allow_dirty:
+        shown = "\n".join(f"    {display_path(p)}"
+                          for p in leftovers[:LEFTOVER_LIMIT])
+        more = (f"\n    ... and {len(leftovers) - LEFTOVER_LIMIT} more"
+                if len(leftovers) > LEFTOVER_LIMIT else "")
+        die(f"The checkout is not clean, so this handoff was not written.\n\n"
+            f"{shown}{more}\n\n"
+            f"  Handing off now makes these somebody else's problem, and they "
+            f"will have no way\n"
+            f"  to tell which of them matters. Commit what belongs to the "
+            f"repository, delete\n"
+            f"  what was scratch, and run the same command again.\n\n"
+            f"  If they genuinely must be left, re-run with "
+            f"{CLEAN_OVERRIDE} -- the handoff will\n"
+            f"  say so and list them, so the next session is told rather than "
+            f"left to guess.")
+    if leftovers:
+        listed = "\n".join(f"> - `{display_path(p)}`"
+                           for p in leftovers[:LEFTOVER_LIMIT])
+        if len(leftovers) > LEFTOVER_LIMIT:
+            # The refusal text says "and N more"; this must too. A successor
+            # handed twenty of sixty paths, with nothing saying so, will read
+            # the list as complete and clean up two thirds of a mess.
+            listed += (f"\n> - ... and {len(leftovers) - LEFTOVER_LIMIT} more")
+        dirty_notice = f"{NOTICE_DIRTY}\n>\n{listed}"
+    elif certainty == "unknown":
+        print("Warning: could not ask git whether this checkout is clean; "
+              "handing off without that check.", file=sys.stderr)
+
     guid = resolve_guid(primary_repo_root(project_root))
     proj_dir = project_dir(guid)
     handoff_file = handoff_path(proj_dir, instance_id)
@@ -603,8 +951,22 @@ def main(argv: list[str] | None = None) -> int:
     for line in migrate_project_handoff(proj_dir):
         print(f"Migrated handoff state: {line}", file=sys.stderr)
 
-    body = render(args.status, args.in_progress, args.next_steps,
-                  args.context, args.prompt, instance=instance_name)
+    # The dirty-checkout notice is joined inside this closure rather than
+    # passed at the call site. It arrived on `main` alongside a lock whose
+    # contended paths each re-rendered with their own notice; instance keying
+    # removed the lock, so there is one caller left. The closure is kept
+    # anyway, because the argument for it never depended on the lock: a caller
+    # that forgets to re-add `dirty_notice` drops the leftovers list from
+    # exactly the handoff whose reader most needs it, and a closure that
+    # cannot be called without it is the only arrangement where forgetting is
+    # not possible.
+    def render_body(notice: str = "") -> str:
+        both = "\n>\n".join(n for n in (dirty_notice, notice) if n)
+        return render(args.status, args.in_progress, args.next_steps,
+                      args.context, args.prompt, notice=both,
+                      instance=instance_name)
+
+    body = render_body()
 
     banked = bank_prior_handoff(handoff_file)
     if banked is not None:

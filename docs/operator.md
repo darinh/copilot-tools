@@ -590,6 +590,93 @@ Intentional operator handoffs still start a fresh Copilot CLI session and rely o
 
 If a named loop resumes with a saved CLI session ID but finds **no handoff file** for the project (`~/.operator/projects/{guid}/handoff/{instance}.md`, resolved from `~/.operator/projects/catalog.csv`), that almost always means the previous session ended without calling `handoff` — most likely a crash. The preamble gets an extra note in that case telling the agent this looks like crash recovery and, if it *did* mean to stop cleanly, to remember to write a handoff next time. Resuming after a clean `handoff`-triggered restart (or any run where the handoff file already exists) never adds this note.
 
+### A handoff will not leave the checkout dirty
+
+`handoff` asks git what is outstanding in the checkout before it writes
+anything, and refuses if the answer is not "nothing":
+
+```
+The checkout is not clean, so this handoff was not written.
+
+    probe.py
+    ntf_review_mutabc/
+
+  Handing off now makes these somebody else's problem, and they will have no way
+  to tell which of them matters. Commit what belongs to the repository, delete
+  what was scratch, and run the same command again.
+
+  If they genuinely must be left, re-run with --allow-dirty -- the handoff will
+  say so and list them, so the next session is told rather than left to guess.
+```
+
+The rule this enforces was documented prose for months, with the story behind
+it and the reasoning, and agents who had read it left artifacts in a shared
+checkout three times in one evening — nine of them in a single review round.
+Prose describes; it does not prevent. `handoff` is the one command every agent
+runs on the way out, so it is where the check belongs.
+
+One more measurement, from a peer instance that read this gate the day it
+landed. It reported that its checkout was clean of scratch by construction —
+its mutation harness clones the repository per mutant into `%TEMP%` — and
+then said the part worth recording: *"I would not have predicted that from
+AGENTS.md alone. I do it because a clone is the only way the git `cat-file`
+check still resolves."* The one agent that satisfied the rule got there from
+an unrelated technical constraint, not from having read it. That is the
+argument for the gate stated better than the argument for the gate: compliance
+that arrives as a by-product of something else is not evidence the prose
+works, and it is the best case the prose ever gets.
+
+Four kinds of leftover are reported: uncommitted changes to tracked files,
+untracked files (individually — `-uall`, so a scratch directory holding fifty
+files is not one line saying "scratch/"), **empty untracked directories**, and
+on Windows, **directory junctions**.
+
+The empty directories are the whole reason this is a tool and not a `git
+status` in a shell prompt. Git has nothing to report for an empty directory —
+there is no blob — so `git status` prints a clean tree while artifacts sit in
+its root. That is precisely what cost three agents an evening diagnosing a
+working-directory bug that did not exist: the directories had been left by
+their own review subagents, and every explanation fitted the evidence equally
+well because the evidence had no provenance.
+
+Junctions are the same silence by a different route, and adversarial review
+found them. A junction is not a symlink — `is_symlink()` answers False and
+`is_dir()` answers True — so the walk descended one as though it were an
+ordinary directory. Point one at a directory and then delete the target, and
+git prints `warning: could not open directory` on **stderr** and nothing at
+all on stdout, so `git status` calls the tree clean; the walk then hit the
+same error and dropped it under "unreadable is not empty". Both halves agreed
+and neither had looked. Git cannot store a junction — there is no tree entry
+for one — so a junction inside a checkout is always something a process left
+behind, and it is now reported rather than walked into. One that is
+legitimate infrastructure (`node_modules` pointed at a shared cache) is in
+`.gitignore` and is pruned like any other ignored path.
+
+The check runs before the tool creates any directory or writes any file, so a
+refusal changes nothing and the same command works once you have cleaned up.
+If git cannot answer at all — the project root is not a checkout, or git is
+not installed — the handoff proceeds with a warning. "No information" is never
+reported as "clean".
+
+`--allow-dirty` exists because refusing outright would be the worse failure:
+it destroys a live session's context to prevent a stray file. The override does
+not merely silence the check, it **records** what was left in the published
+handoff, under the title and above `## Status`, so the successor is told rather
+than left to work out which of the mess is load-bearing.
+
+Two limits worth knowing. The scan covers the checkout you are in — for an
+agent that is its worktree, not the primary checkout, because refusing your
+handoff on account of somebody else's dirty worktree would be wrong. And the
+legacy `handoff.sh` has no equivalent guard (backlog item 0020).
+
+The empty-directory pass walks the whole checkout, not just its root, so a
+scratch directory left under `tests/` is found. It is the one part of the guard
+that costs more than a single `git status`, and it is bounded twice over: the
+directories git reports as ignored (`node_modules/`, `.venv/`, build output)
+are pruned without being entered, and the walk stops after 4096 directories.
+Both bounds fail in the same direction — an unvisited subtree is never reported
+as empty. Exhausting the budget costs a finding; it cannot invent one.
+
 ### An unread handoff
 
 `handoff` does not silently replace one. `os.replace` is atomic — a reader

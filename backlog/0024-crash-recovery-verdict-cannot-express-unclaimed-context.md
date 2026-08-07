@@ -1,5 +1,5 @@
 ---
-id: 21
+id: 24
 title: crash_recovery_verdict cannot express unclaimed context
 status: proposed
 opened: 2026-08-05

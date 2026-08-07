@@ -199,3 +199,12 @@ diagnosed rather than what it is:
    not only that it names the condition, but that it makes the remedy's effect
    observable immediately — otherwise confirmation costs a restart plus a wait
    for the next session, which is long enough that nobody checks.
+
+One thing a parallel write-up of this exchange caught that the account
+above does not: **step 2 of the Evidence section is itself that
+inference.** "`operator.log` has no ... line at that launch. The running
+code never evaluated the verdict" reads the absence as a statement about
+which branch ran. It reached the right conclusion, but only because step 4
+was already in hand — which is exactly the condition under which this
+evidence is safe, and exactly the condition a reader diagnosing it fresh
+does not have.
