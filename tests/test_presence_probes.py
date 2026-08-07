@@ -1034,7 +1034,7 @@ def test_a_project_root_it_cannot_examine_still_gets_its_handoff_written(
     assert seen["n"], "the denial never fired; the test proves nothing"
     assert rc == 0
     written = (handoff_env["home"] / ".operator" / "projects" / "guid-root"
-               / "next-session.md")
+               / "handoff" / "proj.md")
     assert "## Status" in written.read_text(encoding="utf-8")
 
 

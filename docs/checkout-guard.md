@@ -160,6 +160,32 @@ running" is not evidence that the eighth is healthy.
    denied** while such artifacts are outstanding. Staging a path by name is
    always allowed: the aim is to stop artifacts being committed *unnoticed*,
    not to stop them being committed.
+4. **A `create` or `edit` aimed at another checkout of the same repository is
+   denied.** A worktree is a second directory for the same project, not a
+   second project: a file written into the one you are not looking at is
+   invisible to you and turns up in someone else's `git status` with no
+   provenance. Writes *outside* the repository are never blocked — the temp
+   directory is where this guard tells every agent to put scratch work, and a
+   rule that blocked it would leave nowhere legitimate to write.
+5. **Delegating to a subagent with uncommitted changes in tracked files is
+   denied.** A subagent runs its own git commands in the same checkout; one
+   that reaches for `stash`, `reset --hard` or `checkout --` destroys them and
+   leaves `git status` clean afterwards. Untracked files are deliberately not
+   counted — they survive those commands, and counting them would make every
+   session with one scratch file undelegatable.
+6. **`git commit` on `main` or `master` is denied**, unless a merge,
+   cherry-pick or revert is waiting to be concluded. That exception is not a
+   courtesy: merging a feature branch into `main` is how work lands, and a
+   conflicted merge is finished with `git commit`.
+
+Rules 4–6 arrived from the audit in `specs/004-operator-session/audit.md`.
+Each had been carried as a sentence in every project's instruction file that
+an agent had to be holding in mind at the moment it mattered, and each turns
+out to be decidable from a tool call's own arguments before it runs. They live
+in this extension rather than a second one because the parsing they need —
+"which repository does this command actually address", "where is the primary
+checkout" — already exists here, and a second copy of that rule is a
+duplication this repository has already paid for once.
 
 Files written with the `create` and `edit` tools are never treated as strays.
 Those are the sanctioned way to author content, and the distinction between "a

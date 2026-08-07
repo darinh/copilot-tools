@@ -206,3 +206,93 @@ def test_handoff_and_operator_agree_on_what_membership_means():
     assert ours == theirs, (
         "handoff.sh's in_list has drifted from operator.sh's:\n"
         f"--- operator.sh ---\n{theirs}\n--- handoff.sh ---\n{ours}")
+
+
+# -- the instance name has to be a filename ----------------------
+
+def _addressable(tmp_path, name: str):
+    """The real ``addressable_instance_id`` body, on one name.
+
+    `die` is stubbed rather than sourced so the probe can distinguish a
+    refusal from a crash: the script's own `die` exits 1, and so does almost
+    every other way a bash script can fail under `set -e`.
+    """
+    script = (
+        "set -euo pipefail\n"
+        'die() { printf "REFUSED: %s\\n" "$*" >&2; exit 3; }\n'
+        f"addressable_instance_id() {{\n"
+        f"{_shell_function(HANDOFF_SH, 'addressable_instance_id')}}}\n"
+        'addressable_instance_id "$1"\n'
+        'printf "%s\\n" "$instance_id"\n'
+    )
+    path = tmp_path / "probe.sh"
+    path.write_text(script, encoding="utf-8", newline="\n")
+    return subprocess.run([_bash_executable(), "probe.sh", name],
+                          cwd=tmp_path, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=60)
+
+
+@bash
+@pytest.mark.parametrize("name", [
+    "../../elsewhere/steal",   # escapes the project's handoff directory
+    "a/b",                     # ditto, one level
+    "a.b",                     # safe_instance_id would append a digest
+    "a:b",                     # ditto, and would collide with `a.b` without it
+    "-lead",                   # outer dashes are stripped by sanitize_name
+    "trail-",
+    "",
+    "con",                     # a Windows device name gets a digest suffix
+    "COM1",
+    "a-b-69f664",              # already shaped like a generated digest
+])
+def test_a_name_this_script_cannot_address_is_refused_not_guessed(
+        tmp_path, name):
+    """Refusing loudly beats writing a real handoff where nothing reads.
+
+    Every name here is one `safe_instance_id` would return *changed*, so the
+    installed `handoff` and `operator` address it by a different filename than
+    a literal interpolation would. The first two are worse than a mismatch:
+    they leave the project's handoff directory entirely.
+    """
+    proc = _addressable(tmp_path, name)
+
+    assert proc.returncode == 3, (
+        f"{name!r} was not refused; the script would write to a path "
+        f"`operator` does not read. stdout={proc.stdout!r}")
+    assert "REFUSED" in proc.stderr
+
+
+@bash
+@pytest.mark.parametrize("name", ["copilot-tools", "agent-academy", "x9",
+                                  "a-b-1234567"])
+def test_an_ordinary_instance_name_is_passed_through_unchanged(tmp_path, name):
+    """The other half, and the one that would make the guard useless if wrong.
+
+    A refusal that fired on the names `operator` actually generates would
+    break every handoff on the platforms this script exists for, so the
+    accepted set is pinned rather than left to the refusal tests to imply.
+    `a-b-1234567` is one character too long to be the digest suffix, which is
+    the boundary the pattern is most likely to get wrong.
+    """
+    proc = _addressable(tmp_path, name)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == name
+
+
+@bash
+def test_the_script_addresses_the_handoff_by_the_validated_id(tmp_path):
+    """The guard is worth nothing if the paths are still built from the raw name.
+
+    A source check rather than a run, because reaching the write path needs a
+    catalog, a guid and a mux; what can go wrong here is an interpolation left
+    behind, and that is visible in the text.
+    """
+    text = HANDOFF_SH.read_text(encoding="utf-8")
+    after = text[text.index('addressable_instance_id "$instance"'):]
+    leaked = [line.strip() for line in after.splitlines()
+              if "${instance}" in line and "echo" not in line
+              and "printf" not in line]
+    assert not leaked, (
+        "these lines below the guard still interpolate the unvalidated "
+        "name:\n  " + "\n  ".join(leaked))

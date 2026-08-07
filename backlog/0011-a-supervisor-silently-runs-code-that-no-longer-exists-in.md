@@ -118,42 +118,93 @@ whose supervisor cannot show it is running current code say so *in the
 preamble*, next to the claims that code is responsible for? Everything else
 here is done.
 
-## The absent log line is the trap, 2026-08-06
+## Second independent confirmation, 2026-08-05
 
-Reported by the `scripts` operator instance, which hit this class again and
-re-measured it. Worth recording because it is the one piece of evidence in
-this class that **actively points the wrong way**, and this item's own
-evidence chain steps straight into it.
+Reported unprompted by the `scripts` operator instance, which had measured the
+symptom carefully and deliberately declined to hand over a mechanism it had
+not demonstrated. Its evidence: of 64 launches in
+`~/.operator/restart/scripts.runner.log`, 51 carry the "a handoff file could
+not be found for this project" note, consecutively, while over the same window
+handoffs were being written and read normally — 12 banked handoffs in that
+project's `superseded/` plus a live `next-session.md`, and a launch 34 seconds
+after that file was written still carried the note.
 
-`scripts` saw 51 of 64 launches carrying the false "a handoff file could not
-be found" clause while handoffs were demonstrably being written and read --
-12 banked in `superseded/` plus a live `next-session.md`, and a launch 34
-seconds after that file was written still carried the note. Its strongest
-lead was an absence: `crash_recovery_verdict` logs a line on *every* branch
-that returns early, and the runner log contained none of those strings. The
-natural reading is "the verdict is not being reached through the code I
-read" -- so you go looking for a second call site, or a second log sink.
+It explicitly *ruled out* this item's mechanism, and the reasoning is worth
+recording because it is wrong in an instructive way: it compared the notice
+dates against the **commit date** of 8f58a00 and found 13 notices postdating
+it. That does not discriminate. A commit landing does not change a running
+process, so the number to compare against is the **supervisor start time**.
+Measured: `scripts.loop.pid` has mtime 2026-08-04 13:27:53 and 8f58a00 landed
+2026-08-04 19:36:03 — the supervisor started six hours before the fix and is
+running the pre-8f58a00 shape that baked the verdict once at loop start. One
+decision replayed 51 times, not 51 evaluations.
 
-There is no second call site. **An absent log line is evidence about which
-code is loaded, not about which branch ran.** The log lines are younger than
-the running process, so nothing it does can produce them.
+The same fact explains the observation that made it doubt the mechanism:
+`scripts.runner.log` contains none of the verdict's branch log strings, because
+the running code predates those log lines entirely. **An absent log line is
+evidence about which code is running, not about which branch it took** — and
+reading the source cannot show it, because the source is not what is executing.
 
-Step 2 of the Evidence section above ("`operator.log` has no ... line at that
-launch. The running code never evaluated the verdict") is that same
-inference. It reached the right conclusion, but only because step 4 was
-already in hand.
+`operator list` named the instance `[supervisor code unrecorded]` at the time
+of the report, so 6d2385c's record did fire; it simply is not where either
+agent looked. That is the residue above, now confirmed twice: the misinformation
+lands in the preamble and the remedy is legible only at the command line. The
+second instance cost a peer a diagnosis it could not complete rather than
+several sessions, which is an improvement attributable to nothing in this
+repository.
 
-The antidote is to pair the absence with the pid mtime, which is positive
-evidence and dates the process rather than the code. `scripts` measured the
-boundary precisely: the first note-carrying launch of the run landed at
-13:27:54 and `scripts.loop.pid` had an mtime of 13:27:53 -- one second
-earlier. A verdict taken once at loop start has no cleaner signature than
-that, and it also refuted its own earlier framing that the notes were
-consecutive since 08-01, which a run boundary explained and a code path did
-not.
+## Resolved for that instance, and a sharper signature, 2026-08-05
 
-Second thing `scripts` reported, which is a result rather than a lesson:
-`operator list` naming the condition let it confirm the fix **without waiting
-for a launch**. That is the affordance the Correction above says had never
-been exercised in production; it now has been, by a second instance, for a
-purpose it was not specifically built for.
+The `scripts` instance re-measured against the boundary this item names and
+ran the remedy. Both halves are worth keeping, because the measurement is a
+better tell than the one this item had, and the remedy is the first recorded
+confirmation that it works on a live session.
+
+Classifying **every** launch line in `scripts.runner.log` by whether it
+carries the note, rather than looking for the first one:
+
+    off  from 2026-07-31 17:09:08
+    ON   from 2026-08-01 15:36:33
+    off  from 2026-08-01 23:02:00
+    ON   from 2026-08-04 13:27:54   -> 36 of 36, no gap
+
+`scripts.loop.pid` mtime: **2026-08-04 13:27:53**. The first notice of the
+run lands **one second after the supervisor process starts**, and then every
+launch of that run carries it without a gap. A verdict evaluated per launch
+cannot produce that; a verdict taken once at loop start produces exactly it.
+
+The re-measurement also refuted the report's own framing — "consecutive since
+08-01 23:16:54" was wrong, there was an earlier note-carrying block on 08-01
+from a **previous run**. That is the same shape as the mistake corrected
+above: a window drawn from where the evidence was first noticed rather than
+from where the process boundaries are. Blocks of the note are per-run, so the
+unit to bucket by is the supervisor process, not the day.
+
+`operator restart-loop scripts` cleared it: pid 5928 -> 42356, the live
+session kept running, and `operator list` immediately dropped the tag. The
+four other instances were deliberately left alone — live sessions in other
+projects, not that agent's call to make.
+
+Two things that peer asked be recorded, both of which are about how this is
+diagnosed rather than what it is:
+
+1. **The absent log line is the one piece of evidence that actively misleads.**
+   It reads as "the verdict was not reached through that code" and it means
+   "the running code predates those log lines". This item already says so a
+   few paragraphs up; it is repeated here because two independent agents
+   reached for that evidence first and both were pointed the wrong way by it.
+   It is worth more than a mention in passing.
+2. **`operator list` naming the condition is what allowed the fix to be
+   confirmed without waiting for a launch.** The value of 6d2385c's record is
+   not only that it names the condition, but that it makes the remedy's effect
+   observable immediately — otherwise confirmation costs a restart plus a wait
+   for the next session, which is long enough that nobody checks.
+
+One thing a parallel write-up of this exchange caught that the account
+above does not: **step 2 of the Evidence section is itself that
+inference.** "`operator.log` has no ... line at that launch. The running
+code never evaluated the verdict" reads the absence as a statement about
+which branch ran. It reached the right conclusion, but only because step 4
+was already in hand — which is exactly the condition under which this
+evidence is safe, and exactly the condition a reader diagnosing it fresh
+does not have.

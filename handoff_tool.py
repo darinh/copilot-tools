@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """Atomic session handoff for Copilot CLI agents.
 
-Writes ``next-session.md`` for the project and raises the operator's restart
-marker so the loop picks up a fresh session. Cross-platform.
+Writes this instance's handoff and raises the operator's restart marker so the
+loop picks up a fresh session. Cross-platform.
 
-A handoff that is still sitting unread when the next one is written is copied
-into ``superseded/`` beside it rather than overwritten -- see
-``preserve_prior_handoff``. A handoff written on a contended path carries a
-notice saying so in its own bytes -- see ``NOTICE_UNSERIALISED`` -- because the
-stderr warnings belong to the session that is ending, and the party who needs
-to know is the one that reads what was left behind.
+The handoff is keyed by **instance**, at
+``~/.operator/projects/{guid}/handoff/{instance}.md``. It used to be one
+``next-session.md`` per project, and that single mis-keying is what most of
+this module used to be about: a lock, an unbounded ``superseded/`` archive,
+three notice banners, and a rule for telling an unread predecessor from a
+peer's mid-publish copy. A handoff is written in the first person -- *my*
+worktree, *I* claimed this, check *my* inbox -- so it is instance-scoped by
+construction; storing it at a project key meant peers sharing a checkout all
+published to one mailbox while restarting on their own signals.
+
+One writer per file removes the race rather than arbitrating it. What survives
+is one bounded case: a handoff still sitting unread when the next one is
+written is moved aside to ``{instance}.prev.md`` first. That cannot happen in
+the ordinary flow, because the reader deletes the file -- so finding one there
+means a session ended without its predecessor's context ever being picked up.
 
 Differences from the bash predecessor:
 
@@ -28,9 +37,7 @@ import platform
 import stat
 import subprocess
 import sys
-import time
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -75,90 +82,67 @@ IS_WINDOWS = platform.system() == "Windows"
 # itself, which is what the tests here do and what conftest's guard tells you
 # to do when it catches a write to the live catalog.
 CATALOG = projects_root() / "catalog.csv"
-# Where a handoff that was never read goes instead of into the bit bucket.
-SUPERSEDED_DIRNAME = "superseded"
-# The three facts a reader of one of these files cannot otherwise recover.
+
+#: One handoff per *instance*, under this directory inside the project dir.
+#:
+#: The handoff used to be one ``next-session.md`` per project, and almost every
+#: piece of machinery that used to live in this module existed to compensate
+#: for that: a lock, a ``superseded/`` archive nothing pruned, three notice
+#: banners, an authorship stamp and a rule for interpreting it, and several
+#: hundred words of instructions teaching agents to tell two cases apart.
+#:
+#: None of it was wrong. All of it was scaffolding holding up a type error. A
+#: handoff is written in the first person -- *my* worktree, *I* claimed this,
+#: check *my* inbox -- so it is instance-scoped by construction, and storing it
+#: at a project key meant every instance sharing a checkout published to one
+#: mailbox while restarting on its own signal. Whichever instance restarted
+#: next read whatever was there, and the protocol then had that reader delete
+#: it.
+#:
+#: Keyed by instance there is one writer per file. The race is gone, "is this
+#: mine?" is answered by the filename, and a read can no longer consume a
+#: peer's context.
+HANDOFF_DIRNAME = "handoff"
+
+#: Where a handoff goes when it is still sitting unread as the next one is
+#: written. Exactly one slot per instance, replaced each time.
+#:
+#: This is the one preservation case that survives the re-keying, and it is a
+#: different animal from the pile-up that ``superseded/`` was built for. That
+#: one was routine -- peers overwriting each other was the *ordinary* flow, so
+#: the archive grew without bound and needed a promise never to prune it. This
+#: one cannot happen in the ordinary flow at all: the reader deletes the file,
+#: so finding one still there means a session ended without its predecessor's
+#: handoff ever being picked up. That is an anomaly worth keeping, and keeping
+#: one of is enough -- a second consecutive miss is a broken loop, not a
+#: context to rescue.
+PREV_SUFFIX = ".prev.md"
+
+#: Where the project-keyed files are moved to when this layout first appears.
+#: Nothing is deleted: a banked handoff is dropped context, which is the exact
+#: failure this module spends its length avoiding.
+LEGACY_DIRNAME = "legacy"
+
+# The one fact a reader of one of these files cannot recover from its *bytes*:
+# **who wrote this**.
 #
-# Everything the tool knows about a contended handoff is currently said on
-# stderr, which belongs to the session that is about to end -- so the one
-# party who never learns of it is the next session, whose whole job is to read
-# what is left behind. A file in `superseded/` looks the same whether it is an
-# ordinary unread predecessor, a copy banked while a peer was mid-publish, or
-# a handoff that was never published at all; only the last two mean "this may
-# be newer than the `next-session.md` next to it".
+# The filename answers it now -- `handoff/{instance}.md` -- so this is no
+# longer load-bearing for the reader who finds the file in place, and the
+# whole apparatus that used to hang off it is gone: the "is this mine?" check,
+# the three notice banners, and the prose teaching agents to tell an unread
+# predecessor from a peer's mid-publish copy.
 #
-# So the notice goes in the bytes. It survives the session, it travels with
-# the file it describes, and it is addressed to the agent who finds it rather
-# than to the one who caused it.
+# It is kept for two narrower reasons, both measured rather than imagined.
+# First, the migration below needs it: a project-keyed `next-session.md`
+# written before this change has nothing *but* the stamp to say which
+# instance's mailbox it belongs in. Second, a handoff that gets copied or
+# rescued out of its directory loses the filename and keeps the bytes -- which
+# happened on this machine on 2026-08-05, when a supervisor running older code
+# wrote to the pre-migration path and its handoff had to be carried across by
+# hand.
 #
-# **Each notice is written before its own outcome is known, so none of them
-# may assert one.** Both are attached ahead of the events they describe: the
-# published notice is chosen before the spare copy is attempted, and the
-# banked notice is written before the publish is attempted -- and either can
-# then fail. Adversarial review found both halves of that, independently: a
-# published file claiming "a copy was banked" when the bank had just raised,
-# and a banked copy claiming "this session published" when the publish was
-# about to be abandoned. They are phrased as what was *attempted* and what the
-# reader should therefore check, which is true on every path that reaches
-# them.
-#
-# The same rule reaches backwards: **a notice may not assert the cause of the
-# contention either.** ``handoff_lock`` yields False for three different
-# reasons -- a lock still held at the deadline, a directory that will not take
-# a lock file at all, and a lock file that could not be written and so was
-# removed -- and only the first is even possibly a live peer, since a lock
-# left by a process that died reads exactly like one held by a process that is
-# working. A second review round found notices asserting "another handoff was
-# in progress" on all three. What is knowable at the stamp site is that the
-# lock was not taken, and that is what they say.
-NOTICE_UNSERIALISED = (
-    "> **⚠ Published without the handoff lock.** The lock that serialises\n"
-    "> handoffs for this project could not be taken, so this file was written\n"
-    "> unserialised: it may have overwritten a concurrent handoff — or been\n"
-    "> overwritten by one since. Read `superseded/` alongside this file before\n"
-    "> deciding what you are picking up: a copy in there marked as banked may\n"
-    "> be newer than this one."
-)
-NOTICE_BANKED_UNSERIALISED = (
-    "> **⚠ Banked copy — these words may never have reached\n"
-    "> `next-session.md`.** The handoff lock could not be taken, so this\n"
-    "> session banked its context here *before* attempting to publish\n"
-    "> unserialised. If `next-session.md` does not contain these words, the\n"
-    "> publish was abandoned or a concurrent handoff replaced it, and this\n"
-    "> copy is the only one there is."
-)
-NOTICE_BANKED_UNPUBLISHED = (
-    "> **⚠ Banked copy — this handoff was never published.** The handoff\n"
-    "> already at `next-session.md` could not be preserved first, so it was\n"
-    "> not replaced and these words were banked here instead. This copy is\n"
-    "> newer than the `next-session.md` beside it."
-)
-# The fourth fact a reader cannot otherwise recover: **who wrote this**.
-#
-# `next-session.md` is keyed by PROJECT and the restart marker is keyed by
-# INSTANCE, so every operator instance working a shared checkout publishes to
-# one mailbox and restarts on its own signal. Whichever instance restarts next
-# reads the file, whoever wrote it -- and the protocol then has that reader
-# delete it, so the author's own next session finds nothing.
-#
-# Measured on this repository, not reasoned about: ten handoffs accumulated in
-# one project's `superseded/` in a single day, written by at least three
-# distinct instances (identified by each one telling its own next session to
-# check its own `operator inbox <name>`, which is necessarily the author's).
-#
-# The document said nothing about which of them wrote it, and a handoff is
-# written in the first person -- "my worktree", "I claimed it from a peer",
-# "check operator inbox x". Read by the wrong instance those are not merely
-# unhelpful, they are wrong instructions about branches it does not own and a
-# mailbox whose read CONSUMES a peer's mail. And a reader with no author to
-# consult has no way to reach that conclusion: a session that finds a pile in
-# `superseded/` infers the documented cause, "these went unread", which fits
-# the evidence perfectly and is the wrong explanation.
-#
-# So the author goes in the bytes, for the same reason the notices do. This
-# does not make the mailbox per-instance -- project state genuinely is shared,
-# and splitting it would hide a peer's work rather than attribute it. It makes
-# the sharing VISIBLE, which is the part that was missing.
+# It cannot drift from the filename: both are derived from one instance name
+# at one moment, in `main` below.
 AUTHOR_PREFIX = "*Written by operator instance:"
 
 
@@ -204,30 +188,6 @@ def authoring_instance(text: str) -> str | None:
     return None
 
 
-# A handoff is a few kilobytes of prose. Anything past this is not one, and
-# slurping it to "preserve" it would be the denial of service, not the fix.
-MAX_PRESERVE_BYTES = 8 * 1024 * 1024
-# Preserve-then-publish takes milliseconds, so a peer that holds the lock is
-# about to release it. Waiting far longer than the work takes costs nothing
-# and closes the window in every realistic case.
-LOCK_WAIT_SECONDS = 10.0
-# Nothing legitimately holds this for two minutes. A lock older than that
-# belongs to a process that died between creating it and removing it.
-LOCK_STALE_SECONDS = 120.0
-# O_NOFOLLOW: a regular file that turned into a symlink between the check and
-# the open must not be followed. O_NONBLOCK: nor may one that turned into a
-# fifo block the open forever, before there is any descriptor to inspect.
-# Neither exists on Windows, where the size check below is the remaining
-# guard; O_BINARY exists only there, and stops newline translation from
-# rewriting bytes we promised to preserve verbatim.
-_PRIOR_OPEN_FLAGS = (
-    os.O_RDONLY
-    | getattr(os, "O_BINARY", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
-    | getattr(os, "O_NONBLOCK", 0)
-)
-
-
 def state_dir() -> Path:
     override = os.environ.get("COPILOT_OPERATOR_HOME")
     root = Path(override) if override else Path.home() / ".operator"
@@ -264,6 +224,156 @@ def same_or_within(child: str, parent: str) -> bool:
         return False
 
 
+def handoff_dir(proj_dir: Path) -> Path:
+    """Where this project's per-instance handoffs live."""
+    return proj_dir / HANDOFF_DIRNAME
+
+
+def handoff_path(proj_dir: Path, instance_id: str) -> Path:
+    """This instance's handoff file.
+
+    ``instance_id`` must already have been through
+    :func:`operator_mux.safe_instance_id`. It is the same identifier the
+    restart marker is named for, deliberately: the marker and the mailbox are
+    now keyed the same way, which is precisely what they were not before.
+    """
+    return handoff_dir(proj_dir) / f"{instance_id}.md"
+
+
+def bank_prior_handoff(handoff_file: Path) -> Path | None:
+    """Move an unread handoff aside, returning where it went.
+
+    Returns ``None`` when there was nothing to move, which is the ordinary
+    case: the reader deletes the file, so a handoff sitting here as the next
+    one is written means a session ended without its predecessor's context
+    being picked up.
+
+    One slot, replaced each time, rather than an archive that grows. The
+    unbounded version of this needed a promise never to prune it, because
+    under project keying peers overwrote each other constantly and every file
+    in there might have been somebody's only copy. Under instance keying a
+    second consecutive miss means the read side is broken, and keeping the
+    older of two undelivered handoffs does not fix that.
+
+    ``os.replace`` rather than a copy: the point is that the bytes are never
+    in one place only, and a copy leaves a window where they are.
+    """
+    try:
+        if not handoff_file.is_file():
+            return None
+    except OSError:
+        # Unexaminable is not absent. Falling through to the move is safe --
+        # it either works or raises below -- whereas concluding "nothing to
+        # bank" here would let the write overwrite a file we could not read.
+        pass
+    prev = handoff_file.with_name(handoff_file.stem + PREV_SUFFIX)
+    try:
+        os.replace(handoff_file, prev)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        die(f"A handoff is already waiting at {handoff_file} and could not be "
+            f"moved aside ({exc}). Refusing to overwrite it.")
+    return prev
+
+
+def migrate_project_handoff(proj_dir: Path) -> list[str]:
+    """Move project-keyed handoff state into the per-instance layout.
+
+    Returns one human-readable line per thing moved, for the caller to report.
+
+    Nothing is deleted and nothing is overwritten. A banked handoff is dropped
+    context -- that is the failure this whole module is built around -- so a
+    migration that tidied one away would be the same bug wearing the fix's
+    clothes.
+
+    ``next-session.md`` is *delivered* where it can be: if it names its author
+    and that instance has no handoff waiting, it becomes that instance's
+    handoff and the next session picks it up normally. Otherwise it goes to
+    ``handoff/legacy/`` with everything from ``superseded/``, where it is
+    preserved but not claimed to belong to anyone. Guessing a recipient would
+    put a document written in the first person in front of an agent it is not
+    about, which is the exact harm the re-keying exists to end.
+    """
+    moved: list[str] = []
+    legacy_root = handoff_dir(proj_dir) / LEGACY_DIRNAME
+
+    def _park(src: Path, name: str) -> None:
+        try:
+            legacy_root.mkdir(parents=True, exist_ok=True)
+            dest = legacy_root / name
+            # Held from before the loop. Re-reading them from `dest` reads back
+            # the suffix just appended, so a third collision produces
+            # `x-1-2.md` rather than `x-3.md` -- names that still avoid the
+            # collision, and still say nothing about which file they came
+            # from, which is the only thing a parked file has left.
+            stem, ext = dest.stem, dest.suffix
+            suffix = 1
+            while dest.exists():
+                dest = legacy_root / f"{stem}-{suffix}{ext}"
+                suffix += 1
+            os.replace(src, dest)
+        except OSError as exc:
+            print(f"Warning: could not move {src} to {legacy_root}: {exc}",
+                  file=sys.stderr)
+            return
+        moved.append(f"{src.name} -> {dest}")
+
+    old = proj_dir / "next-session.md"
+    try:
+        present = old.is_file()
+    except OSError:
+        present = False
+    if present:
+        author = None
+        try:
+            author = authoring_instance(
+                old.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            pass
+        delivered = False
+        if author:
+            target = handoff_path(proj_dir, safe_instance_id(author))
+            try:
+                if not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(old, target)
+                    moved.append(f"next-session.md -> {target} "
+                                 f"(attributed to {author!r})")
+                    delivered = True
+            except OSError as exc:
+                print(f"Warning: could not deliver {old} to {target}: {exc}",
+                      file=sys.stderr)
+        if not delivered:
+            _park(old, "next-session.md")
+
+    old_archive = proj_dir / "superseded"
+    try:
+        # ``is_dir()`` and ``iterdir()`` both follow links, so a ``superseded``
+        # that is a symlink or a junction would have this loop move files out
+        # of whatever directory it points at -- a migration of one project's
+        # state reaching into somewhere it was never told about. A link is not
+        # something this tool put there, so the safe reading is that it is not
+        # ours to move.
+        if old_archive.is_symlink():
+            print(f"Warning: {old_archive} is a link, not a directory; "
+                  f"leaving it alone.", file=sys.stderr)
+            entries: list[Path] = []
+        else:
+            entries = sorted(old_archive.iterdir()) if old_archive.is_dir() else []
+    except OSError as exc:
+        print(f"Warning: could not read {old_archive}: {exc}", file=sys.stderr)
+        entries = []
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+        except OSError:
+            continue
+        _park(entry, f"superseded-{entry.name}")
+    return moved
+
+
 def write_atomic(path: Path, text: str) -> None:
     """Replace `path` with `text` in one indivisible step.
 
@@ -290,390 +400,6 @@ def write_atomic(path: Path, text: str) -> None:
         except OSError:
             pass
         die(f"Cannot write handoff {path}: {exc}")
-
-
-@contextmanager
-def handoff_lock(handoff_file: Path):
-    """Serialise preserve-then-publish for one project's handoff file.
-
-    Preserving the old handoff and publishing the new one are two steps, and
-    two agents can be inside them at once: A copies the predecessor aside, B
-    copies the same predecessor aside and publishes, then A publishes over B.
-    B's handoff was never in ``superseded/`` -- it was published after A looked
-    -- so it is gone. Preserving without serialising just moves which session
-    gets destroyed.
-
-    ``O_CREAT|O_EXCL`` is the one create-if-absent primitive that is atomic on
-    both POSIX and Windows. This duplicates the shape of
-    ``copilot_operator._restart_handoff_lock`` rather than importing it: that
-    module is the supervisor, it does work at import time, and a lock is not
-    worth coupling the two.
-
-    Yields True when the lock was taken and False when it was not. A caller
-    that could not take it must still go ahead: refusing would discard the
-    context of the session that is running *now*, which is a certain loss, to
-    avoid a contended write that probably is not happening. What the caller
-    owes in that case is insurance -- see ``main`` -- so that even the unlocked
-    path cannot destroy a handoff without leaving a copy of it.
-    """
-    path = handoff_file.with_name(handoff_file.name + ".lock")
-    # Whoever holds the lock says so in the file. A holder that unlinks on the
-    # way out without checking would remove a lock somebody else has since
-    # taken -- which is not theoretical here, because the reclaim below can
-    # hand the lock to a second process while the first is still inside.
-    token = uuid.uuid4().hex
-    acquired = False
-    deadline = time.monotonic() + LOCK_WAIT_SECONDS
-    while True:
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            # Age, not a pid: a stale lock here only costs the serialisation
-            # this function adds, and asking the OS whether a recorded pid is
-            # alive is both platform-specific and wrong after pid reuse. The
-            # window is long enough that a lock past it belongs to a process
-            # that died rather than one that is slow -- this critical section
-            # is a few filesystem calls.
-            try:
-                stale = (time.time() - path.stat().st_mtime) > LOCK_STALE_SECONDS
-            except OSError:
-                stale = False
-            if stale:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-            if time.monotonic() >= deadline:
-                break
-            # Deliberately after the deadline check, so an unremovable stale
-            # lock cannot spin here forever.
-            time.sleep(0.05)
-            continue
-        except OSError:
-            # A directory that will not take a lock file at all. The handoff
-            # itself may still be writable; if it is not, the write below
-            # reports it.
-            break
-        else:
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(f"{token} {os.getpid()} "
-                             f"{datetime.now(timezone.utc).isoformat()}\n")
-            except OSError:
-                # An empty lock nobody can prove ownership of would block every
-                # writer until it aged out, so it goes rather than stays.
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-                break
-            acquired = True
-            break
-    try:
-        yield acquired
-    finally:
-        if acquired:
-            try:
-                held = path.read_text(encoding="utf-8", errors="replace").split()
-            except OSError:
-                held = []
-            # Only our own lock. One we cannot read is left alone too: a lock
-            # that ages out costs a wait, and deleting somebody else's costs a
-            # handoff.
-            if held and held[0] == token:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-
-
-def _superseded_name(handoff_file: Path) -> str:
-    """A name no existing archive can already hold.
-
-    The timestamp is for the human reading the directory; the random suffix is
-    what makes the name unique. Two agents can hand off from one project in the
-    same second -- the docstring above this function's caller says so -- and a
-    second-resolution timestamp alone would have them archive over each other
-    while preserving each other's work, which is the joke that writes itself.
-    """
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{handoff_file.stem}-{stamp}-{uuid.uuid4().hex[:12]}{handoff_file.suffix}"
-
-
-def _swapped(before: os.stat_result, after: os.stat_result) -> bool:
-    """Whether the descriptor holds a different file than the one examined.
-
-    ``O_NOFOLLOW`` does not exist on Windows, so the flag that is supposed to
-    make the open refuse a symlink planted since the ``lstat`` is simply 0
-    there and the open follows it. Identity is therefore re-established from
-    the descriptor. Windows can report a zero file index, and that unknown is
-    not treated as a match -- an unanswered question is not a yes.
-    """
-    if not before.st_ino or not after.st_ino:
-        return False
-    return (before.st_ino, before.st_dev) != (after.st_ino, after.st_dev)
-
-
-def _read_prior_handoff(handoff_file: Path,
-                        before: os.stat_result) -> bytes | None:
-    """The predecessor's bytes, read through one descriptor it cannot swap.
-
-    Checking with ``lstat`` and then reading with ``read_bytes`` re-opens the
-    path by name, so every guarantee the check established is only a guess by
-    the time the read happens: the regular file that was measured can be a fifo
-    by then, and the open blocks until somebody writes to the other end -- or a
-    hundred gigabytes, and the size limit measured a file that no longer
-    exists. The type and the size are therefore checked on the descriptor that
-    is actually read, which nothing can substitute.
-
-    Returns None when the file has gone, which needs no preserving.
-    """
-    try:
-        fd = os.open(handoff_file, _PRIOR_OPEN_FLAGS)
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-    except OSError as exc:
-        raise PreserveError(
-            f"Cannot read the existing handoff {handoff_file}: {exc}\n"
-            f"Refusing to overwrite a file that cannot be read first. "
-            f"Move it aside and retry.")
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise PreserveError(
-                f"{handoff_file} is not a regular file.\n"
-                f"Refusing to replace it. Move it aside and retry.")
-        if _swapped(before, info):
-            # O_NOFOLLOW does not exist on Windows, so the open can have
-            # followed a symlink planted since the lstat. The descriptor is
-            # therefore asked what it actually holds, and a different file
-            # than the one that was examined is not this session's to archive.
-            raise PreserveError(
-                f"{handoff_file} was replaced while it was being examined.\n"
-                f"Refusing to overwrite it. Retry.")
-        if info.st_size > MAX_PRESERVE_BYTES:
-            raise PreserveError(
-                f"The existing handoff {handoff_file} is "
-                f"{info.st_size} bytes, which is not a handoff.\n"
-                f"Refusing to overwrite it. Move it aside and retry.")
-        # One byte past the limit is enough to tell that it was exceeded, and
-        # is all that is ever held beyond it -- the file can still grow between
-        # the fstat and the read.
-        budget = MAX_PRESERVE_BYTES + 1
-        chunks: list[bytes] = []
-        while budget > 0:
-            try:
-                chunk = os.read(fd, min(1 << 20, budget))
-            except OSError as exc:
-                raise PreserveError(
-                    f"Cannot read the existing handoff {handoff_file}: {exc}\n"
-                    f"Refusing to overwrite it. Move it aside and retry.")
-            if not chunk:
-                break
-            chunks.append(chunk)
-            budget -= len(chunk)
-    finally:
-        os.close(fd)
-    data = b"".join(chunks)
-    if len(data) > MAX_PRESERVE_BYTES:
-        raise PreserveError(
-            f"The existing handoff {handoff_file} grew past "
-            f"{MAX_PRESERVE_BYTES} bytes while being read, which is not a "
-            f"handoff.\nRefusing to overwrite it. Move it aside and retry.")
-    return data
-
-
-def _drop_symlink(handoff_file: Path, archived: Path) -> None:
-    """Remove the link now that where it pointed has been written down.
-
-    On POSIX ``os.replace`` would replace the link itself, so removing it first
-    changes nothing. On Windows it would not: a symlink to a *directory* is a
-    directory entry, ``MoveFileEx`` refuses to replace one, and the handoff
-    would die with a bare access-denied -- losing the live session's context to
-    protect a link whose target is not even in danger. Removing it first makes
-    both platforms do the same thing, and the thing the archive says was done.
-    """
-    try:
-        os.unlink(handoff_file)
-    except FileNotFoundError:
-        return
-    except OSError:
-        # Windows again: a directory symlink comes off with rmdir, not unlink.
-        try:
-            os.rmdir(handoff_file)
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            raise PreserveError(
-                f"Recorded the handoff symlink at {archived}, but cannot "
-                f"remove the link at {handoff_file}: {exc}")
-
-
-class PreserveError(Exception):
-    """The predecessor could not be saved, so it must not be overwritten.
-
-    Raised rather than exiting on the spot: the caller holds this session's
-    handoff text and can put it somewhere safe before it gives up, so that
-    refusing to destroy the old context does not destroy the new one instead.
-    """
-
-
-def _archive(handoff_file: Path, payload: bytes) -> Path:
-    """Write ``payload`` into ``superseded/`` under a name nothing else holds.
-
-    Raises OSError when it cannot, because the two callers want opposite things
-    from that: preserving a predecessor must abort the handoff rather than
-    proceed to destroy it, while the insurance copy is a second chance and must
-    never be the reason a handoff fails.
-    """
-    dest_dir = handoff_file.parent / SUPERSEDED_DIRNAME
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    for _ in range(5):
-        dest = dest_dir / _superseded_name(handoff_file)
-        try:
-            # "xb" is O_EXCL: it fails rather than truncating, so no archive
-            # can ever be written over another one.
-            with open(dest, "xb") as fh:
-                fh.write(payload)
-        except FileExistsError:
-            continue
-        return dest
-    raise FileExistsError(f"no unused name available in {dest_dir}")
-
-
-def _archived_author(archive: Path) -> str | None:
-    """The instance that wrote the handoff now preserved at ``archive``.
-
-    Every failure answers ``None`` -- "cannot say". This runs between the
-    preserve and the publish, the one stretch where an escaping exception
-    abandons a handoff whose predecessor has *already* been copied aside; the
-    phrasing of a warning is not worth that risk. ``None`` is also already the
-    value the caller must handle, because a predecessor written before the
-    stamp existed carries no name either, so a failed read joins a state that
-    is being handled rather than inventing one.
-
-    The archive is read rather than the original: it is the copy this process
-    just created, its size is bounded by ``MAX_PRESERVE_BYTES``, and it is the
-    file the warning is about to name.
-    """
-    try:
-        text = archive.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    return authoring_instance(text)
-
-
-def preserve_prior_handoff(handoff_file: Path) -> Path | None:
-    """Copy an unread handoff aside before it is replaced.
-    ``write_atomic`` guarantees a reader never sees *half* a handoff. It says
-    nothing about a handoff nobody ever read: ``os.replace`` overwrites the
-    destination unconditionally, so a session that hands off while the previous
-    handoff is still sitting there destroys it, silently, permanently, and with
-    no record that it existed. That is not a hypothetical -- the tool itself
-    prints "no running session found ... restart may not trigger" and writes
-    anyway, and a handoff nothing restarts to consume is exactly a handoff that
-    is still there next time. Two agents sharing one project is the other way
-    in.
-
-    The protocol says the reader deletes the file once it has been read, so an
-    occupied destination means *nobody has consumed this one yet* -- which has
-    two causes, not one, and the difference is invisible here. Either this
-    instance's own predecessor went unread, or a peer sharing the project's
-    mailbox published while this session worked. Measured on this repository,
-    the second is the common case: the mailbox is per-project and the restart
-    marker is per-instance. Either way the losing side is a session that has
-    already ended and cannot be asked to repeat itself, and refusing to hand
-    off would be worse -- it loses the current session's context instead, and
-    the current session is the one that still exists. So neither is discarded
-    -- the old one is copied into ``superseded/`` and the new one is written.
-    Which of the two happened is reported by the caller, from the authorship
-    stamp in the preserved bytes; this function does not need to know.
-
-    Copied, not moved: the source stays in place until the copy has succeeded,
-    so there is no instant at which the only extant copy is in flight. The
-    archive is created with ``O_EXCL``, which is the only way to be sure this
-    function -- whose whole purpose is to stop a silent overwrite -- does not
-    perform one.
-
-    Nothing is ever pruned from ``superseded/``. A reaper here would be a
-    delete path inside a fix for an unwanted delete, and it would be reasoning
-    about the age of files whose value it cannot judge. The directory only
-    grows when a handoff went unread, which is already the anomaly.
-
-    Returns the archive path, or ``None`` when there was nothing worth saving.
-    """
-    present = path_present(handoff_file)
-    if present is False:
-        return None
-
-    # `present` is True, or None for "the path cannot be examined" -- a denied
-    # permission, an unready drive, a home that has gone away. Absent is the
-    # only answer that licenses an overwrite, so anything else is handled here
-    # rather than assumed away.
-    try:
-        info = os.lstat(handoff_file)
-    except (FileNotFoundError, NotADirectoryError):
-        # Consumed between the probe and the stat. Nothing to save, and the
-        # write that follows now lands on an empty slot, which is the case
-        # this function exists to stay out of the way of.
-        return None
-    except OSError as exc:
-        raise PreserveError(
-            f"Cannot examine the existing handoff {handoff_file}: {exc}\n"
-            f"Refusing to overwrite a file that cannot be read first. "
-            f"Move it aside and retry.")
-
-    was_symlink = stat.S_ISLNK(info.st_mode)
-    if was_symlink:
-        # The link's target is not at risk -- it is a separate file and nothing
-        # here opens it. What is lost is the user's redirection, so that -- and
-        # only that -- is what gets recorded. Reading through the link instead
-        # could block forever on a fifo or swallow a terabyte, to preserve
-        # bytes that were never in danger.
-        try:
-            target = os.readlink(handoff_file)
-        except OSError as exc:
-            raise PreserveError(
-                f"Cannot read the symlink at {handoff_file}: {exc}")
-        prior = (f"# Superseded handoff symlink\n\n"
-                 f"`{handoff_file}` was a symlink to `{target}`.\n"
-                 f"The handoff written at {datetime.now(timezone.utc).isoformat()} "
-                 f"removed the link and wrote a regular file in its place. "
-                 f"The link's target was not read and not modified.\n"
-                 # A symlink target is bytes on POSIX, so it reaches Python
-                 # with surrogate escapes when it is not valid UTF-8. Encoding
-                 # that strictly raises UnicodeEncodeError, which is not an
-                 # OSError and would escape every handler here as a traceback.
-                 ).encode("utf-8", errors="backslashreplace")
-    elif stat.S_ISREG(info.st_mode):
-        prior = _read_prior_handoff(handoff_file, info)
-        if prior is None:
-            return None
-        if not prior.strip():
-            # An empty file carries no context, so replacing it loses nothing
-            # and archiving it would only add noise to `superseded/`.
-            return None
-    else:
-        # A directory, a fifo, a device node. `os.replace` would happily
-        # destroy the last two and fail on the first, and reading a fifo would
-        # hang this process for as long as nobody opens the other end.
-        raise PreserveError(
-            f"{handoff_file} is not a regular file.\n"
-            f"Refusing to replace it. Move it aside and retry.")
-
-    try:
-        dest = _archive(handoff_file, prior)
-    except OSError as exc:
-        raise PreserveError(
-            f"Cannot preserve the unread handoff beside {handoff_file}: "
-            f"{exc}\nRefusing to overwrite it.")
-    if was_symlink:
-        _drop_symlink(handoff_file, dest)
-    return dest
 
 
 def resolve_guid(project_root) -> str:
@@ -1074,15 +800,16 @@ def render(status: str, in_progress: str, next_steps: str,
     """The handoff document.
 
     ``notice`` is a block the *tool* has to say about the circumstances of the
-    write -- see :data:`NOTICE_UNSERIALISED`. It sits under the title rather
-    than above it so the file is still a handoff document to anything that
-    keys on the ``# Session Handoff`` header, and above ``## Status`` so a
-    reader meets it before the content it qualifies.
+    write -- currently only :data:`NOTICE_DIRTY`, since instance keying
+    removed the lock whose contended paths used to have their own. It sits
+    under the title rather than above it so the file is still a handoff
+    document to anything that keys on the ``# Session Handoff`` header, and
+    above ``## Status`` so a reader meets it before the content it qualifies.
 
-    ``instance`` is stamped in the same band, below the notice: the notice
-    is about *this write* and may change what the reader does next, while the
-    stamp qualifies every word in the file. Both are above ``## Status``, so
-    a reader learns whose session this was before reading a document written
+    ``instance`` is stamped in the same band, below the notice: the notice is
+    about *this write* and may change what the reader does next, while the
+    stamp qualifies every word in the file. Both are above ``## Status``, so a
+    reader learns whose session this was before reading a document written
     throughout in the first person. An empty ``instance`` emits no stamp at
     all rather than an empty one -- see :func:`authoring_instance` on why
     "does not say" must stay distinct from a name.
@@ -1209,29 +936,30 @@ def main(argv: list[str] | None = None) -> int:
 
     guid = resolve_guid(primary_repo_root(project_root))
     proj_dir = project_dir(guid)
-    handoff_file = proj_dir / "next-session.md"
+    handoff_file = handoff_path(proj_dir, instance_id)
     marker = state_dir() / instance_id
 
     # Even a validated guid can fail here -- a read-only home, a full disk, a
     # revoked permission. Report it the way the rest of the tool reports
     # trouble rather than with a bare traceback.
     try:
-        proj_dir.mkdir(parents=True, exist_ok=True)
+        handoff_file.parent.mkdir(parents=True, exist_ok=True)
         state_dir().mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        die(f"Cannot create {proj_dir} or {state_dir()}: {exc}")
+        die(f"Cannot create {handoff_file.parent} or {state_dir()}: {exc}")
 
-    # Rendered before the lock is taken: it cannot fail on the filesystem, and
-    # holding a shared lock across work that does not need it is how a
-    # millisecond lock becomes a contended one. `render_body` is kept so the
-    # contended paths below can re-render the same words carrying a notice --
-    # still pure string work, still nothing that can fail under the lock.
-    #
-    # The dirty-checkout notice is joined *inside* this closure rather than
-    # passed at each call site. Every caller below passes its own notice about
-    # lock contention, and a caller that forgot to re-add this one would drop
-    # the leftovers list from exactly the handoffs written under trouble --
-    # the ones whose reader most needs to know the tree was not clean.
+    for line in migrate_project_handoff(proj_dir):
+        print(f"Migrated handoff state: {line}", file=sys.stderr)
+
+    # The dirty-checkout notice is joined inside this closure rather than
+    # passed at the call site. It arrived on `main` alongside a lock whose
+    # contended paths each re-rendered with their own notice; instance keying
+    # removed the lock, so there is one caller left. The closure is kept
+    # anyway, because the argument for it never depended on the lock: a caller
+    # that forgets to re-add `dirty_notice` drops the leftovers list from
+    # exactly the handoff whose reader most needs it, and a closure that
+    # cannot be called without it is the only arrangement where forgetting is
+    # not possible.
     def render_body(notice: str = "") -> str:
         both = "\n>\n".join(n for n in (dirty_notice, notice) if n)
         return render(args.status, args.in_progress, args.next_steps,
@@ -1239,85 +967,19 @@ def main(argv: list[str] | None = None) -> int:
                       instance=instance_name)
 
     body = render_body()
-    published = body
 
-    with handoff_lock(handoff_file) as locked:
-        if not locked:
-            # Another handoff is inside its critical section, or a lock could
-            # not be made at all. Going ahead is right -- refusing would throw
-            # away this session for certain -- but going ahead unserialised is
-            # the one path on which the other writer can still publish between
-            # this process's preserve and its rename, and then be overwritten
-            # by it. So this session's context is banked first: whatever the
-            # race does to `next-session.md`, the words exist on disk.
-            #
-            # Both copies say so in their own bytes. The warnings below go to
-            # stderr, which belongs to the session that is ending; the next
-            # session -- the one that has to decide whether the file it is
-            # reading is the newest -- would otherwise get no sign at all.
-            #
-            # `published` is chosen here, before the bank is attempted, and is
-            # deliberately not revised when the bank fails: the notice claims
-            # nothing about the spare copy, precisely so that it stays true
-            # whichever way the next few lines go.
-            published = render_body(NOTICE_UNSERIALISED)
-            try:
-                spare = _archive(
-                    handoff_file,
-                    render_body(NOTICE_BANKED_UNSERIALISED).encode("utf-8"))
-            except OSError as exc:
-                spare = None
-                print(f"Warning: could not take the handoff lock, and could "
-                      f"not bank a spare copy either: {exc}", file=sys.stderr)
-            if spare is not None:
-                print(f"Warning: could not take the handoff lock for this "
-                      f"project. Writing anyway; a copy of this one is banked "
-                      f"at {spare}", file=sys.stderr)
-        try:
-            saved = preserve_prior_handoff(handoff_file)
-        except PreserveError as exc:
-            # The predecessor cannot be saved, so it must not be replaced --
-            # but this session's words must not pay for that. They are banked
-            # first, and only then does the tool give up, so the operator is
-            # choosing between two files that both still exist rather than
-            # being told which one was destroyed on its behalf.
-            #
-            # On the unlocked path this is the *second* bank of the same
-            # words, and that is deliberate rather than tidy: the first copy
-            # was insurance against a race, this one records that the publish
-            # was abandoned, and the two notices are complementary because
-            # neither claims an outcome. Two identical bodies in `superseded/`
-            # cost a reader nothing; a missing one costs a session.
-            try:
-                spare = _archive(
-                    handoff_file,
-                    render_body(NOTICE_BANKED_UNPUBLISHED).encode("utf-8"))
-            except OSError as bank_exc:
-                die(f"{exc}\nThis handoff could not be banked either "
-                    f"({bank_exc}); it is printed below so it is not lost.\n\n"
-                    f"{body}")
-            die(f"{exc}\nThis handoff was not lost: it is at {spare}")
-        if saved is not None:
-            prior_author = _archived_author(saved)
-            if prior_author is None:
-                why = ("It does not say which instance wrote it, so it is "
-                       "either this instance's own previous session going "
-                       "unread, or a peer's published while you worked.")
-            elif prior_author == instance_name:
-                why = (f"It was written by this instance "
-                       f"({instance_name!r}), so it reached no reader.")
-            else:
-                why = (f"It was written by a DIFFERENT instance "
-                       f"({prior_author!r}), which shares this project's "
-                       f"mailbox. That session's next agent will now find "
-                       f"nothing waiting; its context is only in "
-                       f"{SUPERSEDED_DIRNAME}/.")
-            print(f"Warning: a handoff was already waiting at "
-                  f"{handoff_file}.\n"
-                  f"         {why}\n"
-                  f"         It has been preserved at {saved}",
-                  file=sys.stderr)
-        write_atomic(handoff_file, published)
+    banked = bank_prior_handoff(handoff_file)
+    if banked is not None:
+        # This instance's own previous handoff was never read. Under project
+        # keying that was ambiguous -- it might have been a peer's -- and the
+        # tool needed several paragraphs to help a reader tell which. Keyed by
+        # instance there is only one explanation left: a session of this
+        # instance ended without picking up what the one before it left.
+        print(f"Warning: {instance_name!r} had an unread handoff at "
+              f"{handoff_file}; a session ended without reading it.\n"
+              f"         It has been moved to {banked}", file=sys.stderr)
+
+    write_atomic(handoff_file, body)
     try:
         marker.touch()
     except OSError as exc:

@@ -130,7 +130,7 @@ Manifest: /home/you/.operator/install-manifest.json
 
 Deployed artifacts:
   templates/mcp-config.json           1.0.0  up to date
-  skills/operator-agents                  —  not installed
+  skills/peer-agents                      —  not installed
 
 Retired artifacts:
   ~/.copilot/copilot-instructions.md         still present

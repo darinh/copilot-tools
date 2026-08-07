@@ -42,6 +42,7 @@ __all__ = [
     "consume",
     "archive",
     "history",
+    "last_correspondent",
     "flatten",
     "reply_hint",
     "render_line",
@@ -628,6 +629,58 @@ def history(root: Path, instance_id: str, limit: int = 20) -> list[dict]:
     return archived[-limit:] if limit > 0 else archived
 
 
+def last_correspondent(root: Path, instance_id: str) -> str | None:
+    """Who most recently wrote to `instance_id`, or None if nobody has.
+
+    This is what lets `operator reply` take no recipient. Both the archive
+    and the inbox are considered, because the two hold the same conversation
+    at different stages: a session start consumes the inbox into the archive,
+    so looking in only one of them makes the answer depend on whether the
+    agent has started its session yet.
+
+    Ordering is by ``sent_at`` rather than by directory listing. The two
+    directories cannot be concatenated meaningfully -- each is chronological
+    within itself, and an archived message is normally *older* than a pending
+    one but need not be, since a message can arrive live and be archived
+    while an earlier one is still queued.
+
+    A message whose sender is missing or blank is skipped rather than
+    answered with a placeholder. `reply_hint` can afford to print
+    ``<sender>`` because a human reads it before running it; a resolved
+    recipient goes straight to delivery, and a plausible-looking guess would
+    send somebody's reply to an instance that never wrote to them.
+
+    Raises :class:`MailError` if any message file cannot be read, rather than
+    skipping it. An unreadable file may be the newest one, and skipping it
+    silently returns an older sender -- a wrong recipient manufactured by a
+    transient read failure.
+    """
+    msgs: list[dict] = []
+    for directory in (archive_dir(root, instance_id), inbox_dir(root, instance_id)):
+        for path in _message_files(directory):
+            data = _read_message(path)
+            if data is UNREADABLE:
+                # `_load_dir` skips these, which is right for listing -- a
+                # file that could not be read this time is simply still
+                # there next time, and nothing is destroyed. It is wrong
+                # here. The unreadable file may be the *newest* message, and
+                # skipping it silently answers with an older sender: the
+                # reply then goes to whoever wrote before, which is a wrong
+                # recipient produced by a transient read failure. Refusing
+                # costs the caller a `--to`; guessing costs them the reply.
+                raise MailError(
+                    f"could not read {path.name}, so the most recent sender "
+                    "cannot be established")
+            if isinstance(data, dict):
+                msgs.append(data)
+    msgs.sort(key=lambda m: _field(m, "sent_at", ""))
+    for msg in reversed(msgs):
+        name = _field(msg, "from", "")
+        if name:
+            return name
+    return None
+
+
 def flatten(text: str) -> str:
     """Collapse a message to one control-character-free line.
 
@@ -670,10 +723,17 @@ def reply_hint(msg: dict) -> str:
     A missing name becomes a visible placeholder rather than a guess. Filling
     one in would produce a command that runs happily and sends the reply to
     the wrong agent.
+
+    ``--to`` is spelled out even though `operator reply` defaults it to the
+    most recent correspondent. The default is right for the common case of
+    one conversation, and wrong exactly when a batch arrived from several
+    agents at once -- which is when the hint is most likely to be used, since
+    it is printed once per message. Naming the recipient makes each hint
+    answer *its own* message rather than whichever one happened to be last.
     """
     sender = _field(msg, "from", "<sender>")
     recipient = _field(msg, "to", "<your-instance>")
-    return f'operator send --from {recipient} --to {sender} "your reply"'
+    return f'operator reply --instance {recipient} --to {sender} "your reply"'
 
 
 def render_line(msg: dict) -> str:

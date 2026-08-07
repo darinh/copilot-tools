@@ -598,8 +598,14 @@ def wired(repo, tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(ho.Mux, "available", lambda self: False)
     return {"repo": repo, "restart": restart,
+            # Keyed by instance, not by project: a handoff is written in the
+            # first person, so `handoff/{instance}.md` is where this branch
+            # publishes it. The guard suite arrived on `main` while that was
+            # still `next-session.md`, and pointing it at the old path would
+            # make every assertion below read a file the tool never writes --
+            # which is a suite that passes by finding nothing.
             "handoff": home / ".operator" / "projects" / "guid-cg"
-                       / "next-session.md"}
+                       / "handoff" / "cg.md"}
 
 
 def _run(wired, *extra):

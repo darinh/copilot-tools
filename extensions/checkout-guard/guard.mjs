@@ -831,6 +831,67 @@ export async function primaryCheckoutRoot(cwd) {
 }
 
 /**
+ * Every working checkout of this repository except `workingRoot`.
+ *
+ * The primary and every linked worktree, which together are the set a write
+ * can land in and be invisible from here. Null when git could not answer --
+ * `[]` would mean "this session is the only checkout", and a guard that
+ * concluded that from a failed probe would stop blocking exactly when the
+ * repository layout was too complicated for git to report quickly.
+ */
+export async function siblingCheckouts(cwd, workingRoot) {
+  const { ok, stdout } = await git(["worktree", "list", "--porcelain"], cwd);
+  if (!ok) return null;
+  const roots = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!line.startsWith("worktree ")) continue;
+    const path = line.slice("worktree ".length).trim();
+    if (!path) continue;
+    const abs = resolve(path);
+    if (workingRoot && within(abs, workingRoot) && within(workingRoot, abs)) continue;
+    roots.push(abs);
+  }
+  return roots;
+}
+
+/**
+ * The checked-out branch name, or null for a detached HEAD or a failed probe.
+ *
+ * Detached HEAD answers `HEAD`, which is not a branch and must not be compared
+ * to one: `PROTECTED_BRANCHES` would never match it, so folding it in would be
+ * harmless today and wrong the first time somebody adds a name to that set.
+ */
+export async function currentBranch(cwd) {
+  const { ok, stdout } = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
+  if (!ok) return null;
+  const name = stdout.trim();
+  return name && name !== "HEAD" ? name : null;
+}
+
+/**
+ * Whether a merge, cherry-pick or revert is waiting to be concluded.
+ *
+ * All three finish with `git commit`, and all three are legitimate on a
+ * protected branch -- merging a feature branch into `main` is how work lands
+ * here. Answering `false` on a failed probe is the deliberate direction: the
+ * cost of a wrong `false` is one blocked commit with a message naming the
+ * override, and the cost of a wrong `true` is the guard silently not existing.
+ */
+export async function mergeInProgress(cwd) {
+  for (const ref of ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"]) {
+    const { ok } = await git(["rev-parse", "--verify", "--quiet", ref], cwd);
+    if (ok) return true;
+  }
+  return false;
+}
+
+/** `git status --porcelain` for `cwd`, or null when git could not answer. */
+export async function porcelainStatus(cwd) {
+  const { ok, stdout } = await git(["status", "--porcelain"], cwd);
+  return ok ? stdout : null;
+}
+
+/**
  * Decide which second checkout to watch, and whether the decision is worth
  * remembering.
  *
@@ -1137,6 +1198,213 @@ export const SUBAGENT_TOOLS = new Set(["task", "agent"]);
 /** Tools that author content deliberately, so never produce a stray. */
 export const AUTHORING_TOOLS = new Set(["create", "edit"]);
 
+// ---------------------------------------------------------------------------
+// Worktree scope, delegation and protected branches.
+//
+// These three rules arrived together, from the G1/G2 audit of the managed
+// instruction block: each was carried as prose that an agent had to be holding
+// in mind at the moment it mattered, and each turns out to be decidable from a
+// tool call's own arguments before it runs. They live in THIS extension rather
+// than a second one because the parsing they need -- `gitInvocations`,
+// `gitSubcommand`, `primaryCheckoutRoot` -- already exists here, and a second
+// copy of the rule for "which repository does this command actually address"
+// is the duplication this repository has already paid for once.
+// ---------------------------------------------------------------------------
+
+/**
+ * Branches a commit is never made on directly.
+ *
+ * `master` is included though this repository does not use it: the guard ships
+ * to every project on the machine, and being right only about the branch name
+ * the author happened to use is how a guard becomes decorative elsewhere.
+ */
+export const PROTECTED_BRANCHES = new Set(["main", "master"]);
+
+/**
+ * Whether a shell command commits, and onto which branch.
+ *
+ * Returns `null` to allow, or `{ verb, branch }` to block.
+ *
+ * `redirected` invocations are skipped for the same reason `sweepDecision`
+ * skips them: `git -C ../elsewhere commit` is a statement about a different
+ * repository, and `branch` was measured in this one. Blocking on it would be a
+ * confident wrong answer.
+ *
+ * `mergeInProgress` is not a courtesy. Merging a feature branch into `main` is
+ * the documented way work lands, and a conflicted merge is finished with `git
+ * commit` -- so a guard without this clause would block the very workflow the
+ * rule exists to protect, at the least convenient moment available, with a
+ * message telling the agent to do what it is already doing.
+ */
+export function commitDecision(command, { branch, mergeInProgress = false } = {}) {
+  if (!branch || !PROTECTED_BRANCHES.has(branch)) return null;
+  if (mergeInProgress) return null;
+  for (const args of gitInvocations(command)) {
+    const sub = gitSubcommand(args);
+    if (!sub || sub.redirected) continue;
+    if (sub.name === "commit") return { verb: "git commit", branch };
+  }
+  return null;
+}
+
+/** Message shown when a commit onto a protected branch is blocked. */
+export function commitBlockReason({ verb, branch }) {
+  return (
+    `[checkout-guard] BLOCKED: \`${verb}\` on \`${branch}\`. Feature work is ` +
+    `committed on a branch and merged, so that it can be reviewed as a unit ` +
+    `and abandoned without rewriting anything.\n\n` +
+    `Move to a branch first -- \`git checkout -b <type>/<slug>\` keeps the ` +
+    `changes you already have -- or, better, work in a worktree ` +
+    `(\`operator worktree new <branch>\`).\n\n` +
+    `A merge that needs a commit to finish is allowed and is not what this ` +
+    `blocked. Set COPILOT_CHECKOUT_GUARD_DISABLE=1 to override.`
+  );
+}
+
+/**
+ * Records in `git status --porcelain` output that a commit would capture.
+ *
+ * Untracked paths are deliberately NOT counted. They are already this guard's
+ * other subject, they survive a careless `git checkout` or `reset --hard`, and
+ * counting them would make every session with one scratch file undelegatable.
+ * What cannot be recovered is a modification to a tracked file, which those
+ * commands discard without a trace -- `git fsck` can only return what was
+ * once written to the object store.
+ *
+ * `!!` (ignored) is excluded for the same reason, and appears only under
+ * `--ignored`, which this guard never passes.
+ */
+export function uncommittedTracked(porcelain) {
+  const paths = [];
+  for (const line of String(porcelain ?? "").split(/\r?\n/)) {
+    if (line.length < 4) continue;
+    const code = line.slice(0, 2);
+    if (code === "??" || code === "!!") continue;
+    // Rename and copy records read `R  old -> new`; the new name is the one
+    // that exists on disk and the one an agent would go looking for.
+    const rest = line.slice(3);
+    const arrow = rest.indexOf(" -> ");
+    paths.push(arrow === -1 ? rest : rest.slice(arrow + 4));
+  }
+  return paths;
+}
+
+/**
+ * Whether delegating to a subagent right now could lose work.
+ *
+ * Returns `null` to allow, or `{ paths }` to block.
+ *
+ * The incident this encodes cost 454 lines: a review subagent ran `git stash`
+ * inside another agent's worktree, mentioned it in passing, and the work was
+ * recovered only because it had been `git add`-ed and so still existed as
+ * dangling blobs. A reviewer that reaches for `git checkout` or `reset --hard`
+ * instead leaves nothing to recover at all.
+ *
+ * Staged is not safe, which is why this counts the index column too. That is
+ * the part the prose version of this rule had to say twice and agents still
+ * got wrong, because "I've staged it" feels like having saved it.
+ */
+export function delegationDecision(porcelain) {
+  const paths = uncommittedTracked(porcelain);
+  return paths.length === 0 ? null : { paths };
+}
+
+/** Message shown when a delegation is blocked by uncommitted work. */
+export function delegationBlockReason({ paths }) {
+  const plural = paths.length === 1 ? "" : "s";
+  return (
+    `[checkout-guard] BLOCKED: delegating with ${paths.length} uncommitted ` +
+    `change${plural} in tracked file${plural}:\n` +
+    formatPathList(paths) +
+    `\n\nA subagent runs its own git commands in this same checkout. One that ` +
+    `reaches for \`stash\`, \`reset --hard\` or \`checkout --\` destroys ` +
+    `everything above, and \`git status\` will come back clean afterwards. ` +
+    `Staging is not enough -- staged blobs are recoverable via ` +
+    `\`git fsck --unreachable\`, but only by someone who already knows to look.` +
+    `\n\nCommit first, then point the subagent at \`git diff main...HEAD\`. ` +
+    `Set COPILOT_CHECKOUT_GUARD_DISABLE=1 to override.`
+  );
+}
+
+/**
+ * Whether a write lands in a checkout of this repository other than this
+ * session's own.
+ *
+ * Returns `null` to allow, or `{ target, owner }` to block.
+ *
+ * Writes *outside* the repository entirely are allowed and must be: the temp
+ * directory is where this guard tells every agent to put scratch work, and a
+ * rule that blocked it would leave nowhere legitimate to write at all.
+ *
+ * The comparison is on resolved absolute paths with a separator appended, so
+ * that `/repo/.worktrees/feat-a` is not read as a prefix of
+ * `/repo/.worktrees/feat-ab`. `startsWith` on bare roots is the classic form
+ * of this bug and it fails silently in the permissive direction.
+ *
+ * A session working *in* the primary checkout is not restricted by this. The
+ * incident shape is an agent in a worktree writing into the primary -- the
+ * tree every other agent resolves as the project -- and inverting it would
+ * block enrollment and setup work that legitimately runs from the primary.
+ */
+export function outsideWorktreeDecision(target, workingRoot, otherRoots = []) {
+  if (!target || !workingRoot) return null;
+  const abs = resolve(target);
+  // The roots are resolved here too, not merely assumed to be. `siblingCheckouts`
+  // does resolve them, so today every caller arrives with absolute paths -- and a
+  // predicate that is correct only for its current callers is one refactor from
+  // returning `null` for everything, which is the direction this one fails in.
+  if (within(abs, resolve(workingRoot))) return null;
+  // The MOST SPECIFIC containing root wins, not the first one found. The
+  // convention puts linked worktrees at `<primary>/.worktrees/<name>`, so the
+  // primary contains every one of them as a directory: taking the first match
+  // named the primary as the owner of a write that actually landed in a peer's
+  // worktree. The path in the message would have been right and the tree named
+  // beside it wrong, which sends the reader to the wrong checkout to clean up.
+  let best = null;
+  for (const other of otherRoots) {
+    if (!other) continue;
+    const root = resolve(other);
+    if (!within(abs, root)) continue;
+    if (!best || root.length > resolve(best).length) best = other;
+  }
+  return best === null ? null : { target: abs, owner: best };
+}
+
+/**
+ * Whether `path` is `root` or lies beneath it.
+ *
+ * Case-insensitive on Windows, where `C:\Repo` and `c:\repo` are one
+ * directory. Getting that wrong would not fail loudly; it would let every
+ * write through on the platform this toolkit is developed on.
+ */
+export function within(path, root) {
+  const sep = path.includes("/") || root.includes("/") ? "/" : "\\";
+  const norm = (s) => {
+    const trimmed = s.replace(/[\\/]+$/, "");
+    return process.platform === "win32" ? trimmed.toLowerCase() : trimmed;
+  };
+  const a = norm(path);
+  const b = norm(root);
+  return a === b || a.startsWith(b + sep);
+}
+
+/** Message shown when a write into another checkout is blocked. */
+export function outsideWorktreeReason({ target, owner }, workingRoot) {
+  return (
+    `[checkout-guard] BLOCKED: that path is in another checkout of this ` +
+    `repository.\n\n  writing to  ${target}\n  which is in  ${owner}\n` +
+    `  you are in  ${workingRoot}\n\n` +
+    `A worktree is a second directory for the same project, not a second ` +
+    `project. A file written into the one you are not looking at is invisible ` +
+    `to you and shows up in someone else's \`git status\` with no provenance.` +
+    `\n\nIf it belongs to your branch, write it under your own worktree. If it ` +
+    `genuinely belongs to the other checkout, do it there deliberately -- from ` +
+    `a session that has it checked out. Scratch work goes in a temp directory, ` +
+    `which this guard never blocks. ` +
+    `Set COPILOT_CHECKOUT_GUARD_DISABLE=1 to override.`
+  );
+}
+
 /**
  * An agent that ignores the report would otherwise accumulate an unbounded
  * list and be told about the same artifacts after every command it runs.
@@ -1353,6 +1621,10 @@ export function createGuard({
   scan = scanCheckoutTree,
   otherRoot = otherRootToWatch,
   look = observe,
+  siblings = siblingCheckouts,
+  branchOf = currentBranch,
+  merging = mergeInProgress,
+  status = porcelainStatus,
 } = {}) {
   async function onSessionStart() {
     if (disabled) return;
@@ -1391,6 +1663,39 @@ export function createGuard({
 
   async function onPreToolUse(input) {
     if (disabled) return;
+
+    // A write into another checkout of this repository. Checked before the
+    // shell rules because it is the only one that can fire on create/edit,
+    // and because it is the cheapest: no git process unless the path is
+    // outside the tree the session is working in.
+    if (AUTHORING_TOOLS.has(input.toolName)) {
+      const target = String(input.toolArgs?.path || "");
+      if (!target) return;
+      const root = await rootOf(cwd());
+      if (!root) return;
+      if (within(resolve(target), root)) return;
+      const others = await siblings(cwd(), root);
+      if (others === null) return;
+      const decision = outsideWorktreeDecision(target, root, others);
+      if (!decision) return;
+      return {
+        permissionDecision: "deny",
+        permissionDecisionReason: outsideWorktreeReason(decision, root),
+      };
+    }
+
+    // Delegating with unrecoverable work in the tree.
+    if (SUBAGENT_TOOLS.has(input.toolName)) {
+      const porcelain = await status(cwd());
+      if (porcelain === null) return;
+      const decision = delegationDecision(porcelain);
+      if (!decision) return;
+      return {
+        permissionDecision: "deny",
+        permissionDecisionReason: delegationBlockReason(decision),
+      };
+    }
+
     if (!SHELL_TOOLS.has(input.toolName)) return;
     const command = String(input.toolArgs?.command || "");
     // Cheap reject first: this hook runs on every shell command, and the
@@ -1398,6 +1703,25 @@ export function createGuard({
     if (!/\bgit\b/i.test(command)) return;
     const root = await rootOf(cwd());
     if (!root) return;
+
+    // Committing onto a protected branch. Ordered before the sweep check
+    // because it is the more specific finding: a `git add -A && git commit`
+    // on `main` with strays outstanding violates both, and being told to
+    // clean up the strays first would only surface the branch problem after
+    // the agent had done that work.
+    const branch = await branchOf(cwd());
+    if (branch && PROTECTED_BRANCHES.has(branch)) {
+      const decision = commitDecision(command, {
+        branch, mergeInProgress: await merging(cwd()),
+      });
+      if (decision) {
+        return {
+          permissionDecision: "deny",
+          permissionDecisionReason: commitBlockReason(decision),
+        };
+      }
+    }
+
     // Re-observe rather than trusting the last scan. Anything this turns up
     // arrived without a tool call of this agent's in between -- a peer agent
     // in the same checkout, or a background process -- so it has never been

@@ -85,6 +85,12 @@ _TRANSIENT_SERVER_ERRORS = (
     "no server running",
 )
 
+#: The one transient signature that is *conclusive* about session presence: no
+#: server means no sessions. The other three say the request never reached a
+#: server that could answer, which is a different thing entirely and the reason
+#: `session_present` reports them as unknown rather than as absent.
+_SERVER_GONE = ("no server running",)
+
 #: Total `new-session` attempts, and the base linear backoff between them. Three
 #: attempts spanning ~0.75s comfortably outlast a server shutdown while keeping
 #: a genuinely broken backend fast to report.
@@ -95,6 +101,11 @@ _NEW_SESSION_BACKOFF = 0.25
 def _is_transient_server_error(err: str) -> bool:
     lowered = (err or "").casefold()
     return any(signature in lowered for signature in _TRANSIENT_SERVER_ERRORS)
+
+
+def _server_is_gone(err: str) -> bool:
+    lowered = (err or "").casefold()
+    return any(signature in lowered for signature in _SERVER_GONE)
 
 
 class MuxError(Exception):
@@ -230,6 +241,36 @@ class Mux:
     def has_session(self, session: str) -> bool:
         _, _, rc = self._run("has-session", "-t", session)
         return rc == 0
+
+    def session_present(self, session: str) -> "bool | None":
+        """Tri-state ``has_session``: ``None`` means *could not tell*.
+
+        :meth:`has_session` answers a three-valued question with two values --
+        every failure, from a missing binary to a server that was mid-shutdown,
+        reads as "no such session". That is the right shape for the callers it
+        has, which are deciding whether to *create* a session and lose nothing
+        by trying again. It is the wrong shape for liveness: there, a wrong
+        "absent" says a live agent is dead, and the reclaim built on top of it
+        puts a second agent into somebody's worktree.
+
+        Asked through ``list-sessions`` rather than ``has-session`` because its
+        cross-backend behaviour is already pinned (see the module docstring):
+        psmux exits 0 with empty output when no server is running where tmux
+        exits 1, so emptiness comes from the output and only a genuinely failed
+        *call* is left to interpret. "No server running" is conclusive -- no
+        server, no sessions -- and anything else is reported as unknown rather
+        than guessed at.
+        """
+        try:
+            out, err, rc = self._run("list-sessions", "-F", "#{session_name}")
+        except (MuxError, OSError):
+            return None
+        if rc == 0:
+            return session in [line.strip() for line in out.splitlines()
+                               if line.strip()]
+        if _server_is_gone(err):
+            return False
+        return None
 
     def list_sessions(self) -> list[str]:
         # psmux exits 0 with empty output when no server is running while tmux

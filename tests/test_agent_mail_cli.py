@@ -222,7 +222,7 @@ def test_live_session_is_typed_into_and_not_queued(live_recipient):
     assert session == inst.id
     assert "ping" in text
     assert '"alpha"' in text
-    assert "operator send --from beta --to alpha" in text
+    assert "operator reply --instance beta --to alpha" in text
     # Delivered live, so it must not also arrive in the next preamble.
     assert operator_mail.pending(op.OPERATOR_HOME, inst.id) == []
     assert operator_mail.history(op.OPERATOR_HOME, inst.id)[0]["delivery"] == "live"
@@ -1116,10 +1116,10 @@ def test_reply_command_from_a_message_actually_works(idle_recipient, monkeypatch
     hint = operator_mail.reply_hint(msg)
 
     parts = shlex.split(hint)
-    assert parts[0] == "operator" and parts[1] == "send"
+    assert parts[0] == "operator" and parts[1] == "reply"
     args = parts[2:]
     args[-1] = "an answer"
-    assert op.send_message(args) == 0
+    assert op.reply_message(args) == 0
     (reply,) = operator_mail.pending(op.OPERATOR_HOME, "alpha")
     assert reply["from"] == "beta"
     assert reply["text"] == "an answer"
@@ -1234,7 +1234,7 @@ def test_queued_mail_is_appended_to_the_next_session_preamble(idle_recipient):
     base = op.build_preamble("anvil", inst)
     combined = base + block
     assert "do the thing" in combined
-    assert "operator send --from beta --to alpha" in combined
+    assert "operator reply --instance beta --to alpha" in combined
     assert "\n" not in block
 
 

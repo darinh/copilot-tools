@@ -2,7 +2,7 @@
 # ═══════════════════════════════════════════════════════════════════
 # handoff — Atomic session handoff for Copilot CLI agents
 #
-# Writes a next-session.md handoff file and touches the restart
+# Writes a per-instance handoff file and touches the restart
 # marker so the operator loop picks up the new session automatically.
 #
 # Usage:
@@ -82,6 +82,50 @@ Add it with:
     echo "$guid"
 }
 
+# ── The instance name has to be a filename, and the same one ───
+#
+# Sets `instance_id`, the name every path here is built from. A name
+# containing `/` or `..` would write outside the project's handoff directory,
+# and a name the Python writer would mangle gets written where the Python
+# reader will not look. `operator` and the installed `handoff` both address an
+# instance through `safe_instance_id`, which replaces `.:\/*?"<>|` and control
+# characters, strips outer dashes, case-folds where the filesystem is
+# case-insensitive, and appends a sha1 digest of the original whenever it
+# changed anything -- so `a.b` and `a:b` stay two instances rather than
+# collapsing into one.
+#
+# Reimplementing that here would mean reimplementing sha1 in bash 3.2 across
+# two different checksum binaries, and a *nearly* matching id is the worst
+# outcome available: it writes a real handoff to a path nothing reads, and
+# reports success. So this refuses the names it cannot address identically
+# instead of guessing. What is left is the set `safe_instance_id` returns
+# unchanged, which is what `operator` generates.
+addressable_instance_id() {
+    local name="$1"
+    case "$name" in
+        *[!a-zA-Z0-9-]* | -* | *- | "")
+            die "Instance name '${name}' is not addressable by this script (letters, digits and inner dashes only). Use the installed \`handoff\` command, which handles any name." ;;
+    esac
+
+    # Folded on macOS only, because that is where the id is folded: APFS is
+    # case-insensitive, so `Build` and `build` are one file and therefore one
+    # instance. On Linux they are two, and folding here would merge them.
+    instance_id="$name"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        instance_id=$(printf '%s' "$name" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+    fi
+
+    case "$instance_id" in
+        con | prn | aux | nul | com[1-9] | lpt[1-9] | CON | PRN | AUX | NUL | COM[1-9] | LPT[1-9])
+            die "Instance name '${name}' is a reserved device name, which the installed \`handoff\` gives a digest suffix. Use that command instead." ;;
+    esac
+
+    case "$instance_id" in
+        *-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+            die "Instance name '${name}' ends in something the installed \`handoff\` reads as a generated digest, so the two would disagree about its file. Use that command instead." ;;
+    esac
+}
+
 resolve_instance() {
     # If no instance specified, try to find the one running in this project's cwd
     local project_root="$1"
@@ -151,7 +195,7 @@ operator sessions whose working directory matches the project root.
 
 WHAT IT DOES
     1. Resolves project GUID from ~/.operator/projects/catalog.csv
-    2. Writes ~/.operator/projects/{guid}/next-session.md
+    2. Writes ~/.operator/projects/{guid}/handoff/{instance}.md
     3. Touches ~/.operator/restart/{instance} to trigger operator restart
 HELP
 }
@@ -223,17 +267,39 @@ if ! tmux has-session -t "$instance" 2>/dev/null; then
     echo "Warning: No tmux session '$instance' found. Handoff file will be written but restart may not trigger." >&2
 fi
 
+addressable_instance_id "$instance"
+
 # ── Resolve GUID ────────────────────────────────────────────────
 guid=$(resolve_guid "$project_root")
 project_dir="${HOME}/.operator/projects/${guid}"
-handoff_file="${project_dir}/next-session.md"
-restart_marker="${RESTART_DIR}/${instance}"
+handoff_dir="${project_dir}/handoff"
+handoff_file="${handoff_dir}/${instance_id}.md"
+restart_marker="${RESTART_DIR}/${instance_id}"
 
-mkdir -p "$project_dir" "$RESTART_DIR"
+mkdir -p "$handoff_dir" "$RESTART_DIR"
+
+# ── Bank an unread predecessor ─────────────────────────────────
+#
+# The reader deletes this file once it has consumed it, so finding one here
+# means a session of THIS instance ended without picking up what the one
+# before it left. One slot, replaced each time: a second consecutive miss
+# means the read side is broken, and keeping the older of two undelivered
+# handoffs does not fix that.
+if [[ -f "$handoff_file" ]]; then
+    prev_file="${handoff_dir}/${instance_id}.prev.md"
+    if mv -f "$handoff_file" "$prev_file"; then
+        echo "Warning: '${instance}' had an unread handoff at ${handoff_file};" >&2
+        echo "         a session ended without reading it. Moved to ${prev_file}" >&2
+    else
+        die "A handoff is already waiting at ${handoff_file} and could not be moved aside. Refusing to overwrite it."
+    fi
+fi
 
 # ── Write Handoff ───────────────────────────────────────────────
 {
     echo "# Session Handoff"
+    echo ""
+    echo "*Written by operator instance: \`${instance}\`*"
     echo ""
     echo "## Status"
     echo "$status"
@@ -269,7 +335,7 @@ touch "$restart_marker"
 LEGACY_RESTART_DIR="${HOME}/.copilot/restart"
 if [[ "$LEGACY_RESTART_DIR" != "$RESTART_DIR" ]]; then
     mkdir -p "$LEGACY_RESTART_DIR" 2>/dev/null || true
-    touch "${LEGACY_RESTART_DIR}/${instance}" 2>/dev/null || true
+    touch "${LEGACY_RESTART_DIR}/${instance_id}" 2>/dev/null || true
 fi
 
 echo "✅ Handoff written: $handoff_file"

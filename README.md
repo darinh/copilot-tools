@@ -14,13 +14,24 @@ messaging, and spec-driven workflow conventions.
 | [`copilot_operator.py`](docs/operator.md) | Cross-platform Copilot CLI wrapper with metrics capture, autonomous loop mode, and multi-instance support |
 | [`operator_runner.py`](docs/operator.md#architecture) | In-pane session supervisor: correct process attribution and metrics after detach |
 | [`operator_mux.py`](docs/operator.md#platform-support) | Session-backend abstraction (tmux / psmux) |
+| [`work_claims.py`](work_claims.py) | One work item, one owner: the claim store behind `operator work` |
+| [`operator_liveness.py`](operator_liveness.py) | Whether a claim's owner is provably gone: LIVE / DEAD / STALE |
+| [`operator_session.py`](operator_session.py) | The session lifecycle: the assignment resolved on the way in, the handoff and claim disposal on the way out |
+| [`operator_work.py`](operator_work.py) | The policy over the claim store: `operator work`, and the reclaim that preserves a departed owner's work first |
+| [`operator_worktree.py`](operator_worktree.py) | The checkout a claim owns: `operator worktree new` / `finish` / `recover` |
+| [`operator_ownership.py`](operator_ownership.py) | Whether a branch stayed inside its subproject: `operator ownership check` |
 | [`operator_ingest.py`](operator_ingest.py) | Pure-Python log parser for copilot process logs |
 | [`handoff_tool.py`](docs/operator.md) | Atomic session handoff for agents |
 | [`backlog_tool.py`](backlog/README.md) | Reads and enforces the tracked `backlog/`; ships the `backlog` command |
 | [`operator.sh`](operator.sh), [`handoff.sh`](handoff.sh), [`operator-ingest.py`](operator-ingest.py) | Original bash implementation, retained on disk for rollback but no longer installed fresh by `setup.sh` |
 | [`skills/code-intelligence`](skills/code-intelligence/SKILL.md) | Roslyn-backed C# structural analysis |
-| [`skills/operator-agents`](skills/operator-agents/SKILL.md) | Starting parallel operator agents and messaging them |
+| [`skills/peer-agents`](skills/peer-agents/SKILL.md) | Starting peer operator agents and messaging them |
+| [`skills/worktrees`](skills/worktrees/SKILL.md) | Worktree lifecycle, scratch discipline, safe delegation |
+| [`skills/backlog`](skills/backlog/SKILL.md) | The tracked backlog format, the approval gate, and evidence |
+| [`skills/spec-driven`](skills/spec-driven/SKILL.md) | The spec-kit workflow and when a change needs a spec update |
+| [`skills/field-notes`](skills/field-notes/SKILL.md) | The cross-project journal about working with AI agents |
 | [`skills/operator-backlog-*`](docs/skills.md) | Filing, refining and checking in on the tracked backlog |
+| [`docs/rationale.md`](docs/rationale.md) | Why the rules exist — the incidents behind them. Linked, never loaded |
 | [`operator_mail.py`](docs/operator.md#parallel-agents-and-messaging) | Message store behind `operator send` / `operator inbox` |
 | [`operator_trace.py`](operator_trace.py) | Records who invoked the operator and how each invocation ended, for attributing incidents |
 | [`install_manifest.py`](docs/versioning.md) | Records what setup deployed and its hash, so upgrades know what's safe to replace |
@@ -231,10 +242,14 @@ See [Operator Documentation](docs/operator.md) for full details.
 | Skill | Type | Source |
 |-------|------|--------|
 | **code-intelligence** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
-| **operator-agents** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
 | **operator-backlog-newitem** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
 | **operator-backlog-refinement** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
 | **operator-backlog-scrum** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **peer-agents** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **worktrees** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **backlog** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **spec-driven** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
+| **field-notes** | User skill (installed to `~/.copilot/skills/`) | Included in this repo |
 | **Anvil** | Installable plugin | [`burkeholland/anvil`](https://github.com/burkeholland/anvil) |
 | **frontend-design** | Built-in CLI skill | Ships with Copilot CLI |
 | **find-skills** | Built-in CLI skill | Ships with Copilot CLI |
@@ -292,6 +307,8 @@ backlog list          # one line per item
 backlog ready         # what an agent may work right now
 backlog new --title "..." --evidence "..."   # file an item, awaiting approval
 backlog approve 3     # the owner's act: proposed -> open
+backlog close 3       # shipped: records today and the SHA HEAD resolves to
+backlog close 3 --reject   # considered and declined; no commit, because none
 backlog scrum         # what changed since the last check-in
 backlog check         # validate every item; non-zero on failure
 backlog html --open   # a self-contained page, in a browser
@@ -321,9 +338,17 @@ from its fix is a window in which the backlog is wrong. In practice the close
 is the branch's last commit, naming the SHA of the one before it; filling in a
 SHA and then `git commit --amend` records an object the amend destroys.
 
+`backlog close` writes that pair for you and enforces the same gate `ready`
+does: it closes only an item an agent was allowed to work, so filing your own
+item and marking it shipped is not a path. Declining one is `--reject`, which
+is deliberately *not* gated on approval — the ordinary thing to decline is an
+unapproved proposal — and writes no commit, because nothing shipped. Both
+verbs are also reachable as `operator backlog …`, which is a delegation to
+this same tool rather than a second implementation of it.
+
 `tests/test_backlog_conformance.py` enforces the format, the spec mapping, and
 that every closing SHA actually resolves; `tests/test_backlog_workflow.py`
-covers filing, approval and the check-in. See
+covers filing, approval, closing and the check-in. See
 [`backlog/README.md`](backlog/README.md) for the field reference.
 
 ## MCP Servers
@@ -363,11 +388,17 @@ copilot-tools/
 ├── operator_ingest.py             # Pure-Python log parser
 ├── operator_mail.py               # Agent-to-agent mail, live and queued delivery
 ├── operator_trace.py              # Who invoked the operator, and how it ended
+├── operator_liveness.py           # Is a claim's owner still there? LIVE / DEAD / STALE
+├── operator_session.py            # Session lifecycle: assignment in, handoff out
+├── operator_work.py               # `operator work`: request, release, list, heartbeat, reclaim
+├── operator_worktree.py           # `operator worktree`: new, finish, recover
+├── operator_ownership.py          # `operator ownership check`: did this branch leave its subproject?
 ├── operator_console.py            # UTF-8 console output
 ├── project_paths.py               # Project identity: catalog and per-project dirs
 ├── project_features.py            # The feature vocabulary, and each project's choices
 ├── project_instructions.py        # Renders each project's AGENTS.md; retires the global file
 ├── handoff_tool.py                # Session handoff
+├── work_claims.py                 # One work item, one owner: the claim store
 ├── backlog_tool.py                # Backlog parser, validator, and HTML view
 ├── setup_tools.py                 # Cross-platform environment setup
 ├── install_manifest.py            # Records what setup deployed; upgrade strategies
@@ -387,8 +418,16 @@ copilot-tools/
 ├── skills/
 │   ├── code-intelligence/
 │   │   └── SKILL.md               # Roslyn routing
-│   ├── operator-agents/
-│   │   └── SKILL.md               # Parallel operator agents and mail
+│   ├── peer-agents/
+│   │   └── SKILL.md               # Peer operator agents and messaging
+│   ├── worktrees/
+│   │   └── SKILL.md               # Worktree lifecycle and safe delegation
+│   ├── backlog/
+│   │   └── SKILL.md               # Backlog format, approval gate, evidence
+│   ├── spec-driven/
+│   │   └── SKILL.md               # The spec-kit workflow
+│   ├── field-notes/
+│   │   └── SKILL.md               # The cross-project agent journal
 │   └── operator-backlog-*/
 │       └── SKILL.md               # Filing, refinement and the check-in
 ├── templates/

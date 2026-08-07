@@ -69,6 +69,19 @@ import {
   strayReport,
   sweepDecision,
   tokenizeCommand,
+  commitDecision,
+  commitBlockReason,
+  currentBranch,
+  delegationBlockReason,
+  delegationDecision,
+  mergeInProgress,
+  outsideWorktreeDecision,
+  outsideWorktreeReason,
+  porcelainStatus,
+  siblingCheckouts,
+  uncommittedTracked,
+  within,
+  PROTECTED_BRANCHES,
 } from "./guard.mjs";
 
 const NUL = "\0";
@@ -2276,3 +2289,324 @@ test("the decision scan cannot be silenced by a comment, a string or a regex", (
 });
 
 
+
+// ---------------------------------------------------------------------------
+// Worktree scope, delegation and protected branches (G1/G2 audit).
+//
+// Same convention as the rest of this file: no ALLOW assertion stands alone.
+// Each of these three rules replaced a sentence of prose, and a rule that has
+// stopped firing reads exactly like a rule nobody has had to break.
+// ---------------------------------------------------------------------------
+
+test("commitDecision blocks a commit on a protected branch and not on a feature branch", () => {
+  const cmd = 'git commit -m "wip"';
+  assert.deepEqual(commitDecision(cmd, { branch: "main" }),
+    { verb: "git commit", branch: "main" });
+  // The pairing. Without it, a predicate that never matched would pass.
+  assert.equal(commitDecision(cmd, { branch: "feat/login" }), null);
+  assert.deepEqual(commitDecision(cmd, { branch: "master" }),
+    { verb: "git commit", branch: "master" },
+    "master ships to projects that use it, so it is not this repo's branch name that matters");
+});
+
+test("commitDecision allows the commit that finishes a merge", () => {
+  const cmd = "git commit";
+  // Control through the same call: without the merge, this same command on
+  // this same branch blocks. Otherwise `null` here proves nothing.
+  assert.ok(commitDecision(cmd, { branch: "main", mergeInProgress: false }));
+  assert.equal(commitDecision(cmd, { branch: "main", mergeInProgress: true }), null,
+    "merging a feature branch into main is how work lands here");
+});
+
+test("commitDecision reads a commit out of a chained command but not out of prose", () => {
+  assert.ok(commitDecision('git add -A && git commit -m "x"', { branch: "main" }),
+    "the second command in a chain is still a commit");
+  assert.ok(commitDecision('bash -c "git commit -m x"', { branch: "main" }),
+    "a shell runner's -c string is a command in its own right");
+  assert.equal(commitDecision("echo git commit -m x", { branch: "main" }), null,
+    "a sentence describing the action is not the action");
+  assert.equal(commitDecision("git -C ../elsewhere commit -m x", { branch: "main" }), null,
+    "the branch was measured here; that command is about another repository");
+});
+
+test("commitDecision needs a branch it recognises", () => {
+  assert.equal(commitDecision("git commit", { branch: null }), null,
+    "a detached HEAD is not a branch");
+  assert.equal(commitDecision("git commit", {}), null);
+  // Control: the same call with a protected branch does fire, so the nulls
+  // above are the branch check and not a broken parser.
+  assert.ok(commitDecision("git commit", { branch: "main" }));
+  assert.ok(PROTECTED_BRANCHES.has("main") && PROTECTED_BRANCHES.has("master"));
+});
+
+test("uncommittedTracked counts what a careless git command would destroy", () => {
+  const porcelain = [
+    " M operator_mail.py",
+    "A  tests/test_new.py",
+    "?? scratch.py",
+    "!! build/",
+    "R  old_name.py -> new_name.py",
+  ].join("\n");
+  assert.deepEqual(uncommittedTracked(porcelain),
+    ["operator_mail.py", "tests/test_new.py", "new_name.py"]);
+});
+
+test("delegationDecision blocks on tracked changes and allows on untracked alone", () => {
+  assert.equal(delegationDecision("?? scratch.py\n"), null,
+    "an untracked file survives stash and reset; it is the other guard's subject");
+  assert.equal(delegationDecision(""), null);
+  // Paired, through the same call.
+  assert.deepEqual(delegationDecision(" M operator_mail.py\n"),
+    { paths: ["operator_mail.py"] });
+  assert.deepEqual(delegationDecision("A  staged.py\n"), { paths: ["staged.py"] },
+    "staging is not saving -- that is the half agents get wrong");
+});
+
+test("within does not read a sibling worktree as a parent of its neighbour", () => {
+  const a = join("/repo", ".worktrees", "feat-a");
+  const ab = join("/repo", ".worktrees", "feat-ab");
+  assert.equal(within(ab, a), false,
+    "startsWith on bare roots is the classic form of this bug");
+  // Control: the same function does answer true for a real containment, so the
+  // false above is the separator check rather than a predicate that never fires.
+  assert.equal(within(join(a, "src", "x.py"), a), true);
+  assert.equal(within(a, a), true, "a root contains itself");
+  assert.equal(within(a, a + "/"), true, "a trailing separator is not a different path");
+});
+
+test("outsideWorktreeDecision blocks a write into a sibling checkout only", () => {
+  const mine = join("/repo", ".worktrees", "feat-mine");
+  const theirs = join("/repo", ".worktrees", "feat-theirs");
+  const primary = "/repo";
+  const others = [primary, theirs];
+
+  assert.equal(outsideWorktreeDecision(join(mine, "src", "x.py"), mine, others), null,
+    "my own tree is where my work goes");
+  assert.equal(outsideWorktreeDecision(join(tmpdir(), "probe.py"), mine, others), null,
+    "the temp directory is where this guard tells everyone to put scratch work");
+
+  const intoTheirs = outsideWorktreeDecision(join(theirs, "src", "x.py"), mine, others);
+  assert.ok(intoTheirs, "a write into a peer's worktree is the incident shape");
+  assert.equal(intoTheirs.owner, theirs,
+    "the peer's worktree, not the primary that contains it as a directory");
+  const intoPrimary = outsideWorktreeDecision(join(primary, "notes.md"), mine, others);
+  assert.ok(intoPrimary, "the primary is the tree every other agent resolves as the project");
+  assert.equal(intoPrimary.owner, primary);
+});
+
+test("outsideWorktreeDecision names the most specific checkout, in either argument order", () => {
+  const mine = join("/repo", ".worktrees", "feat-mine");
+  const theirs = join("/repo", ".worktrees", "feat-theirs");
+  const target = join(theirs, "src", "x.py");
+  // The convention nests worktrees inside the primary, so both roots contain
+  // this path and the answer must not depend on which git listed first.
+  assert.equal(outsideWorktreeDecision(target, mine, ["/repo", theirs]).owner, theirs);
+  assert.equal(outsideWorktreeDecision(target, mine, [theirs, "/repo"]).owner, theirs);
+});
+
+test("outsideWorktreeDecision needs both a target and a working root", () => {
+  const mine = join("/repo", ".worktrees", "feat-mine");
+  assert.equal(outsideWorktreeDecision("", mine, ["/repo"]), null);
+  assert.equal(outsideWorktreeDecision(join("/repo", "x.py"), null, ["/repo"]), null);
+  assert.equal(outsideWorktreeDecision(join("/repo", "x.py"), mine, []), null,
+    "with no other checkout known, there is nothing this can be inside");
+  // Control: supply all three and it fires.
+  assert.ok(outsideWorktreeDecision(join("/repo", "x.py"), mine, ["/repo"]));
+});
+
+test("the block messages name the override and the way out", () => {
+  const commit = commitBlockReason({ verb: "git commit", branch: "main" });
+  assert.match(commit, /COPILOT_CHECKOUT_GUARD_DISABLE=1/);
+  assert.match(commit, /checkout -b/, "a block with no next step is a wall");
+  const delegate = delegationBlockReason({ paths: ["a.py", "b.py"] });
+  assert.match(delegate, /a\.py/);
+  assert.match(delegate, /Commit first/);
+  const outside = outsideWorktreeReason(
+    { target: "/repo/x.py", owner: "/repo" }, "/repo/.worktrees/feat");
+  assert.match(outside, /\/repo\/x\.py/);
+  assert.match(outside, /\/repo\/\.worktrees\/feat/, "the agent has to be told where it is");
+});
+
+test("the probes answer from a real repository", async () => {
+  await withWorktree(async ({ primary, worktree }) => {
+    assert.equal(await currentBranch(primary), "main");
+    assert.equal(await currentBranch(worktree), "feat",
+      "control: the probe reads the checkout it was pointed at, not a constant");
+
+    assert.equal(await mergeInProgress(primary), false);
+
+    const clean = await porcelainStatus(worktree);
+    assert.equal(delegationDecision(clean), null, "a fresh worktree has nothing to lose");
+    await writeFile(join(worktree, "README.md"), "# changed\n");
+    const dirty = await porcelainStatus(worktree);
+    assert.ok(delegationDecision(dirty), "and a modified tracked file is exactly the risk");
+
+    const others = await siblingCheckouts(worktree, worktree);
+    assert.ok(others.includes(primary), "the primary is a checkout this write could vanish into");
+    assert.ok(!others.some((p) => within(p, worktree) && within(worktree, p)),
+      "and the session's own tree is not one of them");
+  });
+});
+
+test("the probes report failure as failure", async () => {
+  const base = await mkdtemp(join(tmpdir(), "checkout-guard-norepo3-"));
+  try {
+    const outside = await realpath(base);
+    assert.equal(await siblingCheckouts(outside, outside), null,
+      "null, not [] -- an empty list would mean `no other checkout exists`");
+    assert.equal(await porcelainStatus(outside), null);
+    assert.equal(await currentBranch(outside), null);
+  } finally {
+    await rm(base, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+// --- the three new rules, driven through the hook the extension calls -------
+
+const SCOPE_PRIMARY = join(tmpdir(), "cg-hook-primary");
+const HOOK_PEER = join(SCOPE_PRIMARY, ".worktrees", "peer");
+
+/** A guard whose working root is a linked worktree with a peer beside it. */
+function scopedGuard(overrides = {}) {
+  return hookGuard({
+    cwd: () => HOOK_ROOT,
+    rootOf: async () => HOOK_ROOT,
+    siblings: async () => [SCOPE_PRIMARY, HOOK_PEER],
+    status: async () => "",
+    branchOf: async () => "feat/x",
+    merging: async () => false,
+    ...overrides,
+  });
+}
+
+test("the hook denies an edit aimed at another checkout and allows one in its own", async () => {
+  const guard = scopedGuard();
+  const own = await guard.onPreToolUse({
+    toolName: "edit", toolArgs: { path: join(HOOK_ROOT, "src", "x.py") } });
+  assert.equal(own, undefined, "my own worktree is where my work goes");
+  const scratch = await guard.onPreToolUse({
+    toolName: "create", toolArgs: { path: join(tmpdir(), "probe.py") } });
+  assert.equal(scratch, undefined, "and a temp path is never blocked");
+
+  const peer = await guard.onPreToolUse({
+    toolName: "create", toolArgs: { path: join(HOOK_PEER, "notes.md") } });
+  assert.equal(peer?.permissionDecision, "deny");
+  assert.match(peer.permissionDecisionReason, /another checkout/);
+  assert.ok(peer.permissionDecisionReason.includes(HOOK_PEER),
+    "the message names the tree the write would have vanished into");
+});
+
+test("the hook fails open when git cannot list the checkouts", async () => {
+  // Control first: with the list available, this same call denies.
+  const seeing = scopedGuard();
+  assert.equal(
+    (await seeing.onPreToolUse({ toolName: "create", toolArgs: { path: join(HOOK_PEER, "a") } }))
+      ?.permissionDecision, "deny");
+  const blind = scopedGuard({ siblings: async () => null });
+  assert.equal(
+    await blind.onPreToolUse({ toolName: "create", toolArgs: { path: join(HOOK_PEER, "a") } }),
+    undefined,
+    "a failed probe is not evidence that the write is safe, but a guard that "
+    + "breaks a session is worse than the artifacts it prevents");
+});
+
+test("the hook denies delegation with tracked changes and allows it clean", async () => {
+  const clean = scopedGuard({ status: async () => "?? scratch.py\n" });
+  assert.equal(await clean.onPreToolUse({ toolName: "task", toolArgs: {} }), undefined);
+  const dirty = scopedGuard({ status: async () => " M operator_mail.py\n" });
+  const denied = await dirty.onPreToolUse({ toolName: "task", toolArgs: {} });
+  assert.equal(denied?.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /operator_mail\.py/);
+  const unknown = scopedGuard({ status: async () => null });
+  assert.equal(await unknown.onPreToolUse({ toolName: "task", toolArgs: {} }), undefined,
+    "fails open");
+});
+
+test("the hook denies a commit on main and allows the same command on a branch", async () => {
+  const onMain = scopedGuard({ branchOf: async () => "main" });
+  const denied = await onMain.onPreToolUse({
+    toolName: "bash", toolArgs: { command: 'git commit -m "wip"' } });
+  assert.equal(denied?.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /`main`/);
+
+  const onBranch = scopedGuard({ branchOf: async () => "feat/x" });
+  assert.equal(await onBranch.onPreToolUse({
+    toolName: "bash", toolArgs: { command: 'git commit -m "wip"' } }), undefined);
+
+  const merging = scopedGuard({ branchOf: async () => "main", merging: async () => true });
+  assert.equal(await merging.onPreToolUse({
+    toolName: "bash", toolArgs: { command: "git commit" } }), undefined,
+    "the commit that concludes a merge into main is how work lands");
+});
+
+test("the branch rule does not swallow the sweep rule", async () => {
+  // Both apply to `git add -A` on main with a stray outstanding. The add is
+  // not a commit, so the sweep block is what must come back -- a branch check
+  // that returned early on every git command would silently retire the guard
+  // this extension was written for.
+  const guard = scopedGuard({
+    branchOf: async () => "main",
+    trees: { [HOOK_ROOT]: ["probe.py"] },
+  });
+  await guard.onSessionStart();
+  guard.state.outstanding.set(HOOK_ROOT, new Set(["probe.py"]));
+  const swept = await guard.onPreToolUse({
+    toolName: "bash", toolArgs: { command: "git add -A" } });
+  assert.equal(swept?.permissionDecision, "deny");
+  assert.match(swept.permissionDecisionReason, /stray artifact/);
+});
+
+test("a disabled guard denies none of the three", async () => {
+  const off = scopedGuard({
+    disabled: true, branchOf: async () => "main", status: async () => " M x.py\n" });
+  assert.equal(await off.onPreToolUse({
+    toolName: "create", toolArgs: { path: join(HOOK_PEER, "a") } }), undefined);
+  assert.equal(await off.onPreToolUse({ toolName: "task", toolArgs: {} }), undefined);
+  assert.equal(await off.onPreToolUse({
+    toolName: "bash", toolArgs: { command: "git commit" } }), undefined);
+  // Control: the identical guard with the switch on denies all three, so the
+  // undefineds above are the switch and not three broken predicates.
+  const on = scopedGuard({ branchOf: async () => "main", status: async () => " M x.py\n" });
+  assert.equal((await on.onPreToolUse({
+    toolName: "create", toolArgs: { path: join(HOOK_PEER, "a") } }))?.permissionDecision, "deny");
+  assert.equal((await on.onPreToolUse({ toolName: "task", toolArgs: {} }))?.permissionDecision,
+    "deny");
+  assert.equal((await on.onPreToolUse({
+    toolName: "bash", toolArgs: { command: "git commit" } }))?.permissionDecision, "deny");
+});
+
+test("an edit with no path, and a non-git shell command, reach no probe at all", async () => {
+  let probed = 0;
+  const guard = scopedGuard({ siblings: async () => { probed += 1; return [HOOK_PEER]; } });
+  assert.equal(await guard.onPreToolUse({ toolName: "edit", toolArgs: {} }), undefined);
+  assert.equal(probed, 0, "no path means nothing to adjudicate");
+  // Control: a call that does carry a path reaches the probe.
+  await guard.onPreToolUse({ toolName: "edit", toolArgs: { path: join(HOOK_PEER, "a") } });
+  assert.equal(probed, 1);
+});
+
+test("within follows the platform's own idea of path identity", () => {
+  const root = join("/repo", ".worktrees", "feat");
+  assert.equal(within(root.toUpperCase(), root), process.platform === "win32",
+    "C:\\Repo and c:\\repo are one directory on Windows and two elsewhere; "
+    + "getting this wrong lets every write through on the platform this is developed on");
+  // Control through the same call, so the equality above is the case rule
+  // rather than a predicate that has stopped matching anything.
+  assert.equal(within(root, root), true);
+});
+
+test("currentBranch answers null for a detached HEAD, never the string HEAD", async () => {
+  await withWorktree(async ({ primary }) => {
+    // Control first: attached, it names the branch. Without this the null
+    // below is satisfied by a probe that has stopped working entirely.
+    assert.equal(await currentBranch(primary), "main");
+    const { stdout } = await git(["rev-parse", "HEAD"], primary);
+    const { ok } = await git(["checkout", "-q", "--detach", stdout.trim()], primary);
+    assert.ok(ok, "premise: git could detach HEAD");
+    assert.equal(await currentBranch(primary), null,
+      "`HEAD` is not a branch name; comparing it to one is harmless only until "
+      + "somebody adds a name to PROTECTED_BRANCHES");
+    // And the decision that consumes it lets a detached commit through.
+    assert.equal(commitDecision("git commit", { branch: await currentBranch(primary) }), null);
+  });
+});

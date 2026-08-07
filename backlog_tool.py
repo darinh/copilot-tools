@@ -4,10 +4,10 @@ Why this exists
 ---------------
 
 Open work in a Copilot-tools project survives only in
-``~/.operator/projects/{guid}/next-session.md``, which is read-once and deleted
-at session start. Closed work is answerable from ``git log``; open work was
-answerable from nothing durable at all. It lived in a live agent's context and
-was carried forward as one re-summarised sentence per session -- lossy by
+``~/.operator/projects/{guid}/handoff/{instance}.md``, which is read-once and
+deleted at session start. Closed work is answerable from ``git log``; open work
+was answerable from nothing durable at all. It lived in a live agent's context
+and was carried forward as one re-summarised sentence per session -- lossy by
 construction, and nothing could detect the loss.
 
 ``backlog/`` is the fallback. One file per item, under version control, in the
@@ -91,15 +91,16 @@ from project_paths import (
 
 __all__ = [
     "STATUSES", "TERMINAL_STATUSES", "COMMIT_REQUIRED_STATUSES", "OPEN_STATUS",
-    "PROPOSED_STATUS", "ACTIVE_STATUSES", "APPROVED_STATUSES",
+    "PROPOSED_STATUS", "CLOSED_STATUS", "REJECTED_STATUS", "ACTIVE_STATUSES",
+    "APPROVED_STATUSES",
     "NO_SPEC", "BACKLOG_DIRNAME", "EVIDENCE_HEADING", "REQUIRED_FIELDS",
     "KNOWN_FIELDS", "ITEM_FILENAME", "Item", "BacklogFormatError",
     "checkout_root", "item_paths", "split_front_matter", "parse_item", "load",
     "check", "workable", "why_not_workable", "by_filename_id", "next_id",
-    "slug_for", "render_item", "create_item", "approve_item",
+    "slug_for", "render_item", "create_item", "approve_item", "close_item",
     "WatermarkError", "watermark_path", "read_watermark", "write_watermark",
     "ScrumReport", "scrum_report", "format_scrum",
-    "render_html", "main",
+    "render_html", "main", "build_parser",
 ]
 
 #: The complete status vocabulary. This tuple is the only place the legal
@@ -118,9 +119,19 @@ PROPOSED_STATUS = "proposed"
 #: Approved, outstanding work. The one status an agent may pick up freely.
 OPEN_STATUS = "open"
 
+#: Shipped. The only status that names a commit, because it is the only one
+#: that claims something was built.
+CLOSED_STATUS = "closed"
+
+#: Considered and declined. A decision, and recorded as one -- which is why it
+#: is a status rather than a deleted file. A deleted item is indistinguishable
+#: from an item nobody ever filed, so the next agent to notice the same defect
+#: files it again and the decision is paid for twice.
+REJECTED_STATUS = "rejected"
+
 #: Statuses that end an item's life. Both require a ``closed`` date: a
 #: rejection is a decision with a date, not an absence.
-TERMINAL_STATUSES = ("closed", "rejected")
+TERMINAL_STATUSES = (CLOSED_STATUS, REJECTED_STATUS)
 
 #: Statuses that mean the item is still alive. These carry neither a closing
 #: date nor a commit -- the complement of :data:`TERMINAL_STATUSES`, spelled
@@ -137,7 +148,7 @@ APPROVED_STATUSES = ("open",)
 #: ``rejected`` means nothing shipped, so demanding a SHA for it would force
 #: whoever rejects an item to invent one, and an invented SHA is worse than a
 #: blank field because it looks like evidence.
-COMMIT_REQUIRED_STATUSES = ("closed",)
+COMMIT_REQUIRED_STATUSES = (CLOSED_STATUS,)
 
 #: The literal a ``spec`` field carries when an item has no spec-kit impact.
 #: Required rather than allowing the field to be blank, so "this changes no
@@ -486,24 +497,27 @@ def check(repo_root=None, *, resolve_commits: bool = True) -> list:
             problems.append(
                 f"{name}: the {EVIDENCE_HEADING!r} section is missing or empty")
 
-        # R7. Terminal items carry a closing date; live items carry neither a
-        # closing date nor a commit.
+        # R7. Terminal items carry a closing date; live items carry none.
         closed_on = front.get("closed", "")
         commit = front.get("commit", "")
         if status in TERMINAL_STATUSES and not closed_on:
             problems.append(
                 f"{name}: status is {status!r} but no 'closed' date is set")
-        if status in ACTIVE_STATUSES:
-            if closed_on:
-                problems.append(
-                    f"{name}: status is {status!r} but a 'closed' date is set")
-            if commit:
-                problems.append(
-                    f"{name}: status is {status!r} but a 'commit' is set")
+        if status in ACTIVE_STATUSES and closed_on:
+            problems.append(
+                f"{name}: status is {status!r} but a 'closed' date is set")
 
         # R8. A closed item names a commit, and that commit resolves here. A
         # close pointing at nothing is a claim that something shipped with
         # nothing behind it.
+        #
+        # Every other status names none, because a SHA *is* the claim that
+        # work landed. ``rejected`` is the case that costs the most and the
+        # one this rule was widened for: nothing shipped, so a SHA against a
+        # rejection reads as evidence of work that never happened. It is
+        # reachable -- rejecting an item that was already carrying a commit
+        # moves it out of the live statuses, and a rule that only asked about
+        # those would have watched the field become legal on its way past.
         if status in COMMIT_REQUIRED_STATUSES:
             if not commit:
                 problems.append(
@@ -512,6 +526,9 @@ def check(repo_root=None, *, resolve_commits: bool = True) -> list:
                 problems.append(
                     f"{name}: commit {commit!r} does not resolve to a commit "
                     "in this repository")
+        elif commit and status in STATUSES:
+            problems.append(
+                f"{name}: status is {status!r} but a 'commit' is set")
 
         # R9. The spec-kit mapping. Either a path that exists under specs/, or
         # the explicit literal 'none'.
@@ -826,6 +843,119 @@ def create_item(directory, **kwargs) -> Path:
 #: function whose entire claim is that it changed one line.
 _LINE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
 
+#: New front-matter fields are written directly after this one.
+#:
+#: ``closed`` and ``commit`` are the two fields an item gains on its way out,
+#: and ``opened`` is the field they belong beside -- the item's dates read as a
+#: pair rather than with the whole record between them. Appending at the end of
+#: the block instead would put them after ``spec``, which is legal and reads as
+#: though somebody had added them by hand in a hurry.
+_INSERT_AFTER = "opened"
+
+
+def _item_path(directory, item_id: int) -> Path:
+    """The file holding item ``item_id``, or :class:`BacklogFormatError`.
+
+    Matched on the *filename* id for the same reason :func:`check` cross-
+    references on it: it is the id guaranteed to parse, so a front-matter typo
+    reports itself as its own problem instead of making this lookup answer
+    "no such item" about a file that is plainly there.
+    """
+    match = [p for p in item_paths(Path(directory))
+             if int(ITEM_FILENAME.match(p.name).group(1)) == item_id]
+    if not match:
+        raise BacklogFormatError(f"no backlog item with id {item_id}")
+    return match[0]
+
+
+def _field_line(key: str, value, ending: str) -> str:
+    """One front-matter line, with no trailing space when ``value`` is empty.
+
+    ``closed:`` and ``commit:`` are legal empty, and the template in this
+    project's own documentation writes them bare. ``f"{key}: {value}"`` would
+    write ``"commit: "`` instead -- same meaning to the parser, but a
+    whitespace-only difference from every hand-written item, and one that a
+    later reader has to open a hex dump to explain.
+    """
+    return f"{key}:{' ' + str(value) if str(value) else ''}{ending}"
+
+
+def _set_front_matter(path: Path, updates: dict, *, require: tuple = ()) -> None:
+    """Set each ``key: value`` in ``updates`` in ``path``'s front matter.
+
+    Every other byte of the file survives: the rest of each line, its ending,
+    the trailing blank lines, and any exotic separator inside the prose. The
+    rewrite is assembled from the original pieces rather than re-rendered, so
+    a one-line decision is a one-line diff -- and a one-line decision that
+    shows up as a hundred-line change is a decision nobody reviews.
+
+    A key already present is replaced in place, keeping its own line ending. A
+    key that is absent is *inserted* after :data:`_INSERT_AFTER`, carrying that
+    line's ending, so a CR-only or CRLF file does not gain one LF line in the
+    middle of it. Keys named in ``require`` must already be there: for those,
+    absence is a malformed item rather than something to fill in, and writing
+    the field would repair the symptom while leaving whatever produced it.
+
+    Only the front matter is considered. Prose discussing ``status: open`` is
+    prose, and rewriting it would corrupt somebody's evidence while reporting
+    a successful edit.
+    """
+    lines = _LINE.findall(path.read_bytes().decode("utf-8"))
+    out: list = []
+    in_front = False
+    closing = None       # index in `out` of the front matter's closing '---'
+    anchor = None        # index in `out` just past the _INSERT_AFTER line
+    seen = {key: 0 for key in updates}
+    for index, line in enumerate(lines):
+        if line.strip() == _DELIMITER:
+            if not in_front and index == 0:
+                in_front = True
+            elif in_front:
+                in_front = False
+                closing = len(out)
+            out.append(line)
+            continue
+        if not in_front:
+            out.append(line)
+            continue
+        # Matched with the parser's own field pattern, not `startswith`, so
+        # that this function and `split_front_matter` cannot disagree about
+        # what counts as a field -- a file that lists and validates cleanly
+        # and then refuses to edit is the failure that costs the most time,
+        # because the error blames a line the reader can see is present.
+        match = _FIELD.match(line)
+        key = match.group(1) if match else None
+        if key in updates:
+            ending = line[len(line.rstrip("\r\n")):]
+            out.append(_field_line(key, updates[key], ending))
+            seen[key] += 1
+        else:
+            out.append(line)
+        if key == _INSERT_AFTER:
+            anchor = len(out)
+
+    for key in require:
+        if seen.get(key, 0) != 1:
+            raise BacklogFormatError(
+                f"{path.name}: expected exactly one {key + ':'!r} line in the "
+                f"front matter, found {seen.get(key, 0)}")
+    missing = [key for key, count in seen.items() if count == 0]
+    if missing:
+        if closing is None:
+            raise BacklogFormatError(
+                f"{path.name}: the front-matter block is never closed with "
+                f"'{_DELIMITER}', so there is nowhere to write "
+                f"{', '.join(missing)}")
+        at = closing if anchor is None else anchor
+        previous = out[at - 1] if at else ""
+        ending = previous[len(previous.rstrip("\r\n")):] or "\n"
+        out[at:at] = [_field_line(key, updates[key], ending)
+                      for key in missing]
+
+    # Bytes, not text: an encoding-aware write would translate newlines on the
+    # way out and undo the preservation above.
+    path.write_bytes("".join(out).encode("utf-8"))
+
 
 def approve_item(directory, item_id: int) -> Path:
     """Move item ``item_id`` from ``proposed`` to ``open``.
@@ -834,20 +964,8 @@ def approve_item(directory, item_id: int) -> Path:
     changes exactly one line and refuses everything else. It will not approve
     an item that is already approved or already terminal, because both would
     be silent no-ops that read as an approval having happened.
-
-    Every other byte of the file survives: the rest of each line, its ending,
-    the trailing blank lines, and any exotic separator inside the prose. The
-    rewrite is assembled from the original pieces rather than re-rendered, so
-    a one-line decision is a one-line diff -- and a one-line decision that
-    shows up as a hundred-line change is a decision nobody reviews.
     """
-    directory = Path(directory)
-    match = [p for p in item_paths(directory)
-             if int(ITEM_FILENAME.match(p.name).group(1)) == item_id]
-    if not match:
-        raise BacklogFormatError(f"no backlog item with id {item_id}")
-    path = match[0]
-    raw = path.read_bytes()
+    path = _item_path(directory, item_id)
     item = parse_item(path)
     if item.status == OPEN_STATUS:
         raise BacklogFormatError(
@@ -856,30 +974,105 @@ def approve_item(directory, item_id: int) -> Path:
         raise BacklogFormatError(
             f"{path.name} is {item.status!r}, not {PROPOSED_STATUS!r}; only a "
             "proposed item can be approved")
+    _set_front_matter(path, {"status": OPEN_STATUS}, require=("status",))
+    return path
 
-    lines = _LINE.findall(raw.decode("utf-8"))
-    out, replaced, in_front = [], 0, False
-    for index, line in enumerate(lines):
-        if line.strip() == _DELIMITER:
-            if not in_front and index == 0:
-                in_front = True
-            elif in_front:
-                in_front = False
-            out.append(line)
-            continue
-        if in_front and line.startswith("status:"):
-            ending = line[len(line.rstrip("\r\n")):]
-            out.append(f"status: {OPEN_STATUS}{ending}")
-            replaced += 1
-            continue
-        out.append(line)
-    if replaced != 1:
+
+def _resolve_commit(rev: str, repo_root) -> "str | None":
+    """``rev`` as a full commit SHA, or ``None`` when it names no commit here.
+
+    ``^{commit}`` is load-bearing for the same reason it is in
+    :func:`_commit_resolves`: without it a tag or a tree would resolve, and an
+    item would close naming an object that is not a commit at all.
+
+    Resolving rather than storing what was typed is what makes ``--commit
+    HEAD`` safe to offer. ``HEAD`` is the natural thing to pass straight after
+    committing the work, and it is also the one string whose meaning changes
+    the moment anybody commits again -- so a record holding the word would
+    point somewhere else tomorrow while still passing every check.
+    """
+    rc, out = _git(["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
+                   repo_root)
+    sha = out.strip()
+    return sha if rc == 0 and sha else None
+
+
+def close_item(directory, item_id: int, *, commit: "str | None" = None,
+               reject: bool = False, repo_root=None,
+               when: "str | None" = None) -> Path:
+    """End item ``item_id``'s life: ``closed`` with a commit, or ``rejected``.
+
+    **The approval gate is preserved here, not just at the queue.** An item may
+    only be closed if :func:`why_not_workable` says an agent was allowed to
+    work it -- approved, or proposed with the recorded ``blocks`` exception.
+    Without that, an agent could file its own item and close it as shipped, and
+    the gate would hold on the one path (``ready``) that nobody has to take.
+
+    Rejection is deliberately *not* gated the same way, and the asymmetry is
+    the point: the ordinary thing to reject is an unapproved proposal, so
+    requiring approval first would mean approving something in order to decline
+    it. It takes no commit, because nothing shipped -- demanding one forces
+    whoever rejects an item to invent a SHA, and an invented SHA looks exactly
+    like evidence. A commit the item was *already* carrying is cleared for the
+    same reason: refusing the flag while letting an inherited SHA through would
+    leave exactly the record the refusal exists to prevent.
+
+    ``commit`` is any revision this repository can resolve; what is written is
+    the full SHA it resolves to. It is required for a close: R8 rejects a
+    ``closed`` item without one, so a tool that wrote the status and left the
+    field blank would hand the caller a backlog its own checker fails.
+    """
+    directory = Path(directory)
+    # backlog/ sits at the checkout root by construction -- every path in this
+    # module is `root / BACKLOG_DIRNAME` -- so the parent is the root. Passed
+    # explicitly by the CLI, which already resolved it.
+    root = Path(repo_root) if repo_root is not None else directory.parent
+    path = _item_path(directory, item_id)
+    item = parse_item(path)
+    status = CLOSED_STATUS if not reject else REJECTED_STATUS
+
+    if item.status in TERMINAL_STATUSES:
         raise BacklogFormatError(
-            f"{path.name}: expected exactly one 'status:' line in the front "
-            f"matter, found {replaced}")
-    # Bytes, not text: an encoding-aware write would translate newlines on the
-    # way out and undo the preservation above.
-    path.write_bytes("".join(out).encode("utf-8"))
+            f"{path.name} is already {item.status!r}; an item's life ends "
+            "once, and reopening it is a new item with its own evidence")
+    if item.status not in ACTIVE_STATUSES:
+        raise BacklogFormatError(
+            f"{path.name} is {item.status!r}, which is not one of "
+            f"{', '.join(ACTIVE_STATUSES)}; fix the status before closing it")
+
+    if reject:
+        if commit:
+            raise BacklogFormatError(
+                f"a {REJECTED_STATUS!r} item names no commit: nothing shipped, "
+                "and a SHA recorded against a rejection reads as though "
+                "something had")
+        updates = {"status": status, "closed": when or _today()}
+        if item.front.get("commit", ""):
+            # A SHA the item was already carrying is the same claim the
+            # refusal above exists to prevent, arriving by a different route.
+            # It is only illegal while the item is live, so a rejection would
+            # otherwise launder it: the field stops being reported at the
+            # exact moment nobody looks at the item again.
+            updates["commit"] = ""
+    else:
+        if not commit:
+            raise BacklogFormatError(
+                f"a {CLOSED_STATUS!r} item names the commit that did the work; "
+                "pass --commit, or --reject if nothing shipped")
+        reason = why_not_workable(item, by_filename_id(load(directory)[0]))
+        if reason is not None:
+            raise BacklogFormatError(
+                f"{path.name} could not be worked ({reason}), so it cannot "
+                f"have been done; approve it first, or close it with --reject")
+        sha = _resolve_commit(commit, root)
+        if sha is None:
+            raise BacklogFormatError(
+                f"commit {commit!r} does not resolve to a commit in {root}; "
+                "an item closed against nothing is a claim with nothing "
+                "behind it")
+        updates = {"status": status, "closed": when or _today(), "commit": sha}
+
+    _set_front_matter(path, updates, require=("status",))
     return path
 
 
@@ -1577,6 +1770,44 @@ def _cmd_approve(args, root: Path) -> int:
     return 0
 
 
+def _cmd_close(args, root: Path) -> int:
+    # Defaulted here rather than in the parser so that `--reject --commit X`
+    # still reaches `close_item`, which refuses it. A default of "HEAD" in the
+    # parser makes the two indistinguishable, and the refusal that protects
+    # the record from a SHA against a rejection would silently never fire.
+    commit = args.commit
+    if commit is None and not args.reject:
+        commit = "HEAD"
+    try:
+        path = close_item(root / BACKLOG_DIRNAME, args.id, commit=commit,
+                          reject=args.reject, repo_root=root)
+    except BacklogFormatError as exc:
+        print(f"refusing to close this item: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"cannot rewrite the item: {exc}", file=sys.stderr)
+        return 1
+    item = parse_item(path)
+    commit = item.front.get("commit", "")
+    print(f"{path.name}: -> {item.status}"
+          f"{' (' + commit[:12] + ')' if commit else ''}")
+    # Validated in the same breath, exactly as `new` does. A close the checker
+    # then rejects has moved the failure to whoever runs the suite next, with
+    # nothing pointing at the command that caused it.
+    remaining = [p for p in check(root) if p.startswith(path.name)]
+    if remaining:
+        for problem in remaining:
+            print(problem, file=sys.stderr)
+        print("the item was closed, and it does not conform; fix it in place",
+              file=sys.stderr)
+        return 1
+    if not args.reject:
+        print("Commit this close with the work it names, or as the commit "
+              "after it -- `git commit --amend` at this point would destroy "
+              "the object just recorded.")
+    return 0
+
+
 def _cmd_scrum(args, root: Path) -> int:
     try:
         mark = watermark_path(root)
@@ -1601,10 +1832,17 @@ def _cmd_scrum(args, root: Path) -> int:
     return 0
 
 
-def main(argv=None) -> int:
-    enable_utf8_output()
+def build_parser(prog: str = "backlog") -> argparse.ArgumentParser:
+    """The command line, as a value.
+
+    Separate from :func:`main` so that a test can ask what a subcommand
+    accepts without running it. The flags ``close`` carries are the gate's
+    surface: a documented option that closes an item the gate would have
+    refused is the bypass published in the tool's own ``--help``, which is the
+    exact shape ``new --status open`` had.
+    """
     parser = argparse.ArgumentParser(
-        prog="backlog",
+        prog=prog,
         description="Read and validate the repository's tracked backlog.")
     parser.add_argument("-C", "--repo", default=None,
                         help="a path inside the repository (default: cwd)")
@@ -1654,6 +1892,25 @@ def main(argv=None) -> int:
     p_approve.add_argument("id", type=int)
     p_approve.set_defaults(func=_cmd_approve)
 
+    p_close = sub.add_parser(
+        "close", help=f"end an item's life: {CLOSED_STATUS} with the commit "
+                      f"that did the work, or {REJECTED_STATUS}")
+    p_close.add_argument("id", type=int)
+    # HEAD is the natural thing to pass straight after committing the work,
+    # and what is recorded is the SHA it resolves to rather than the word --
+    # a stored 'HEAD' would name a different commit every time anybody
+    # committed, while still passing every check that reads it.
+    p_close.add_argument("--commit", default=None,
+                         help="the revision that did the work (default: HEAD)")
+    # There is deliberately no way to close an item the approval gate would
+    # not have let an agent work. `--reject` is the lawful exit for one that
+    # was never approved, and it writes no commit, so declining an item can
+    # never be mistaken in the record for having built it.
+    p_close.add_argument("--reject", action="store_true",
+                         help=f"{REJECTED_STATUS}: considered and declined, "
+                              "with no commit")
+    p_close.set_defaults(func=_cmd_close)
+
     p_scrum = sub.add_parser(
         "scrum", help="what changed since the previous check-in")
     p_scrum.add_argument("--peek", action="store_true",
@@ -1666,6 +1923,12 @@ def main(argv=None) -> int:
                         help="open the page in a browser")
     p_html.set_defaults(func=_cmd_html)
 
+    return parser
+
+
+def main(argv=None, prog: str = "backlog") -> int:
+    enable_utf8_output()
+    parser = build_parser(prog)
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):
         args = parser.parse_args(["list"] + (["-C", args.repo] if args.repo

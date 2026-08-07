@@ -921,15 +921,24 @@ def test_missing_skills_directory_is_not_an_error(tmp_path, monkeypatch):
     setup_tools.install_skills(assume_yes=True)
 
 
-def test_the_operator_skill_is_shipped():
-    """The skill the instructions point agents at must actually exist."""
+def test_the_peer_agent_skill_is_shipped():
+    """The skill the instructions point agents at must actually exist.
+
+    Named `peer-agents` since D7 retired `operator-agents`: two skills on one
+    subject is the drift this repo keeps paying for, and the retired one
+    described the mailbox-polling model that `operator reply` replaced.
+    """
     root = Path(__file__).resolve().parent.parent
-    skill = root / "skills" / "operator-agents" / "SKILL.md"
+    skill = root / "skills" / "peer-agents" / "SKILL.md"
     assert skill.is_file()
     text = skill.read_text(encoding="utf-8")
     assert text.startswith("---")
-    assert "name: operator-agents" in text
+    assert "name: peer-agents" in text
     assert "operator send" in text and "--headless" in text
+    assert "operator reply" in text
+
+    assert not (root / "skills" / "operator-agents").exists(), \
+        "the retired skill is still shipped, so both models are installed"
 
 
 # ── install manifest integration ─────────────────────────────────
