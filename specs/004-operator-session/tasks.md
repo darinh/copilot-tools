@@ -327,7 +327,9 @@ Status is tracked in SQL during execution; this file is the reconciled record.
       guard without that clause would block the workflow it exists to protect
       at the least convenient moment available.
 - [x] G8 New root and subproject templates.
-      The root template is rewritten wholesale: 4,332 rendered words → 674,
+      The root template is rewritten wholesale: 4,332 rendered words → 674
+      on delivery and 694 after adversarial review restored two dropped
+      rules,
       an 84% cut, keeping every line that is a guardrail, a procedure or a
       check and deleting the prose that explained *why*. The rationale is not
       lost — it moved to `docs/rationale.md` and the skills, which are read on
@@ -488,7 +490,10 @@ The human lifted the hold on 2026-08-06 and accepted all three
 recommendations, the 700-word figure, and deleting the emptied sections.
 Measured after: the block renders **674 words of 700** with every flag on,
 against 4,332 before — an **84% cut**. The subproject block renders 63 of
-120.
+120. Three adversarial reviewers then found eight defects, including a path
+traversal all three caught independently; the fixes restored two rules the
+cut had dropped and the block now renders **694 of 700**. Full account in
+`audit.md`.
 
 ## Still open for the human
 

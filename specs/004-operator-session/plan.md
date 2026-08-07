@@ -772,11 +772,12 @@ each is load-bearing for the next: the budget is only reachable once the cut
 has happened, and the cut is only safe once the deleted lines have somewhere
 to go.
 
-**Root template.** 4,332 rendered words to **674**, an 84% cut, against a
-`WORD_BUDGET` of 700. Kept: guardrails, procedures, checks. Deleted: the
-prose explaining why, which moved to `docs/rationale.md` and the skills —
-read on demand instead of on every turn. The block now carries no platform
-brackets at all, so both renderings are byte-identical.
+**Root template.** 4,332 rendered words to **674** on delivery, and **694**
+after adversarial review restored two rules the cut had dropped — an 84% cut,
+against a `WORD_BUDGET` of 700. Kept: guardrails, procedures, checks.
+Deleted: the prose explaining why, which moved to `docs/rationale.md` and the
+skills — read on demand instead of on every turn. The block now carries no
+platform brackets at all, so both renderings are byte-identical.
 
 **The budget is a mechanism, not an intention.** `render()` raises above 700.
 No warning, no override flag: a warning is a line of output nobody is obliged
@@ -784,7 +785,9 @@ to act on and the block that produced it still ships, which is how the
 predecessor reached 4,332 words with every one of them added for a reason.
 The count includes markers and fences, so prose cannot be hidden from it by
 moving it into a fence. It fired on its own first run — 756 words — and the
-82-word cut that followed took no guardrail with it.
+82-word cut that followed took no guardrail with it. It fired a second time
+during review, at 704, and two sentences were compressed rather than the
+number moved.
 
 **D10 held throughout.** Twenty-nine tests failed after the rewrite, and not
 one was deleted. Each was handled one of four ways: retargeted at the

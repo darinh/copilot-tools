@@ -51,7 +51,9 @@ Replaced at render time. Nothing written here ships.
 
 *Enabled by feature flag: `session-handoff`*
 
-Open and close every session with `operator session start|end`.
+`operator session start --instance NAME`, and to close:
+`operator session end --instance NAME --status TEXT --next TEXT`, plus `--done` to release
+the work item.
 
 - **Write it proactively.** Noticing that context has got heavy is a judgement no tool can make.
 - **Never write the handoff file by hand** — it destroys an unread one and raises no restart marker.
@@ -62,7 +64,7 @@ Open and close every session with `operator session start|end`.
 
 *Enabled by feature flag: `session-history`*
 
-`operator session start|end` records it. No schema to paste, no table to create.
+Recorded by `operator session start|end`. No schema to paste, no table to create.
 
 - **A session left open is recorded as abandoned, not lost.** Say what happened rather than
   reopening it quietly.
@@ -136,6 +138,6 @@ See the `peer-agents` skill.
 
 *Enabled by feature flag: `branching-strategy`*
 
-- `main` is the integration branch. **There is no `develop` branch — don't create one, don't assume
-  one.**
+- `main` is the integration branch; never commit to it directly. **There is no `develop` branch — don't create
+  one, don't assume one.**
 - `feat/`, `fix/`, `docs/` off `main`, worked in a worktree. Conventional commits.

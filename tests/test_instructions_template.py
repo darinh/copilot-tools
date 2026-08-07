@@ -45,6 +45,7 @@ coverage and prove nothing, so it is not here.
 """
 from __future__ import annotations
 
+import io
 import re
 import shlex
 from pathlib import Path
@@ -647,12 +648,21 @@ def test_the_replacement_commands_have_their_own_tests():
     is checked now.
     """
     for name in ("test_session_cli.py", "test_work_cli.py",
-                 "test_work_claims.py"):
+                 "test_work_claims.py", "test_handoff.py"):
         path = REPO / "tests" / name
         assert path.is_file(), (
-            f"tests/{name} is gone. The claim and session protocols left the "
-            "block on the promise that these check them in code; without it "
-            "the protocol is documented nowhere and tested nowhere.")
+            f"tests/{name} is gone. The claim, session and handoff protocols "
+            "left the block on the promise that these check them in code; "
+            "without it the protocol is documented nowhere and tested "
+            "nowhere.")
+    handoff = (REPO / "tests" / "test_handoff.py").read_text(encoding="utf-8")
+    assert "render" in handoff, (
+        "test_handoff.py no longer exercises the renderer. "
+        "`test_documented_handoff_layout_matches_what_the_tool_writes` was "
+        "retired against this file's promise to pin the layout against the "
+        "parser; a file that no longer does that keeps the promise's name "
+        "and not the promise. Review caught the first version of this guard "
+        "checking only that the other three files existed.")
 
 
 # --------------------------------------------------------------------------
@@ -936,3 +946,84 @@ def test_the_guid_detector_would_fire():
     assert _LOOKS_LIKE_A_REAL_GUID.findall(
         "id: c48add2d-aedc-45e5-a562-946da32753ff")
     assert not _LOOKS_LIKE_A_REAL_GUID.findall("id: `{guid}` or 0000-not-a-guid")
+
+
+def _required_flags(group: str, verb: str) -> set[str]:
+    """The flags `operator {group} {verb}` demands, read off its own usage.
+
+    Taken from the tool rather than written down here, so a flag that becomes
+    required later fails this suite instead of somebody's session. Optional
+    flags are the bracketed ones -- that is the usage string's own convention
+    and the only thing in it that distinguishes the two.
+    """
+    stream = io.StringIO()
+    _USAGE_PRINTERS[group](stream)
+    wanted = f"operator {group} {verb} "
+    for line in stream.getvalue().splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(wanted):
+            continue
+        bare = re.sub(r"\[[^\]]*\]", "", stripped)
+        return {tok for tok in bare.split() if tok.startswith("--")}
+    raise AssertionError(f"{wanted!r} is not in the usage for {group}")
+
+
+_USAGE_PRINTERS = {"session": copilot_operator._session_usage,
+                   "work": copilot_operator._work_usage}
+
+
+def test_the_required_flag_reader_separates_required_from_optional():
+    """The control. A reader that returned everything would pass the test
+    below on a line that spelled only the optional flags, and one that
+    returned nothing would pass it on a line that spelled none at all."""
+    assert _required_flags("session", "start") == {"--instance"}
+    assert _required_flags("session", "end") == {
+        "--instance", "--status", "--next"}
+    assert "--json" not in _required_flags("session", "end")
+    assert _required_flags("work", "list") == set()
+
+
+def test_the_block_forbids_committing_to_the_integration_branch(rendered):
+    """Restored after review found the cut had dropped it, with no check.
+
+    D10 says a rule is never deleted in a commit that does not add its check.
+    The cut obeyed that in one direction and not the other: the rule went out
+    and nothing objected, because nothing had ever asserted it was in. A
+    guardrail that no test names is one edit from gone, and this one is the
+    difference between an agent branching and an agent committing to `main`.
+
+    No tool enforces it -- `operator` cannot refuse a commit -- so it earns a
+    place in a 700-word block, and therefore earns a test.
+    """
+    branching = _section(rendered, "Branching Strategy")
+    assert "never commit to it directly" in branching, (
+        "the rendered block no longer tells an agent to keep off the "
+        "integration branch. Nothing in this toolkit enforces that, so the "
+        "sentence is the only thing that does.")
+
+
+def test_every_command_the_block_shows_is_spelled_completely(rendered):
+    """Review found `operator session end` named but never spelled.
+
+    A block that tells an agent to run a command it cannot construct is worse
+    than one that stays silent: the agent tries, the tool errors on missing
+    arguments, and the block has spent words to produce a failure. Both
+    session verbs take required flags, so both must show them.
+
+    Checked against the tool's own parser rather than a hard-coded list, so a
+    flag that becomes required later fails here instead of in somebody's
+    session.
+    """
+    missing = []
+    for verb in copilot_operator.SESSION_VERBS:
+        shown = [line for line in rendered.splitlines()
+                 if f"operator session {verb}" in line]
+        if not shown:
+            continue
+        text = " ".join(shown)
+        for flag in _required_flags("session", verb):
+            if flag not in text:
+                missing.append(f"session {verb} needs {flag}")
+    assert not missing, (
+        "the block shows a command an agent cannot run as written: "
+        + "; ".join(missing))

@@ -205,6 +205,15 @@ def read_declaration(root, name: str = DECLARATION_NAME):
                     f"names the repository root. A subproject that owns "
                     f"everything is the check switched off; delete the "
                     f"subproject instead, so it says so.")
+            if ".." in segments:
+                raise OwnershipError(
+                    f"Subproject {name_!r} in {path} owns {item!r}, which "
+                    f"climbs out of the repository. Refused here rather than "
+                    f"anywhere downstream: this declaration is also what "
+                    f"decides where `operator projects` writes a subproject's "
+                    f"instructions file, and a prefix that escapes the root "
+                    f"is a write into a directory nobody in this repository "
+                    f"named.")
             prefixes.append(segments)
         owned[name_] = tuple(prefixes)
     contracts = data.get("contracts", [])
@@ -223,6 +232,12 @@ def read_declaration(root, name: str = DECLARATION_NAME):
             raise OwnershipError(
                 f"A contract path in {path} names the repository root, so "
                 f"every change would be a contract change.")
+        if ".." in segments:
+            raise OwnershipError(
+                f"A contract path in {path} climbs out of the repository: "
+                f"{item!r}. A contract is a path inside this repository that "
+                f"more than one subproject depends on; one outside it is not "
+                f"a thing this check can see, let alone protect.")
         shared.append(segments)
     return Declaration(subprojects=owned, contracts=tuple(shared),
                        source=str(path))

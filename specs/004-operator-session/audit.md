@@ -194,13 +194,15 @@ The audit's estimate was that the block would land near 435 words of
 guardrail residue. It delivered at **674 of a 700-word budget**, every flag
 on, on both platforms — the template carries no platform brackets, so the two
 renderings are byte-identical and the earlier 4,332/4,321 split is gone.
+Adversarial review restored two rules the cut had dropped, taking it to
+**694**; see the review section at the end of this file.
 
 | | words | note |
 |---|---|---|
 | before (Windows) | 4,332 | measured after G12 |
-| after (either platform) | 674 | 84% cut |
+| after (either platform) | 694 | 84% cut |
 | of which generated | ~106 | `_header` ~30, `_configuration_section` ~76 |
-| budget | 700 | 26 words of headroom |
+| budget | 700 | 6 words of headroom after review |
 | subproject block | 63 | of a 120-word budget |
 
 Three things the estimate got wrong, all recorded because the *direction* of
@@ -211,11 +213,14 @@ the error is the useful part:
    "keep the guardrail, drop the rationale" keeps more than the guardrail's
    own sentence. First honest draft was 756 words and had to be cut by 82.
 
-2. **26 words of headroom is thin, and that is a known cost.** The audit
-   warned that a too-tight budget makes the next legitimate line an
-   emergency. It stands as accepted: the three places a line can go instead
-   are named in the error message, so the emergency has an exit that is not
-   "raise the budget".
+2. **The headroom is thin, and that is a known cost.** The audit warned that
+   a too-tight budget makes the next legitimate line an emergency. It stands
+   as accepted: the three places a line can go instead are named in the error
+   message, so the emergency has an exit that is not "raise the budget".
+   Adversarial review then spent most of it — the block was 674 words on
+   delivery and is 694 after two restored rules, having gone *over* at 704
+   and been cut back rather than the budget raised. That is the mechanism
+   working, and it is also the whole margin gone in one review round.
 
 3. **The generated content is a fixed tax.** ~106 of the 700 are written by
    `render()` itself, so the template's real allowance is ~594. Trimming
@@ -240,3 +245,137 @@ recorded it, so the property could have been removed by an edit to the
 *generated* section with no test objecting. G10 made it enforced, and gave
 the commands a home outside the markers (`VALIDATION_STUB`) so the rule is
 followable rather than merely true.
+
+## Adversarial review of the cut (three models, commit `b5a237a`)
+
+Three reviewers ran in parallel over the staged diff. Eight findings, all
+fixed in the follow-up commit; the numbers above were re-measured after.
+
+### The one that mattered: a declared prefix could write outside the repository
+
+All three found it independently, and `gpt-5.3-codex` reproduced an actual
+write outside the checkout. `operator_ownership.normalize()` strips `.` and
+empty segments but keeps `..` -- correct for the check it was written for,
+since git never emits a `..` path and the segment is inert there. `G8b` was
+the first code to turn a declared prefix into a *destination*, and
+`root.joinpath(*prefix)` then honoured it.
+
+Two guards, kept deliberately, because they catch different things:
+
+- `read_declaration()` refuses `..` in an `owns` or a `contracts` path. This
+  one names the file a human can edit, so the error is actionable.
+- `_place_subprojects` resolves the repository root once and refuses any
+  target whose own `resolve()` escapes it. This is what actually stops the
+  write, and it is the only one that can catch a symlink or a junction --
+  an escape the declaration file cannot express and so the first guard can
+  never see.
+
+The generalisable form: **a validator is only valid for the question it was
+asked.** `normalize()` was right about comparison and wrong about
+construction, and nothing in its name or its tests said which.
+
+### Checking the generator is not checking the shipped file
+
+`compose()` sits between `render_subproject()` and the bytes on disk, and
+that gap is exactly how `VALIDATION_STUB` reached `CLAUDE.md` -- a file whose
+entire content is one import line -- and every subproject file, without a
+single FR-9 test objecting. `compose()` now takes `seed_validation`,
+defaulting **off**, and only `_place_one` asks for the stub. The FR-9
+assertions now read bytes back off disk after `_retire`.
+
+### The subproject budget was charging data
+
+A subproject legitimately owning ~30 directories overflowed 120 words, so
+`operator projects` refused to set the repository up, and the only available
+fix was to own fewer directories. A refusal with no action behind it is worse
+than no check. `render_subproject` now charges prose only: two words per
+`` - `path` `` line and one per inline contract are subtracted before the
+comparison. `test_a_subproject_that_owns_many_paths_still_renders` pins that
+input as legal; the budget is forced in test with a patched constant instead.
+
+The budget exists to stop *writing* creeping back in. A path list is verified
+data, and data was never the thing it was defending against.
+
+### Two rules the cut lost
+
+`gemini-3.1-pro-preview` caught both, and both are the failure D10 names:
+
+- **"Don't commit directly on `main`"** vanished with no check added.
+  Restored to the branching section.
+- **`operator session end`'s flags** were referenced but never spelled, so
+  the block told an agent to run a command it could not construct. Both verbs
+  now carry their full argument list.
+
+### Declined: "don't hardcode configuration values"
+
+Universal engineering advice, true everywhere and specific to nothing here.
+It survives in no tool, teaches no agent anything about *this* repository,
+and the budget is a zero-sum allowance -- 700 words spent on this is 700 not
+spent on the rules only this repository can state. Declining it is recorded
+because a silent omission and a considered one read identically later.
+
+### Disagreement, recorded not overruled
+
+`gemini-3.1-pro-preview` objected that `test_the_budget_is_the_number_the_human_agreed`
+is unfalsifiable: it asserts `WORD_BUDGET == 700`, which restates the source.
+
+The objection is sound in general and wrong here, and the evidence is a
+mutation run. `WORD_BUDGET = 70000` **survived** every other budget test,
+because every one of them was written *relative* to the constant -- raising
+it moved them all and the suite stayed green. That is precisely the "budget
+becomes a warning, one exception at a time" failure FR-8 exists to prevent,
+and the tautological-looking test is the only thing that kills the mutant.
+
+The generalisable form: **a test that restates a constant is worthless unless
+the constant is a decision.** 700 is a decision a human made. The test is
+there to make changing it an argument rather than an edit.
+
+### Mutation found two things review did not
+
+Nine mutants over the changed predicates. Six died on the first run; the
+three survivors were the interesting output.
+
+**D10 was violated in reverse, and nothing could see it.** Two of the eight
+findings were rules the cut had *dropped* -- "never commit to `main`" and the
+spelling of `operator session end`. Restoring them satisfied review, and both
+mutants survived: `never commit to it directly` → `commit to it freely` left
+the whole suite green.
+
+D10 says a rule is never deleted in a commit that does not add its check. The
+symmetric half was never stated and is what actually bit: **a rule restored
+without a check is one edit from gone again, and the second deletion is
+silent because the first one was.** The cut removed the rule and nothing
+objected, precisely because nothing had ever asserted it was there. Both now
+have guards, and the command one reads the required flags off the tool's own
+usage string rather than a list in the test, so a flag that becomes required
+later fails here instead of in somebody's session.
+
+**Defence in depth hides which layer is load-bearing.** The `..` refusal in
+`read_declaration`'s `owns` loop could be deleted with the suite still green,
+because the resolved-containment check caught the same input and the test
+asserted only that generation failed. Nothing unsafe would have shipped --
+and that is the trap. What the deletion loses is the *message* naming
+`subprojects.json`, which is the entire reason the first guard exists; the
+containment check can only say a path resolved somewhere bad, not which line
+of which file to edit.
+
+An end-to-end assertion cannot distinguish two guards that produce the same
+verdict. The test moved to `read_declaration` directly, where only one of
+them can answer.
+
+### A conformance guard in this repository caught the security fix
+
+`test_resolve_conformance` refuses a `Path.resolve()` call that does not cover
+everything it raises -- `OSError` on a denial, `RuntimeError` on a symlink
+loop, `ValueError` on an embedded NUL, and only the first is an `OSError`. The
+containment fix added two such calls, both catching one of the three, and the
+full suite went red on a file no reviewer had flagged.
+
+The repository's existing answer is `project_paths.resolved_str`, whose
+fallback is a lexical absolute path. It is the wrong answer *here*, and the
+reason is worth keeping: a lexical path is **less** resolved than the truth,
+so a containment gate built on it admits the target it could not check. Every
+other caller compares two paths put through the same function, where less
+resolved is still consistent. A write gate has no second path to compare
+against -- it has a decision to make, and the safe direction is to refuse.
+Both calls now catch all three and return a refusal.

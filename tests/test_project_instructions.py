@@ -19,12 +19,14 @@ import ast
 import hashlib
 import json
 import re
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 import install_manifest
+import operator_ownership
 import project_features
 import project_instructions as pi
 from project_instructions import (
@@ -442,7 +444,20 @@ def test_the_subproject_block_names_what_the_root_block_cannot_know():
     assert "`api` subproject" in block
     assert "`services/api`" in block
     assert "`specs/contracts`" in block
-    assert "operator ownership check" in block
+
+
+def test_the_subproject_block_does_not_name_the_ownership_gate():
+    """Review caught this, and my own overlap check did not.
+
+    The first draft said "`operator ownership check` refuses a branch that
+    changed anything else" -- the root block's rule, in different words. The
+    sentence-overlap test could not see it precisely *because* the words
+    differed, which is the drift FR-9 exists to stop: neither file can see the
+    other, so the copy that goes stale is invisible from both.
+    """
+    block = _subproject()
+    assert "ownership check" not in block
+    assert "refuses" not in block
 
 
 def test_the_contract_waiver_is_spelled_the_way_the_command_accepts_it():
@@ -540,18 +555,34 @@ def test_the_subproject_block_fits_its_own_budget():
     assert pi.SUBPROJECT_WORD_BUDGET < pi.WORD_BUDGET
 
 
+def test_a_subproject_that_owns_many_paths_still_renders():
+    """Review found this, and it would have blocked real repositories.
+
+    The declared paths are data. Charging them to a word budget meant to stop
+    *writing* creeping back in means a subproject legitimately owning thirty
+    directories overflows, `operator projects` raises, and the repository
+    cannot be set up at all — a refusal with no action behind it, since the
+    only fix is to own fewer directories.
+    """
+    block = _subproject(owns=[f"services/s{n}" for n in range(200)])
+    assert "`services/s199`" in block
+    assert pi.block_words(block) > pi.SUBPROJECT_WORD_BUDGET
+
+
 def test_a_subproject_block_over_the_budget_is_refused():
     """Same failure direction as FR-8: it errors, and there is no override.
 
-    The realistic way this overflows is a subproject owning a long list of
-    paths, so the budget is measured against the rendered list rather than
-    against the generator's prose.
+    What can overflow it now is prose added to the generator, which is the
+    only thing it was ever meant to catch. Forced with a lowered budget
+    rather than a long path list, because a long path list is exactly the
+    input that must *not* trip it.
     """
-    owns = [f"services/{n}" for n in range(pi.SUBPROJECT_WORD_BUDGET)]
-    with pytest.raises(pi.InstructionsError) as caught:
-        _subproject(owns=owns)
+    with mock.patch.object(pi, "SUBPROJECT_WORD_BUDGET", 5):
+        with pytest.raises(pi.InstructionsError) as caught:
+            _subproject()
     message = str(caught.value).lower()
     assert "budget" in message and "fr-9" in message
+    assert "prose" in message
 
 
 def test_the_shipped_subproject_template_is_not_rendered():
@@ -586,10 +617,10 @@ def test_composing_into_nothing_seeds_a_home_for_the_project_s_own_commands():
     pass. The stub is that somewhere, and it is outside the markers, so
     ``compose`` preserves whatever the project writes into it.
     """
-    out = pi.compose(None, "BLOCK\n")
+    out = pi.compose(None, "BLOCK\n", seed_validation=True)
     assert out.startswith("BLOCK\n")
     assert pi.VALIDATION_STUB in out
-    assert pi.compose("   \n\n", "BLOCK\n") == out
+    assert pi.compose("   \n\n", "BLOCK\n", seed_validation=True) == out
 
 
 def test_the_seeded_section_is_outside_the_markers():
@@ -599,7 +630,8 @@ def test_the_seeded_section_is_outside_the_markers():
     not that it appears but *where*: a stub written between the markers reads
     identically in the file and is gone on the next `operator projects`.
     """
-    out = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n")
+    out = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n",
+                       seed_validation=True)
     assert out.index(MANAGED_END) < out.index(pi.VALIDATION_STUB.strip())
 
 
@@ -611,7 +643,8 @@ def test_a_project_that_deletes_the_stub_is_not_given_it_back():
     purpose -- the same silent overwrite D11 exists to prevent, arriving from
     the other direction.
     """
-    seeded = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n")
+    seeded = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n",
+                       seed_validation=True)
     without = seeded.replace(pi.VALIDATION_STUB, "")
     again = pi.compose(without, f"{MANAGED_BEGIN}\ny\n{MANAGED_END}\n")
     assert "## Validation" not in again
@@ -624,7 +657,8 @@ def test_the_seeded_section_survives_regeneration_and_is_not_doubled():
     ``compose`` preserving text it just wrote proves less than it preserving
     text somebody replaced.
     """
-    seeded = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n")
+    seeded = pi.compose(None, f"{MANAGED_BEGIN}\nx\n{MANAGED_END}\n",
+                       seed_validation=True)
     edited = seeded.replace(pi.VALIDATION_STUB,
                             "## Validation\n\n`pytest -q`, then `ruff check`.\n")
     again = pi.compose(edited, f"{MANAGED_BEGIN}\ny\n{MANAGED_END}\n")
@@ -1371,6 +1405,186 @@ def test_a_subproject_file_regenerates_and_keeps_what_is_outside_the_block(
     assert "kept" in out, "content outside the block was destroyed"
     assert "0.0.1" not in out and "stale" not in out
     assert "`services/api`" in out
+
+
+def test_a_declared_prefix_that_climbs_out_of_the_repository_is_refused(
+        machine):
+    """Found by review, and it wrote a real file outside a real checkout.
+
+    `operator_ownership.normalize` drops `.` segments and empty ones but
+    keeps `..`, which is correct for the check it was written for -- git
+    never emits a `..` path, so the segment is inert there. It is not inert
+    here: this is the first code that turns a declared prefix into a
+    *destination*, and `root.joinpath("..", "..", "x")` is a write into
+    somebody else's repository.
+
+    Refused at the declaration, so every consumer gets it and the message
+    names the file a human can edit.
+    """
+    root = Path(machine["projects"][0]["path"])
+    (root / ".operator").mkdir(parents=True)
+    (root / ".operator" / "subprojects.json").write_text(
+        json.dumps({"subprojects": {"api": {"owns": ["../escaped"]}}}),
+        encoding="utf-8")
+    (root.parent / "escaped").mkdir(exist_ok=True)
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert not (root.parent / "escaped" / AGENTS_NAME).exists()
+
+
+def test_each_climbing_path_guard_is_separately_falsifiable(tmp_path):
+    """Mutation found this: the end-to-end tests could not tell them apart.
+
+    Two guards refuse a climbing path -- the declaration reader and the
+    resolved-containment check in `_place_subprojects`. Asserting only that
+    generation failed means either one alone satisfies the test, so deleting
+    the declaration refusal left the suite green. The containment check does
+    stop the write, so nothing unsafe shipped; what was lost was the *message*
+    naming `subprojects.json`, which is the whole reason for having the first
+    guard at all.
+
+    So this one goes at `read_declaration` directly, where only one guard can
+    answer.
+    """
+    (tmp_path / ".operator").mkdir(parents=True)
+    declaration = tmp_path / ".operator" / "subprojects.json"
+
+    for payload in (
+            {"subprojects": {"api": {"owns": ["../escaped"]}}},
+            {"subprojects": {"api": {"owns": ["services/api"]}},
+             "contracts": ["../elsewhere"]}):
+        declaration.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(operator_ownership.OwnershipError) as caught:
+            operator_ownership.read_declaration(tmp_path)
+        assert ".." in str(caught.value)
+
+
+def test_the_declaration_reader_admits_an_ordinary_path(tmp_path):
+    """The control for the pair above. A reader that refused every path would
+    pass both of them and ship a tool that can declare nothing."""
+    (tmp_path / ".operator").mkdir(parents=True)
+    (tmp_path / ".operator" / "subprojects.json").write_text(
+        json.dumps({"subprojects": {"api": {"owns": ["services/api"]}},
+                    "contracts": ["specs/contracts"]}),
+        encoding="utf-8")
+    declaration = operator_ownership.read_declaration(tmp_path)
+    assert declaration is not None
+    assert tuple(declaration.subprojects["api"]) == (("services", "api"),)
+
+
+def test_a_contract_path_that_climbs_out_of_the_repository_is_refused(machine):
+    """The same segment in the other list.
+
+    A guard written on one of two loops over the same JSON is a guard the
+    next edit walks around.
+    """
+    root = _declare(machine, {"api": ["services/api"]},
+                    contracts=["../elsewhere"])
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert not (root / "services" / "api" / AGENTS_NAME).exists()
+
+
+def test_a_symlinked_subproject_directory_that_escapes_is_refused(
+        machine, tmp_path):
+    """The half the declaration cannot express.
+
+    `..` is refusable in the file. A directory that *is* a symlink or a
+    junction pointing out of the tree is not: the declaration says
+    `services/api` and means it, and only the resolved path knows better.
+    Both checks are kept because each catches a case the other cannot.
+    """
+    root = Path(machine["projects"][0]["path"])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "services").mkdir(parents=True)
+    try:
+        (root / "services" / "api").symlink_to(outside,
+                                               target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this machine will not create a directory symlink")
+    (root / ".operator").mkdir(parents=True)
+    (root / ".operator" / "subprojects.json").write_text(
+        json.dumps({"subprojects": {"api": {"owns": ["services/api"]}}}),
+        encoding="utf-8")
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert not (outside / AGENTS_NAME).exists()
+
+
+def test_the_containment_check_admits_what_it_should():
+    """The control. A guard that refuses everything is the same defect
+    wearing a safer face -- it stops the writes it was meant to allow, and
+    the suite above cannot tell the difference."""
+    root = Path("/repo").resolve()
+    assert pi._within(root, root)
+    assert pi._within(root / "services" / "api", root)
+    assert not pi._within(root.parent / "repo-two", root)
+    assert not pi._within(root.parent, root)
+
+
+def test_a_target_that_cannot_be_resolved_is_refused_not_skipped(
+        machine, monkeypatch):
+    """Caught by `test_resolve_conformance`, which is the point of having it.
+
+    `Path.resolve` fails three ways -- `OSError` on a denial, `RuntimeError`
+    on a symlink loop, `ValueError` on an embedded NUL -- and the first draft
+    caught one of the three, so the other two left as tracebacks out of
+    `operator projects`.
+
+    The direction matters more than the coverage. `project_paths.resolved_str`
+    exists for exactly this and is *wrong* here: its fallback is a lexical
+    absolute path, which is less resolved than the truth, so a containment
+    gate using it admits the target it could not check. A write gate that
+    cannot see must say no.
+    """
+    root = _declare(machine, {"api": ["services/api"]})
+    real_resolve = Path.resolve
+
+    def exploding(self, *args, **kwargs):
+        if self.name == "api":
+            raise RuntimeError("symlink loop")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", exploding)
+    result = _retire(machine)
+    assert result.outcomes[0].state == FAILED
+    assert not (root / "services" / "api" / AGENTS_NAME).exists()
+
+
+def test_only_the_root_file_is_given_the_validation_stub(machine):
+    """Found by review: the stub was leaking into every new file.
+
+    `compose` seeds it when it is creating a file from nothing, and both
+    `CLAUDE.md` and the subproject files are usually created from nothing.
+    `CLAUDE.md`'s entire content is one import line, and a subproject file is
+    supposed to carry facts and nothing else -- neither is anybody's home for
+    build commands. The seed is off by default now and one caller asks for it.
+    """
+    root = _declare(machine, {"api": ["services/api"]})
+    _retire(machine)
+    stub_heading = pi.VALIDATION_STUB.splitlines()[0]
+    assert stub_heading in (root / AGENTS_NAME).read_text(encoding="utf-8")
+    assert stub_heading not in (root / pi.CLAUDE_NAME).read_text(
+        encoding="utf-8")
+    assert stub_heading not in (
+        root / "services" / "api" / AGENTS_NAME).read_text(encoding="utf-8")
+
+
+def test_the_shipped_subproject_file_states_no_rules(machine):
+    """FR-9 measured on the bytes that reach the disk.
+
+    The generator's output and the file's content are not the same thing --
+    `compose` sits between them, and it is what put the validation stub into
+    subproject files in the first place. Checking the generator alone is how
+    that went unnoticed.
+    """
+    root = _declare(machine, {"api": ["services/api"]})
+    _retire(machine)
+    shipped = (root / "services" / "api" / AGENTS_NAME).read_text(
+        encoding="utf-8")
+    found = [tell for tell in _DIRECTIVE_TELLS if tell in shipped.lower()]
+    assert not found, f"the shipped subproject file gives directions: {found}"
 
 
 def test_a_second_run_leaves_the_subproject_files_alone(machine):
