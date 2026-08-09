@@ -259,6 +259,18 @@ CODE_STALE = "stale"
 CODE_UNKNOWN = "unknown"
 CODE_UNRECORDED = "unrecorded"
 
+#: How many numbered clauses the unconditional part of the preamble already
+#: spends, so the optional ones know where to start counting.
+#:
+#: This is an assumption about prose that lives somewhere else, which is the
+#: shape that reads as fact and is checked by nobody. Editing the base text to
+#: add a "(6)" would silently make the first optional clause a duplicate,
+#: because a wrong number here is still a number and every clause after it
+#: stays self-consistently wrong. `test_the_base_clause_count_matches_the_text`
+#: counts the clauses in the rendered preamble instead of trusting this, so the
+#: assumption is falsified by the text rather than restated by it.
+BASE_CLAUSES = 5
+
 # Extra Popen/run kwargs for helper subprocesses that must never show a window.
 #
 # On Windows, a process that has no console of its own (for example the
@@ -2164,34 +2176,43 @@ def build_preamble(agent_name: str, instance: Instance, crash_recovery: bool = F
         f"(5) Operator instance: {instance.display_name}. "
         "Now: check for your session handoff and get to work."
     )
-    clause = 5
+    clauses: list[str] = []
     if crash_recovery:
-        clause += 1
-        text += (
-            f" ({clause}) This session is being resumed because a handoff file could not be "
+        clauses.append(
+            "This session is being resumed because a handoff file could not be "
             "found for this project. Either a crash occurred or the previous session "
             "ended without the handoff being written. If you intended to end the "
             "session, please make sure you write a handoff first next time."
         )
     notice = _code_state_notice(code_state, instance, crash_recovery)
     if notice:
-        clause += 1
-        text += f" ({clause}) {notice}"
+        clauses.append(notice)
     # The assignment is resolved by `operator session start` before the agent's
     # first token (FR-2), and reaches it here. Nothing is said when there is
     # nothing to say: `describe` returns "" for an unassigned session, and an
     # always-present line reading "you have no assignment" would be paid for on
     # every token of every session that has none.
-    #
-    # Numbered from the running counter rather than a literal, because the two
-    # clauses above it are both conditional: a hardcoded "(7)" here is correct
-    # only for the session that happens to have had both of them, and reads as
-    # (5) (7) for every session that had neither.
     if assignment is not None:
         described = operator_session.describe(assignment)
         if described:
-            clause += 1
-            text += f" ({clause}) {described}"
+            clauses.append(described)
+    # Numbered from the clauses actually collected, rather than from a counter
+    # incremented alongside them. Both spellings produce the same text today;
+    # they differ in what they make *possible*. A counter is two statements --
+    # bump it, append the text -- and nothing ties them together, so it can be
+    # bumped without appending (leaving a gap in the numbering) or appended to
+    # without bumping (using a number twice). The literal "(7)" that this
+    # replaced was the second of those, and it survived because at the time it
+    # was written only one optional clause could precede it.
+    #
+    # Numbering a list at render time makes both unrepresentable: a clause that
+    # is not appended cannot consume a number, because the number *is* its
+    # index. This is deliberately not a test -- a guard that has to fire is
+    # weaker than a shape that cannot fail, and this one previously cost a
+    # surviving mutant that could only be argued equivalent by reasoning about
+    # which clause happened to be last.
+    for offset, body in enumerate(clauses):
+        text += f" ({BASE_CLAUSES + 1 + offset}) {body}"
     return text
 
 

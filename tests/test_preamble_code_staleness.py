@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -330,6 +331,75 @@ def test_an_unassigned_session_is_charged_nothing_for_it():
     assert operator_session.describe(none) == ""
     assert _preamble(assignment=none) == _preamble(), \
         "an empty assignment must leave the preamble byte for byte unchanged"
+
+
+# ── the numbering is contiguous, not merely unique ──────────────
+def _clause_numbers(text: str) -> "list[int]":
+    """Every "(n)" the preamble spends, in the order it spends them.
+
+    Deliberately reads the numbers out of the rendered text rather than being
+    told what to expect. A test that asks "is (7) present" can only find the
+    numbers it already thought of, and the defect this file exists for was a
+    number nobody thought to look for.
+    """
+    return [int(m) for m in re.findall(r"\((\d+)\)", text)]
+
+
+@pytest.mark.parametrize("crash", [False, True])
+@pytest.mark.parametrize("state", [op.CODE_CURRENT, op.CODE_STALE,
+                                   op.CODE_UNKNOWN, op.CODE_UNRECORDED])
+@pytest.mark.parametrize("assigned", [False, True])
+def test_the_numbering_is_contiguous_from_one_in_every_combination(
+        crash, state, assigned):
+    """The property, over all sixteen combinations rather than the one or two
+    a hand-written case list happens to name.
+
+    Uniqueness is not enough on its own: a clause that consumes a number
+    without rendering leaves 1..5 and 7 -- every number used once, and a gap
+    where nobody looks. Contiguity catches both that and the duplicate, and
+    it does so without the test needing to know how many clauses this call
+    should have produced.
+    """
+    assignment = _resume_assignment() if assigned else None
+    numbers = _clause_numbers(_preamble(crash_recovery=crash, code_state=state,
+                                        assignment=assignment))
+    assert numbers == list(range(1, len(numbers) + 1)), (
+        f"crash_recovery={crash}, code_state={state}, assigned={assigned} "
+        f"rendered clause numbers {numbers}, which is not 1..n with no gaps "
+        "or repeats")
+
+
+def test_the_base_clause_count_matches_the_text():
+    """`BASE_CLAUSES` is an assumption about prose held somewhere else.
+
+    Nothing about the constant makes it true -- a wrong value is still a
+    number, and every optional clause after it would be self-consistently
+    wrong, which is exactly how the literal "(7)" survived. So it is counted
+    off the rendered base preamble rather than asserted.
+    """
+    numbers = _clause_numbers(_preamble())
+    assert numbers == list(range(1, op.BASE_CLAUSES + 1)), (
+        f"the base preamble renders clauses {numbers}, but BASE_CLAUSES says "
+        f"{op.BASE_CLAUSES}; adding or removing a numbered clause in the base "
+        "text means updating the constant in the same edit")
+
+
+def test_a_clause_that_renders_nothing_consumes_no_number():
+    """The property the surviving mutant used to hide behind.
+
+    Numbering off the collected list makes "consume a number without
+    rendering" unrepresentable rather than merely untested -- there is no
+    counter to bump. This asserts the consequence directly, at the boundary
+    where an empty clause would show up: the preamble of a session that has
+    the caveat but no assignment must not skip a number on the way past.
+    """
+    none = operator_session.Assignment(kind=operator_session.NONE,
+                                       instance="proj")
+    text = _preamble(crash_recovery=True, code_state=op.CODE_STALE,
+                     assignment=none)
+    assert _clause_numbers(text) == [1, 2, 3, 4, 5, 6, 7]
+    assert not text.rstrip().endswith(")"), \
+        "a trailing '(n)' with nothing after it is an empty clause"
 
 
 def test_the_preamble_stays_platform_neutral_with_the_caveat():
