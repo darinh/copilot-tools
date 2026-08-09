@@ -131,3 +131,29 @@ Two traps, both silent:
 Both are resolvable in code — `git worktree list --porcelain`, first record — and the
 resolution never varies. That makes it a bad thing to teach an agent and a good thing
 for operator to do once, before the session starts.
+
+## Affiliation on a message
+
+Recorded by `mail_affiliation.py`, attached in `send_message()`. Two nullable
+endpoints — `origin` and `delivered_to` — each carrying a cwd, a project id,
+and a status naming why there is no id when there is none.
+
+It is metadata and nothing else. **No failure to place either end may prevent,
+delay or alter a send.** That is the 0025 council's decision, not a shortcut:
+two of three seats rejected gating delivery on affiliation, because no wrong
+outcome has ever been traced to a cross-project message while two of the four
+cross-project threads measurably improved this repository — and a refusal
+built on an *unknown* affiliation drops work the sender believed was sent.
+
+The relationship is tri-state: `same-project`, `cross-project`, or
+`project-unknown`. It is a claim only when **both** ends are known. One known
+endpoint says nothing about the pair, and "we know the sender's project, so
+assume local" is how an unknown becomes a reassuring lie.
+
+`render_line()` carries the absolute `sent_at`, never a computed age. An age
+is written once at delivery and then frozen, so a line that says "just now"
+and is not read for two days goes on saying "just now" — at its most wrong in
+exactly the case it exists to catch.
+
+The 286 messages that predate this carry no endpoints. They are unknowable,
+and render as unknown; there is no migration and no inference from agent names.
