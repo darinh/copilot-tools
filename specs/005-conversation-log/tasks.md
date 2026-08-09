@@ -164,3 +164,36 @@ All tasks complete. Checkboxes reflect delivered state, not intent.
 - [x] T073 — A control asserts every tag listed in `_MACHINE_TAGS` is matched
       by the pattern built from it, so a listed-but-unmatched tag cannot
       report the corpus clean.
+
+## Reading it as a conversation
+
+- [x] T074 — Bodies rendered as Markdown: fenced and inline code, headings,
+      bold, italic, lists, blockquotes, rules and links. Tables are not
+      rendered and are recorded as a gap rather than left unsaid.
+- [x] T075 — Chat layout: inbound right, outbound left, with the coloured
+      edge following the bubble to the side it sits on.
+- [x] T076 — `esc()` runs over the whole body before any transform, so the
+      only angle brackets in the output are ones `md()` wrote.
+- [x] T077 — URLs allow-listed to `http`/`https`; everything else stays
+      literal text.
+- [x] T078 — Search highlighting moved to the DOM, so it cannot insert a
+      `<mark>` inside an attribute of the markup it now runs against.
+- [x] T079 — `MARKDOWN_JS` extracted so the suite executes it under node
+      against 23 XSS payloads, rather than grepping the page.
+- [x] T080 — The oracle parses the output with `html.parser` and checks an
+      element allow-list, `on*` attributes and `href` schemes. The first
+      version used substring matching and reported holes that were not there.
+- [x] T081 — Control: the same payloads through an unescaped copy must
+      produce script, img and iframe elements, an event handler and a
+      `javascript:` href.
+- [x] T082 — `md()` strips NUL before using one as its fence sentinel; the
+      previous "no body can contain one" was a guess, and SQLite stores NUL
+      in TEXT without complaint.
+- [x] T083 — Inline ```` ```code``` ```` keeps its content: the info-string
+      pattern excluded backticks and was made optional after it was found
+      eating the closing fence.
+- [x] T084 — `_assemble()` raises if either JavaScript placeholder is missing,
+      because a silent miss degrades to literal markdown and no highlighting,
+      which reads as a styling regression.
+- [x] T085 — All 4,440 messages in the real store rendered and audited: zero
+      disallowed elements, zero event handlers, zero non-http URLs.
