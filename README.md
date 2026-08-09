@@ -148,17 +148,30 @@ git pull            # or the clone above, on a machine that has none
 ./setup.ps1         # ./setup.sh on Linux/macOS/WSL — idempotent
 ```
 
-**Re-run setup after every pull that adds an extension or skill.** A pull
-updates the checkout; it does not touch `~/.copilot/`. A newly added
-extension therefore sits in the repository and loads nowhere, and nothing
-announces that — an extension that never loaded cannot report its own
-absence.
+**Re-run setup after every pull.** A pull updates the checkout; it does not
+touch `~/.copilot/`, and it cannot repair the installed package. Two distinct
+failures follow from skipping it:
 
-Verify with `python setup_tools.py --status`, which names the installed
-version and lists every deployed artifact with its state. Do **not** use
-`operator --version`: it prints a hardcoded literal that has not moved since
-July, so it reports the same number whatever you deployed (backlog item
-`0027`).
+- **A new extension or skill loads nowhere.** It sits in the repository and
+  nothing announces the gap, because an extension that never loaded cannot
+  report its own absence.
+- **A new Python module is not importable at all.** An editable install is not
+  a symlink — setuptools writes a finder holding a *static* table of module
+  name to path, built at install time. `git pull` updates the source of every
+  module already in that table and cannot add one. The result is a correct
+  checkout, a broken install, and `ModuleNotFoundError` from a command that
+  worked yesterday.
+
+`python setup_tools.py --status` reports both: the installed version, every
+deployed artifact with its state, and whether the installed package still
+imports. The import check runs in an isolated subprocess from a temporary
+directory, so it answers a question about the *install* rather than about the
+directory the command was run from — from inside the checkout, every module
+resolves from the current directory and the answer would always be yes.
+
+Do **not** verify with `operator --version`: it prints a hardcoded literal
+that has not moved since July, so it reports the same number whatever you
+deployed (backlog item `0027`).
 
 Two things are per machine and are not deployed by git:
 
