@@ -56,6 +56,8 @@ import operator_work                                         # noqa: E402
 import operator_worktree                                     # noqa: E402
 import operator_ownership                                    # noqa: E402
 import work_claims                                           # noqa: E402
+import conversation_log                                      # noqa: E402
+import conversation_viewer                                   # noqa: E402
 import backlog_tool                                          # noqa: E402
 import handoff_tool                                          # noqa: E402
 import install_manifest                                      # noqa: E402
@@ -209,7 +211,7 @@ SUBCOMMANDS = ("help", "version", "list", "menu", "projects", "report",
                "join", "reload", "forget", "send", "reply", "inbox", "logs",
                "trace",
                "tabs", "restore", "session", "work", "backlog", "worktree",
-               "ownership")
+               "ownership", "conversations")
 
 RESERVED_WORDS = set(SUBCOMMANDS)
 
@@ -5028,6 +5030,7 @@ USAGE
     operator stop-session NAME                                 Stop only the Copilot session
     operator forget NAME                                       Drop operator state only
     operator report [type]                                     View usage reports
+    operator conversations [seed|serve|stats]                  Browse what was said to agents and back
     operator ingest [--force]                                  Process copilot logs
     operator logs [--prune] [--days N]                         Inspect/prune copilot logs
     operator trace [-n N] [--kind K] [--json] [--all]          Who invoked the operator, and how it ended
@@ -7753,6 +7756,8 @@ def _dispatch_command(args: list[str]) -> int:
         return browse_project_configurations()
     if head == "report":
         return report_metrics(args[1] if len(args) > 1 else "summary")
+    if head == "conversations":
+        return conversations_command(args[1:])
     if head == "ingest":
         return ingest_all_logs(force="--force" in args[1:])
     if head == "stop":
@@ -7896,6 +7901,182 @@ def _missing_mux_message() -> str:
         return f"Error: {exc}"
     return "Error: no terminal multiplexer available."
 
+
+
+
+#: The verbs ``operator conversations`` answers to. See :data:`SESSION_VERBS`.
+CONVERSATIONS_VERBS = ("seed", "serve", "stats")
+
+
+def _flag_value(args: list[str], flag: str) -> str:
+    """The value following ``flag``, or ``""``.
+
+    ``--port`` with nothing after it returns ``""`` rather than consuming the
+    next flag: ``operator conversations serve --port --no-browser`` is a typo,
+    and reading ``--no-browser`` as a port number turns it into a confusing
+    ``ValueError`` about something the user never typed.
+    """
+    for i, arg in enumerate(args):
+        if arg == flag and i + 1 < len(args):
+            candidate = args[i + 1]
+            return "" if candidate.startswith("--") else candidate
+        if arg.startswith(flag + "="):
+            return arg.split("=", 1)[1]
+    return ""
+
+
+def _flag_values(args: list[str], flag: str) -> list[str]:
+    """Every value given for a repeatable flag.
+
+    ``--allow-host`` is repeatable because a machine reached from a LAN has
+    more than one name browsers may use, and collapsing them to the last one
+    given would refuse the others with the same 403 as an attack.
+    """
+    found: list[str] = []
+    for i, arg in enumerate(args):
+        if arg == flag and i + 1 < len(args):
+            candidate = args[i + 1]
+            if not candidate.startswith("--"):
+                found.append(candidate)
+        elif arg.startswith(flag + "="):
+            found.append(arg.split("=", 1)[1])
+    return found
+
+
+def _conversations_usage(stream) -> None:
+    print("Usage: operator conversations <seed|serve|stats>", file=stream)
+    print(file=stream)
+    print("  seed [--source S]   Copy existing messages into the store",
+          file=stream)
+    print("  serve [--port N] [--host H] [--allow-host H] [--no-browser]",
+          file=stream)
+    print("                      Browse them at http://127.0.0.1:8765/",
+          file=stream)
+    print("  stats               What is stored, and where it came from",
+          file=stream)
+    print(file=stream)
+    print("The store is per machine, at ~/.operator/conversations.db.",
+          file=stream)
+    print("Seeding is idempotent — run it as often as you like.",
+          file=stream)
+    print(file=stream)
+    print("Future messages are captured by the conversation-capture "
+          "extension,", file=stream)
+    print("which setup installs along with every other one in extensions/.",
+          file=stream)
+
+
+def _seed_sources(conn, wanted: str) -> list:
+    """Run the seeders the caller asked for.
+
+    Every root is passed explicitly rather than left to each seeder's own
+    default. They resolve identically today, but the first draft did leave
+    them independent, and a test home wrote its rows into the *real*
+    ``~/.operator/conversations.db`` while reading mail from the temporary one
+    -- a store half from one machine's state and half from another's, which no
+    error could report because each half was individually correct.
+
+    ``--source`` exists because the three read very different things -- one
+    opens somebody else's live database, one walks a mail directory, one folds
+    in whatever the capture hook has spooled -- and when one of them is what is
+    being debugged, running the other two is noise.
+    """
+    available = {
+        conversation_log.SOURCE_SESSION_STORE:
+            lambda c: conversation_log.seed_session_store(c),
+        conversation_log.SOURCE_OPERATOR_MAIL:
+            lambda c: conversation_log.seed_operator_mail(
+                c, OPERATOR_HOME / "messages"),
+        conversation_log.SOURCE_HOOK:
+            lambda c: conversation_log.ingest_spool(
+                c, conversation_log.spool_dir(OPERATOR_HOME)),
+    }
+    if not wanted:
+        return [fn(conn) for fn in available.values()]
+    if wanted not in available:
+        die(f"Unknown source: {wanted}\n"
+            f"Expected one of: {', '.join(available)}")
+    return [available[wanted](conn)]
+
+
+def conversations_command(args: list[str]) -> int:
+    """``operator conversations`` — the record of what was said, and to whom.
+
+    Sessions are ephemeral by design and ``git log`` answers only for work that
+    landed. What a human asked an agent, and what came back, has until now been
+    held in two places that are not queryable as a conversation and in one --
+    the session database -- that does not outlive the session.
+    """
+    if not args or args[0] in HELP_FLAGS:
+        _conversations_usage(sys.stdout if args else sys.stderr)
+        return 0 if args else 1
+    verb, rest = args[0], args[1:]
+    if verb not in CONVERSATIONS_VERBS:
+        print(f"Unknown subcommand: operator conversations {verb}",
+              file=sys.stderr)
+        print(f"Expected one of: {', '.join(CONVERSATIONS_VERBS)}",
+              file=sys.stderr)
+        return 1
+
+    path = conversation_log.db_path(OPERATOR_HOME)
+    try:
+        if verb == "serve":
+            raw = _flag_value(rest, "--port")
+            if raw and not (raw.isascii() and raw.isdigit()):
+                # Checked before int(), which accepts `80_80`, ` 8765 `,
+                # `+8765` and unicode digits like `８７６５` -- none of them a
+                # port anyone typed on purpose, and every one of them passes
+                # the range check below.
+                die(f"--port wants a number, not {raw!r}")
+            port = int(raw) if raw else 8765
+            if not 1 <= port <= 65535:
+                die(f"--port must be between 1 and 65535, not {port}")
+            return conversation_viewer.serve(
+                path,
+                host=_flag_value(rest, "--host") or "127.0.0.1",
+                port=port,
+                allow_hosts=_flag_values(rest, "--allow-host"),
+                open_browser="--no-browser" not in rest)
+
+        conn = conversation_log.connect(path)
+    except conversation_log.ConversationError as exc:
+        die(str(exc))
+    except OSError as exc:
+        die(f"Could not serve the conversation store: {exc}")
+
+    try:
+        if verb == "seed":
+            reports = _seed_sources(conn, _flag_value(rest, "--source") or "")
+            for report in reports:
+                print("  " + report.describe())
+                for problem in report.errors[:5]:
+                    print(f"    ! {problem}", file=sys.stderr)
+            total = conversation_log.summary(conn)["messages"]
+            print(f"{total} message(s) in {path}")
+            print("Run `operator conversations serve` to read them.")
+            # A source that was *present and unreadable* fails the run even
+            # though the others may have succeeded: a seeder that exits 0
+            # having silently dropped a whole source is one nobody re-runs.
+            # A source that is simply not on this machine is not a failure --
+            # see SeedReport.absent.
+            return 1 if any(r.failed for r in reports) else 0
+
+        stats = conversation_log.summary(conn)
+        print(f"{path}")
+        print(f"  {stats['messages'] or 0} message(s), "
+              f"{stats['projects'] or 0} project(s), "
+              f"{stats['sessions'] or 0} session(s)")
+        if stats["first_day"]:
+            print(f"  {stats['first_day']} .. {stats['last_day']}")
+        print(f"  search: {stats['search_mode']}")
+        for row in sorted(stats["breakdown"], key=lambda r: -r["n"]):
+            print(f"  {row['n']:>6}  {row['channel']:<12} {row['actor']}")
+        for project in conversation_log.projects(conn)[:12]:
+            print(f"  {project['messages']:>6}  {project['project']} "
+                  f"({project['first_day']} .. {project['last_day']})")
+        return 0
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     sys.exit(main())

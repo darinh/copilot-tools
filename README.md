@@ -33,9 +33,11 @@ messaging, and spec-driven workflow conventions.
 | [`skills/operator-backlog-*`](docs/skills.md) | Filing, refining and checking in on the tracked backlog |
 | [`docs/rationale.md`](docs/rationale.md) | Why the rules exist — the incidents behind them. Linked, never loaded |
 | [`operator_mail.py`](docs/operator.md#parallel-agents-and-messaging) | Message store behind `operator send` / `operator inbox` |
+| [`conversation_log.py`](conversation_log.py) | One record of everything said to an agent and back: seeds from the session store, the mail store and the capture spool |
+| [`conversation_viewer.py`](conversation_viewer.py) | Loopback web viewer for that record — filter and search by project, day, speaker |
 | [`operator_trace.py`](operator_trace.py) | Records who invoked the operator and how each invocation ended, for attributing incidents |
 | [`install_manifest.py`](docs/versioning.md) | Records what setup deployed and its hash, so upgrades know what's safe to replace |
-| [`extensions/`](extensions/README.md) | Copilot CLI runtime extensions: open-in-vs-code, lint-on-edit, security-shield, test-enforcer, architecture-enforcer, checkout-guard, copy-to-clipboard-tool |
+| [`extensions/`](extensions/README.md) | Copilot CLI runtime extensions: open-in-vs-code, lint-on-edit, security-shield, test-enforcer, architecture-enforcer, checkout-guard, copy-to-clipboard-tool, conversation-capture |
 | [`templates/`](templates/) | Configuration templates for copilot-instructions, MCP servers, and per-project setup |
 | [`docs/`](docs/) | Documentation for operator, skills, versioning, and spec-kit |
 | [`setup.sh`](setup.sh) | Linux/WSL/macOS setup: migrates any legacy bash install to Python, then delegates to `setup_tools.py` |
@@ -227,6 +229,10 @@ operator inbox backend
 # Usage reports
 operator report costs
 
+# What did I ask, and what came back — across every project on this machine
+operator conversations seed     # idempotent; run it again whenever you like
+operator conversations serve    # opens http://127.0.0.1:8765/
+
 # Per-project feature configuration (which conventions a project opted into)
 operator projects
 ```
@@ -388,6 +394,8 @@ copilot-tools/
 ├── operator_mux.py                # Session-backend abstraction (tmux / psmux)
 ├── operator_ingest.py             # Pure-Python log parser
 ├── operator_mail.py               # Agent-to-agent mail, live and queued delivery
+├── conversation_log.py            # What was said to agents and back: store and seeders
+├── conversation_viewer.py         # Loopback web viewer for that store
 ├── operator_trace.py              # Who invoked the operator, and how it ended
 ├── operator_liveness.py           # Is a claim's owner still there? LIVE / DEAD / STALE
 ├── operator_session.py            # Session lifecycle: assignment in, handoff out

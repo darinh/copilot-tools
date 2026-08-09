@@ -44,6 +44,8 @@ py-modules = [
     "backlog_tool",
     "copilot_operator",
     "copilot_tools_version",
+    "conversation_log",
+    "conversation_viewer",
     "install_manifest",
     "operator_console",
     "operator_ingest",

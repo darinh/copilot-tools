@@ -44,6 +44,7 @@ grep experimental ~/.copilot/settings.json
 | `test-enforcer`        | `onPreToolUse`  | Blocks `git commit` if source files were modified without tests in the same session. |
 | `checkout-guard`       | session start + `onPreToolUse` + `onPostToolUse` | Names a scratch directory, reports untracked artifacts the moment they appear in the checkout — and in the repository's primary checkout when the session is in a linked worktree — and blocks a blanket `git add -A` / `git stash -u` while they are outstanding. |
 | `architecture-enforcer` | `onPostToolUse` | Surfaces import-boundary violations defined in a per-project `.copilot-architecture.json`. |
+| `conversation-capture` | `onUserPromptSubmitted` + `assistant.message` | Appends every prompt an agent receives, and every final reply it gives, to a JSONL spool under `~/.operator/conversation-spool/`. `operator conversations seed` folds it into the store. |
 
 ## Knobs
 
@@ -52,6 +53,7 @@ grep experimental ~/.copilot/settings.json
 | `COPILOT_AUTO_OPEN_DISABLE=1` | Disables `open-in-vs-code`. |
 | `COPILOT_TEST_ENFORCER_BYPASS=1` | Lets `git commit` through even with untested source changes. |
 | `COPILOT_CHECKOUT_GUARD_DISABLE=1` | Turns `checkout-guard` off entirely. |
+| `COPILOT_CONVERSATION_CAPTURE_DISABLE=1` | Stops `conversation-capture` recording anything. Checked before any hook is registered, so nothing is read, let alone written. |
 
 ## checkout-guard
 
