@@ -254,6 +254,9 @@ function messageHtml(m){
   if(m.project) bits.push("<span class='tag'>" + esc(m.project) + "</span>");
   if(m.branch) bits.push(esc(m.branch));
   if(m.asks) bits.push("<span class='q'>?</span>");
+  if(m.category)
+    bits.push("<span class='tag cat'>" + esc(m.category)
+              + (m.subcategory ? " " + esc(m.subcategory) : "") + "</span>");
   bits.push("<span class='tag'>" + esc(m.source) + "</span>");
   return "<div class='meta'>" + bits.join("").replace(/><s/g, "> <s")
        + "</div><div class='body'>" + md(m.body) + "</div>";
@@ -323,6 +326,7 @@ margin-bottom:5px;align-items:center}
 .who{font-weight:600;color:var(--fg)}
 .tag{background:#20242e;border:1px solid var(--line);border-radius:4px;
 padding:0 5px;font-size:10px;text-transform:uppercase;letter-spacing:.05em}
+.tag.cat{background:#232b3a;border-color:#33415a;color:#a9c2e8}
 .q{color:#151821;background:var(--mail);border-radius:4px;padding:0 5px;
 font-size:10px;font-weight:700}
 .body{word-break:break-word;overflow-wrap:anywhere;font-size:13px;
@@ -366,6 +370,7 @@ mark{background:#5a4a00;color:#ffe9a8;border-radius:2px}
     <button id="t-ha">Human</button>
     <button id="t-aa">Agent mail</button>
   </div>
+  <h2>Categories</h2><div id="categories"></div>
   <h2>Projects</h2><div id="projects"></div>
   <h2>Days</h2><div id="days"></div>
 </aside>
@@ -394,7 +399,7 @@ mark{background:#5a4a00;color:#ffe9a8;border-radius:2px}
 </main>
 <script>
 const S = {channel:"", project:"", day:"", q:"", actor:"", direction:"",
-           asks:false};
+           category:"", subcategory:"", asks:false};
 const $ = s => document.querySelector(s);
 /*MARKDOWN_JS*//*ROW_JS*//*HIGHLIGHT_JS*/
 
@@ -423,12 +428,42 @@ function pickList(el, rows, key, label, current, onPick){
   }
 }
 
+function categoryLabel(row){
+  return row.subcategory ? row.category + " · " + row.subcategory
+                         : (row.category || "uncategorised");
+}
+
+// Categories pick on a *pair*, so `pickList` -- which matches one key --
+// cannot express them. Two rows can share `skill` and mean different things.
+function categoryList(el, rows){
+  el.innerHTML = "";
+  const all = document.createElement("div");
+  all.className = "item" + (S.category ? "" : " on");
+  all.innerHTML = "<span>everything</span>";
+  all.onclick = () => { S.category = ""; S.subcategory = "";
+                        refreshSidebar(); load(); };
+  el.appendChild(all);
+  for(const row of rows){
+    const on = row.category === S.category
+            && (row.subcategory || "") === S.subcategory;
+    const d = document.createElement("div");
+    d.className = "item" + (on ? " on" : "");
+    d.innerHTML = "<span>" + esc(categoryLabel(row)) + "</span>"
+                + "<span class='n'>" + row.messages + "</span>";
+    d.onclick = () => { S.category = row.category;
+                        S.subcategory = row.subcategory || "";
+                        refreshSidebar(); load(); };
+    el.appendChild(d);
+  }
+}
+
 async function refreshSidebar(){
   const s = await get("/api/summary");
   $("#stats").textContent =
     s.messages + " messages · " + s.projects + " projects · "
     + (s.first_day || "?") + " → " + (s.last_day || "?")
     + (s.search_mode === "fts" ? "" : " · substring search");
+  categoryList($("#categories"), await get("/api/categories"));
   pickList($("#projects"), await get("/api/projects"), "project",
            r => r.project, S.project, v => { S.project = v; S.day = "";
                                              refreshSidebar(); load(); });
@@ -443,6 +478,7 @@ async function load(){
     rows = await get("/api/messages", {
       channel:S.channel, project:S.project, date_from:S.day, date_to:S.day,
       search:S.q, actor:S.actor, direction:S.direction,
+      category:S.category, subcategory:S.subcategory,
       asks:S.asks ? "1" : ""});
   }catch(err){
     list.innerHTML = "<div class='note'>" + esc(String(err)) + "</div>";
@@ -493,7 +529,7 @@ $("#direction").onchange = e => { S.direction = e.target.value; load(); };
 $("#asks").onchange = e => { S.asks = e.target.checked; load(); };
 $("#clear").onclick = () => {
   Object.assign(S, {project:"", day:"", q:"", actor:"", direction:"",
-                    asks:false});
+                    category:"", subcategory:"", asks:false});
   $("#q").value = ""; $("#actor").value = ""; $("#direction").value = "";
   $("#asks").checked = false;
   refreshSidebar(); load();
@@ -640,6 +676,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(clog.projects(self._conn()))
             elif route == "/api/days":
                 self._json(clog.days(self._conn(), args.get("project", "")))
+            elif route == "/api/categories":
+                self._json(clog.categories(self._conn()))
             elif route == "/api/messages":
                 self._json(self._messages(args))
             else:
@@ -660,6 +698,8 @@ class _Handler(BaseHTTPRequestHandler):
             date_from=args.get("date_from", ""),
             date_to=args.get("date_to", ""),
             asks=bool(args.get("asks")),
+            category=args.get("category", ""),
+            subcategory=args.get("subcategory", ""),
             limit=int(args.get("limit", 200)))
         return rows
 

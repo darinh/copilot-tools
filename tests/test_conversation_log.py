@@ -1837,3 +1837,169 @@ def test_a_corrupt_event_log_is_not_fatal(tmp_path):
         '"skill-x"}}\n{ truncated mid-\n', encoding="utf-8")
     found = clog.session_event_sources("s2", tmp_path / "session-state")
     assert found == {"ok": "skill-x"}
+
+
+# --------------------------------------------------------------------------
+# Categories: what a message IS, not who said it
+# --------------------------------------------------------------------------
+#
+# ctor answers "did a person write this". That is one axis, and it is not
+# a category. Filing a backlog skill definition and a repository instruction
+# reminder both as sender copilot-cli says which program emitted them and
+# nothing about what they are -- and the name that separates them is sitting
+# in the text, in <skill-context name="backlog">, being discarded.
+
+def test_a_skill_is_categorised_by_its_name():
+    body = '<skill-context name="backlog">\nBase directory: x\n</skill-context>'
+    assert clog.categorize(body) == (clog.SKILL, "backlog")
+
+
+def test_the_skill_name_can_come_from_provenance_instead():
+    """Two spellings of one fact: the block says name="backlog", the event
+    log says source "skill-backlog". Either will do."""
+    assert clog.categorize("anything", provenance="skill-merge-to-main") == \
+        (clog.SKILL, "merge-to-main")
+
+
+def test_instruction_reminders_are_categorised_by_their_file():
+    """195 AGENTS.md, 161 copilot-instructions.md and 108 CLAUDE.md on this
+    machine -- three different documents arriving under one tag."""
+    body = ("\n<system_reminder>\nCustom instructions from "
+            ".worktrees/x/.github/copilot-instructions.md. Apply these:\n"
+            "</system_reminder>")
+    assert clog.categorize(body) == (clog.INSTRUCTIONS,
+                                     "copilot-instructions.md")
+
+
+def test_a_reminder_with_no_named_file_still_categorises():
+    assert clog.categorize("<system_reminder>x</system_reminder>") == \
+        (clog.INSTRUCTIONS, "")
+
+
+@pytest.mark.parametrize("body,expected", [
+    (REAL_PREAMBLE, clog.PREAMBLE),
+    (clog.CLI_CONTINUE, clog.CONTINUATION),
+    (REAL_PEER, clog.PEER_MESSAGE),
+    (REAL_HUMAN, clog.HUMAN_MESSAGE),
+])
+def test_the_other_kinds_each_get_their_own_category(body, expected):
+    assert clog.categorize(body)[0] == expected
+
+
+def test_a_pipeline_prompt_carries_which_template():
+    """"pipeline" alone is barely better than "copilot cli" when the four
+    list templates are different questions."""
+    category, detail = clog.categorize(REAL_LIST_PROMPT)
+    assert category == clog.PIPELINE
+    assert detail.startswith("List every person"), detail
+
+
+def test_source_decides_before_the_body_for_mail_and_handoffs():
+    """A handoff is a handoff because of where it came from, not because of
+    what it says -- and its body legitimately quotes preambles and peer
+    messages."""
+    assert clog.categorize(REAL_PREAMBLE, source=clog.SOURCE_HANDOFF) == \
+        (clog.HANDOFF_REPORT, "")
+    assert clog.categorize(REAL_PREAMBLE,
+                           source=clog.SOURCE_OPERATOR_MAIL)[0] == \
+        clog.PEER_MESSAGE
+
+
+def test_an_agent_reply_is_a_reply_whatever_it_quotes():
+    """Outbound is decided by direction. An agent quoting a skill definition
+    back is still the agent talking."""
+    body = '<skill-context name="backlog">quoted</skill-context>'
+    assert clog.categorize(body, direction=clog.OUTBOUND) == \
+        (clog.AGENT_REPLY, "")
+
+
+def test_every_category_constant_is_reachable():
+    """A vocabulary entry nothing can produce is a filter that always returns
+    nothing."""
+    produced = {
+        clog.categorize(REAL_HUMAN)[0],
+        clog.categorize(REAL_PREAMBLE)[0],
+        clog.categorize(clog.CLI_CONTINUE)[0],
+        clog.categorize(REAL_PEER)[0],
+        clog.categorize(REAL_LIST_PROMPT)[0],
+        clog.categorize('<skill-context name="x">y</skill-context>')[0],
+        clog.categorize("<system_reminder>y</system_reminder>")[0],
+        clog.categorize("x", direction=clog.OUTBOUND)[0],
+        clog.categorize("x", source=clog.SOURCE_HANDOFF)[0],
+    }
+    assert produced == set(clog.CATEGORIES), set(clog.CATEGORIES) - produced
+
+
+def test_categories_are_stored_and_countable(conn):
+    _add(conn, source_id="c1",
+         body='<skill-context name="backlog">y</skill-context>')
+    _add(conn, source_id="c2",
+         body='<skill-context name="backlog">z</skill-context>')
+    _add(conn, source_id="c3", body=REAL_HUMAN)
+    conn.commit()
+    found = {(r["category"], r["subcategory"]): r["messages"]
+             for r in clog.categories(conn)}
+    assert found[(clog.SKILL, "backlog")] == 2, found
+    assert found[(clog.HUMAN_MESSAGE, "")] == 1, found
+
+
+def test_a_category_can_be_filtered_on(conn):
+    _add(conn, source_id="f1",
+         body='<skill-context name="backlog">y</skill-context>')
+    _add(conn, source_id="f2",
+         body='<skill-context name="merge-to-main">z</skill-context>')
+    conn.commit()
+    hits = clog.query(conn, category=clog.SKILL, subcategory="backlog")
+    assert [r["source_id"] for r in hits] == ["f1"], hits
+    assert len(clog.query(conn, category=clog.SKILL)) == 2
+
+
+def test_a_store_made_before_categories_existed_gains_them(tmp_path):
+    """CREATE TABLE IF NOT EXISTS does nothing to a table that already
+    exists, so without the migration an older store would keep every other
+    change and silently lack these columns -- and the first symptom would be
+    a query failing on a column the code is certain about."""
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(str(path))
+    raw.executescript(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " source TEXT NOT NULL, source_id TEXT NOT NULL,"
+        " project TEXT NOT NULL DEFAULT '', repository TEXT NOT NULL DEFAULT '',"
+        " cwd TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',"
+        " session_id TEXT NOT NULL DEFAULT '', instance TEXT NOT NULL DEFAULT '',"
+        " channel TEXT NOT NULL, direction TEXT NOT NULL, actor TEXT NOT NULL,"
+        " sender TEXT NOT NULL DEFAULT '', recipient TEXT NOT NULL DEFAULT '',"
+        " body TEXT NOT NULL, asks INTEGER NOT NULL DEFAULT 0,"
+        " sent_at TEXT NOT NULL, captured_at TEXT NOT NULL,"
+        " UNIQUE (source, source_id));")
+    raw.commit()
+    raw.close()
+
+    conn = clog.connect(path)
+    try:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+        assert "category" in columns and "subcategory" in columns
+        _add(conn, source_id="m1",
+             body='<skill-context name="backlog">y</skill-context>')
+        conn.commit()
+        row = conn.execute(
+            "SELECT category, subcategory FROM messages").fetchone()
+        assert (row["category"], row["subcategory"]) == (clog.SKILL, "backlog")
+    finally:
+        conn.close()
+
+
+def test_reseeding_backfills_the_recipient(conn):
+    """Found by a question about operator mail: seven agent-to-agent replies
+    had neither sender nor recipient, because the reclassification update
+    never included them. A corrected rule that cannot reach stored rows is
+    only a rule about the future."""
+    _add(conn, source_id="r1", body="answering", direction=clog.OUTBOUND,
+         channel=clog.AGENT_AGENT, actor=clog.AGENT)
+    assert conn.execute(
+        "SELECT recipient FROM messages WHERE source_id='r1'").fetchone()[0] == ""
+    _add(conn, source_id="r1", body="answering", direction=clog.OUTBOUND,
+         channel=clog.AGENT_AGENT, actor=clog.AGENT, recipient="scripts")
+    assert conn.execute(
+        "SELECT recipient FROM messages WHERE source_id='r1'").fetchone()[0] \
+        == "scripts"

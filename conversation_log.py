@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS messages (
     recipient   TEXT NOT NULL DEFAULT '',
     body        TEXT NOT NULL,
     asks        INTEGER NOT NULL DEFAULT 0,
+    category    TEXT NOT NULL DEFAULT '',
+    subcategory TEXT NOT NULL DEFAULT '',
     sent_at     TEXT NOT NULL,
     captured_at TEXT NOT NULL,
     UNIQUE (source, source_id)
@@ -95,6 +97,25 @@ CREATE INDEX IF NOT EXISTS messages_sent_at ON messages (sent_at);
 CREATE INDEX IF NOT EXISTS messages_project ON messages (project, sent_at);
 CREATE INDEX IF NOT EXISTS messages_channel ON messages (channel, sent_at);
 """
+
+#: Created after the migration below, not inside :data:`SCHEMA`. An index on
+#: a column that an older table has not been given yet fails, and the whole
+#: script fails with it -- which is how a store that predates a column stops
+#: opening at all. The migration test found this.
+_LATE_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS messages_category"
+    " ON messages (category, subcategory)",
+)
+
+#: Columns added after the table first shipped. `CREATE TABLE IF NOT EXISTS`
+#: does nothing to a table that already exists, so a store made before these
+#: existed would keep every other change and silently lack these two -- and
+#: the first symptom would be a query failing on a column the code is certain
+#: about.
+_ADDED_COLUMNS = (
+    ("category", "TEXT NOT NULL DEFAULT ''"),
+    ("subcategory", "TEXT NOT NULL DEFAULT ''"),
+)
 
 # The FTS mirror is created separately: FTS5 is a compile-time option, and a
 # Python whose sqlite3 lacks it must still be able to use everything else here.
@@ -173,6 +194,12 @@ def connect(path: "Path | None" = None) -> sqlite3.Connection:
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        have = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+        for column, spec in _ADDED_COLUMNS:
+            if column not in have:
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {column} {spec}")
+        for statement in _LATE_INDEXES:
+            conn.execute(statement)
         try:
             existing = conn.execute(
                 "SELECT 1 FROM sqlite_master"
@@ -465,6 +492,92 @@ def session_event_sources(session_id: str,
     return found
 
 
+#: What a message *is*, as opposed to who said it.
+#:
+#: `actor` answers "did a person write this", which is one axis and the one
+#: this store was built around. It is not a category. Filing a `backlog`
+#: skill definition and a repository instruction reminder both as
+#: "copilot-cli" says which program emitted them and nothing about what they
+#: are -- and the name that distinguishes them is sitting in the text, in
+#: `<skill-context name="backlog">`, being thrown away.
+HUMAN_MESSAGE = "human"
+AGENT_REPLY = "reply"
+PREAMBLE = "preamble"
+SKILL = "skill"
+INSTRUCTIONS = "instructions"
+CONTINUATION = "continuation"
+PIPELINE = "pipeline"
+PEER_MESSAGE = "peer-message"
+HANDOFF_REPORT = "handoff"
+
+#: Every category, so a viewer can offer them without discovering them.
+CATEGORIES = (HUMAN_MESSAGE, AGENT_REPLY, PREAMBLE, SKILL, INSTRUCTIONS,
+              CONTINUATION, PIPELINE, PEER_MESSAGE, HANDOFF_REPORT)
+
+_SKILL_NAME_RE = re.compile(r'<skill-context\s+name="([^"]+)"')
+_INSTRUCTION_FILE_RE = re.compile(r"Custom instructions from (\S+?\.md)")
+
+
+def _skill_name(body: str, source: str = "") -> str:
+    """Which skill, from the tag or from the CLI's own provenance.
+
+    Two spellings of the same fact: the injected block says
+    `<skill-context name="backlog">`, and the event log records
+    `source: "skill-backlog"`. Either will do, and having both means a
+    message keeps its name when one of them is absent.
+    """
+    match = _SKILL_NAME_RE.search(body or "")
+    if match:
+        return match.group(1)
+    text = str(source or "")
+    return text[len("skill-"):] if text.startswith("skill-") else ""
+
+
+def categorize(body: str, direction: str = INBOUND, source: str = "",
+               provenance: str = "") -> tuple:
+    """``(category, subcategory)`` -- what this message is.
+
+    Deliberately separate from :func:`classify`. They answer different
+    questions and conflating them is what produced 588 messages labelled
+    "copilot cli": one axis is *who spoke*, the other is *what kind of thing
+    this is*, and a viewer needs both to group anything usefully.
+
+    ``subcategory`` is the specific one within the kind -- which skill, which
+    instruction file, which pipeline template -- because "skill" alone is
+    barely more useful than "copilot cli" when 107 of the 124 are the same
+    skill.
+    """
+    text = body or ""
+    if source == SOURCE_HANDOFF:
+        return HANDOFF_REPORT, ""
+    if source == SOURCE_OPERATOR_MAIL:
+        return PEER_MESSAGE, ""
+    if direction == OUTBOUND:
+        return AGENT_REPLY, ""
+    if PREAMBLE_MARKER in text[:400]:
+        return PREAMBLE, ""
+    name = _skill_name(text, provenance)
+    if name:
+        return SKILL, name
+    if "<system_reminder>" in text or provenance == "instruction-discovery":
+        found = _INSTRUCTION_FILE_RE.search(text)
+        # The file is the useful half: a reminder about this repository's
+        # AGENTS.md and one about a worktree's copilot-instructions.md are
+        # different documents arriving under one tag.
+        return INSTRUCTIONS, (found.group(1).replace("\\", "/").rsplit("/", 1)[-1]
+                              if found else "")
+    if text == CLI_CONTINUE or provenance == "thinking-exhausted-continuation":
+        return CONTINUATION, ""
+    for head, anchors in _PIPELINE_PROMPTS:
+        if text.startswith(head) and all(a in text for a in anchors):
+            # The head, shortened, is the template's name. Better than a
+            # number, which would renumber the day somebody reorders the table.
+            return PIPELINE, head[:48].rstrip(" .,")
+    if peer_sender(text) is not None:
+        return PEER_MESSAGE, ""
+    return HUMAN_MESSAGE, ""
+
+
 def is_only_machine_text(body: str) -> bool:
     """True when nothing is left after removing the CLI's own insertions.
 
@@ -590,7 +703,8 @@ def now_utc() -> str:
 
 _COLUMNS = ("source", "source_id", "project", "repository", "cwd", "branch",
             "session_id", "instance", "channel", "direction", "actor",
-            "sender", "recipient", "body", "asks", "sent_at", "captured_at")
+            "sender", "recipient", "body", "asks", "category", "subcategory",
+            "sent_at", "captured_at")
 
 
 def record(conn: sqlite3.Connection, *, source: str, source_id: str,
@@ -598,7 +712,8 @@ def record(conn: sqlite3.Connection, *, source: str, source_id: str,
            project: str = "", repository: str = "", cwd: str = "",
            branch: str = "", session_id: str = "", instance: str = "",
            channel: "str | None" = None, actor: "str | None" = None,
-           sender: str = "", recipient: str = "") -> bool:
+           sender: str = "", recipient: str = "",
+           provenance: str = "") -> bool:
     """Store one message. Returns ``True`` if it was new.
 
     ``INSERT OR IGNORE`` against ``UNIQUE (source, source_id)`` is what makes
@@ -610,6 +725,7 @@ def record(conn: sqlite3.Connection, *, source: str, source_id: str,
     if not text.strip():
         return False
     guessed_actor, guessed_channel, guessed_sender = classify(text)
+    kind, detail = categorize(text, direction, source, provenance)
     if direction == OUTBOUND:
         # The agent speaking. Channel is inherited from whoever it is
         # answering, which the caller knows and this function does not.
@@ -628,6 +744,8 @@ def record(conn: sqlite3.Connection, *, source: str, source_id: str,
         "recipient": recipient,
         "body": text,
         "asks": 1 if asks_question(text) else 0,
+        "category": kind,
+        "subcategory": detail,
         "sent_at": _utc(sent_at) or now_utc(),
         "captured_at": now_utc(),
     }
@@ -651,10 +769,13 @@ def record(conn: sqlite3.Connection, *, source: str, source_id: str,
     # said; only the verdict about it is ours to revise.
     conn.execute(
         "UPDATE messages SET channel = :channel, actor = :actor,"
-        " sender = :sender, asks = :asks"
+        " sender = :sender, recipient = :recipient, asks = :asks,"
+        " category = :category, subcategory = :subcategory"
         " WHERE source = :source AND source_id = :source_id"
         "   AND (channel != :channel OR actor != :actor"
-        "        OR sender != :sender OR asks != :asks)", row)
+        "        OR sender != :sender OR recipient != :recipient"
+        "        OR asks != :asks OR category != :category"
+        "        OR subcategory != :subcategory)", row)
     # A body is only ever *shortened*, and only when the removed tail is a
     # block another row already holds verbatim -- today, the mail appended to
     # a launch preamble. The condition is the guarantee: the stored text must
@@ -830,7 +951,9 @@ def seed_session_store(conn: sqlite3.Connection,
                 conn, source=SOURCE_SESSION_STORE,
                 source_id=f'{row["session_id"]}:{row["turn_index"]}:in',
                 body=prompt, direction=INBOUND, sent_at=stamp,
-                actor=actor, channel=channel, sender=sender, **context)
+                actor=actor, channel=channel, sender=sender,
+                provenance=provenance.get(row["user_message"] or "", ""),
+                **context)
             report.added += 1 if added else 0
             report.duplicate += 0 if added else 1
 
@@ -1262,6 +1385,7 @@ def query(conn: sqlite3.Connection, *, search: str = "", project: str = "",
           channel: str = "", direction: str = "", actor: str = "",
           instance: str = "", date_from: str = "", date_to: str = "",
           session_id: str = "", asks: bool = False,
+          category: str = "", subcategory: str = "",
           limit: int = 200, offset: int = 0) -> list[dict]:
     """Messages matching the given filters, newest first."""
     where: list[str] = []
@@ -1309,7 +1433,9 @@ def query(conn: sqlite3.Connection, *, search: str = "", project: str = "",
                 params.append(f"%{_like_term(search.strip())}%")
 
     for column, value in (("project", project), ("instance", instance),
-                          ("session_id", session_id)):
+                          ("session_id", session_id),
+                          ("category", category),
+                          ("subcategory", subcategory)):
         if value:
             where.append(f"m.{column} = ?")
             params.append(value)
@@ -1336,6 +1462,20 @@ def query(conn: sqlite3.Connection, *, search: str = "", project: str = "",
            f"ORDER BY m.sent_at DESC, m.id DESC LIMIT ? OFFSET ?")
     params.extend([max(1, min(int(limit), 1000)), max(0, int(offset))])
     return [dict(r) for r in conn.execute(sql, params)]
+
+
+def categories(conn: sqlite3.Connection) -> list[dict]:
+    """Every category and subcategory, with counts, newest activity first.
+
+    What the sidebar needs to offer grouping at all. Ordered by count rather
+    than by name because the useful fact about `skill > merge-to-main` is
+    that there are 107 of them and one each of three others.
+    """
+    return [dict(r) for r in conn.execute(
+        "SELECT category, subcategory, COUNT(*) AS messages,"
+        "       MAX(substr(sent_at, 1, 10)) AS last_day"
+        "  FROM messages GROUP BY category, subcategory"
+        " ORDER BY messages DESC, category, subcategory")]
 
 
 def projects(conn: sqlite3.Connection) -> list[dict]:
