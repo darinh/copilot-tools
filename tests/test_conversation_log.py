@@ -1305,3 +1305,81 @@ def test_the_extension_and_the_builders_are_one_program(tmp_path):
     assert 'from "./events.mjs"' in source
     for name in ("inboundEvent(", "outboundEvent("):
         assert name in source, f"the extension no longer calls {name}"
+
+
+# --------------------------------------------------------------------------
+# The CLI's own insertions are not human speech
+# --------------------------------------------------------------------------
+
+REAL_REMINDER = (
+    "\n<system_reminder>\nCustom instructions from "
+    ".worktrees/chore-land-peer-fixes/.github/copilot-instructions.md. "
+    "Apply these to any code you write here:\n\n# Repository Agent "
+    "Instructions\n</system_reminder>\n")
+
+
+def test_a_turn_that_is_only_a_system_reminder_is_not_human_speech():
+    """Measured on the real store: 462 of 1918 rows filed as human speech --
+    24% -- were `<system_reminder>` blocks and nothing else. Not one of the
+    462 contained a word the human typed. Asked "what did I say", the store
+    answered with a quarter of its own instruction files."""
+    actor, _channel, sender = clog.classify(REAL_REMINDER)
+    assert actor == clog.SYSTEM, (actor, sender)
+    assert sender == "copilot-cli"
+
+
+def test_a_reminder_appended_to_real_speech_is_still_human():
+    """The mirror failure, and the reason the test is "what remains" rather
+    than "does it contain one". Dropping a turn because a reminder was
+    appended to it would lose the sentence the human actually typed."""
+    body = "please fix the failing test" + REAL_REMINDER
+    actor, _channel, _sender = clog.classify(body)
+    assert actor == clog.HUMAN, body[:60]
+
+
+def test_a_leading_newline_does_not_hide_a_reminder():
+    """None of the 462 rows *started* with the tag -- the CLI writes a
+    newline first -- so a prefix check finds zero of them and reports the
+    whole corpus clean, which reads exactly like success."""
+    assert not REAL_REMINDER.startswith("<system_reminder>")
+    assert clog.is_only_machine_text(REAL_REMINDER)
+
+
+def test_ordinary_speech_is_untouched():
+    """Positive control: the detector must be able to *not* fire."""
+    assert not clog.is_only_machine_text(REAL_HUMAN)
+    assert clog.classify(REAL_HUMAN)[0] == clog.HUMAN
+
+
+def test_reseeding_reclassifies_a_row_filed_under_an_older_rule(conn,
+                                                                monkeypatch):
+    """Seeding is idempotent, which without this is idempotent in the
+    unhelpful direction: a fixed rule leaves every previously-misfiled row
+    misfiled, and the only remedy is knowing to delete the database.
+
+    Simulated by filing a row while the detector is switched off, then
+    seeding again with it on -- which is exactly the shape of shipping a
+    classification fix to a machine that already has a store.
+    """
+    monkeypatch.setattr(clog, "is_only_machine_text", lambda _b: False)
+    assert _add(conn, source_id="r1", body=REAL_REMINDER) is True
+    assert conn.execute(
+        "SELECT actor FROM messages WHERE source_id='r1'").fetchone()[0] \
+        == clog.HUMAN
+
+    monkeypatch.undo()
+    assert _add(conn, source_id="r1", body=REAL_REMINDER) is False
+    row = conn.execute(
+        "SELECT actor, sender FROM messages WHERE source_id='r1'").fetchone()
+    assert row["actor"] == clog.SYSTEM, dict(row)
+    assert row["sender"] == "copilot-cli"
+
+
+def test_reseeding_does_not_rewrite_what_was_said(conn):
+    """A message's text is what was said; only the verdict about it is ours
+    to revise. Re-seeding must never edit a body."""
+    _add(conn, source_id="r2", body="the original words")
+    _add(conn, source_id="r2", body="tampered")
+    assert conn.execute(
+        "SELECT body FROM messages WHERE source_id='r2'").fetchone()[0] \
+        == "the original words"

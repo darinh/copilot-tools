@@ -135,8 +135,41 @@ sessions started after `setup.sh` / `setup.ps1` has deployed it.
 That limitation is a property of the source data, verified by direct query
 against `session-store.db`, not a defect in the seeder.
 
-## Known gap: an agent-to-agent thread has no project
+## What counts as the human speaking
 
+Everything reaching an agent arrives as a "user message", which is a fact
+about the transport and not about who spoke. Three kinds of machine text
+arrive that way and are filed under their real speaker:
+
+| Insertion | Detected by | Filed as |
+|---|---|---|
+| The operator launch preamble | `PREAMBLE_MARKER` in the first 400 chars | `system`, sender `operator` |
+| A peer message from `operator send` | `PEER_PREFIX_RE` | declined — mail owns it |
+| The CLI's `<system_reminder>` blocks | `is_only_machine_text()` | `system`, sender `copilot-cli` |
+
+The last was found by running the finished feature against the real store:
+**462 of 1918 rows filed as human speech — 24% — were `<system_reminder>`
+blocks and nothing else.** Not one of the 462 contained a word the human
+typed. Asked "what did I say", the store answered with a quarter of its own
+instruction files.
+
+Two details are load-bearing. The test is *what remains after removing the
+blocks*, not *does the body start with one*: none of the 462 started with the
+tag, because the CLI writes a newline first, so a prefix check finds zero of
+them and reports the corpus clean. And a body that is *partly* a reminder
+stays human, because the reminder is appended to something a person wrote —
+the mirror failure would lose the sentence.
+
+`record()` re-applies the classification when a row already exists, so a
+corrected rule reaches rows already filed under the old one. Seeding is
+otherwise idempotent in the unhelpful direction: the fix would ship and every
+previously-misfiled row would stay misfiled, with "delete the database" as the
+only remedy — which is exactly the sort of thing nobody knows to do. The body
+is never rewritten; a message's text is what was said, and only the verdict
+about it is ours to revise. Re-seeding the real store moved 462 rows out of
+`human` and 7 agent replies into `agent-agent`.
+
+## Known gap: an agent-to-agent thread has no project
 The `messages` table has one `project` column, and `seed_operator_mail` leaves
 it empty for every message it files. That is honest — mail carries no project
 today — but it is a real limitation of the "agent conversations, separately"

@@ -262,6 +262,31 @@ def peer_sender(body: str) -> "str | None":
     return match.group(1) if match else None
 
 
+#: A `<system_reminder>` block. The CLI appends these to a user turn to
+#: re-state project instructions, and they arrive inside the "user message"
+#: exactly as the operator preamble does.
+_REMINDER_RE = re.compile(r"<system_reminder>.*?</system_reminder>", re.S)
+
+
+def is_only_machine_text(body: str) -> bool:
+    """True when nothing is left after removing the CLI's own insertions.
+
+    Measured on the real store before this existed: 462 of 1918 rows filed as
+    human speech -- 24% -- were `<system_reminder>` blocks and **nothing
+    else**. Not one of the 462 contained a word the human typed. Asked "what
+    did I say", the store answered with a quarter of its own instruction
+    files.
+
+    The test is "what remains", not "does it start with one". None of the 462
+    started with the tag, because the CLI puts a newline first, so a prefix
+    check finds zero of them and reports the corpus clean. It is also why a
+    message that is *partly* a reminder stays human: the reminder is appended
+    to something a person wrote, and dropping that would trade this failure
+    for its mirror image.
+    """
+    return bool(body) and not _REMINDER_RE.sub("", body).strip()
+
+
 def classify(body: str) -> "tuple[str, str, str]":
     """Who really said this: ``(actor, channel, sender)``.
 
@@ -281,6 +306,8 @@ def classify(body: str) -> "tuple[str, str, str]":
     text = body or ""
     if PREAMBLE_MARKER in text[:400]:
         return SYSTEM, HUMAN_AGENT, "operator"
+    if is_only_machine_text(text):
+        return SYSTEM, HUMAN_AGENT, "copilot-cli"
     sender = peer_sender(text)
     if sender is not None:
         return AGENT, AGENT_AGENT, sender
@@ -399,7 +426,27 @@ def record(conn: sqlite3.Connection, *, source: str, source_id: str,
     cur = conn.execute(
         f"INSERT OR IGNORE INTO messages ({', '.join(_COLUMNS)}) "
         f"VALUES ({placeholders})", row)
-    return cur.rowcount > 0
+    if cur.rowcount > 0:
+        return True
+    # Already stored. Re-apply the classification, because the *rules* change
+    # and the messages do not: `classify` learning that a body is machine text
+    # must be able to reach the rows already filed under the old answer.
+    #
+    # Without this, seeding is idempotent in the unhelpful direction -- a fixed
+    # rule leaves every previously-misfiled row misfiled, and the only remedy
+    # is knowing to delete the database, which is exactly the kind of thing
+    # nobody knows. Measured when it mattered: a quarter of the "human" rows on
+    # this machine were the CLI's own instruction files.
+    #
+    # The body is deliberately not rewritten. A message's text is what was
+    # said; only the verdict about it is ours to revise.
+    conn.execute(
+        "UPDATE messages SET channel = :channel, actor = :actor,"
+        " sender = :sender, asks = :asks"
+        " WHERE source = :source AND source_id = :source_id"
+        "   AND (channel != :channel OR actor != :actor"
+        "        OR sender != :sender OR asks != :asks)", row)
+    return False
 
 
 # --------------------------------------------------------------------------

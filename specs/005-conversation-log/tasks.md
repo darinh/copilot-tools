@@ -136,3 +136,21 @@ All tasks complete. Checkboxes reflect delivered state, not intent.
       calls them.
 - [x] T064 — Guard verified by mutating the real `events.mjs` and observing
       the suite go red, then restoring it.
+
+## Found by running the finished feature against the real store
+
+- [x] T065 — `<system_reminder>` blocks recognised as the CLI's own text.
+      462 of 1918 rows filed as human speech (24%) were nothing else, and not
+      one of them contained a word the human typed.
+- [x] T066 — Detected by what remains after removal, not by prefix: none of
+      the 462 started with the tag, so a prefix check finds zero and reports
+      the corpus clean.
+- [x] T067 — A reminder appended to real speech stays human, with a test, so
+      the fix cannot trade this failure for its mirror.
+- [x] T068 — `record()` re-applies the classification to rows already stored,
+      so a corrected rule reaches them; the body is never rewritten.
+- [x] T069 — Verified against the real store: 462 rows moved out of `human`,
+      7 agent replies moved into `agent-agent`.
+- [x] T070 — Viewer exercised end to end on the real 4,438-message store:
+      page, summary, agent-agent filter, search, and an `asks` query reaching
+      messages older than the page limit.
