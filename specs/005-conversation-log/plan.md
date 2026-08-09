@@ -149,3 +149,131 @@ existing fuzz tests asserted only that no exception escaped and that HTTP was
 input" shape in a third form: falsifiable in principle, but scored against an
 assertion too weak to see the bug. Both now assert the returned rows.
 
+## Round two: reviewing the repairs
+
+A repair is a claim too. The fixes above were sent back to the same reviewer
+with instructions to attack them specifically. **Four of the five findings
+were reachable through the fixes themselves.**
+
+11. **A NUL byte in a search still matched everything.** `search="\x00"` is
+    truthy, so it took the *new* substring path — and a NUL in a bound LIKE
+    parameter truncates the pattern at the NUL, so `%\x00%` degenerates to
+    `%`. The match-everything failure defect 6 removed, restored by the fix
+    for defect 6. A NUL cannot occur in a stored body, so the search now
+    matches nothing, structurally.
+12. **The Host guard admitted `[::1]evil.com`.** It stripped the IPv6 bracket
+    by cutting at `]` and keeping what came before, which reads that as
+    `[::1]`. Anything after the address is junk, and junk there is the whole
+    attack; the port is now parsed rather than trimmed and must be digits.
+13. **The Host guard refused the address `serve(host=...)` was told to bind**,
+    making `--host` a broken flag rather than a security control — it
+    protected nothing the bind had not already exposed. The bound host joins
+    the allow-list, and a non-loopback bind prints a warning naming what the
+    store contains.
+14. **The id-less mail key collided.** Joining fields on `\x00` is ambiguous
+    when a field can *contain* `\x00`: `from="a" to="b\0c"` and
+    `from="a\0b" to="c"` hashed identically, so two different messages became
+    one row and one was lost. Length-prefixed now. Duplicating a message is
+    untidy; losing one silently is the failure this store exists to prevent.
+15. **`--port` still accepted `80_80`, `" 8765"` and unicode digits**, because
+    `int()` does and the range check passes all of them.
+
+### The finding worth keeping
+
+**The regression test written for the LIKE-escaping fix never ran the LIKE
+path.** On any build with FTS5 — which is every build here — `100%` tokenises
+to `100` and takes the MATCH branch. The test asserted the right rows, for the
+right reason, through code that was not the code under test, and **would have
+passed with the escaping deleted**.
+
+That is a fourth shape of unfalsifiable test, and the hardest to see: not a
+weak assertion, not a constant, but a *correct* assertion evaluated against
+the wrong code path. It now forces substring mode, and a second test asserts
+that `query()` still consults `search_mode` at all — otherwise the monkeypatch
+quietly becomes decorative and the test returns to proving nothing.
+
+## Round three: a different family
+
+The first two rounds were run by the same model. This one was `gpt-5.6-sol` —
+a different family from the author, at maximum reasoning effort, told what the
+first two rounds had already found and asked for what they missed. **Ten more
+findings, all real, all reproduced.**
+
+Four were silent wrong answers of the kind the earlier rounds kept surfacing:
+
+16. **An FTS index created after the rows it indexes stays empty.** A store
+    written by a Python whose sqlite3 lacks FTS5 and later opened by one that
+    has it gets the virtual table and the triggers — but the triggers only
+    fire on rows inserted *after* they exist. Every search then returns
+    nothing, most convincingly on the machine with the most history. Rebuilt
+    once, at the transition.
+17. **`search_mode` read the catalogue instead of trying.** `messages_fts` in
+    `sqlite_master` does not mean FTS5 is loadable, so the reverse case — a
+    store made with FTS5, opened without — reported `"fts"` and then failed
+    every query. It now runs a trivial MATCH: a probe cannot be wrong about
+    the thing it just did.
+18. **A search for `_` found nothing, with two rows containing one.** Python's
+    `\w` includes `_`; FTS5's tokeniser treats it as a separator. So the
+    emptiness test said "FTS can answer this", and FTS then tokenised the
+    query away to nothing. The split now uses FTS's own separator set.
+19. **The `asks` filter ran after `LIMIT`.** The viewer filtered the page it
+    got back, so one old question behind 200 newer statements returned
+    nothing — and "you were never asked anything" is indistinguishable from
+    "not in the last 200 rows". Pushed into SQL.
+
+Three were failures of the record itself:
+
+20. **Every turn was filed twice once the extension was installed.** Both
+    sources see the identical turn and their ids are unrelated, so
+    `UNIQUE (source, source_id)` cannot notice. Matched per message rather
+    than per session, because skipping a session the hook had only *partly*
+    seen would drop the turns from before it was installed: a duplicate is
+    visible noise, a gap is invisible loss. `seed_all` now reads the spool
+    first, and that ordering is asserted by calling it.
+21. **A reply to a peer was filed as human conversation.** The peer's message
+    is declined and held by mail — but the agent's *answer* went into the
+    human's conversation, which is the one view the human asked to keep
+    separate. Replies now inherit the channel of what they answer, on both
+    the seeder and the capture path.
+22. **Two id-less messages to different agents collapsed into one.** `to_id`
+    decides the recipient instance and was not in the content key. The same
+    text sent to two agents is an ordinary broadcast, and one of the two was
+    being dropped.
+
+23. **`process.cwd()` was evaluated outside the writer's `try`.** It throws on
+    POSIX once the working directory is gone — the ordinary end of every
+    `git worktree remove` — and the throw would reject the hook's promise
+    mid-turn. `spool()` now takes a builder rather than a built event, so
+    there is no expression left on the outside to fail.
+
+### And two more tests that were not testing anything
+
+24. **The forced-substring test still did not prove the path.** Forcing
+    `search_mode` was not enough: FTS returns the same two answers for that
+    fixture, so an implementation that consulted `search_mode` and ignored it
+    passed. `_fts_query` is now replaced with something that raises.
+25. **The cross-language seam test never ran any JavaScript.** It scanned
+    `extension.mjs` for key spellings and then built its own event in Python.
+    Replacing both body expressions with `body: ""` left every assertion
+    green while every captured message would have been discarded as empty.
+
+The remedy for 25 is the structural one: the builders moved into
+`events.mjs`, and the test now *executes* them under node and feeds the real
+bytes to `ingest_spool`. Its control performs exactly the `body: ""` mutation
+that defeated the old test, and a third test asserts the extension still
+imports and calls the builders — otherwise the executing tests would score a
+module nothing runs. Verified by mutating the real file and watching the suite
+go red.
+
+### What the three rounds have in common
+
+Twenty-five findings, and the shape barely varies: **a mechanism that returns
+a confident answer nobody can check.** A dropped predicate returns
+"everything". An empty index returns "nothing". A catalogue lookup returns
+"fts". A test that never reaches the code returns "pass". None of them is an
+error, and each one is most convincing on the machine where it costs most.
+
+The rate has not fallen — five, five, then ten. What changed at round three
+was the reviewer's family, not the reviewer's effort, which is the argument
+for the model policy this work also produced.
+

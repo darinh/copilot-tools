@@ -10,7 +10,9 @@ own author's idea of the input is a detector that has agreed with itself.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -620,11 +622,15 @@ def test_the_extension_records_finished_replies_and_not_reasoning():
 
 
 def test_the_ingester_reads_the_fields_the_extension_writes(tmp_path):
-    """Scored against a line built from the extension's own key names rather
-    than from mine: a spool record whose fields the ingester ignores is
-    silently dropped, and an empty ingest looks exactly like a quiet day.
+    """The cheap half of the seam check, kept for machines without node.
+
+    Scored against the *builders* in `events.mjs`, which is where the key
+    names now live. This asserts only that the spellings exist; that the code
+    produces them is asserted by executing it, below. Keeping both is
+    deliberate -- this one runs everywhere, and a missing key name here is a
+    clearer failure than a mismatched row count.
     """
-    source = _extension_source()
+    source = (EXTENSION.parent / "events.mjs").read_text(encoding="utf-8")
     keys = ["id", "direction", "body", "cwd", "session_id", "sent_at"]
     for key in keys:
         assert f"{key}:" in source, f"the extension no longer writes {key}"
@@ -702,8 +708,18 @@ def test_a_like_wildcard_in_a_search_is_not_treated_as_syntax(conn,
     ``100`` and took the MATCH branch instead. It asserted the right rows,
     for the right reason, through code that was not the code under test, and
     would have passed with the escaping deleted.
+
+    The *second* version forced the mode but proved nothing more, because FTS
+    returns the same two answers for this fixture: an implementation that
+    called ``search_mode`` and ignored it passed both. ``_fts_query`` is
+    therefore replaced with something that raises, so taking the FTS branch
+    is an error rather than a coincidence.
     """
+    def unreachable(_text):
+        raise AssertionError("took the FTS branch; _like_term was never run")
+
     monkeypatch.setattr(clog, "search_mode", lambda _conn: "substring")
+    monkeypatch.setattr(clog, "_fts_query", unreachable)
     clog.record(conn, source="hook", source_id="w1", body="it hit 100% today",
                 direction="inbound", sent_at="2026-08-09T10:00:00Z",
                 channel="human-agent", actor="human")
@@ -826,3 +842,466 @@ def test_the_same_id_less_message_still_keys_identically_twice(conn, tmp_path):
     (inbox / "a.json").write_text(json.dumps(body), encoding="utf-8")
     assert clog.seed_operator_mail(conn, root).added == 1
     assert clog.seed_operator_mail(conn, root).added == 0
+
+
+# --------------------------------------------------------------------------
+# Round three: what the second round of repairs left behind
+# --------------------------------------------------------------------------
+
+def test_a_search_for_an_underscore_finds_the_rows_containing_one(conn):
+    """Python's ``\\w`` includes ``_``; FTS5's tokeniser treats it as a
+    separator. So ``_fts_query("_")`` returned the non-empty expression
+    ``'"_"'``, the caller read that as "FTS can answer this", and FTS then
+    tokenised it to an empty phrase and matched nothing. No error, no
+    fallback, and two rows on the machine that contain ``_``.
+    """
+    _add(conn, source_id="u1", body="has_under here", channel="human-agent",
+         actor="human")
+    _add(conn, source_id="u2", body="a_b there", channel="human-agent",
+         actor="human")
+    _add(conn, source_id="u3", body="nothing at all", channel="human-agent",
+         actor="human")
+    hits = sorted(r["source_id"] for r in clog.query(conn, search="_"))
+    assert hits == ["u1", "u2"], hits
+
+
+def test_the_underscore_split_agrees_with_what_fts_will_keep(conn):
+    """Control for the line above: the decision to fall back is made by
+    ``_fts_query`` returning empty, so that is what has to be asserted. A
+    search that survives tokenisation must still take the FTS path."""
+    assert clog._fts_query("_") == ""
+    assert clog._fts_query("___") == ""
+    assert clog._fts_query("a_b") == '"a" AND "b"'
+
+
+def test_an_index_created_after_the_rows_is_populated(tmp_path):
+    """A store written by a Python whose sqlite3 lacks FTS5, then opened by
+    one that has it. The triggers only fire on rows inserted after they
+    exist, so without a rebuild the index is empty and every search returns
+    nothing -- most convincingly on the machine with the most history.
+    """
+    path = tmp_path / "legacy.db"
+    raw = sqlite3.connect(str(path))
+    raw.executescript(clog.SCHEMA)
+    raw.execute(
+        "INSERT INTO messages (source, source_id, channel, direction, actor,"
+        " body, sent_at, captured_at) VALUES"
+        " ('hook','legacy','human-agent','inbound','human','legacy needle',"
+        "  '2026-08-09T00:00:00Z','2026-08-09T00:00:00Z')")
+    raw.commit()
+    raw.close()
+
+    conn = clog.connect(path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+        found = [r["source_id"] for r in clog.query(conn, search="needle")]
+        assert found == ["legacy"], found
+    finally:
+        conn.close()
+
+
+def test_search_mode_reports_what_it_can_run_not_what_is_catalogued(tmp_path):
+    """Presence in ``sqlite_master`` is not usability. Probing by running a
+    MATCH cannot be wrong about the thing it just did."""
+    path = tmp_path / "probe.db"
+    conn = clog.connect(path)
+    try:
+        assert clog.search_mode(conn) == "fts"
+        conn.execute("DROP TABLE messages_fts")
+        assert clog.search_mode(conn) == "substring"
+    finally:
+        conn.close()
+
+
+def test_a_turn_the_hook_already_captured_is_not_filed_again(tmp_path):
+    """Both sources see the identical turn -- the CLI writes it to its own
+    session store and the extension appends it to the spool -- and their ids
+    are unrelated, so ``UNIQUE (source, source_id)`` cannot notice. Every
+    turn captured live appeared twice once the extension was installed,
+    which is the one promise this store exists to keep.
+    """
+    store = tmp_path / "session-store.db"
+    src = sqlite3.connect(str(store))
+    src.executescript(
+        "CREATE TABLE sessions (id TEXT, repository TEXT, cwd TEXT,"
+        " branch TEXT);"
+        "CREATE TABLE turns (session_id TEXT, turn_index INT,"
+        " user_message TEXT, assistant_response TEXT, timestamp TEXT);")
+    src.execute("INSERT INTO sessions VALUES ('s2','r','C:/x','main')")
+    src.execute("INSERT INTO turns VALUES ('s2',0,'what is the plan',"
+                "'the plan is this','2026-08-09T00:00:00Z')")
+    src.commit()
+    src.close()
+
+    spool = tmp_path / "conversation-spool"
+    spool.mkdir()
+    (spool / "2026-08-09.jsonl").write_text("\n".join([
+        json.dumps({"id": "h1", "direction": "inbound",
+                    "body": "what is the plan", "session_id": "s2",
+                    "sent_at": "2026-08-09T00:00:01Z", "cwd": "C:/x"}),
+        json.dumps({"id": "h2", "direction": "outbound",
+                    "body": "the plan is this", "session_id": "s2",
+                    "sent_at": "2026-08-09T00:00:02Z", "cwd": "C:/x"}),
+    ]) + "\n", encoding="utf-8")
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        clog.ingest_spool(conn, spool)
+        report = clog.seed_session_store(conn, store)
+        bodies = [r["body"] for r in conn.execute(
+            "SELECT body FROM messages ORDER BY id")]
+        assert bodies == ["what is the plan", "the plan is this"], bodies
+        assert report.skipped.get("already captured live") == 2, report
+    finally:
+        conn.close()
+
+
+def test_the_duplicate_guard_still_files_what_the_hook_missed(tmp_path):
+    """Positive control, and the reason the match is per message rather than
+    per session: an extension installed mid-session has captured some turns
+    and not others, and dropping the whole session to avoid a duplicate
+    would lose the earlier ones. A duplicate is visible noise; a gap is not.
+    """
+    store = tmp_path / "session-store.db"
+    src = sqlite3.connect(str(store))
+    src.executescript(
+        "CREATE TABLE sessions (id TEXT, repository TEXT, cwd TEXT,"
+        " branch TEXT);"
+        "CREATE TABLE turns (session_id TEXT, turn_index INT,"
+        " user_message TEXT, assistant_response TEXT, timestamp TEXT);")
+    src.execute("INSERT INTO sessions VALUES ('s3','r','C:/x','main')")
+    src.execute("INSERT INTO turns VALUES ('s3',0,'earlier question','',"
+                "'2026-08-09T00:00:00Z')")
+    src.execute("INSERT INTO turns VALUES ('s3',1,'later question','',"
+                "'2026-08-09T00:10:00Z')")
+    src.commit()
+    src.close()
+
+    spool = tmp_path / "conversation-spool"
+    spool.mkdir()
+    (spool / "2026-08-09.jsonl").write_text(json.dumps(
+        {"id": "h9", "direction": "inbound", "body": "later question",
+         "session_id": "s3", "sent_at": "2026-08-09T00:10:01Z",
+         "cwd": "C:/x"}) + "\n", encoding="utf-8")
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        clog.ingest_spool(conn, spool)
+        clog.seed_session_store(conn, store)
+        bodies = sorted(r["body"] for r in conn.execute(
+            "SELECT body FROM messages"))
+        assert bodies == ["earlier question", "later question"], bodies
+    finally:
+        conn.close()
+
+
+def test_seed_all_reads_the_spool_before_the_session_store(monkeypatch):
+    """Order is the fix, not decoration. `seed_session_store` skips what the
+    hook already holds, so the hook has to have been read first or the test
+    has nothing to answer with -- and the very first seed on a machine with
+    the extension installed files every captured turn twice.
+
+    Observed by calling it. The first version of this test read the source
+    text of `seed_all` and compared the positions of two names in it, which
+    found them in the docstring and failed against correct code -- a test
+    scoring the prose rather than the behaviour.
+    """
+    order = []
+
+    def spy(name):
+        def call(_conn, *_a, **_k):
+            order.append(name)
+            return clog.SeedReport(name)
+        return call
+
+    monkeypatch.setattr(clog, "ingest_spool", spy("hook"))
+    monkeypatch.setattr(clog, "seed_operator_mail", spy("mail"))
+    monkeypatch.setattr(clog, "seed_session_store", spy("session"))
+    clog.seed_all(None)
+    assert order.index("hook") < order.index("session"), order
+
+
+def test_a_reply_to_a_peer_is_not_filed_as_human_conversation(tmp_path):
+    """The peer's message is declined and held by mail, but the agent's
+    answer to it was still being recorded as `human-agent` -- putting it in
+    the one view the human asked to keep separate."""
+    store = tmp_path / "session-store.db"
+    src = sqlite3.connect(str(store))
+    src.executescript(
+        "CREATE TABLE sessions (id TEXT, repository TEXT, cwd TEXT,"
+        " branch TEXT);"
+        "CREATE TABLE turns (session_id TEXT, turn_index INT,"
+        " user_message TEXT, assistant_response TEXT, timestamp TEXT);")
+    src.execute("INSERT INTO sessions VALUES ('s4','r','C:/x','main')")
+    src.execute("INSERT INTO turns VALUES ('s4',0,?,?,?)",
+                (REAL_PEER, "agent reply to peer", "2026-08-09T00:00:00Z"))
+    src.commit()
+    src.close()
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        clog.seed_session_store(conn, store)
+        rows = [dict(r) for r in conn.execute(
+            "SELECT channel, direction, recipient, body FROM messages")]
+        assert len(rows) == 1, rows
+        assert rows[0]["channel"] == clog.AGENT_AGENT, rows[0]
+        assert rows[0]["recipient"] == "scripts", rows[0]
+    finally:
+        conn.close()
+
+
+def test_a_human_reply_is_still_filed_as_human_conversation(tmp_path):
+    """Positive control for the line above: inheriting the prompt's channel
+    must not reclassify ordinary turns."""
+    store = tmp_path / "session-store.db"
+    src = sqlite3.connect(str(store))
+    src.executescript(
+        "CREATE TABLE sessions (id TEXT, repository TEXT, cwd TEXT,"
+        " branch TEXT);"
+        "CREATE TABLE turns (session_id TEXT, turn_index INT,"
+        " user_message TEXT, assistant_response TEXT, timestamp TEXT);")
+    src.execute("INSERT INTO sessions VALUES ('s5','r','C:/x','main')")
+    src.execute("INSERT INTO turns VALUES ('s5',0,?,?,?)",
+                (REAL_HUMAN, "here is the answer", "2026-08-09T00:00:00Z"))
+    src.commit()
+    src.close()
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        clog.seed_session_store(conn, store)
+        channels = [r["channel"] for r in conn.execute(
+            "SELECT channel FROM messages")]
+        assert channels == [clog.HUMAN_AGENT, clog.HUMAN_AGENT], channels
+    finally:
+        conn.close()
+
+
+def test_a_spooled_reply_inherits_the_channel_of_what_it_answered(tmp_path):
+    """Same defect on the capture path. An outbound event carries no sender,
+    and defaulting every one to `human-agent` filed replies to peers in the
+    human's conversation."""
+    spool = tmp_path / "conversation-spool"
+    spool.mkdir()
+    (spool / "2026-08-09.jsonl").write_text("\n".join([
+        json.dumps({"id": "p1", "direction": "inbound", "body": REAL_PEER,
+                    "session_id": "s6", "sent_at": "2026-08-09T00:00:00Z"}),
+        json.dumps({"id": "p2", "direction": "outbound",
+                    "body": "answering the peer", "session_id": "s6",
+                    "sent_at": "2026-08-09T00:00:01Z"}),
+    ]) + "\n", encoding="utf-8")
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        clog.ingest_spool(conn, spool)
+        rows = [dict(r) for r in conn.execute(
+            "SELECT channel, recipient, body FROM messages")]
+        assert len(rows) == 1, rows
+        assert rows[0]["channel"] == clog.AGENT_AGENT, rows[0]
+        assert rows[0]["recipient"] == "scripts", rows[0]
+    finally:
+        conn.close()
+
+
+def test_a_spooled_reply_to_a_human_stays_human(tmp_path):
+    """Positive control for the line above."""
+    spool = tmp_path / "conversation-spool"
+    spool.mkdir()
+    (spool / "2026-08-09.jsonl").write_text("\n".join([
+        json.dumps({"id": "q1", "direction": "inbound", "body": REAL_HUMAN,
+                    "session_id": "s7", "sent_at": "2026-08-09T00:00:00Z"}),
+        json.dumps({"id": "q2", "direction": "outbound", "body": "an answer",
+                    "session_id": "s7", "sent_at": "2026-08-09T00:00:01Z"}),
+    ]) + "\n", encoding="utf-8")
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        clog.ingest_spool(conn, spool)
+        channels = [r["channel"] for r in conn.execute(
+            "SELECT channel FROM messages ORDER BY id")]
+        assert channels == [clog.HUMAN_AGENT, clog.HUMAN_AGENT], channels
+    finally:
+        conn.close()
+
+
+def test_two_id_less_messages_to_different_agents_are_both_kept(tmp_path):
+    """`to_id` decides the recipient instance, and leaving it out of the
+    content key collapsed two messages that differed only in who they were
+    addressed to. The same text sent to two agents is the ordinary shape of
+    a broadcast, and one of the two was being dropped."""
+    inbox = tmp_path / "messages" / "inbox"
+    inbox.mkdir(parents=True)
+    for name, to_id in (("m1", "id-A"), ("m2", "id-B")):
+        (inbox / f"{name}.json").write_text(json.dumps(
+            {"from": "x", "to": "y", "to_id": to_id, "text": "same text",
+             "sent_at": "2026-08-09T00:00:00Z"}), encoding="utf-8")
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        report = clog.seed_operator_mail(conn, tmp_path / "messages")
+        assert report.added == 2, report
+        assert sorted(r["instance"] for r in conn.execute(
+            "SELECT instance FROM messages")) == ["id-A", "id-B"]
+    finally:
+        conn.close()
+
+
+def test_the_same_message_seen_twice_is_still_filed_once(tmp_path):
+    """Positive control: widening the key must not retire the deduplication
+    it exists for. The same message in the inbox and in the archive -- the
+    normal life of every message here -- is one row."""
+    root = tmp_path / "messages"
+    (root / "inbox").mkdir(parents=True)
+    (root / "archive").mkdir(parents=True)
+    payload = json.dumps({"from": "x", "to": "y", "to_id": "id-A",
+                          "text": "one message",
+                          "sent_at": "2026-08-09T00:00:00Z"})
+    (root / "inbox" / "live.json").write_text(payload, encoding="utf-8")
+    (root / "archive" / "renamed-on-move.json").write_text(
+        payload, encoding="utf-8")
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        report = clog.seed_operator_mail(conn, root)
+        assert report.added == 1, report
+        assert report.duplicate == 1, report
+    finally:
+        conn.close()
+
+
+def test_the_asks_filter_is_applied_before_the_limit(conn):
+    """The viewer filtered the page it got back, which applies the filter
+    after LIMIT: one old question behind 200 newer statements returned
+    nothing, and "no questions" is indistinguishable from "none in the last
+    200 rows"."""
+    _add(conn, source_id="old-q", body="what did I ask you?",
+         channel="human-agent", actor="human", sent_at="2026-08-01T00:00:00Z")
+    for i in range(250):
+        _add(conn, source_id=f"n{i}", body="a plain statement",
+             channel="human-agent", actor="human",
+             sent_at=f"2026-08-09T{i // 60:02d}:{i % 60:02d}:00Z")
+    hits = [r["source_id"] for r in clog.query(conn, asks=True, limit=200)]
+    assert hits == ["old-q"], hits
+
+
+def test_the_asks_filter_still_returns_nothing_when_there_are_none(conn):
+    """Positive control."""
+    _add(conn, source_id="s1", body="a plain statement",
+         channel="human-agent", actor="human")
+    assert clog.query(conn, asks=True) == []
+
+
+# --------------------------------------------------------------------------
+# The cross-language seam, executed rather than read
+# --------------------------------------------------------------------------
+
+needs_node = pytest.mark.skipif(shutil.which("node") is None,
+                                reason="node is not installed")
+
+_EVENTS_MJS = (Path(__file__).resolve().parents[1]
+               / "extensions" / "conversation-capture" / "events.mjs")
+
+# Runs the extension's real builders and prints what they actually produce.
+# The point is that no key name, no field and no default is spelled twice:
+# whatever JavaScript emits is what Python is handed.
+_DRIVER = """
+import { inboundEvent, outboundEvent } from %s;
+const lines = [
+  inboundEvent(
+    { prompt: "what did I ask you yesterday?", workingDirectory: "C:/x",
+      sessionId: "s1" },
+    { id: "fixed-in", now: "2026-08-09T10:00:00Z" }),
+  outboundEvent(
+    { data: { messageId: "fixed-out", content: "you asked about the plan" },
+      sessionId: "s1" },
+    { id: "unused", now: "2026-08-09T10:00:01Z", cwd: "C:/x" }),
+];
+for (const line of lines) process.stdout.write(JSON.stringify(line) + "\\n");
+"""
+
+
+@needs_node
+def test_the_ingester_reads_what_the_extension_actually_emits(tmp_path):
+    """The seam, executed.
+
+    The previous version of this test scanned `extension.mjs` for key
+    spellings and then built its own event in Python, so it proved the
+    strings appeared in the source -- not that the code produced them.
+    Replacing both body expressions with `body: ""` left every assertion
+    passing while every captured message would have been discarded as empty.
+    See the control below, which is that mutation.
+    """
+    driver = tmp_path / "driver.mjs"
+    driver.write_text(_DRIVER % json.dumps(_EVENTS_MJS.as_uri()),
+                      encoding="utf-8")
+    proc = subprocess.run(["node", str(driver)], capture_output=True,
+                          text=True, encoding="utf-8",
+                          errors="replace")
+    assert proc.returncode == 0, proc.stderr
+
+    spool = tmp_path / "conversation-spool"
+    spool.mkdir()
+    (spool / "2026-08-09.jsonl").write_text(proc.stdout, encoding="utf-8")
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        report = clog.ingest_spool(conn, spool)
+        assert report.added == 2, report
+        rows = sorted((r["direction"], r["body"], r["session_id"], r["cwd"])
+                      for r in clog.query(conn))
+        assert rows == [
+            ("inbound", "what did I ask you yesterday?", "s1", "C:/x"),
+            ("outbound", "you asked about the plan", "s1", "C:/x"),
+        ], rows
+    finally:
+        conn.close()
+
+
+@needs_node
+def test_the_seam_test_notices_an_extension_that_stops_emitting_bodies(
+        tmp_path):
+    """Positive control, and the exact mutation that defeated the old test.
+
+    A builder that returns an empty body is a capture extension that records
+    nothing, and the suite has to be able to say so. If this ever passes, the
+    test above has stopped scoring the JavaScript.
+    """
+    mutated = tmp_path / "events.mjs"
+    source = _EVENTS_MJS.read_text(encoding="utf-8")
+    mutated.write_text(
+        source.replace('body: String(input?.prompt ?? "")', 'body: ""')
+              .replace('body: String(data.content ?? "")', 'body: ""'),
+        encoding="utf-8")
+    assert 'body: ""' in mutated.read_text(encoding="utf-8")
+
+    driver = tmp_path / "driver.mjs"
+    driver.write_text(_DRIVER % json.dumps(mutated.as_uri()),
+                      encoding="utf-8")
+    proc = subprocess.run(["node", str(driver)], capture_output=True,
+                          text=True, encoding="utf-8",
+                          errors="replace")
+    assert proc.returncode == 0, proc.stderr
+
+    spool = tmp_path / "conversation-spool"
+    spool.mkdir()
+    (spool / "2026-08-09.jsonl").write_text(proc.stdout, encoding="utf-8")
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        report = clog.ingest_spool(conn, spool)
+        assert report.added == 0, "an empty-bodied extension looked healthy"
+        assert report.skipped.get("empty body") == 2, report
+    finally:
+        conn.close()
+
+
+@needs_node
+def test_the_extension_and_the_builders_are_one_program(tmp_path):
+    """`events.mjs` is only worth executing if the extension really uses it.
+
+    Otherwise the tests above score a module nothing calls -- green, and
+    entirely disconnected from what runs in a session.
+    """
+    source = (_EVENTS_MJS.parent / "extension.mjs").read_text(encoding="utf-8")
+    assert 'from "./events.mjs"' in source
+    for name in ("inboundEvent(", "outboundEvent("):
+        assert name in source, f"the extension no longer calls {name}"

@@ -172,7 +172,23 @@ def connect(path: "Path | None" = None) -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         try:
+            existing = conn.execute(
+                "SELECT 1 FROM sqlite_master"
+                " WHERE type='table' AND name='messages_fts'").fetchone()
             conn.executescript(FTS_SCHEMA)
+            if not existing:
+                # The index is only populated by the triggers, and the triggers
+                # only exist from here on. Rows already in `messages` were
+                # never indexed, so without this the store answers every search
+                # with nothing -- silently, and most convincingly on the
+                # machine with the most history.
+                #
+                # Reachable two ways: a store created by a Python whose sqlite3
+                # lacks FTS5 and later opened by one that has it, and a store
+                # created before this table existed at all. Rebuilding costs a
+                # single pass, once, at the transition.
+                conn.execute(
+                    "INSERT INTO messages_fts (messages_fts) VALUES ('rebuild')")
         except sqlite3.Error:
             # No FTS5 in this interpreter's sqlite3. Everything else works;
             # `search_mode` will report the substring fallback.
@@ -191,11 +207,21 @@ def search_mode(conn: sqlite3.Connection) -> str:
     a LIKE scan does neither -- and a viewer that silently returned fewer
     results on one machine than another would be indistinguishable from having
     fewer messages.
+
+    The question is asked by *running* a trivial MATCH rather than by looking
+    the table up in ``sqlite_master``. Presence in the catalogue is not
+    usability: a store created by a build with FTS5 and opened by one without
+    still lists ``messages_fts``, so the catalogue answers "fts" and every
+    search then fails with ``no such module: fts5``. A probe cannot be wrong
+    about the thing it just did.
     """
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'"
-    ).fetchone()
-    return "fts" if row else "substring"
+    try:
+        conn.execute(
+            "SELECT rowid FROM messages_fts WHERE messages_fts MATCH ? LIMIT 1",
+            ('"a"',)).fetchone()
+    except sqlite3.Error:
+        return "substring"
+    return "fts"
 
 
 # --------------------------------------------------------------------------
@@ -423,6 +449,30 @@ class SeedReport:
         return ", ".join(parts)
 
 
+def _body_key(body: str) -> str:
+    """A message's identity for cross-source matching.
+
+    Whitespace-normalised: the two sources quote the same text but need not
+    agree on trailing newlines, and a mismatch here costs a duplicate rather
+    than a loss, so the normalisation is deliberately mild.
+    """
+    return hashlib.sha256(" ".join((body or "").split()).encode("utf-8")).hexdigest()
+
+
+def _hook_index(conn: sqlite3.Connection) -> set:
+    """``(session_id, direction, body key)`` for everything the hook captured.
+
+    Read once per seed rather than queried per turn; the store is a few
+    thousand rows on the machine that has been running longest.
+    """
+    return {
+        (r["session_id"] or "", r["direction"], _body_key(r["body"]))
+        for r in conn.execute(
+            "SELECT session_id, direction, body FROM messages WHERE source = ?",
+            (SOURCE_HOOK,))
+    }
+
+
 def seed_session_store(conn: sqlite3.Connection,
                        store: "Path | None" = None) -> SeedReport:
     """Copy human/agent turns out of the Copilot CLI's own session store.
@@ -462,6 +512,21 @@ def seed_session_store(conn: sqlite3.Connection,
         src.close()
         return report
 
+    # What the capture hook already holds, so the same sentence is not filed
+    # twice under two sources.
+    #
+    # Both sources see the identical turn: the CLI writes it to its own session
+    # store, and the extension appends it to the spool. `UNIQUE (source,
+    # source_id)` cannot notice, because the two ids are unrelated and `source`
+    # differs -- so every turn captured live appeared twice, once the extension
+    # was installed. That is the promise this store is for.
+    #
+    # Matched per message rather than per session, deliberately. Skipping a
+    # whole session the hook had *partly* seen would drop the turns from before
+    # the extension was installed, and a gap is worse than a duplicate here: a
+    # duplicate is visible noise, a gap is invisible loss.
+    covered = _hook_index(conn)
+
     for row in rows:
         context = {
             "repository": row["repository"] or "",
@@ -472,11 +537,14 @@ def seed_session_store(conn: sqlite3.Connection,
         stamp = row["timestamp"] or ""
         prompt = row["user_message"] or ""
         actor, channel, sender = classify(prompt)
+        session = row["session_id"] or ""
         if channel == AGENT_AGENT:
             # Owned by the mail store; see peer_sender().
             report.skip("peer message, held by operator mail")
         elif not prompt.strip():
             report.skip("empty prompt")
+        elif (session, INBOUND, _body_key(prompt)) in covered:
+            report.skip("already captured live")
         else:
             added = record(
                 conn, source=SOURCE_SESSION_STORE,
@@ -490,11 +558,20 @@ def seed_session_store(conn: sqlite3.Connection,
         if not reply.strip():
             report.skip("empty response")
             continue
+        if (session, OUTBOUND, _body_key(reply)) in covered:
+            report.skip("already captured live")
+            continue
         added = record(
             conn, source=SOURCE_SESSION_STORE,
             source_id=f'{row["session_id"]}:{row["turn_index"]}:out',
             body=reply, direction=OUTBOUND, sent_at=stamp,
-            actor=AGENT, channel=HUMAN_AGENT, **context)
+            # A reply inherits the channel of what it answers. Filing it as
+            # `human-agent` unconditionally was wrong for exactly the turns the
+            # branch above declines to store: the peer's message is held by
+            # mail, but the agent's answer to it was still landing in the
+            # human's conversation, which is the one view the human asked to
+            # keep separate.
+            actor=AGENT, channel=channel, recipient=sender, **context)
         report.added += 1 if added else 0
         report.duplicate += 0 if added else 1
 
@@ -557,7 +634,14 @@ def seed_operator_mail(conn: sqlite3.Connection,
             # bytes, so two different messages collide onto one key and one is
             # dropped. Duplicating a message is untidy; losing one silently is
             # the failure this whole store exists to prevent.
-            fields = [str(msg.get(k) or "") for k in ("from", "to", "sent_at")]
+            #
+            # `to_id` is in the key because it is what decides the recipient
+            # instance. Leaving it out collapsed two messages that differed
+            # only in who they were addressed to -- the same text sent to two
+            # agents is the ordinary shape of a broadcast, and one of the two
+            # was being dropped.
+            fields = [str(msg.get(k) or "")
+                      for k in ("from", "to", "to_id", "sent_at")]
             fields.append(str(text))
             blob = "".join(f"{len(f)}:{f}" for f in fields)
             identity = "sha256:" + hashlib.sha256(
@@ -592,6 +676,32 @@ def spool_dir(home: "Path | None" = None) -> Path:
     return (Path(home) if home is not None else operator_home()) / "conversation-spool"
 
 
+def _prior_channel(conn: sqlite3.Connection, session: str) -> tuple:
+    """``(channel, sender)`` of the last message stored *to* this session.
+
+    The fallback for a reply whose prompt was ingested on an earlier run --
+    a session that spanned midnight, or one still running when the last seed
+    happened. Returns the human channel when there is nothing to go on, which
+    is both the common case and the one a wrong guess costs least.
+
+    It cannot recover a peer prompt: those are declined on purpose and held by
+    mail, so no row exists to find. Within a run the in-memory map covers that;
+    across runs a reply to a peer can still land in the human conversation.
+    Recorded here rather than papered over -- the alternative is correlating
+    mail to sessions by timestamp, which is a guess wearing a fact's clothes.
+    """
+    if not session:
+        return (HUMAN_AGENT, "")
+    row = conn.execute(
+        "SELECT channel, sender FROM messages"
+        " WHERE session_id = ? AND direction = ?"
+        " ORDER BY sent_at DESC, id DESC LIMIT 1",
+        (session, INBOUND)).fetchone()
+    if row is None:
+        return (HUMAN_AGENT, "")
+    return (row["channel"], row["sender"] or "")
+
+
 def ingest_spool(conn: sqlite3.Connection,
                  directory: "Path | None" = None) -> SeedReport:
     """Fold captured events into the store.
@@ -611,6 +721,12 @@ def ingest_spool(conn: sqlite3.Connection,
             f"could not determine whether {base} exists (permissions?)")
         return report
     for path in sorted(base.glob("*.jsonl")):
+        # The channel of the last thing said *to* each session, so a reply can
+        # be filed against the conversation it belongs to. An outbound event
+        # carries no sender of its own, and defaulting every one of them to
+        # `human-agent` put the agent's answers to peers into the human's
+        # conversation -- the one view the human asked to keep separate.
+        answering: dict = {}
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError as exc:
@@ -638,19 +754,30 @@ def ingest_spool(conn: sqlite3.Connection,
                 report.skip("empty body")
                 continue
             if direction == INBOUND and peer_sender(body) is not None:
+                # Held by mail -- but remember what it was, so the reply to it
+                # is not filed as human conversation.
+                answering[str(event.get("session_id") or "")] = (
+                    AGENT_AGENT, peer_sender(body))
                 report.skip("peer message, held by operator mail")
                 continue
             identity = str(event.get("id") or f"{path.stem}:{number}")
+            session = str(event.get("session_id") or "")
             actor = channel = None
-            sender = ""
+            sender = recipient = ""
             if direction == INBOUND:
                 actor, channel, sender = classify(body)
+                answering[session] = (channel, sender)
+            else:
+                channel, recipient = (answering.get(session)
+                                      or _prior_channel(conn, session))
+                actor = AGENT
             added = record(
                 conn, source=SOURCE_HOOK, source_id=identity, body=body,
                 direction=direction, sent_at=str(event.get("sent_at") or ""),
                 cwd=str(event.get("cwd") or ""),
-                session_id=str(event.get("session_id") or ""),
-                actor=actor, channel=channel, sender=sender)
+                session_id=session,
+                actor=actor, channel=channel, sender=sender,
+                recipient=recipient)
             report.added += 1 if added else 0
             report.duplicate += 0 if added else 1
     conn.commit()
@@ -658,8 +785,16 @@ def ingest_spool(conn: sqlite3.Connection,
 
 
 def seed_all(conn: sqlite3.Connection) -> list[SeedReport]:
-    return [seed_session_store(conn), seed_operator_mail(conn),
-            ingest_spool(conn)]
+    """Every source, spool first.
+
+    Order is load-bearing, not cosmetic. The session store and the capture
+    hook both see the same turn, and `seed_session_store` skips what the hook
+    already holds -- so the hook has to have been read for that test to have
+    anything to answer with. Run the other way round, the very first seed on a
+    machine with the extension installed files every captured turn twice.
+    """
+    return [ingest_spool(conn), seed_operator_mail(conn),
+            seed_session_store(conn)]
 
 
 # --------------------------------------------------------------------------
@@ -683,8 +818,18 @@ def _fts_query(text: str) -> str:
     ``-``, ``*``, ``:``, ``(`` and ``"`` as syntax, so a search for a filename
     or a flag -- exactly what gets searched for here -- raises rather than
     returning nothing, and an error page for `--force` would be absurd.
+
+    Split on ``[\\W_]+`` rather than ``[^\\w]+`` because the two disagree about
+    one character and the disagreement is silent. Python's ``\\w`` includes
+    ``_``; FTS5's unicode61 tokeniser treats it as a separator. So a search for
+    ``_`` produced the term ``_``, this returned the non-empty expression
+    ``"_"``, the caller took that as "FTS can answer this" -- and FTS then
+    tokenised it away to an empty phrase and matched nothing. Two rows on the
+    test machine contain ``_`` and the search for it found neither, with no
+    error and no fallback. Splitting on FTS's own separator set makes the
+    emptiness test agree with the engine that has to run the query.
     """
-    terms = [t for t in re.split(r"[^\w]+", text) if t]
+    terms = [t for t in re.split(r"[\W_]+", text) if t]
     return " AND ".join('"' + t + '"' for t in terms)
 
 
@@ -704,10 +849,18 @@ def _like_term(text: str) -> str:
 def query(conn: sqlite3.Connection, *, search: str = "", project: str = "",
           channel: str = "", direction: str = "", actor: str = "",
           instance: str = "", date_from: str = "", date_to: str = "",
-          session_id: str = "", limit: int = 200, offset: int = 0) -> list[dict]:
+          session_id: str = "", asks: bool = False,
+          limit: int = 200, offset: int = 0) -> list[dict]:
     """Messages matching the given filters, newest first."""
     where: list[str] = []
     params: list[object] = []
+
+    if asks:
+        # In SQL, not in the caller. The viewer filtered the returned page,
+        # which applies the filter *after* LIMIT: one old question behind 200
+        # newer statements returned nothing at all, and "no questions" is
+        # indistinguishable from "none in the last 200 rows".
+        where.append("m.asks = 1")
 
     if search.strip():
         if "\x00" in search:

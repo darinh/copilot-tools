@@ -287,6 +287,15 @@ class _Handler(BaseHTTPRequestHandler):
     #: expose, and it costs the user the feature.
     bound_host = ""
 
+    #: Extra authorities named by `--allow-host`. Needed because a wildcard
+    #: bind cannot name itself: a server on `0.0.0.0` is reached by clients
+    #: sending the machine's own IP or hostname, never the literal `0.0.0.0`,
+    #: so `bound_host` alone refuses every real request to it. The choice is
+    #: the user's and has to be written down, because the alternative -- trust
+    #: any Host once the bind is wide -- silently retires the guard exactly
+    #: where the exposure is greatest.
+    allowed_hosts = frozenset()
+
     def _host_is_local(self) -> bool:
         """Whether the Host header names this server rather than some name
         that merely resolved to it.
@@ -309,7 +318,8 @@ class _Handler(BaseHTTPRequestHandler):
             address, rest = host, ""
         if rest and not (rest.startswith(":") and rest[1:].isdigit()):
             return False
-        return address in self.LOCAL_HOSTS or address == self.bound_host
+        return (address in self.LOCAL_HOSTS or address == self.bound_host
+                or address in self.allowed_hosts)
 
     def do_GET(self) -> None:  # noqa: N802
         if not self._host_is_local():
@@ -356,21 +366,22 @@ class _Handler(BaseHTTPRequestHandler):
             session_id=args.get("session_id", ""),
             date_from=args.get("date_from", ""),
             date_to=args.get("date_to", ""),
+            asks=bool(args.get("asks")),
             limit=int(args.get("limit", 200)))
-        if args.get("asks"):
-            rows = [r for r in rows if r["asks"]]
         return rows
 
 
 def serve(db: "Path | None" = None, host: str = "127.0.0.1", port: int = 8765,
-          open_browser: bool = True) -> int:
+          open_browser: bool = True, allow_hosts: "tuple | list" = ()) -> int:
     path = Path(db) if db is not None else clog.db_path()
     conn = clog.connect(path)
     total = clog.summary(conn)["messages"]
     conn.close()
 
+    allowed = frozenset(h.strip().lower() for h in allow_hosts if h.strip())
     handler = type("Handler", (_Handler,),
-                   {"db_file": path, "bound_host": host.strip().lower()})
+                   {"db_file": path, "bound_host": host.strip().lower(),
+                    "allowed_hosts": allowed})
     httpd = ThreadingHTTPServer((host, port), handler)
     url = f"http://{host}:{httpd.server_port}/"
     print(f"Conversations: {total} message(s) from {path}")
@@ -382,6 +393,16 @@ def serve(db: "Path | None" = None, host: str = "127.0.0.1", port: int = 8765,
         print(f"WARNING: bound to {host}, not loopback. This store holds every "
               "word typed to an agent on this machine, and anything that can "
               "reach that address can read all of it.")
+        if host in ("0.0.0.0", "::", "*") and not allowed:
+            # A wildcard bind cannot name itself. Clients reach it by the
+            # machine's own address or hostname and never by the literal
+            # `0.0.0.0`, so the Host guard refuses every one of them and the
+            # flag the user typed does nothing but print this warning. Naming
+            # the remedy rather than quietly widening the guard: which names
+            # are legitimate is a fact about their network, not ours.
+            print("         Requests will be refused: a wildcard bind matches "
+                  "no Host header. Add --allow-host <name-or-ip> for each "
+                  "address browsers will use.")
     if total == 0:
         print("Nothing stored yet — run `operator conversations seed` first.")
     if open_browser:

@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { joinSession } from "@github/copilot-sdk/extension";
+import { inboundEvent, outboundEvent } from "./events.mjs";
 
 const HOME =
   process.env.COPILOT_OPERATOR_HOME || join(homedir(), ".operator");
@@ -34,9 +35,19 @@ const SPOOL = join(HOME, "conversation-spool");
 //: not hook, right up until someone changes the writer.
 const DISABLED = process.env.COPILOT_CONVERSATION_CAPTURE_DISABLE === "1";
 
-/** Best-effort append. A logger must never be able to fail a session. */
-function spool(event) {
+/** Best-effort append. A logger must never be able to fail a session.
+ *
+ * Takes a *builder*, not an event. The first version took the event, so the
+ * arguments were evaluated at the call site -- outside this try -- and
+ * `randomUUID()`, `isoFrom()` and especially `process.cwd()` could all throw
+ * from there. `process.cwd()` throws on POSIX once the working directory has
+ * been removed, which is the ordinary end of every `git worktree remove`, and
+ * the throw would reject the hook's promise mid-turn. Moving construction
+ * inside means there is no expression left on the outside to fail.
+ */
+function spool(build) {
   try {
+    const event = typeof build === "function" ? build() : build;
     mkdirSync(SPOOL, { recursive: true });
     const day = new Date().toISOString().slice(0, 10);
     appendFileSync(
@@ -48,6 +59,15 @@ function spool(event) {
     // Intentionally silent: stderr from an extension lands in the user's
     // terminal mid-turn, and a disk hiccup is not worth interrupting them for.
     // Loss is detectable -- `operator conversations stats` shows the day.
+  }
+}
+
+/** `process.cwd()`, or "" if the directory it named is gone. */
+function cwdOrEmpty() {
+  try {
+    return process.cwd();
+  } catch {
+    return "";
   }
 }
 
@@ -74,14 +94,10 @@ const session = DISABLED
         // Inbound. Returning nothing leaves the prompt exactly as typed: this
         // extension observes, and must never alter what the agent is asked.
         onUserPromptSubmitted: async (input) => {
-          spool({
+          spool(() => inboundEvent(input, {
             id: randomUUID(),
-            direction: "inbound",
-            body: String(input?.prompt ?? ""),
-            cwd: String(input?.workingDirectory ?? ""),
-            session_id: String(input?.sessionId ?? ""),
-            sent_at: isoFrom(input?.timestamp),
-          });
+            now: isoFrom(input?.timestamp),
+          }));
         },
       },
     });
@@ -92,13 +108,9 @@ const session = DISABLED
 // The ask was for what was said, not for how it was arrived at, and the
 // deltas are where all the volume is.
 session?.on("assistant.message", (event) => {
-  const data = event?.data ?? {};
-  spool({
-    id: String(data.messageId || randomUUID()),
-    direction: "outbound",
-    body: String(data.content ?? ""),
-    cwd: process.cwd(),
-    session_id: String(event?.sessionId ?? data.sessionId ?? ""),
-    sent_at: iso(),
-  });
+  spool(() => outboundEvent(event, {
+    id: randomUUID(),
+    now: iso(),
+    cwd: cwdOrEmpty(),
+  }));
 });

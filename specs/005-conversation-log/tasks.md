@@ -86,3 +86,53 @@ All tasks complete. Checkboxes reflect delivered state, not intent.
 - [x] T041 — `--port` validated with a range check rather than a bare `int()`.
 - [x] T042 — The fuzz tests, which asserted only "no exception" and "HTTP
       200", now assert the returned rows. They passed against the bug.
+- [x] T043 — Second adversarial review, run against the repairs rather than
+      the original code: five findings, four of them reachable through the
+      fixes themselves.
+- [x] T044 — A NUL byte in `search` no longer truncates the bound LIKE
+      pattern to `%` and matches every row.
+- [x] T045 — The `Host` port is parsed rather than trimmed, so
+      `[::1]evil.com` is refused.
+- [x] T046 — The deliberately-bound `--host` joins the allow-list, so the
+      flag works; a non-loopback bind warns and names what the store holds.
+- [x] T047 — Mail content-hash fields are length-prefixed, so a field
+      containing the separator cannot collide two messages onto one key.
+- [x] T048 — `--port` rejects `80_80`, `" 8765"` and unicode digits by
+      checking `isascii()`/`isdigit()` before converting.
+- [x] T049 — The LIKE-escaping regression test forces substring mode. It had
+      been taking the FTS branch, and would have passed with the fix deleted.
+- [x] T050 — A meta-control asserts `query()` still consults `search_mode`,
+      so T049's monkeypatch cannot silently become decorative.
+- [x] T051 — Third adversarial review, `gpt-5.6-sol` at maximum effort — a
+      different model family from the author, which is what changed between
+      this round and the two before it. Ten findings, all real.
+- [x] T052 — An FTS index created after the rows exist is rebuilt, so a store
+      opened by a newer Python does not answer every search with nothing.
+- [x] T053 — `search_mode` runs a MATCH instead of reading `sqlite_master`,
+      so a catalogued-but-unloadable index reports `substring`.
+- [x] T054 — `_fts_query` splits on FTS5's separator set, so a search for `_`
+      falls back instead of matching nothing.
+- [x] T055 — `asks` moved into `query()`'s SQL, so it filters before `LIMIT`.
+- [x] T056 — Turns already captured by the hook are not filed again from the
+      session store; matched per message, so a partly-captured session keeps
+      its earlier turns.
+- [x] T057 — `seed_all` reads the spool before the session store, asserted by
+      calling it rather than by reading its source.
+- [x] T058 — A reply inherits the channel of what it answered, on both the
+      seeder and the capture path, so answers to peers stay out of the human
+      conversation.
+- [x] T059 — `to_id` joins the mail content key, so two id-less messages to
+      different agents are both kept.
+- [x] T060 — `spool()` takes a builder, so `process.cwd()` and every other
+      field expression is inside the writer's `try`.
+- [x] T061 — `--allow-host` makes a deliberate non-loopback bind usable; a
+      wildcard bind without it says why requests will be refused.
+- [x] T062 — The forced-substring test replaces `_fts_query` with something
+      that raises, because forcing the mode alone did not distinguish the
+      paths for that fixture.
+- [x] T063 — Event builders extracted to `events.mjs`; the seam test executes
+      them under node and ingests the real output, with the `body: ""`
+      mutation as its control and a third test asserting the extension still
+      calls them.
+- [x] T064 — Guard verified by mutating the real `events.mjs` and observing
+      the suite go red, then restoring it.

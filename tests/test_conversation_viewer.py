@@ -281,3 +281,125 @@ def test_a_deliberately_bound_host_is_accepted(tmp_path):
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
+
+
+# --------------------------------------------------------------------------
+# Round three
+# --------------------------------------------------------------------------
+
+def test_an_old_question_is_found_behind_a_page_of_newer_statements(tmp_path):
+    """The `asks` filter used to be applied to the page the query returned,
+    which is after LIMIT. One old question behind 200 newer statements
+    returned nothing at all -- and "you were never asked anything" is
+    indistinguishable from "not in the most recent 200 rows"."""
+    db = tmp_path / "conversations.db"
+    conn = clog.connect(db)
+    clog.record(conn, source=clog.SOURCE_HOOK, source_id="old-q",
+                body="what did I ask you?", direction=clog.INBOUND,
+                sent_at="2026-08-01T00:00:00Z")
+    for i in range(250):
+        clog.record(conn, source=clog.SOURCE_HOOK, source_id=f"n{i}",
+                    body="a plain statement", direction=clog.INBOUND,
+                    sent_at=f"2026-08-09T{i // 60:02d}:{i % 60:02d}:00Z")
+    conn.commit()
+    conn.close()
+
+    handler = type("Handler", (viewer._Handler,), {"db_file": db})
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_port}"
+        rows = get_json(base, "/api/messages?asks=1")
+        assert [r["source_id"] for r in rows] == ["old-q"], rows
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_the_asks_filter_can_still_return_nothing(server):
+    """Positive control: pushing the filter into SQL must not make it
+    vacuous."""
+    rows = get_json(server, "/api/messages?asks=1&session_id=nothing-here")
+    assert rows == []
+
+
+def test_an_explicitly_allowed_host_is_accepted(tmp_path):
+    """`--host` bound the server somewhere the Host guard then refused,
+    which made the flag a broken feature rather than a security control. The
+    remedy is an explicit list, not a wider guard: which names are
+    legitimate is a fact about the user's network."""
+    db = tmp_path / "conversations.db"
+    clog.connect(db).close()
+    handler = type("Handler", (viewer._Handler,),
+                   {"db_file": db, "bound_host": "0.0.0.0",
+                    "allowed_hosts": frozenset({"desktop.local"})})
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_port}"
+        assert _with_host(base, "/api/summary", "desktop.local")[0] == 200
+        assert _with_host(base, "/api/summary", "DESKTOP.LOCAL:8765")[0] == 200
+        # The control: everything not named is still refused.
+        assert _with_host(base, "/api/summary", "attacker.example")[0] == 403
+        assert _with_host(base, "/api/summary", "desktop.local.evil")[0] == 403
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_a_wildcard_bind_without_allowed_hosts_says_so(tmp_path, capsys,
+                                                       monkeypatch):
+    """A wildcard bind cannot name itself: browsers send the machine's own
+    address, never `0.0.0.0`, so every request is refused. Printing that is
+    the alternative to quietly trusting any Host once the bind is wide --
+    which would retire the guard exactly where exposure is greatest."""
+    db = tmp_path / "conversations.db"
+    clog.connect(db).close()
+
+    class _Stub:
+        server_port = 8765
+
+        def __init__(self, *_a, **_k):
+            pass
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    monkeypatch.setattr(viewer, "ThreadingHTTPServer", _Stub)
+    viewer.serve(db, host="0.0.0.0", port=8765, open_browser=False)
+    out = capsys.readouterr().out
+    assert "--allow-host" in out, out
+    assert "refused" in out.lower(), out
+
+
+def test_a_wildcard_bind_with_allowed_hosts_does_not_warn(tmp_path, capsys,
+                                                          monkeypatch):
+    """Positive control: the notice must be about the broken case, not
+    printed at every non-loopback bind regardless."""
+    db = tmp_path / "conversations.db"
+    clog.connect(db).close()
+
+    class _Stub:
+        server_port = 8765
+
+        def __init__(self, *_a, **_k):
+            pass
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    monkeypatch.setattr(viewer, "ThreadingHTTPServer", _Stub)
+    viewer.serve(db, host="0.0.0.0", port=8765, open_browser=False,
+                 allow_hosts=["desktop.local"])
+    out = capsys.readouterr().out
+    assert "--allow-host" not in out, out

@@ -134,3 +134,30 @@ sessions started after `setup.sh` / `setup.ps1` has deployed it.
 
 That limitation is a property of the source data, verified by direct query
 against `session-store.db`, not a defect in the seeder.
+
+## Known gap: an agent-to-agent thread has no project
+
+The `messages` table has one `project` column, and `seed_operator_mail` leaves
+it empty for every message it files. That is honest — mail carries no project
+today — but it is a real limitation of the "agent conversations, separately"
+view: those rows can be told apart by `channel`, and cannot be grouped by
+which project they belong to.
+
+The 0025 review council named the underlying reason, and it is sharper than
+"the field is empty": **a message does not have one project. It has an origin
+and a delivery context, and they can differ.** A single column cannot say that
+an agent working in `copilot-tools` wrote to an agent working in `scripts`,
+which is exactly the shape 5 of the 10 ordered instance pairs on this machine
+have.
+
+Backlog item **0025** (approved) adds a nullable origin and destination to
+each message at send time, with an explicit status when either is unknown.
+When that lands, `seed_operator_mail` should carry **both endpoints** into the
+store and the viewer should show the tri-state — same-project, cross-project,
+or project unknown — rather than folding an unknown affiliation into a known
+one. The 286 messages predating that change are unknowable and must render as
+unknown, never as same-project.
+
+Recorded here rather than fixed here: the field does not exist yet, and
+inventing one on this side would mean guessing a project from an instance
+name, which is the guess the council explicitly ruled out.

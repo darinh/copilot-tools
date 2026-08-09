@@ -7925,12 +7925,31 @@ def _flag_value(args: list[str], flag: str) -> str:
     return ""
 
 
+def _flag_values(args: list[str], flag: str) -> list[str]:
+    """Every value given for a repeatable flag.
+
+    ``--allow-host`` is repeatable because a machine reached from a LAN has
+    more than one name browsers may use, and collapsing them to the last one
+    given would refuse the others with the same 403 as an attack.
+    """
+    found: list[str] = []
+    for i, arg in enumerate(args):
+        if arg == flag and i + 1 < len(args):
+            candidate = args[i + 1]
+            if not candidate.startswith("--"):
+                found.append(candidate)
+        elif arg.startswith(flag + "="):
+            found.append(arg.split("=", 1)[1])
+    return found
+
+
 def _conversations_usage(stream) -> None:
     print("Usage: operator conversations <seed|serve|stats>", file=stream)
     print(file=stream)
     print("  seed [--source S]   Copy existing messages into the store",
           file=stream)
-    print("  serve [--port N] [--host H] [--no-browser]", file=stream)
+    print("  serve [--port N] [--host H] [--allow-host H] [--no-browser]",
+          file=stream)
     print("                      Browse them at http://127.0.0.1:8765/",
           file=stream)
     print("  stats               What is stored, and where it came from",
@@ -8016,6 +8035,7 @@ def conversations_command(args: list[str]) -> int:
                 path,
                 host=_flag_value(rest, "--host") or "127.0.0.1",
                 port=port,
+                allow_hosts=_flag_values(rest, "--allow-host"),
                 open_browser="--no-browser" not in rest)
 
         conn = conversation_log.connect(path)
