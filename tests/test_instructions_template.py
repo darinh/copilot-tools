@@ -205,6 +205,7 @@ _VERB_SOURCES = {
     "work": lambda: copilot_operator.WORK_VERBS,
     "worktree": lambda: copilot_operator.WORKTREE_VERBS,
     "ownership": lambda: copilot_operator.OWNERSHIP_VERBS,
+    "conversations": lambda: copilot_operator.CONVERSATIONS_VERBS,
     "backlog": lambda: tuple(
         backlog_tool.build_parser()._subparsers._group_actions[0].choices),
 }
