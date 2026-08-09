@@ -1,7 +1,7 @@
 ---
 id: 25
 title: Operator mail routing is project-blind, so cross-project messages land mid-task with no affiliation, age or opt-out
-status: proposed
+status: open
 opened: 2026-08-09
 spec: none
 ---
@@ -69,11 +69,23 @@ recipient cannot decline. A message is injected into a live session's context
 whether or not it is relevant, whether or not it is current, and whether or
 not the recipient has capacity. Three specific exposures:
 
-- **Staleness.** Live delivery types into a session; if that session is not
-  at a prompt, the text sits in the input box until a human notices. One such
-  message here sat for an unknown period and arrived days late, describing a
-  state that had moved on. The recipient cannot tell a stale message from a
-  fresh one -- `sent_at` is recorded but never shown at the point of delivery.
+- **Staleness.** One cross-project message reached its recipient days late:
+  the human found it "sitting in the textbox" of a session and submitted it
+  by hand. That the delay happened is observed. **Why it happened is not
+  diagnosed, and an earlier draft of this item got it wrong.** That draft
+  asserted that live delivery types text without submitting it; it does not.
+  `OperatorMux.send_keys()` in `operator_mux.py:344` takes `enter: bool =
+  True` and `send_message()` calls it without overriding that, so the Enter
+  is sent. The remaining candidates -- a TUI that discards the submit while
+  the agent is mid-turn, a partial write, or something else entirely -- are
+  untested. Whoever picks this up should reproduce the incident before
+  building anything that assumes a cause.
+
+  What *is* demonstrated regardless of cause: `render_line()` puts no
+  timestamp on the delivered line, so a recipient reading a message cannot
+  tell whether it was sent a minute or a week ago. `sent_at` is recorded --
+  set in `new_message()` before the live/queue split, so it is genuinely send
+  time -- and simply never shown on the live path.
 
 - **Context cost.** ~8,500 tokens of another project's narrative landed in
   this project's sessions. That is spent before the recipient can judge
@@ -118,3 +130,89 @@ action. Candidate directions, in rough order of cost, none of them decided:
 Option 1 is a prerequisite for 3, 4 and 5, and is the only one that is
 strictly additive to the data. Option 6 is a legitimate outcome and must stay
 on the table, or the council is not a decision.
+
+## Council decision — 2026-08-09
+
+Three seats, three model families, each asked the identical question in
+parallel with no sight of the others: `gpt-5.6-sol` (xhigh), `gemini-3.1-pro`
+(high), `grok-4.5` (high). The human delegated the decision: *"whatever the
+review council approves / decides is fine."*
+
+| Option | sol | gemini | grok | Verdict |
+|---|---|---|---|---|
+| 1 — record affiliation | approve | approve | approve | **APPROVED, unanimous** |
+| 2 — surface staleness | approve* | silent | approve | **APPROVED** |
+| 3 — mark cross-project | approve | silent | approve | **APPROVED** |
+| 4 — refuse without a flag | reject | approve | reject | **REJECTED, 2–1** |
+| 5 — force-queue cross-project | reject | approve | reject | **REJECTED, 2–1** |
+| 6 — do nothing | reject | reject | reject | **REJECTED, unanimous** |
+
+\* approved with a modification that changes the design; see below.
+
+### What is approved, and what "done" means
+
+**1. Affiliation, recorded as nullable and never inferred.** `new_message()`
+gains an origin and a destination: the sender's cwd and resolved project id,
+and the recipient's, each with an explicit status when unknown
+(`catalog-missing`, `catalog-unreadable`, `no-entry`, `unplaceable`). Filled
+at send time from the `operator send` process's own cwd resolved through the
+primary checkout and the project catalog. On any failure the field is `null`
+and **the send still succeeds** — affiliation is metadata, not a gate.
+
+**2. Staleness — as an absolute timestamp, not an age.** This is sol's
+modification and it overrides the item's own proposal. A computed age is
+written once, at delivery, and a delivered line that says "just now" then sits
+unread *stays* saying "just now" — the rendered age freezes at exactly the
+moment the failure begins. `render_line()` therefore carries the immutable
+`sent_at`; an age may supplement it where it is computed at read time
+(`inbox`, history), never replace it. Malformed or missing renders as
+`sent time unknown`.
+
+**3. Tri-state relationship, shown before the body.** `SAME-PROJECT`,
+`CROSS-PROJECT`, or `PROJECT UNKNOWN` — the third is a first-class state, not
+a blank. Classification happens only when *both* ids are known. A sender-side
+note on stderr for a known cross-project send, non-blocking, exit 0.
+
+### What is rejected, and why
+
+**4 and 5 fail on evidence, not on principle.** No wrong outcome has been
+traced to a cross-project message, and two of the four threads improved this
+repository. Refusing or delaying delivery on that record would spend a real
+cost against a harm nobody has demonstrated. Grok named the specific danger:
+a hard refuse is this repository's own defect class — a check returning a
+confident wrong answer — and unknown affiliation makes the refusal unreliable
+in exactly the cases it would matter. Sol added that queueing does not even
+solve the stated problem: the full body still enters the next session's
+context, so the token cost is deferred, not avoided.
+
+Both remain reopenable. The trigger is named: measure known-cross live
+volume and stale-discard incidents after this ships, and revisit if they stay
+costly.
+
+### Corrections the council forced on this item
+
+- The staleness mechanism was asserted and is not diagnosed. Grok checked
+  `send_keys` and found `enter=True`; the Evidence section above now says so.
+- **A message does not have one project — it has an origin and a delivery
+  context, and they can differ, including in time** (sol). The conversation
+  log under `specs/005-conversation-log` has a single `project` column and
+  therefore *cannot* represent an agent-to-agent thread truthfully. It must
+  store both endpoints and the tri-state.
+- `--from` is self-asserted. This is command provenance, not authenticated
+  identity, and nothing downstream may treat it as the latter.
+- Live delivery records that keystrokes were *injected*, not that anything was
+  read. `read_at` is not evidence of reading.
+
+### The finding all three seats reached independently
+
+Project affiliation is not the root cause. **The recipient has no way to
+decline or defer, and that is equally true of same-project mail.** Sol,
+gemini and grok each arrived at this unprompted, from different directions:
+gemini proposed a busy lockfile, grok called scoping queue-on-busy to
+cross-project "a category error", sol observed there is no acknowledgement in
+the protocol at all. Three independent seats converging on the same unasked
+question is the strongest signal this exercise produced.
+
+It is deliberately **not** folded into this item — it is a larger design and
+smuggling it in here would be how 0025 stops being finishable. Filed
+separately as **0026**.
