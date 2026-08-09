@@ -8003,10 +8003,13 @@ def conversations_command(args: list[str]) -> int:
     try:
         if verb == "serve":
             raw = _flag_value(rest, "--port")
-            try:
-                port = int(raw) if raw else 8765
-            except ValueError:
+            if raw and not (raw.isascii() and raw.isdigit()):
+                # Checked before int(), which accepts `80_80`, ` 8765 `,
+                # `+8765` and unicode digits like `８７６５` -- none of them a
+                # port anyone typed on purpose, and every one of them passes
+                # the range check below.
                 die(f"--port wants a number, not {raw!r}")
+            port = int(raw) if raw else 8765
             if not 1 <= port <= 65535:
                 die(f"--port must be between 1 and 65535, not {port}")
             return conversation_viewer.serve(

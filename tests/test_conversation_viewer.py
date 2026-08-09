@@ -237,3 +237,47 @@ def test_a_punctuation_search_filters_rather_than_returning_everything(server):
 def test_the_viewer_punctuation_guard_can_fail(server):
     """Positive control: punctuation present in no body returns no rows."""
     assert get_json(server, "/api/messages?search=%7B") == []
+
+
+def test_host_junk_after_an_ipv6_literal_is_refused(server):
+    """The first Host guard cut at `]` and kept what came before, so
+    `[::1]evil.com` read as `[::1]` and went straight through. Anything after
+    the address is junk, and junk here is the whole attack."""
+    for host in ("[::1]evil.com", "[::1]:80x", "localhost.evil.com",
+                 "127.0.0.1.evil.com", "localhost evil.com",
+                 "user@evil.com", "127.0.0.1:80:80"):
+        status, body = _with_host(server, "/api/messages", host)
+        assert status == 403, f"{host} was accepted: {body[:80]}"
+
+
+def test_the_ipv6_junk_guard_still_admits_the_real_thing(server):
+    """Positive control: tightening the parse must not lock out the forms a
+    browser genuinely sends."""
+    for host in ("[::1]", "[::1]:8765", "127.0.0.1", "127.0.0.1:8765",
+                 "localhost", "localhost:8765", "localhost."):
+        assert _with_host(server, "/api/summary", host)[0] == 200, host
+
+
+def test_a_deliberately_bound_host_is_accepted(tmp_path):
+    """`serve(host=...)` exists, so a guard that refuses the address the user
+    asked to bind is a broken flag, not a security control -- it protects
+    nothing the bind did not already expose."""
+    db = tmp_path / "c.db"
+    conn = clog.connect(db)
+    clog.record(conn, source=clog.SOURCE_HOOK, source_id="x", body="hi",
+                direction=clog.INBOUND, sent_at="2026-08-09T10:00:00Z")
+    conn.commit()
+    conn.close()
+    handler = type("Handler", (viewer._Handler,),
+                   {"db_file": db, "bound_host": "0.0.0.0"})
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_port}"
+        assert _with_host(base, "/api/summary", "0.0.0.0:1234")[0] == 200
+        assert _with_host(base, "/api/summary", "attacker.example")[0] == 403
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)

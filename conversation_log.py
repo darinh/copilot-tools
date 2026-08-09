@@ -549,10 +549,19 @@ def seed_operator_mail(conn: sqlite3.Connection,
             # here, and a rename during that move makes the same message file
             # itself a second time under a second key. The content cannot
             # move, so it is what identifies the message.
-            identity = "sha256:" + hashlib.sha256("\x00".join([
-                str(msg.get("from") or ""), str(msg.get("to") or ""),
-                str(msg.get("sent_at") or ""), str(text),
-            ]).encode("utf-8")).hexdigest()
+            #
+            # Length-prefixed rather than joined on a separator. Any separator
+            # is ambiguous if a field can contain it, and these are arbitrary
+            # strings from another program's JSON: with a plain join,
+            # from="a" to="b\0c" and from="a\0b" to="c" produce identical
+            # bytes, so two different messages collide onto one key and one is
+            # dropped. Duplicating a message is untidy; losing one silently is
+            # the failure this whole store exists to prevent.
+            fields = [str(msg.get(k) or "") for k in ("from", "to", "sent_at")]
+            fields.append(str(text))
+            blob = "".join(f"{len(f)}:{f}" for f in fields)
+            identity = "sha256:" + hashlib.sha256(
+                blob.encode("utf-8")).hexdigest()
             report.skip("message had no id; keyed by content")
         added = record(
             conn, source=SOURCE_OPERATOR_MAIL, source_id=identity,
@@ -701,27 +710,38 @@ def query(conn: sqlite3.Connection, *, search: str = "", project: str = "",
     params: list[object] = []
 
     if search.strip():
-        expr = _fts_query(search) if search_mode(conn) == "fts" else ""
-        if expr:
-            where.append("m.id IN (SELECT rowid FROM messages_fts "
-                         "WHERE messages_fts MATCH ?)")
-            params.append(expr)
+        if "\x00" in search:
+            # A NUL cannot occur in a stored body -- these come from JSON and
+            # from SQLite TEXT -- so this search matches nothing. Saying that
+            # explicitly matters because the alternative is not "no rows": a
+            # NUL in a bound LIKE parameter truncates the pattern at the NUL,
+            # so `%\x00%` degenerates to `%` and every row comes back. That is
+            # the same match-everything failure this branch was rewritten to
+            # remove, reachable through the rewrite.
+            where.append("1 = 0")
         else:
-            # Either there is no FTS index, or the search is all punctuation
-            # -- `(`, `*`, `-->` -- which FTS5's tokeniser discards entirely,
-            # leaving an empty MATCH expression.
-            #
-            # Dropping the predicate here is what this branch used to do, and
-            # it is the worst of the three options: the user searches for `(`,
-            # every row comes back, and a result set that means "no filter was
-            # applied" is indistinguishable from one that means "everything
-            # matched". Returning nothing would at least be honest, but it is
-            # still wrong -- there really are rows containing `(`, and the
-            # substring path can find them. So punctuation searches take the
-            # same route as a machine with no FTS5, which also keeps the two
-            # modes returning the same rows for the same query.
-            where.append("m.body LIKE ? ESCAPE '\\'")
-            params.append(f"%{_like_term(search.strip())}%")
+            expr = _fts_query(search) if search_mode(conn) == "fts" else ""
+            if expr:
+                where.append("m.id IN (SELECT rowid FROM messages_fts "
+                             "WHERE messages_fts MATCH ?)")
+                params.append(expr)
+            else:
+                # Either there is no FTS index, or the search is all
+                # punctuation -- `(`, `*`, `-->` -- which FTS5's tokeniser
+                # discards entirely, leaving an empty MATCH expression.
+                #
+                # Dropping the predicate here is what this branch used to do,
+                # and it is the worst of the three options: the user searches
+                # for `(`, every row comes back, and a result set that means
+                # "no filter was applied" is indistinguishable from one that
+                # means "everything matched". Returning nothing would at least
+                # be honest, but it is still wrong -- there really are rows
+                # containing `(`, and the substring path can find them. So
+                # punctuation searches take the same route as a machine with
+                # no FTS5, which also keeps the two modes returning the same
+                # rows for the same query.
+                where.append("m.body LIKE ? ESCAPE '\\'")
+                params.append(f"%{_like_term(search.strip())}%")
 
     for column, value in (("project", project), ("instance", instance),
                           ("session_id", session_id)):

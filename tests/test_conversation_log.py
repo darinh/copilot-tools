@@ -690,10 +690,20 @@ def test_the_punctuation_guard_can_fail(conn):
     assert clog.query(conn, search="{") == []
 
 
-def test_a_like_wildcard_in_a_search_is_not_treated_as_syntax(conn):
+def test_a_like_wildcard_in_a_search_is_not_treated_as_syntax(conn,
+                                                              monkeypatch):
     """``%`` and ``_`` are LIKE's metacharacters, so an unescaped search for
     ``100%`` matches every body containing ``100`` followed by anything --
-    more rows than were asked for, silently."""
+    more rows than were asked for, silently.
+
+    ``search_mode`` is forced to the substring path, because that is the only
+    path ``_like_term`` is on. The first version of this test did not, and on
+    a build with FTS5 -- which is every build here -- ``100%`` tokenised to
+    ``100`` and took the MATCH branch instead. It asserted the right rows,
+    for the right reason, through code that was not the code under test, and
+    would have passed with the escaping deleted.
+    """
+    monkeypatch.setattr(clog, "search_mode", lambda _conn: "substring")
     clog.record(conn, source="hook", source_id="w1", body="it hit 100% today",
                 direction="inbound", sent_at="2026-08-09T10:00:00Z",
                 channel="human-agent", actor="human")
@@ -702,6 +712,22 @@ def test_a_like_wildcard_in_a_search_is_not_treated_as_syntax(conn):
                 channel="human-agent", actor="human")
     hits = [r["source_id"] for r in clog.query(conn, search="100%")]
     assert hits == ["w1"], hits
+    under = [r["source_id"] for r in clog.query(conn, search="t_day")]
+    assert under == [], under
+
+
+def test_the_wildcard_test_is_actually_on_the_substring_path(conn,
+                                                             monkeypatch):
+    """Control for the control.
+
+    If `query` ever stops consulting `search_mode`, the monkeypatch above
+    becomes decorative and the test silently returns to proving nothing.
+    """
+    seen = []
+    monkeypatch.setattr(clog, "search_mode",
+                        lambda _conn: seen.append(1) or "substring")
+    clog.query(conn, search="100%")
+    assert seen, "query() no longer consults search_mode"
 
 
 def test_an_id_less_message_that_moves_and_is_renamed_is_filed_once(conn,
@@ -741,3 +767,62 @@ def test_an_id_less_message_is_keyed_by_content_not_by_path(conn, tmp_path):
     (inbox / "a.json").write_text(json.dumps(first), encoding="utf-8")
     (inbox / "b.json").write_text(json.dumps(second), encoding="utf-8")
     assert clog.seed_operator_mail(conn, root).added == 2
+
+
+def test_a_nul_in_a_search_matches_nothing_rather_than_everything(conn):
+    """A NUL in a bound LIKE parameter truncates the pattern at the NUL, so
+    ``%\x00%`` degenerates to ``%`` and every row comes back -- the same
+    match-everything failure the punctuation fix removed, reachable through
+    the fix itself."""
+    clog.record(conn, source="hook", source_id="n1", body="ordinary text",
+                direction="inbound", sent_at="2026-08-09T10:00:00Z",
+                channel="human-agent", actor="human")
+    clog.record(conn, source="hook", source_id="n2", body="more text",
+                direction="inbound", sent_at="2026-08-09T10:01:00Z",
+                channel="human-agent", actor="human")
+    assert clog.query(conn, search="\x00") == []
+    assert clog.query(conn, search="text\x00") == []
+
+
+def test_the_nul_guard_does_not_swallow_ordinary_searches(conn):
+    """Positive control: a guard that refused every search would satisfy the
+    test above while making search useless, and nothing else would say so."""
+    clog.record(conn, source="hook", source_id="n1", body="ordinary text",
+                direction="inbound", sent_at="2026-08-09T10:00:00Z",
+                channel="human-agent", actor="human")
+    assert [r["source_id"] for r in clog.query(conn, search="ordinary")] == ["n1"]
+
+
+def test_two_id_less_messages_do_not_collide_through_the_separator(conn,
+                                                                    tmp_path):
+    """A separator a field can contain is not a separator.
+
+    Joining on ``\\x00`` made from="a" to="b\\0c" and from="a\\0b" to="c"
+    hash identically, so two different messages became one row and one was
+    lost. Losing a message is worse than duplicating one.
+    """
+    root = tmp_path / "messages"
+    inbox = root / "inst"
+    inbox.mkdir(parents=True)
+    base = {"sent_at": "2026-08-09T10:00:00Z", "text": "hi"}
+    (inbox / "a.json").write_text(
+        json.dumps(dict(base, **{"from": "a", "to": "b\x00c"})),
+        encoding="utf-8")
+    (inbox / "b.json").write_text(
+        json.dumps(dict(base, **{"from": "a\x00b", "to": "c"})),
+        encoding="utf-8")
+    report = clog.seed_operator_mail(conn, root)
+    assert report.added == 2, report
+    assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
+
+
+def test_the_same_id_less_message_still_keys_identically_twice(conn, tmp_path):
+    """Positive control: the length prefix must not make the key depend on
+    anything that changes between runs, or every seed duplicates the corpus."""
+    root = tmp_path / "messages"
+    inbox = root / "inst"
+    inbox.mkdir(parents=True)
+    body = {k: v for k, v in MAIL.items() if k != "id"}
+    (inbox / "a.json").write_text(json.dumps(body), encoding="utf-8")
+    assert clog.seed_operator_mail(conn, root).added == 1
+    assert clog.seed_operator_mail(conn, root).added == 0

@@ -274,21 +274,42 @@ class _Handler(BaseHTTPRequestHandler):
     #: Hostnames a browser may legitimately have used to reach this server.
     #: A literal loopback address, or the one name that always means it.
     #: Anything else is a name that resolved here without being ours.
-    LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", ""})
+    #:
+    #: ``localhost.`` is the same name with an explicit root label, which
+    #: browsers do send; ``127.1`` is the short form some clients accept.
+    LOCAL_HOSTS = frozenset({"127.0.0.1", "127.1", "localhost", "localhost.",
+                             "::1", "[::1]", "[::ffff:127.0.0.1]", ""})
+
+    #: The address this server was actually bound to, if it is not loopback.
+    #: `serve(host=...)` lets a user deliberately bind elsewhere, and a guard
+    #: that then refuses their own requests is a broken flag rather than a
+    #: security control -- it protects nothing the bind did not already
+    #: expose, and it costs the user the feature.
+    bound_host = ""
 
     def _host_is_local(self) -> bool:
-        """Whether the Host header names loopback.
+        """Whether the Host header names this server rather than some name
+        that merely resolved to it.
 
-        The port is stripped, but an IPv6 literal is bracketed and full of
-        colons, so splitting on the last colon only works after checking for
-        the bracket -- ``[::1]:8765`` and ``[::1]`` must both survive.
+        Strict, and structurally rather than by prefix: the first attempt
+        stripped an IPv6 bracket by cutting at ``]`` and keeping what came
+        before, which read ``[::1]evil.com`` as ``[::1]`` and let it straight
+        through. Anything after the address is junk, and junk here is the
+        whole attack -- so the port is *parsed*, not trimmed, and must be
+        digits.
         """
         host = (self.headers.get("Host") or "").strip().lower()
         if host.startswith("["):
-            host = host.split("]", 1)[0] + "]"
+            address, _, rest = host.partition("]")
+            address += "]"
         elif host.count(":") == 1:
-            host = host.split(":", 1)[0]
-        return host in self.LOCAL_HOSTS
+            address, _, rest = host.partition(":")
+            rest = ":" + rest
+        else:
+            address, rest = host, ""
+        if rest and not (rest.startswith(":") and rest[1:].isdigit()):
+            return False
+        return address in self.LOCAL_HOSTS or address == self.bound_host
 
     def do_GET(self) -> None:  # noqa: N802
         if not self._host_is_local():
@@ -348,11 +369,19 @@ def serve(db: "Path | None" = None, host: str = "127.0.0.1", port: int = 8765,
     total = clog.summary(conn)["messages"]
     conn.close()
 
-    handler = type("Handler", (_Handler,), {"db_file": path})
+    handler = type("Handler", (_Handler,),
+                   {"db_file": path, "bound_host": host.strip().lower()})
     httpd = ThreadingHTTPServer((host, port), handler)
     url = f"http://{host}:{httpd.server_port}/"
     print(f"Conversations: {total} message(s) from {path}")
     print(f"Serving on {url}  (Ctrl-C to stop)")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        # Said out loud because the default is the safe one, so reaching this
+        # line means somebody typed `--host` and may not have thought about
+        # what the store contains.
+        print(f"WARNING: bound to {host}, not loopback. This store holds every "
+              "word typed to an agent on this machine, and anything that can "
+              "reach that address can read all of it.")
     if total == 0:
         print("Nothing stored yet — run `operator conversations seed` first.")
     if open_browser:
