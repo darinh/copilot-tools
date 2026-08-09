@@ -154,3 +154,13 @@ All tasks complete. Checkboxes reflect delivered state, not intent.
 - [x] T070 — Viewer exercised end to end on the real 4,438-message store:
       page, summary, agent-agent filter, search, and an `asks` query reaching
       messages older than the page limit.
+- [x] T071 — `<skill-context>` recognised too: 124 more rows, found by
+      reading the viewer's own output after T065 shipped. `_MACHINE_TAGS` is
+      a list because there will be a third.
+- [x] T072 — Every tag a person actually typed in this corpus —
+      `<feature-branch>`, `<merge-sha>`, `<path>`, `<the>`, `<div>` — has a
+      test asserting it is left alone. Widening the rule to "anything
+      angle-bracketed" would silently delete the store's whole purpose.
+- [x] T073 — A control asserts every tag listed in `_MACHINE_TAGS` is matched
+      by the pattern built from it, so a listed-but-unmatched tag cannot
+      report the corpus clean.

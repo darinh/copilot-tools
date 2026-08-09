@@ -1383,3 +1383,54 @@ def test_reseeding_does_not_rewrite_what_was_said(conn):
     assert conn.execute(
         "SELECT body FROM messages WHERE source_id='r2'").fetchone()[0] \
         == "the original words"
+
+
+REAL_SKILL_CONTEXT = (
+    '<skill-context name="backlog">\nBase directory for this skill: '
+    'C:\\Users\\darin\\.copilot\\skills\\backlog\n\n# Backlog\n\nOpen work '
+    'belongs in the repository.\n</skill-context>')
+
+
+def test_a_turn_that_is_only_a_skill_context_is_not_human_speech():
+    """The second wrapper, and the reason `_MACHINE_TAGS` is a list.
+
+    Found the same way as the first -- by reading the finished store rather
+    than a fixture -- 124 rows, every one of them pure, none containing a
+    word the human typed. There will be a third.
+    """
+    actor, _channel, sender = clog.classify(REAL_SKILL_CONTEXT)
+    assert actor == clog.SYSTEM, actor
+    assert sender == "copilot-cli"
+
+
+def test_a_skill_context_appended_to_real_speech_is_still_human():
+    body = "load the backlog skill and file this\n" + REAL_SKILL_CONTEXT
+    assert clog.classify(body)[0] == clog.HUMAN
+
+
+@pytest.mark.parametrize("body", [
+    "use <feature-branch> as the placeholder name",
+    "the diff is at <merge-sha> and <fix-sha>",
+    "write it to <path> when you are done",
+    "List everything <the> book has set up so far",
+    "<div>this is markup I am asking about</div>",
+])
+def test_angle_brackets_a_person_typed_are_left_alone(body):
+    """The failure this detector must not have.
+
+    Every one of these tags occurs in a real human message in the store.
+    Widening the rule to "anything angle-bracketed" would delete exactly what
+    the store exists to keep, and it would do it silently -- the rows would
+    simply stop being the user's.
+    """
+    assert not clog.is_only_machine_text(body), body
+    assert clog.classify(body)[0] == clog.HUMAN
+
+
+def test_every_machine_tag_is_actually_detected():
+    """Control for the table itself. A tag listed in `_MACHINE_TAGS` whose
+    pattern does not match is a rule that reports the corpus clean."""
+    for tag in clog._MACHINE_TAGS:
+        assert clog.is_only_machine_text(f"<{tag}>anything</{tag}>"), tag
+        assert not clog.is_only_machine_text(
+            f"human words <{tag}>anything</{tag}>"), tag

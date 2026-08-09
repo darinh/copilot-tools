@@ -262,10 +262,23 @@ def peer_sender(body: str) -> "str | None":
     return match.group(1) if match else None
 
 
-#: A `<system_reminder>` block. The CLI appends these to a user turn to
-#: re-state project instructions, and they arrive inside the "user message"
-#: exactly as the operator preamble does.
-_REMINDER_RE = re.compile(r"<system_reminder>.*?</system_reminder>", re.S)
+#: Wrappers the CLI injects into a user turn. They arrive inside the "user
+#: message" exactly as the operator preamble does, and neither is speech.
+#:
+#: A list rather than one pattern because there will be more of them: the
+#: second was found only by reading the finished store, and the third will be
+#: too. Adding one is a word here.
+#:
+#: What must *not* go in this list is any tag a person might type. Measured
+#: over the real corpus, the tags occurring in human bodies are
+#: `<feature-branch>`, `<merge-sha>`, `<path>`, `<the>` and similar -- all of
+#: them either placeholders somebody typed or content inside a block already
+#: matched below. Widening this to "anything angle-bracketed" would delete
+#: what the store exists to keep.
+_MACHINE_TAGS = ("system_reminder", "skill-context")
+
+_MACHINE_RE = re.compile(
+    "|".join(rf"<{tag}\b.*?</{tag}>" for tag in _MACHINE_TAGS), re.S)
 
 
 def is_only_machine_text(body: str) -> bool:
@@ -273,18 +286,18 @@ def is_only_machine_text(body: str) -> bool:
 
     Measured on the real store before this existed: 462 of 1918 rows filed as
     human speech -- 24% -- were `<system_reminder>` blocks and **nothing
-    else**. Not one of the 462 contained a word the human typed. Asked "what
-    did I say", the store answered with a quarter of its own instruction
-    files.
+    else**, and a further 124 were `<skill-context>` blocks. Not one of the
+    586 contained a word the human typed. Asked "what did I say", the store
+    answered with a quarter of its own instruction files.
 
     The test is "what remains", not "does it start with one". None of the 462
     started with the tag, because the CLI puts a newline first, so a prefix
     check finds zero of them and reports the corpus clean. It is also why a
-    message that is *partly* a reminder stays human: the reminder is appended
+    message that is *partly* an insertion stays human: the block is appended
     to something a person wrote, and dropping that would trade this failure
     for its mirror image.
     """
-    return bool(body) and not _REMINDER_RE.sub("", body).strip()
+    return bool(body) and not _MACHINE_RE.sub("", body).strip()
 
 
 def classify(body: str) -> "tuple[str, str, str]":

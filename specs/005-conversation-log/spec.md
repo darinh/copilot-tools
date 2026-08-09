@@ -146,12 +146,21 @@ arrive that way and are filed under their real speaker:
 | The operator launch preamble | `PREAMBLE_MARKER` in the first 400 chars | `system`, sender `operator` |
 | A peer message from `operator send` | `PEER_PREFIX_RE` | declined — mail owns it |
 | The CLI's `<system_reminder>` blocks | `is_only_machine_text()` | `system`, sender `copilot-cli` |
+| The CLI's `<skill-context>` blocks | `is_only_machine_text()` | `system`, sender `copilot-cli` |
 
-The last was found by running the finished feature against the real store:
-**462 of 1918 rows filed as human speech — 24% — were `<system_reminder>`
-blocks and nothing else.** Not one of the 462 contained a word the human
-typed. Asked "what did I say", the store answered with a quarter of its own
-instruction files.
+The last two were found by running the finished feature against the real store:
+**586 of 1918 rows filed as human speech — 31% — were injected blocks and
+nothing else** (462 `<system_reminder>`, 124 `<skill-context>`). Not one of the
+586 contained a word the human typed. Asked "what did I say", the store
+answered with a third of its own instruction files.
+
+`_MACHINE_TAGS` is a list because there will be a third. Both of these were
+found by reading the finished store rather than a fixture, and adding another
+is one word. What must *not* go in it is any tag a person might type: the
+other tags occurring in human bodies are `<feature-branch>`, `<merge-sha>`,
+`<path>`, `<the>` and `<div>` — placeholders somebody typed, or content inside
+a block already matched. Widening the rule to "anything angle-bracketed" would
+silently delete what the store exists to keep, so each of those has a test.
 
 Two details are load-bearing. The test is *what remains after removing the
 blocks*, not *does the body start with one*: none of the 462 started with the
@@ -166,7 +175,7 @@ otherwise idempotent in the unhelpful direction: the fix would ship and every
 previously-misfiled row would stay misfiled, with "delete the database" as the
 only remedy — which is exactly the sort of thing nobody knows to do. The body
 is never rewritten; a message's text is what was said, and only the verdict
-about it is ours to revise. Re-seeding the real store moved 462 rows out of
+about it is ours to revise. Re-seeding the real store moved 586 rows out of
 `human` and 7 agent replies into `agent-agent`.
 
 ## Known gap: an agent-to-agent thread has no project
