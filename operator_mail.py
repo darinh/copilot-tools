@@ -32,6 +32,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import mail_affiliation
+
 __all__ = [
     "MailError",
     "new_message",
@@ -736,17 +738,59 @@ def reply_hint(msg: dict) -> str:
     return f'operator reply --instance {recipient} --to {sender} "your reply"'
 
 
+def stamp_label(msg: dict) -> str:
+    """``sent_at`` as written, or a statement that it is not known.
+
+    Never a computed age; see :func:`render_line`. A message with no usable
+    timestamp says so rather than rendering an empty bracket, because a
+    missing field and a message sent at an unrecorded time are the same thing
+    to the reader and neither is "now".
+    """
+    stamp = _field(msg, "sent_at", "").strip()
+    return f"at {stamp}" if stamp else "sent time unknown"
+
+
+def relationship_note(msg: dict) -> str:
+    """`` · cross-project`` when both ends are known and differ, else ``""``.
+
+    Silent for same-project, because that is the ordinary case and a label on
+    every message is a label nobody reads. Silent for *unknown* too, and that
+    is the harder call: the alternative marks all 286 pre-existing messages
+    with a warning that says nothing about them. Unknown is still a
+    first-class state everywhere it can be acted on -- `endpoints_of` and
+    `relationship_label` report it, and the conversation log buckets it --
+    but a live delivery line is not a place to spend a recipient's attention
+    on the absence of a field.
+    """
+    if mail_affiliation.relationship_label(msg) == mail_affiliation.CROSS_PROJECT:
+        return " · cross-project"
+    return ""
+
+
 def render_line(msg: dict) -> str:
     """One-line form typed into a live session.
 
     The bracketed prefix is not decoration: it guarantees the text never
     starts with '/' or '@', which a terminal UI would read as a slash command
     or a mention rather than as a message.
+
+    It carries the *absolute* `sent_at` and, when both ends are known, whether
+    the sender was working on the same project. Both are there so a recipient
+    can weigh a message before paying to read it.
+
+    An absolute timestamp rather than a relative age, and the distinction is
+    the whole point. An age is computed once, at delivery, and then frozen
+    into the text -- so a line that says "just now" and is not read for two
+    days goes on saying "just now" for those two days. It would be at its most
+    wrong in exactly the case it exists to catch, which is a message observed
+    here arriving days late. A timestamp cannot rot. `inbox` and `--history`
+    compute their ages when they render, so they may show one.
     """
     text = _field(msg, "text", "")
     if len(text) > LIVE_TEXT_LIMIT:
         text = text[:LIVE_TEXT_LIMIT] + " […truncated, see: operator inbox --history]"
-    return (f'[operator message from "{_field(msg, "from", "?")}"] {text} '
+    return (f'[operator message from "{_field(msg, "from", "?")}" '
+            f'{stamp_label(msg)}{relationship_note(msg)}] {text} '
             f'(To reply, run: {reply_hint(msg)})')
 
 
@@ -776,7 +820,8 @@ def render_for_agent(msgs: list[dict]) -> str:
     for i, msg in enumerate(msgs, 1):
         lines.append(
             f' [{i}] from "{_field(msg, "from", "?")}" at '
-            f'{_field(msg, "sent_at", "?")}: {_field(msg, "text", "")} '
+            f'{_field(msg, "sent_at", "?")}{relationship_note(msg)}: '
+            f'{_field(msg, "text", "")} '
             f'(To reply: {reply_hint(msg)})')
     return " ".join(lines)
 

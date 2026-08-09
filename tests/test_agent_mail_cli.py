@@ -16,6 +16,7 @@ import pytest
 from conftest import denied
 
 import copilot_operator as op
+import mail_affiliation
 import operator_mail
 
 
@@ -1286,3 +1287,80 @@ def test_inbox_prints_the_mail_it_already_marked_read_when_consume_fails(
     consumed_text = calls[0]["text"]
     assert consumed_text in combined, (
         f"{consumed_text!r} was marked read and never shown to anybody")
+
+
+# --------------------------------------------------------------------------
+# Affiliation is recorded, and is never allowed to matter to delivery
+# --------------------------------------------------------------------------
+
+def test_a_send_records_both_endpoints(live_recipient):
+    """Every new message grows an origin and a destination, even when neither
+    can be placed. The fields are what later readers key on, and a field that
+    is sometimes absent and sometimes null is two shapes to handle."""
+    inst, _mux = live_recipient
+    assert op.send_message(["--from", "a", "--to", "beta", "hi"]) == 0
+    stored = operator_mail.history(op.OPERATOR_HOME, inst.id)[0]
+    assert mail_affiliation.ORIGIN_KEY in stored
+    assert mail_affiliation.DESTINATION_KEY in stored
+
+
+def test_an_unplaceable_sender_still_sends(live_recipient, monkeypatch):
+    """The half most likely to be broken by a later change, because a send
+    that fails looks entirely reasonable from inside the function that failed.
+
+    Affiliation is metadata. Two of the three 0025 council seats rejected
+    gating delivery on it, and a refusal built on an *unknown* affiliation
+    would drop work the sender believed was sent.
+    """
+    def boom(*_a, **_k):
+        raise OSError("catalog is on fire")
+
+    monkeypatch.setattr(mail_affiliation.project_paths, "catalog_guid", boom)
+    inst, mux = live_recipient
+    assert op.send_message(["--from", "a", "--to", "beta", "hi"]) == 0
+    assert len(mux.sent) == 1
+    stored = operator_mail.history(op.OPERATOR_HOME, inst.id)[0]
+    assert stored[mail_affiliation.ORIGIN_KEY]["project_id"] is None
+
+
+def test_a_cross_project_send_notes_it_on_stderr_and_still_succeeds(
+        live_recipient, monkeypatch, capsys):
+    """A note, not a gate: exit 0, message delivered."""
+    monkeypatch.setattr(
+        mail_affiliation, "describe_path",
+        lambda _cwd: mail_affiliation.Affiliation(project="g1",
+                                                  status="known"))
+    monkeypatch.setattr(
+        mail_affiliation, "describe_instance",
+        lambda *_a, **_k: mail_affiliation.Affiliation(project="g2",
+                                                       status="known"))
+    inst, mux = live_recipient
+    assert op.send_message(["--from", "a", "--to", "beta", "hi"]) == 0
+    assert len(mux.sent) == 1
+    assert "cross-project" in capsys.readouterr().err
+
+
+def test_a_same_project_send_says_nothing(live_recipient, monkeypatch,
+                                          capsys):
+    """Positive control: a note printed for every send is a note nobody
+    reads, and would make the cross-project case invisible."""
+    same = mail_affiliation.Affiliation(project="g1", status="known")
+    monkeypatch.setattr(mail_affiliation, "describe_path", lambda _cwd: same)
+    monkeypatch.setattr(mail_affiliation, "describe_instance",
+                        lambda *_a, **_k: same)
+    _inst, _mux = live_recipient
+    assert op.send_message(["--from", "a", "--to", "beta", "hi"]) == 0
+    assert "cross-project" not in capsys.readouterr().err
+
+
+def test_an_unknown_affiliation_says_nothing_either(live_recipient, capsys):
+    """Unknown is not cross-project. Warning about the 286 legacy-shaped
+    messages would be a warning about the absence of a field."""
+    unknown = mail_affiliation.Affiliation()
+    import unittest.mock as _mock
+    with _mock.patch.object(mail_affiliation, "describe_path",
+                            lambda _cwd: unknown), \
+         _mock.patch.object(mail_affiliation, "describe_instance",
+                            lambda *_a, **_k: unknown):
+        assert op.send_message(["--from", "a", "--to", "beta", "hi"]) == 0
+    assert "cross-project" not in capsys.readouterr().err

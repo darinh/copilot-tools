@@ -49,6 +49,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import operator_ingest                                       # noqa: E402
+import mail_affiliation                                      # noqa: E402
 import operator_mail                                         # noqa: E402
 import operator_session                                      # noqa: E402
 import operator_trace                                        # noqa: E402
@@ -3806,6 +3807,26 @@ def send_message(args: list[str]) -> int:
         return 1
 
     msg = operator_mail.new_message(sender, target.display_name, target.id, text)
+
+    # Affiliation is recorded, never enforced. Two of the three 0025 council
+    # seats rejected gating delivery on it: no wrong outcome has been traced
+    # to a cross-project message, two of the four cross-project threads
+    # improved this repository, and a refusal built on an *unknown*
+    # affiliation would drop work the sender believed was sent. So every
+    # failure below is a blank field, and the send proceeds.
+    origin = mail_affiliation.describe_path(Path.cwd())
+    destination = mail_affiliation.describe_instance(
+        target.id, RESTART_DIR, read_tabs)
+    mail_affiliation.attach(msg, origin, destination)
+    relation = mail_affiliation.relationship(origin, destination)
+    if relation == mail_affiliation.CROSS_PROJECT:
+        # stderr, exit 0, message still sent. For the human reading a
+        # transcript later, not a gate: the recipient is told the same thing
+        # in the delivered line, which is where it can still change a
+        # decision.
+        print(f"Note: cross-project send — your project "
+              f"{origin.project} → recipient project {destination.project}.",
+              file=sys.stderr)
 
     if not queue_only and _can_receive_live(target):
         try:

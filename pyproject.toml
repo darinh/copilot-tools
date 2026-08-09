@@ -47,6 +47,7 @@ py-modules = [
     "conversation_log",
     "conversation_viewer",
     "install_manifest",
+    "mail_affiliation",
     "operator_console",
     "operator_ingest",
     "operator_liveness",
