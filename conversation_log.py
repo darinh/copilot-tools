@@ -315,6 +315,156 @@ def strip_appended_mail(body: str) -> str:
     return text[:start].rstrip()
 
 
+#: The exact body the CLI submits as the next user turn when the previous
+#: assistant turn hit the output cap. Not a heuristic: joined against
+#: `assistant_usage_events` in the CLI's own store, **all 442 of these follow a
+#: turn whose `finish_reason` is `length`**, and the one human message that
+#: begins "please continue" follows `stop`/`tool_calls` instead. The machine
+#: wrote it.
+#:
+#: Matched on the whole body, exactly. `startswith("Please continue")` would
+#: eat "please continue. Do not stop working. I don't care about status
+#: update." -- a real instruction from the human, in this corpus, that means
+#: the opposite of a truncation artifact.
+CLI_CONTINUE = "Please continue from where you left off."
+
+#: Prompt templates a *script* submits through the user channel.
+#:
+#: Each entry is a head the body must start with, plus anchors it must also
+#: contain. Both halves are load-bearing and in opposite directions.
+#:
+#: The head is anchored to the start so that a human quoting one of these --
+#: "what do you think of this: You extract a temporal..." -- stays human. The
+#: anchors are required so the head alone cannot fire: a person really might
+#: type "List every person who has appeared in the book so far, once each."
+#: as a question, and without the anchors that sentence would vanish from
+#: their own record.
+#:
+#: A table rather than a chain of `if`s because there will be more pipelines,
+#: and because what makes one recognisable is data -- a head and some anchors
+#: -- not logic. Adding one is a tuple.
+_PIPELINE_PROMPTS = (
+    ("You extract a temporal, queryable knowledge representation from a story",
+     ("Rules (the firewall", "assertion envelope")),
+    ("List everything the book has set up so far that it has not yet paid off.",
+     ("You are answering as a reader who has read exactly the first",
+      "Reply with JSON only, in this exact shape, and nothing else:")),
+    ("List everything the reader knows at this point that a character in the "
+     "book does not.",
+     ("You are answering as a reader who has read exactly the first",
+      "Reply with JSON only, in this exact shape, and nothing else:")),
+    ("List what each person in the book knows at this point, one claim per "
+     "fact known.",
+     ("You are answering as a reader who has read exactly the first",
+      "Reply with JSON only, in this exact shape, and nothing else:")),
+    ("List every person who has appeared in the book so far, once each.",
+     ("You are answering as a reader who has read exactly the first",
+      "Reply with JSON only, in this exact shape, and nothing else:")),
+)
+
+
+def is_pipeline_prompt(body: str) -> bool:
+    """True when a script, not a person, submitted this through the human's
+    channel.
+
+    Measured on this machine: 624 of 1,337 rows filed as human speech, all in
+    one project, each template repeated verbatim four or five times, the
+    largest 135,714 characters. Asked "what did I say", the store answered
+    with a batch job's prompts.
+
+    Deliberately *not* keyed on length, project or repetition, though all
+    three would separate the corpus today. Length is the worst of them: 86
+    genuinely human turns here are over 20,000 characters, and a rule that
+    ate long messages would delete exactly the ones somebody took trouble
+    over. Project is barely better -- it would trust a human by their absence
+    from a project and miss the next pipeline entirely.
+    """
+    text = body or ""
+    for head, anchors in _PIPELINE_PROMPTS:
+        if text.startswith(head) and all(a in text for a in anchors):
+            return True
+    return False
+
+
+#: What the CLI records in `data.source` on a `user.message` event when the
+#: text was not typed by the person. Ground truth, from the CLI itself, and
+#: universal -- it does not depend on one machine's prompt wording.
+#:
+#: Measured over 2,233 session event logs: 597 `instruction-discovery`, 442
+#: `thinking-exhausted-continuation`, 131 `skill-*`, and 2,884 with no source
+#: at all, which is the human actually typing.
+_MACHINE_SOURCES = ("instruction-discovery", "thinking-exhausted-continuation")
+_MACHINE_SOURCE_PREFIXES = ("skill-",)
+
+
+def source_is_machine(source: str) -> bool:
+    """Whether the CLI says it generated this turn rather than the person.
+
+    A prefix set as well as an exact set because the skill sources carry the
+    skill's name (`skill-backlog`, `skill-merge-to-main`), so the family is
+    open-ended and matching the whole string would go stale on the next skill
+    anybody writes.
+    """
+    text = str(source or "")
+    if not text:
+        return False
+    return (text in _MACHINE_SOURCES
+            or text.startswith(_MACHINE_SOURCE_PREFIXES))
+
+
+def session_event_sources(session_id: str,
+                          root: "Path | None" = None) -> dict:
+    """``{message text: source}`` from a session's own event log.
+
+    The CLI keeps `~/.copilot/session-state/<id>/events.jsonl`, and every
+    `user.message` event in it records where the text came from. That is
+    authoritative in a way no amount of reading the prose can be: it is the
+    program that injected the text saying so.
+
+    Keyed by content because the event log and the session store number their
+    turns differently. Verified on this machine over the six longest sessions:
+    194 of 194 turns matched an event exactly.
+
+    Returns ``{}`` for anything unreadable. Provenance is an improvement on a
+    guess, never a precondition -- a session with no event log must still
+    seed, and its turns simply fall through to the text rules.
+    """
+    if not session_id:
+        return {}
+    base = (Path(root) if root is not None
+            else Path.home() / ".copilot" / "session-state")
+    path = base / session_id / "events.jsonl"
+    if install_manifest.file_present(path) is not True:
+        return {}
+    found: dict = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    for line in text.splitlines():
+        # Cheap pre-filter: these logs run to megabytes and are mostly tool
+        # traffic, so parsing every line costs far more than finding this one.
+        if '"user.message"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "user.message":
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        body = str(data.get("content") or "")
+        source = str(data.get("source") or "")
+        # First writer wins, and only a machine source is recorded: the same
+        # text can legitimately appear twice, and "the human typed this" must
+        # never overwrite "a program injected this".
+        if body and source and body not in found:
+            found[body] = source
+    return found
+
+
 def is_only_machine_text(body: str) -> bool:
     """True when nothing is left after removing the CLI's own insertions.
 
@@ -355,6 +505,18 @@ def classify(body: str) -> "tuple[str, str, str]":
         return SYSTEM, HUMAN_AGENT, "operator"
     if is_only_machine_text(text):
         return SYSTEM, HUMAN_AGENT, "copilot-cli"
+    if text == CLI_CONTINUE:
+        return SYSTEM, HUMAN_AGENT, "copilot-cli"
+    if is_pipeline_prompt(text):
+        # `system` with a distinct sender rather than a fourth actor value.
+        # The question this store answers is "what did *I* say", so the split
+        # that matters is human against not-human; which machine it was is
+        # provenance, and provenance is already what `sender` carries --
+        # `operator`, `copilot-cli`, and now `pipeline`. A new actor would
+        # also cost every reader a decision the viewer already makes well:
+        # `system` renders centred, which is exactly right for a batch job's
+        # prompt, and labelled by sender, which is exactly the distinction.
+        return SYSTEM, HUMAN_AGENT, "pipeline"
     sender = peer_sender(text)
     if sender is not None:
         return AGENT, AGENT_AGENT, sender
@@ -579,7 +741,8 @@ def _hook_index(conn: sqlite3.Connection) -> set:
 
 
 def seed_session_store(conn: sqlite3.Connection,
-                       store: "Path | None" = None) -> SeedReport:
+                       store: "Path | None" = None,
+                       events_root: "Path | None" = None) -> SeedReport:
     """Copy human/agent turns out of the Copilot CLI's own session store.
 
     Read-only, and opened read-only: this is somebody else's live database and
@@ -631,6 +794,8 @@ def seed_session_store(conn: sqlite3.Connection,
     # the extension was installed, and a gap is worse than a duplicate here: a
     # duplicate is visible noise, a gap is invisible loss.
     covered = _hook_index(conn)
+    provenance: dict = {}
+    seen_session = ""
 
     for row in rows:
         context = {
@@ -641,8 +806,18 @@ def seed_session_store(conn: sqlite3.Connection,
         }
         stamp = row["timestamp"] or ""
         prompt = strip_appended_mail(row["user_message"] or "")
-        actor, channel, sender = classify(prompt)
         session = row["session_id"] or ""
+        # The rows arrive ordered by session, so one read per session is
+        # enough and the log is never re-parsed.
+        if session != seen_session:
+            provenance = session_event_sources(session, events_root)
+            seen_session = session
+        actor, channel, sender = classify(prompt)
+        if source_is_machine(provenance.get(row["user_message"] or "", "")):
+            # The CLI's own record of where the text came from, and it
+            # outranks every rule that reads the prose. Those rules infer;
+            # this one is the program that injected the text saying so.
+            actor, channel, sender = SYSTEM, HUMAN_AGENT, "copilot-cli"
         if channel == AGENT_AGENT:
             # Owned by the mail store; see peer_sender().
             report.skip("peer message, held by operator mail")
