@@ -556,10 +556,22 @@ def categorize(body: str, direction: str = INBOUND, source: str = "",
         return AGENT_REPLY, ""
     if PREAMBLE_MARKER in text[:400]:
         return PREAMBLE, ""
-    name = _skill_name(text, provenance)
+    # The injected kinds require the body to be *nothing but* the injection,
+    # the same test `classify` uses. Matching the tag anywhere is the looser
+    # rule, and it is wrong in the one direction that costs something: a
+    # person asking "why does <skill-context name=\"backlog\"> keep appearing
+    # in my prompts?" contains the tag and is not a skill definition. That is
+    # not hypothetical -- it is a real message in this corpus, and it is what
+    # caught this. Provenance is accepted instead, because the CLI naming the
+    # source is not a guess.
+    injected = is_only_machine_text(text)
+    name = _skill_name(text, provenance) if injected else ""
+    if not name and provenance.startswith("skill-"):
+        name = provenance[len("skill-"):]
     if name:
         return SKILL, name
-    if "<system_reminder>" in text or provenance == "instruction-discovery":
+    if (injected and "<system_reminder>" in text) \
+            or provenance == "instruction-discovery":
         found = _INSTRUCTION_FILE_RE.search(text)
         # The file is the useful half: a reminder about this repository's
         # AGENTS.md and one about a worktree's copilot-instructions.md are

@@ -2003,3 +2003,55 @@ def test_reseeding_backfills_the_recipient(conn):
     assert conn.execute(
         "SELECT recipient FROM messages WHERE source_id='r1'").fetchone()[0] \
         == "scripts"
+
+
+REAL_QUESTION_ABOUT_TAGS = (
+    "For example, the first line of one message is: "
+    '<skill-context name="backlog">, and another is: <system_reminder>. '
+    "It seems like those two things alone could be used to develop "
+    "categories, yet you didn't even come across them.")
+
+
+def test_a_question_about_a_tag_is_not_an_instance_of_it():
+    """The row that caught this is real, and it is a message asking about
+    these very tags.
+
+    classify had it right -- the body does not reduce to nothing once the
+    blocks are removed, so the question survives and the speaker is the
+    human. categorize matched the tag anywhere and called it a skill
+    definition, which is the looser rule and wrong in the direction that
+    costs something: the person's question filed as machine scaffolding.
+    """
+    assert clog.classify(REAL_QUESTION_ABOUT_TAGS)[0] == clog.HUMAN
+    assert clog.categorize(REAL_QUESTION_ABOUT_TAGS) == \
+        (clog.HUMAN_MESSAGE, "")
+
+
+def test_the_two_verdicts_cannot_disagree_about_machine_text():
+    """The invariant the row above violated: if the speaker is the human,
+    the category may not be one of the injected kinds."""
+    injected = {clog.SKILL, clog.INSTRUCTIONS, clog.PREAMBLE,
+                clog.CONTINUATION}
+    for body in (REAL_QUESTION_ABOUT_TAGS, REAL_HUMAN,
+                 "what does <system_reminder> mean?",
+                 'is <skill-context name="x"> yours?'):
+        actor = clog.classify(body)[0]
+        category = clog.categorize(body)[0]
+        assert not (actor == clog.HUMAN and category in injected), \
+            (body[:60], actor, category)
+
+
+def test_a_genuine_injection_is_still_categorised():
+    """Positive control: tightening must not switch the rule off."""
+    assert clog.categorize(
+        '<skill-context name="backlog">body</skill-context>') == \
+        (clog.SKILL, "backlog")
+    assert clog.categorize(
+        "<system_reminder>rules</system_reminder>")[0] == clog.INSTRUCTIONS
+
+
+def test_provenance_still_names_a_skill_without_the_tag():
+    """The CLI naming the source is not a guess, so it does not need the
+    body to look like anything."""
+    assert clog.categorize("whatever", provenance="skill-merge-to-main") == \
+        (clog.SKILL, "merge-to-main")
