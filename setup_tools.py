@@ -2028,6 +2028,49 @@ def install_skills(assume_yes: bool = False, manifest: dict | None = None) -> No
         info(f"Installed {label}")
 
 
+#: The modules the console scripts enter through. Importing these transitively
+#: pulls in everything the installed package needs, which is the coverage this
+#: check wants -- a list of module names maintained by hand would go stale in
+#: exactly the situation the check exists to catch.
+ENTRY_MODULES = ("copilot_operator", "handoff_tool", "operator_ingest")
+
+
+def package_import_health(entries: "tuple | list" = ENTRY_MODULES) -> str:
+    """``""`` when the installed package imports, else the error.
+
+    An editable install is not a symlink to the checkout. setuptools writes a
+    finder holding a **static** table of module name to path, built at install
+    time -- so `git pull` updates the source of every module already in that
+    table and cannot add a new one. A pull that introduces a module leaves the
+    checkout correct and the installed package broken, and the first symptom
+    is `ModuleNotFoundError` from a command that worked yesterday.
+
+    That is not hypothetical: `mail_affiliation` was added in this release and
+    `copilot_operator` imports it at module scope, so every `operator` verb
+    would have failed on any machine that pulled without re-running setup.
+
+    Run in a subprocess for the same reason the answer is worth having: this
+    process already imported these modules, from a `sys.path` that includes
+    the checkout, so it is the last thing able to notice their absence.
+    ``-I`` drops the working directory from ``sys.path``, which is what makes
+    the installed finder the only resolver and the result a fact about the
+    *install* rather than about where the command was run from.
+    """
+    program = "import " + ", ".join(entries)
+    with tempfile.TemporaryDirectory() as elsewhere:
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-I", "-c", program], cwd=elsewhere,
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return f"could not run the interpreter: {exc}"
+    if proc.returncode == 0:
+        return ""
+    detail = (proc.stderr or "").strip().splitlines()
+    return detail[-1] if detail else f"exit {proc.returncode}"
+
+
 def report_status() -> int:
     """Print what is installed against what this checkout would install.
 
@@ -2047,6 +2090,18 @@ def report_status() -> int:
              "Pull before running setup.")
     else:
         info(f"Installed version {installed} is current")
+
+    broken = package_import_health()
+    if broken:
+        # Deliberately reported even when the version matches. The manifest
+        # records what setup last deployed; it cannot know that a pull has
+        # since added a module the install has never heard of, and that is the
+        # case where the version reads "current" and the commands do not run.
+        warn(f"The installed package does not import: {broken}")
+        warn("  Re-run setup — a pull cannot add a module to an editable "
+             "install on its own.")
+    else:
+        info("Installed package imports cleanly")
     print(f"\nManifest: {install_manifest.manifest_path(OPERATOR_HOME)}")
 
     report = install_manifest.status(manifest, deployed_artifacts())
