@@ -194,6 +194,40 @@ function markMatches(root, term){
 }
 """
 
+#: How one stored message becomes one bubble.
+#:
+#: Split out of `renderRows` so the suite can run it. Left inline, the only
+#: thing a test could do is assert that a ternary appears in the page source --
+#: which is the shape of test this feature has already shipped twice and had
+#: to replace both times. Nothing here touches the DOM, so node can call it
+#: directly with a row and be told what the browser would build.
+ROW_JS = r"""
+// Inbound is what was said *to* the agent, so it sits on the right, the side
+// a chat client gives the person doing the typing. Outbound is the agent
+// answering, on the left.
+function rowClass(m){
+  return "row " + (m.direction === "inbound" ? "in" : "out");
+}
+
+function whoLabel(m){
+  return m.actor === "human" ? "you"
+       : m.actor === "system" ? "operator preamble"
+       : (m.sender || "agent");
+}
+
+function messageHtml(m){
+  const bits = ["<span class='who'>" + esc(whoLabel(m)) + "</span>"];
+  if(m.recipient) bits.push("&rarr; " + esc(m.recipient));
+  bits.push(esc(String(m.sent_at || "").replace("T", " ").replace("Z", "")));
+  if(m.project) bits.push("<span class='tag'>" + esc(m.project) + "</span>");
+  if(m.branch) bits.push(esc(m.branch));
+  if(m.asks) bits.push("<span class='q'>?</span>");
+  bits.push("<span class='tag'>" + esc(m.source) + "</span>");
+  return "<div class='meta'>" + bits.join("").replace(/><s/g, "> <s")
+       + "</div><div class='body'>" + md(m.body) + "</div>";
+}
+"""
+
 _PAGE_TEMPLATE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -322,7 +356,7 @@ mark{background:#5a4a00;color:#ffe9a8;border-radius:2px}
 const S = {channel:"", project:"", day:"", q:"", actor:"", direction:"",
            asks:false};
 const $ = s => document.querySelector(s);
-/*MARKDOWN_JS*//*HIGHLIGHT_JS*/
+/*MARKDOWN_JS*//*ROW_JS*//*HIGHLIGHT_JS*/
 
 async function get(path, params){
   const u = new URL(path, location.origin);
@@ -379,26 +413,12 @@ async function load(){
   list.innerHTML = "";
   for(const m of rows){
     const kind = m.channel === "agent-agent" ? "mail" : m.actor;
-    const who = m.actor === "human" ? "you"
-              : m.actor === "system" ? "operator preamble"
-              : (m.sender || (m.direction === "outbound" ? "agent" : "agent"));
-    // Inbound is what was said *to* the agent, so it sits on the right, the
-    // side a chat client gives the person doing the typing. Outbound is the
-    // agent answering, on the left.
     const row = document.createElement("div");
-    row.className = "row " + (m.direction === "inbound" ? "in" : "out");
+    row.className = rowClass(m);
     const div = document.createElement("div");
     div.className = "msg " + kind;
-    const bits = ["<span class='who'>" + esc(who) + "</span>"];
-    if(m.recipient) bits.push("→ " + esc(m.recipient));
-    bits.push(esc(m.sent_at.replace("T"," ").replace("Z","")));
-    if(m.project) bits.push("<span class='tag'>" + esc(m.project) + "</span>");
-    if(m.branch) bits.push(esc(m.branch));
-    if(m.asks) bits.push("<span class='q'>?</span>");
-    bits.push("<span class='tag'>" + esc(m.source) + "</span>");
     const long = m.body.length > 1400;
-    div.innerHTML = "<div class='meta'>" + bits.join("") .replace(/><s/g,"> <s")
-      + "</div><div class='body'>" + md(m.body) + "</div>"
+    div.innerHTML = messageHtml(m)
       + (long ? "<span class='more'>show all</span>" : "");
     const b = div.querySelector(".body");
     // After the markup exists, and against the DOM: a regex over rendered
@@ -445,10 +465,10 @@ refreshSidebar(); load();
 
 
 def _assemble(template: str = "", markdown: str = "",
-              highlight: str = "") -> str:
+              highlight: str = "", row: str = "") -> str:
     """Put the JavaScript into the page, and refuse to ship it if it missed.
 
-    Both placeholders are checked rather than assumed. A silent miss is not a
+    Every placeholder is checked rather than assumed. A silent miss is not a
     broken page -- it is a page whose bodies render as literal markdown and
     whose search stops highlighting, which looks like a styling regression and
     reads as one for as long as nobody tries a `<script>` in a message. The
@@ -456,6 +476,7 @@ def _assemble(template: str = "", markdown: str = "",
     """
     page = template or _PAGE_TEMPLATE
     for token, block in (("/*MARKDOWN_JS*/", markdown or MARKDOWN_JS),
+                         ("/*ROW_JS*/", row or ROW_JS),
                          ("/*HIGHLIGHT_JS*/", highlight or HIGHLIGHT_JS)):
         if token not in page:
             raise ConversationViewerError(

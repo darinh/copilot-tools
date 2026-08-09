@@ -665,9 +665,104 @@ def test_the_assembled_page_carries_both_blocks():
 # Chat layout
 # --------------------------------------------------------------------------
 
+def _rows(messages):
+    """Run the page's real `rowClass` and `messageHtml` over each message.
+
+    The first version of this asserted that a ternary appeared in the page
+    source. That is the shape this feature has already shipped twice and
+    replaced both times: it passes for a renderer that was never called, and
+    it would keep passing if `renderRows` stopped using the expression it
+    pins. Running the functions asks the question directly.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        mod = Path(tmp) / "row.mjs"
+        mod.write_text(viewer.MARKDOWN_JS + viewer.ROW_JS
+                       + "\nexport { rowClass, messageHtml };\n",
+                       encoding="utf-8")
+        driver = Path(tmp) / "run.mjs"
+        driver.write_text(
+            "import { rowClass, messageHtml } from %s;\n"
+            "const xs = JSON.parse(process.argv[2]);\n"
+            "process.stdout.write(JSON.stringify(xs.map(\n"
+            "  m => ({cls: rowClass(m), html: messageHtml(m)}))));\n"
+            % json.dumps(mod.as_uri()), encoding="utf-8")
+        proc = subprocess.run(
+            ["node", str(driver), json.dumps(list(messages))],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace")
+        assert proc.returncode == 0, proc.stderr
+        return json.loads(proc.stdout)
+
+
+def _message(**over):
+    base = {"direction": "inbound", "actor": "human", "body": "hello",
+            "sent_at": "2026-08-09T10:00:00Z", "source": "hook",
+            "channel": "human-agent", "sender": "", "recipient": "",
+            "project": "", "branch": "", "asks": 0}
+    base.update(over)
+    return base
+
+
+@needs_node
 def test_inbound_is_placed_on_the_right_and_outbound_on_the_left():
     """What was said *to* the agent sits where a chat client puts the person
     typing; the agent's answer sits opposite."""
-    assert 'm.direction === "inbound" ? "in" : "out"' in viewer.PAGE
+    out = _rows([_message(direction="inbound"),
+                 _message(direction="outbound", actor="agent")])
+    assert out[0]["cls"] == "row in", out
+    assert out[1]["cls"] == "row out", out
+
+
+def test_the_stylesheet_positions_the_two_sides():
+    """The class names above only mean something if the CSS acts on them."""
     assert ".row.in{justify-content:flex-end}" in viewer.PAGE
     assert ".row.out{justify-content:flex-start}" in viewer.PAGE
+
+
+@needs_node
+def test_a_body_reaches_the_markdown_renderer_not_the_escaper():
+    """The wiring, which no markdown test can see.
+
+    Every `md()` test would still pass if `messageHtml` called `esc()`
+    instead -- the renderer would be correct and unused, and every body would
+    show its markdown as literal characters.
+    """
+    html = _rows([_message(body="# Heading\n\n- a\n- b")])[0]["html"]
+    assert "<h3>Heading</h3>" in html, html
+    assert "<ul><li>a</li><li>b</li></ul>" in html, html
+    assert "# Heading" not in html, html
+
+
+@needs_node
+def test_the_meta_line_still_escapes_its_own_fields():
+    """`md()` renders the body; the metadata around it is not markdown and
+    must stay escaped. A project name or a peer's name is attacker-influenced
+    too -- both arrive from another program."""
+    html = _rows([_message(project="<script>alert(1)</script>",
+                           sender="<img src=x onerror=alert(1)>",
+                           actor="agent", recipient="a<b")])[0]["html"]
+    found = _audit(html)
+    # `div` and `span` are the meta line's own wrappers, which `md()` never
+    # emits and so are not in its allow-list.
+    allowed = ALLOWED_TAGS | {"div", "span"}
+    assert not set(found.tags) - allowed, (found.tags, html)
+    for _tag, name, _value in found.attrs:
+        assert not name.lower().startswith("on"), html
+    # And the payloads are present as text, not dropped -- a renderer that
+    # silently discarded the fields would satisfy every line above.
+    assert "&lt;script&gt;" in html, html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html, html
+
+
+@needs_node
+def test_the_speaker_label_names_who_actually_spoke():
+    labels = [r["html"] for r in _rows([
+        _message(actor="human"),
+        _message(actor="system"),
+        _message(actor="agent", sender="scripts"),
+        _message(actor="agent", sender=""),
+    ])]
+    assert ">you<" in labels[0]
+    assert ">operator preamble<" in labels[1]
+    assert ">scripts<" in labels[2]
+    assert ">agent<" in labels[3]
