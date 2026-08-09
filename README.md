@@ -92,7 +92,7 @@ elsewhere. See [Operator](docs/operator.md) for details.
 **PowerShell (Windows)**
 
 ```powershell
-git clone <this-repo> $HOME\repos\copilot-tools
+git clone https://github.com/darinh/copilot-tools.git $HOME\repos\copilot-tools
 cd $HOME\repos\copilot-tools
 ./setup.ps1
 ```
@@ -100,7 +100,7 @@ cd $HOME\repos\copilot-tools
 **bash (Linux/macOS/WSL)**
 
 ```bash
-git clone <this-repo> ~/projects/copilot-tools
+git clone https://github.com/darinh/copilot-tools.git ~/projects/copilot-tools
 cd ~/projects/copilot-tools
 chmod +x setup.sh
 ./setup.sh
@@ -140,6 +140,35 @@ later run can tell "the repository moved on and you never touched your copy"
 (update silently) from "you customised this" (ask first). After pulling on
 another machine, `python setup_tools.py --status` answers whether you need to
 re-run setup. See [Versioning](docs/versioning.md).
+
+### Deploying to a second machine
+
+```
+git pull            # or the clone above, on a machine that has none
+./setup.ps1         # ./setup.sh on Linux/macOS/WSL — idempotent
+```
+
+**Re-run setup after every pull that adds an extension or skill.** A pull
+updates the checkout; it does not touch `~/.copilot/`. A newly added
+extension therefore sits in the repository and loads nowhere, and nothing
+announces that — an extension that never loaded cannot report its own
+absence.
+
+Verify with `python setup_tools.py --status`, which names the installed
+version and lists every deployed artifact with its state. Do **not** use
+`operator --version`: it prints a hardcoded literal that has not moved since
+July, so it reports the same number whatever you deployed (backlog item
+`0027`).
+
+Two things are per machine and are not deployed by git:
+
+- **Experimental mode.** Extensions load only in experimental sessions, and a
+  session without it loads *none* of them silently. See
+  [Experimental default](docs/experimental-default.md).
+- **The conversation store.** `~/.operator/conversations.db` holds what was
+  said on *that* machine and is deliberately not in the repository. Run
+  `operator conversations seed` there; it is idempotent, and re-running it
+  also re-applies corrected classification rules to rows already stored.
 
 You can also invoke `python setup_tools.py` / `python3 setup_tools.py`
 directly if you don't need the migration step below.
