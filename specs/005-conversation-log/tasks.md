@@ -197,3 +197,14 @@ All tasks complete. Checkboxes reflect delivered state, not intent.
       which reads as a styling regression.
 - [x] T085 — All 4,440 messages in the real store rendered and audited: zero
       disallowed elements, zero event handlers, zero non-http URLs.
+- [x] T086 — `rowClass()` and `messageHtml()` split out of `renderRows` so the
+      layout is *run* rather than grepped for. The first version asserted a
+      ternary appeared in the page source, which passes for a renderer that
+      was never called.
+- [x] T087 — A test asserts a body reaches `md()` and not `esc()`. Every
+      markdown test would pass with the renderer correct and unused.
+- [x] T088 — The meta line's own fields — project, sender, recipient — stay
+      escaped, and are asserted present as text so a renderer that dropped
+      them could not pass.
+- [x] T089 — Layout guard verified by mutating the real ternary to a constant
+      and observing the suite go red.
