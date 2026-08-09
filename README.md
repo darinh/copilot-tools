@@ -37,6 +37,7 @@ messaging, and spec-driven workflow conventions.
 | [`conversation_viewer.py`](conversation_viewer.py) | Loopback web viewer for that record — filter and search by project, day, speaker |
 | [`operator_trace.py`](operator_trace.py) | Records who invoked the operator and how each invocation ended, for attributing incidents |
 | [`install_manifest.py`](docs/versioning.md) | Records what setup deployed and its hash, so upgrades know what's safe to replace |
+| [`mail_affiliation.py`](docs/rationale.md) | Which project each end of an operator message belongs to — recorded, never enforced |
 | [`extensions/`](extensions/README.md) | Copilot CLI runtime extensions: open-in-vs-code, lint-on-edit, security-shield, test-enforcer, architecture-enforcer, checkout-guard, copy-to-clipboard-tool, conversation-capture |
 | [`templates/`](templates/) | Configuration templates for copilot-instructions, MCP servers, and per-project setup |
 | [`docs/`](docs/) | Documentation for operator, skills, versioning, and spec-kit |
@@ -411,6 +412,7 @@ copilot-tools/
 ├── backlog_tool.py                # Backlog parser, validator, and HTML view
 ├── setup_tools.py                 # Cross-platform environment setup
 ├── install_manifest.py            # Records what setup deployed; upgrade strategies
+├── mail_affiliation.py           # What project each end of a message belongs to
 ├── copilot_tools_version.py       # The single source of the version number
 ├── worktree_guard_backend.py      # PEP 517 backend; refuses `pip install -e` of a worktree
 ├── backfill_unknown_metrics.py    # One-off repair: fabricated zeros to NULL

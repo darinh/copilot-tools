@@ -761,9 +761,14 @@ def relationship_note(msg: dict) -> str:
     `relationship_label` report it, and the conversation log buckets it --
     but a live delivery line is not a place to spend a recipient's attention
     on the absence of a field.
+
+    ASCII, deliberately. This string is typed into *another terminal*, and a
+    middle dot came back as a replacement character on a cp1252 console. The
+    truncation marker on this same line has the same exposure and predates
+    this, but that is an argument for not adding a second one.
     """
     if mail_affiliation.relationship_label(msg) == mail_affiliation.CROSS_PROJECT:
-        return " · cross-project"
+        return ", cross-project"
     return ""
 
 

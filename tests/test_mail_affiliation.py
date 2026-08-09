@@ -282,3 +282,21 @@ def test_the_queued_preamble_marks_cross_project_too():
 def test_the_queued_preamble_does_not_mark_same_project():
     block = operator_mail.render_for_agent([_msg("g1", "g1")])
     assert "cross-project" not in block
+
+
+def test_the_delivered_line_is_pure_ascii():
+    """It is typed into another terminal. A middle dot came back as a
+    replacement character on a cp1252 console during end-to-end checking,
+    which is a message the recipient reads as corruption rather than as a
+    label. The truncation marker on this same line has the same exposure and
+    predates this -- which is the argument for not adding a second one, not
+    for adding one."""
+    line = operator_mail.render_line(_msg("g1", "g2"))
+    assert "cross-project" in line
+    assert line.isascii(), [c for c in line if not c.isascii()]
+
+
+def test_the_ascii_check_can_fail():
+    """Positive control: `isascii()` on a string that is ASCII by luck proves
+    nothing about the assertion above."""
+    assert not "a \u00b7 b".isascii()
