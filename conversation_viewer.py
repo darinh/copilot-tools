@@ -237,7 +237,8 @@ function rowClass(m){
 // own reminders and skill definitions are not the operator's launch prompt.
 // The store already knows the difference; it is the sender.
 const SYSTEM_LABELS = {"operator": "operator preamble",
-                       "copilot-cli": "copilot cli"};
+                       "copilot-cli": "copilot cli",
+                       "pipeline": "automated prompt"};
 
 function whoLabel(m){
   if(m.actor === "human") return "you";

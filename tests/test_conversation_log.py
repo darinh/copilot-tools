@@ -1616,3 +1616,224 @@ def test_seed_all_includes_the_handoffs(monkeypatch):
     monkeypatch.setattr(clog, "seed_session_store", spy("session"))
     clog.seed_all(None)
     assert "handoff" in order, order
+
+
+# --------------------------------------------------------------------------
+# Prompts a machine submitted through the human's channel
+# --------------------------------------------------------------------------
+#
+# A review council of three models audited the real store and agreed on the
+# same 1,066 rows: 442 CLI continuations and 624 batch-pipeline prompts, out
+# of 1,337 filed as human speech. The rules below are their formulation.
+#
+# Every one of these tests exists because of the asymmetry that decided the
+# design: a rule that swallows a real human message is far worse than one
+# that leaves machine text filed as human. Noise is visible and ignorable; a
+# reclassified human sentence vanishes from the answer to the one question
+# this store exists for, and nothing reports it. So each rule is paired with
+# the real message it must NOT eat.
+
+REAL_HUMAN_CONTINUE = (
+    "please continue. Do not stop working. I don't care about status update. "
+    "Just keep working. You are working autonomously")
+
+REAL_EXTRACT_PROMPT = (
+    "You extract a temporal, queryable knowledge representation from a story "
+    "so it can be re-rendered in a different style without losing "
+    "load-bearing content.\n\nRules (the firewall): every claim must carry an "
+    "assertion envelope naming its source.\n\n[80,000 characters of book]")
+
+REAL_LIST_PROMPT = (
+    "List every person who has appeared in the book so far, once each.\n"
+    "You are answering as a reader who has read exactly the first 12 "
+    "chapters.\nReply with JSON only, in this exact shape, and nothing "
+    "else:\n{\"people\": []}\n\nTHE BOOK (characters, chapters):\n...")
+
+
+def test_the_cli_continuation_is_not_the_human_asking_to_continue():
+    """442 identical copies, and they are not a guess: joined against the
+    CLI's own ssistant_usage_events, all 442 follow a turn whose
+    inish_reason is length. The machine wrote them."""
+    actor, _channel, sender = clog.classify(clog.CLI_CONTINUE)
+    assert actor == clog.SYSTEM
+    assert sender == "copilot-cli"
+
+
+def test_a_human_telling_the_agent_to_continue_is_still_the_human():
+    """The control that decides the rule's shape. This message is real, from
+    this corpus, and it means the opposite of a truncation artifact -- it is
+    the human losing patience. startswith("Please continue") would eat it.
+    """
+    assert clog.classify(REAL_HUMAN_CONTINUE)[0] == clog.HUMAN
+
+
+def test_the_continuation_rule_matches_the_whole_body_or_nothing():
+    """A continuation with anything appended is a person editing it."""
+    assert clog.classify(clog.CLI_CONTINUE + " and then run the tests")[0] \
+        == clog.HUMAN
+    assert clog.classify("First: " + clog.CLI_CONTINUE)[0] == clog.HUMAN
+
+
+@pytest.mark.parametrize("body", [REAL_EXTRACT_PROMPT, REAL_LIST_PROMPT])
+def test_a_batch_pipeline_prompt_is_not_human_speech(body):
+    """624 rows, one project, each template repeated four or five times, the
+    largest 135,714 characters. Asked "what did I say", the store was
+    answering with a batch job's prompts."""
+    actor, _channel, sender = clog.classify(body)
+    assert actor == clog.SYSTEM, body[:60]
+    assert sender == "pipeline"
+
+
+def test_a_human_quoting_a_pipeline_prompt_is_still_the_human():
+    """Why the head is anchored to the start. Somebody asking about the
+    prompt is not the prompt."""
+    quoted = "what do you think of this:\n\n" + REAL_EXTRACT_PROMPT
+    assert clog.classify(quoted)[0] == clog.HUMAN
+
+
+def test_the_head_alone_does_not_fire():
+    """Why the anchors are required. A person really might type this
+    sentence as a question, and without the anchors it would vanish from
+    their own record."""
+    assert clog.classify(
+        "List every person who has appeared in the book so far, once each."
+    )[0] == clog.HUMAN
+    assert clog.classify(
+        "You extract a temporal, queryable knowledge representation from a "
+        "story. Is that a fair summary of what you do?")[0] == clog.HUMAN
+
+
+def test_the_anchors_alone_do_not_fire():
+    """And the other half: the anchors without the head are somebody talking
+    about the pipeline."""
+    assert clog.classify(
+        "the prompt says to Reply with JSON only, in this exact shape, and "
+        "nothing else: is that why it fails?")[0] == clog.HUMAN
+
+
+@pytest.mark.parametrize("body", [
+    REAL_HUMAN,
+    "Also, do copilot instructions tell agents to work in the develop branch?",
+    "what's next?",
+    "stop",
+    "why do i have to tell you this. cant you infer what a vacation is?",
+])
+def test_real_human_messages_are_left_alone(body):
+    """The corpus these were taken from is the point of the store."""
+    assert clog.classify(body)[0] == clog.HUMAN, body[:50]
+
+
+def test_a_new_pipeline_is_a_table_entry_not_a_code_change():
+    """The shape matters more than today's five entries: what makes a
+    pipeline recognisable is data -- a head and some anchors -- and there
+    will be more of them."""
+    for head, anchors in clog._PIPELINE_PROMPTS:
+        assert head and anchors, (head, anchors)
+        assert clog.is_pipeline_prompt(head + " " + " ".join(anchors))
+        # ...and the same head with no anchors must not fire.
+        assert not clog.is_pipeline_prompt(head)
+
+
+# --------------------------------------------------------------------------
+# Provenance: the CLI's own record of who generated a turn
+# --------------------------------------------------------------------------
+
+def _events(tmp_path, session, entries):
+    d = tmp_path / "session-state" / session
+    d.mkdir(parents=True)
+    lines = []
+    for content, source in entries:
+        data = {"content": content}
+        if source:
+            data["source"] = source
+        lines.append(json.dumps({"type": "user.message", "data": data}))
+        lines.append(json.dumps({"type": "tool.execution", "data": {"x": 1}}))
+    (d / "events.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return tmp_path / "session-state"
+
+
+def test_the_cli_says_which_turns_it_generated(tmp_path):
+    """Ground truth, and universal: it does not depend on one machine's
+    prompt wording. 597 instruction-discovery, 442
+    	hinking-exhausted-continuation and 131 skill-* on this machine."""
+    root = _events(tmp_path, "s1", [
+        ("a real question", None),
+        ("<system_reminder>x</system_reminder>", "instruction-discovery"),
+        ("Please continue from where you left off.",
+         "thinking-exhausted-continuation"),
+        ("<skill-context name=\"backlog\">y</skill-context>", "skill-backlog"),
+    ])
+    found = clog.session_event_sources("s1", root)
+    # A turn with no source is simply absent: the map records machine
+    # provenance, and nothing else.
+    assert "a real question" not in found
+    assert clog.source_is_machine(found["<system_reminder>x</system_reminder>"])
+    assert clog.source_is_machine(
+        found["Please continue from where you left off."])
+    assert clog.source_is_machine(
+        found["<skill-context name=\"backlog\">y</skill-context>"])
+
+
+def test_no_source_means_the_human_typed_it():
+    """The control that carries the asymmetry. An absent source must never
+    be read as machine provenance -- 2,884 of the events on this machine have
+    none, and those are the person."""
+    assert not clog.source_is_machine("")
+    assert not clog.source_is_machine(None)
+    assert not clog.source_is_machine("user")
+
+
+def test_the_skill_family_is_matched_by_prefix():
+    """Skill sources carry the skill's name, so the family is open-ended and
+    an exact set would go stale on the next skill anybody writes."""
+    assert clog.source_is_machine("skill-backlog")
+    assert clog.source_is_machine("skill-merge-to-main")
+    assert clog.source_is_machine("skill-something-nobody-has-written-yet")
+    assert not clog.source_is_machine("skilful phrasing")
+
+
+def test_provenance_outranks_the_text_rules(tmp_path):
+    """A turn the CLI generated is machine text even when it reads exactly
+    like something a person would type."""
+    store = tmp_path / "session-store.db"
+    src = sqlite3.connect(str(store))
+    src.executescript(
+        "CREATE TABLE sessions (id TEXT, repository TEXT, cwd TEXT,"
+        " branch TEXT);"
+        "CREATE TABLE turns (session_id TEXT, turn_index INT,"
+        " user_message TEXT, assistant_response TEXT, timestamp TEXT);")
+    src.execute("INSERT INTO sessions VALUES ('s1','r','C:/x','main')")
+    src.execute("INSERT INTO turns VALUES ('s1',0,'go on then','','t')")
+    src.execute("INSERT INTO turns VALUES ('s1',1,'and this one','','t')")
+    src.commit()
+    src.close()
+    root = _events(tmp_path, "s1", [("go on then", "skill-whatever"),
+                                    ("and this one", None)])
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        clog.seed_session_store(conn, store, root)
+        rows = {r["body"]: dict(r) for r in conn.execute(
+            "SELECT body, actor, sender FROM messages")}
+        assert rows["go on then"]["actor"] == clog.SYSTEM, rows
+        assert rows["go on then"]["sender"] == "copilot-cli"
+        # ...and the control: the turn with no source stays the human's.
+        assert rows["and this one"]["actor"] == clog.HUMAN, rows
+    finally:
+        conn.close()
+
+
+def test_a_session_with_no_event_log_still_seeds(tmp_path):
+    """Provenance is an improvement on a guess, never a precondition."""
+    assert clog.session_event_sources("nope", tmp_path) == {}
+    assert clog.session_event_sources("", tmp_path) == {}
+
+
+def test_a_corrupt_event_log_is_not_fatal(tmp_path):
+    d = tmp_path / "session-state" / "s2"
+    d.mkdir(parents=True)
+    (d / "events.jsonl").write_text(
+        '{"type": "user.message", "data": {"content": "ok", "source": '
+        '"skill-x"}}\n{ truncated mid-\n', encoding="utf-8")
+    found = clog.session_event_sources("s2", tmp_path / "session-state")
+    assert found == {"ok": "skill-x"}
