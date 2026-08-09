@@ -756,13 +756,96 @@ def test_the_meta_line_still_escapes_its_own_fields():
 
 @needs_node
 def test_the_speaker_label_names_who_actually_spoke():
+    """`system` is more than one speaker.
+
+    Labelling all of them "operator preamble" was wrong for 586 of the 1,964
+    system rows on this machine: the CLI's own instruction reminders and its
+    skill definitions are not the operator's launch prompt. The store already
+    knew the difference -- it is the sender -- and the viewer was throwing it
+    away.
+    """
     labels = [r["html"] for r in _rows([
         _message(actor="human"),
-        _message(actor="system"),
+        _message(actor="system", sender="operator"),
+        _message(actor="system", sender="copilot-cli"),
         _message(actor="agent", sender="scripts"),
         _message(actor="agent", sender=""),
     ])]
     assert ">you<" in labels[0]
     assert ">operator preamble<" in labels[1]
-    assert ">scripts<" in labels[2]
-    assert ">agent<" in labels[3]
+    assert ">copilot cli<" in labels[2]
+    assert ">operator preamble<" not in labels[2], labels[2]
+    assert ">scripts<" in labels[3]
+    assert ">agent<" in labels[4]
+
+
+@needs_node
+def test_machine_text_sits_in_the_middle():
+    """The preamble, the CLI's reminders and its skill definitions were not
+    said by anybody in the conversation. On the human's side they read as
+    something the human typed."""
+    out = _rows([_message(actor="system", sender="operator"),
+                 _message(actor="system", sender="copilot-cli",
+                          direction="outbound")])
+    assert out[0]["cls"] == "row mid", out
+    assert out[1]["cls"] == "row mid", out
+
+
+@needs_node
+def test_centring_does_not_swallow_the_two_real_sides():
+    """Positive control: a rule that centred everything would satisfy the
+    test above and destroy the layout."""
+    out = _rows([_message(actor="human", direction="inbound"),
+                 _message(actor="agent", direction="outbound")])
+    assert out[0]["cls"] == "row in", out
+    assert out[1]["cls"] == "row out", out
+
+
+def test_the_stylesheet_centres_machine_text():
+    assert ".row.mid{justify-content:center}" in viewer.PAGE
+
+
+@needs_node
+@pytest.mark.parametrize("stored,shown", [
+    ("a &lt; b", "a &lt; b"),
+    ("&lt;repo&gt;/.worktrees/", "&lt;repo&gt;/.worktrees/"),
+    ("x &amp; y", "x &amp; y"),
+    ("&quot;quoted&quot;", "&quot;quoted&quot;"),
+])
+def test_text_the_cli_already_escaped_is_not_escaped_twice(stored, shown):
+    """400 of the 4,440 bodies here hold `&lt;` where the file said `<`,
+    because the CLI escapes the instruction files it injects. Escaping that
+    again put the literal characters `&lt;` on screen -- the transport
+    showing through the message.
+
+    The expectation is the *rendered* HTML: `&lt;` in the output is what a
+    browser draws as `<`. Double encoding would produce `&amp;lt;`.
+    """
+    html = _render([stored])[0]
+    assert html == f"<p>{shown}</p>", html
+    assert "&amp;lt;" not in html, html
+
+
+@needs_node
+def test_text_that_is_really_about_an_entity_still_reads_as_one():
+    """The other direction. Decoding once must not make it impossible to
+    write about `&lt;` -- a body that escaped the ampersand meant the entity,
+    and gets it back."""
+    assert _render(["&amp;lt; is how you write it"])[0] == \
+        "<p>&amp;lt; is how you write it</p>"
+
+
+@needs_node
+def test_decoding_cannot_smuggle_markup_past_the_escaper():
+    """The reason decoding is safe is the order: `esc` runs over the whole
+    decoded string straight afterwards, so nothing decoded here survives as
+    markup. This is that claim, tested."""
+    payloads = ["&lt;script&gt;alert(1)&lt;/script&gt;",
+                "&lt;img src=x onerror=alert(1)&gt;",
+                "&amp;lt;script&amp;gt;",
+                "&#x27;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"]
+    for html in _render(payloads):
+        found = _audit(html)
+        assert not set(found.tags) - ALLOWED_TAGS, (found.tags, html)
+        for _tag, name, _value in found.attrs:
+            assert not name.lower().startswith("on"), html

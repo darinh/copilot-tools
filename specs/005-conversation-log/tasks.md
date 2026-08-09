@@ -208,3 +208,28 @@ All tasks complete. Checkboxes reflect delivered state, not intent.
       them could not pass.
 - [x] T089 — Layout guard verified by mutating the real ternary to a constant
       and observing the suite go red.
+
+## Fidelity, reported from the running viewer
+
+- [x] T090 — Machine text is centred, not placed on the human's side. Three
+      positions: inbound right, outbound left, `system` middle.
+- [x] T091 — The speaker label comes from the sender, so the CLI's reminders
+      and skill definitions stop being called "operator preamble". 586 of the
+      1,964 system rows were mislabelled.
+- [x] T092 — Entities are decoded before escaping, so the 400 bodies the CLI
+      had already escaped stop rendering as `&lt;`. Safe by ordering: `esc()`
+      runs over the whole decoded string immediately after.
+- [x] T093 — A control asserts text genuinely about an entity survives, and
+      four payloads assert decoding cannot smuggle markup past the escaper.
+- [x] T094 — Mail appended to a launch preamble is left to the mail store,
+      the rule already applied to live peer messages.
+- [x] T095 — Re-seeding may shorten a body but never replace one: the stored
+      text must start with the new text, so the update can only truncate.
+- [x] T096 — `seed_handoffs` reads `handoff/*.md`, `next-session.md` and
+      `superseded/*.md`, keyed by content hash so one report in two places is
+      one row. 27 reports across 7 projects imported from the real machine.
+- [x] T097 — Send time from the banked filename when present, else mtime;
+      instance from the stamp, else the filename only where it means
+      something.
+- [x] T098 — A handoff whose project is not in the catalog is still stored:
+      that is a fact about the catalog, not a reason to drop a work summary.
