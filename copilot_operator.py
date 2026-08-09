@@ -8011,6 +8011,9 @@ def _seed_sources(conn, wanted: str) -> list:
         conversation_log.SOURCE_HOOK:
             lambda c: conversation_log.ingest_spool(
                 c, conversation_log.spool_dir(OPERATOR_HOME)),
+        conversation_log.SOURCE_HANDOFF:
+            lambda c: conversation_log.seed_handoffs(
+                c, OPERATOR_HOME / "projects"),
     }
     if not wanted:
         return [fn(conn) for fn in available.values()]

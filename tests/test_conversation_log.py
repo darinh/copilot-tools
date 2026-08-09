@@ -1016,6 +1016,7 @@ def test_seed_all_reads_the_spool_before_the_session_store(monkeypatch):
 
     monkeypatch.setattr(clog, "ingest_spool", spy("hook"))
     monkeypatch.setattr(clog, "seed_operator_mail", spy("mail"))
+    monkeypatch.setattr(clog, "seed_handoffs", spy("handoff"))
     monkeypatch.setattr(clog, "seed_session_store", spy("session"))
     clog.seed_all(None)
     assert order.index("hook") < order.index("session"), order
@@ -1434,3 +1435,184 @@ def test_every_machine_tag_is_actually_detected():
         assert clog.is_only_machine_text(f"<{tag}>anything</{tag}>"), tag
         assert not clog.is_only_machine_text(
             f"human words <{tag}>anything</{tag}>"), tag
+
+
+# --------------------------------------------------------------------------
+# Mail appended to a preamble, and the reports agents write at the end
+# --------------------------------------------------------------------------
+
+MAILED_PREAMBLE = (
+    "You are running under an automated operator wrapper that a human set "
+    "up. Key facts: (1) blanket approval. Now: get to work. "
+    "You have 2 operator message(s) waiting from 'copilot-tools'. These are "
+    "from other agents, not from the human. "
+    '[1] from \"copilot-tools\" at 2026-08-05T16:11:22Z: Canary is clean.')
+
+
+def test_mail_appended_to_a_preamble_is_left_to_the_mail_store():
+    """Queued mail is delivered by appending it to the launch preamble, so
+    the turn is one string containing both. Filed whole, an 80%-mail message
+    is labelled 'operator preamble' and the peer's words are buried inside
+    something that claims to be boilerplate. Measured: one such row here,
+    1,029 characters of preamble and 4,200 of two peer messages.
+    """
+    stripped = clog.strip_appended_mail(MAILED_PREAMBLE)
+    assert stripped.endswith("Now: get to work."), stripped
+    assert "Canary is clean" not in stripped
+    assert clog.PREAMBLE_MARKER in stripped
+
+
+def test_a_preamble_without_mail_is_untouched():
+    """Positive control. A rule that trimmed every preamble would satisfy
+    the test above and quietly shorten 1,378 rows."""
+    plain = clog.REAL_PREAMBLE if hasattr(clog, "REAL_PREAMBLE") else (
+        "You are running under an automated operator wrapper. Now: work.")
+    assert clog.strip_appended_mail(plain) == plain
+    assert clog.strip_appended_mail("nothing to do with mail") == \
+        "nothing to do with mail"
+
+
+def test_reseeding_can_shorten_a_body_but_never_replace_one(conn):
+    """The body rule is 'only the verdict is ours to revise', and this is the
+    one exception, bounded so it cannot become a rewrite: the stored text
+    must *start with* the new text, so the update can truncate and nothing
+    else. Without it a corrected extraction rule could never reach the rows
+    it was written for.
+    """
+    _add(conn, source_id="p1", body=MAILED_PREAMBLE)
+    _add(conn, source_id="p1", body=clog.strip_appended_mail(MAILED_PREAMBLE))
+    stored = conn.execute(
+        "SELECT body FROM messages WHERE source_id='p1'").fetchone()[0]
+    assert "Canary is clean" not in stored
+    assert stored.endswith("Now: get to work.")
+
+    # And the control: a body that is not a prefix is refused.
+    _add(conn, source_id="p1", body="something else entirely")
+    stored = conn.execute(
+        "SELECT body FROM messages WHERE source_id='p1'").fetchone()[0]
+    assert stored.endswith("Now: get to work."), stored
+
+
+def _handoff_tree(tmp_path):
+    projects = tmp_path / "projects"
+    guid = "11111111-2222-3333-4444-555555555555"
+    (projects / guid / "handoff").mkdir(parents=True)
+    (projects / guid / "superseded").mkdir(parents=True)
+    (projects / "catalog.csv").write_text(
+        f'"C:\\repos\\demo","{guid}"\n', encoding="utf-8")
+    return projects, guid
+
+
+def test_handoffs_are_read_from_all_three_places(tmp_path):
+    """The mechanism has moved and nothing rewrote the past: the current
+    handoff/<instance>.md, the older read-once 
+ext-session.md, and
+    superseded/, which is where a handoff lands when it is replaced before
+    anyone read it."""
+    projects, guid = _handoff_tree(tmp_path)
+    (projects / guid / "handoff" / "alpha.md").write_text(
+        "# Session Handoff\n\n*Written by operator instance: `alpha`*\n\n"
+        "## Status\nShipped the parser.\n", encoding="utf-8")
+    (projects / guid / "next-session.md").write_text(
+        "# Session Handoff\n\n## Status\nOlder mechanism.\n", encoding="utf-8")
+    (projects / guid / "superseded" /
+     "next-session-20260805T002443Z-05d2c69.md").write_text(
+        "# Session Handoff\n\n## Status\nNever read by anyone.\n",
+        encoding="utf-8")
+
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        report = clog.seed_handoffs(conn, projects)
+        assert report.added == 3, report
+        rows = {r["body"].strip().splitlines()[-1]: dict(r)
+                for r in conn.execute("SELECT * FROM messages")}
+        assert "Shipped the parser." in rows
+        assert "Older mechanism." in rows
+        assert "Never read by anyone." in rows
+        for row in rows.values():
+            assert row["direction"] == clog.OUTBOUND
+            assert row["actor"] == clog.AGENT
+            assert row["project"] == "demo", row
+        assert rows["Shipped the parser."]["sender"] == "alpha"
+        # The banked name carries the send time; nothing else has to guess.
+        assert rows["Never read by anyone."]["sent_at"] == "2026-08-05T00:24:43Z"
+    finally:
+        conn.close()
+
+
+def test_the_same_handoff_in_two_places_is_one_report(tmp_path):
+    """A handoff is routinely the live file and its banked copy at once.
+    Keyed by path those are two reports; keyed by content they are one --
+    and path would also key two *different* handoffs identically, because
+    
+ext-session.md is read-once and reused."""
+    projects, guid = _handoff_tree(tmp_path)
+    text = "# Session Handoff\n\n## Status\nOne report.\n"
+    (projects / guid / "next-session.md").write_text(text, encoding="utf-8")
+    (projects / guid / "superseded" /
+     "next-session-20260805T002443Z-abc.md").write_text(text, encoding="utf-8")
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        report = clog.seed_handoffs(conn, projects)
+        assert report.added == 1, report
+        assert report.duplicate == 1, report
+    finally:
+        conn.close()
+
+
+def test_two_different_handoffs_are_two_reports(tmp_path):
+    """Positive control for the line above: keying by content must not
+    collapse reports that differ."""
+    projects, guid = _handoff_tree(tmp_path)
+    (projects / guid / "superseded" / "next-session-20260805T000000Z-a.md"
+     ).write_text("# Session Handoff\n\n## Status\nFirst.\n", encoding="utf-8")
+    (projects / guid / "superseded" / "next-session-20260805T010000Z-b.md"
+     ).write_text("# Session Handoff\n\n## Status\nSecond.\n", encoding="utf-8")
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        assert clog.seed_handoffs(conn, projects).added == 2
+    finally:
+        conn.close()
+
+
+def test_a_missing_project_directory_is_absent_not_an_error(tmp_path):
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        report = clog.seed_handoffs(conn, tmp_path / "nothing-here")
+        assert report.absent, report
+        assert not report.errors, report
+    finally:
+        conn.close()
+
+
+def test_a_handoff_for_an_unregistered_project_still_lands(tmp_path):
+    """The catalog can be missing a row -- that is a fact about the catalog,
+    not a reason to drop a work summary."""
+    projects, _guid = _handoff_tree(tmp_path)
+    (projects / "99999999-0000-0000-0000-000000000000" / "handoff").mkdir(
+        parents=True)
+    (projects / "99999999-0000-0000-0000-000000000000" / "handoff" / "x.md"
+     ).write_text("# Session Handoff\n\n## Status\nStranded.\n",
+                  encoding="utf-8")
+    conn = clog.connect(tmp_path / "db.sqlite")
+    try:
+        assert clog.seed_handoffs(conn, projects).added == 1
+    finally:
+        conn.close()
+
+
+def test_seed_all_includes_the_handoffs(monkeypatch):
+    order = []
+
+    def spy(name):
+        def call(_conn, *_a, **_k):
+            order.append(name)
+            return clog.SeedReport(name)
+        return call
+
+    monkeypatch.setattr(clog, "ingest_spool", spy("hook"))
+    monkeypatch.setattr(clog, "seed_operator_mail", spy("mail"))
+    monkeypatch.setattr(clog, "seed_handoffs", spy("handoff"))
+    monkeypatch.setattr(clog, "seed_session_store", spy("session"))
+    clog.seed_all(None)
+    assert "handoff" in order, order

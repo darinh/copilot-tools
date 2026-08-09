@@ -125,8 +125,32 @@ machine, so both halves are needed.
 - **No new dependencies.** Stdlib only — `sqlite3`, `http.server`, `json` —
   so `pyproject.toml` is unchanged.
 
-## What the user gets, and the honest limitation
+## Handoffs: the reports agents write at the end
 
+A fourth source, `seed_handoffs`. A handoff is the one place an agent says what
+it *did* rather than what it is doing, and it is written for a reader — so it
+is the highest-value text this store holds per byte. It is also the half of the
+record that was missing entirely: the CLI kept no assistant response for 76% of
+turns, and none of those summaries existed anywhere else.
+
+Three locations, because the mechanism moved and nothing rewrote the past:
+`handoff/<instance>.md` and its `.prev.md`, the older read-once
+`next-session.md`, and `superseded/` — the pile a handoff lands in when it is
+replaced before anyone read it, which nothing prunes on purpose. All three are
+read; none is consumed.
+
+Keyed by **content hash**, not by path. A handoff is routinely the live file
+and its banked copy at the same time, and those are one report; path would also
+key two *different* handoffs identically, because `next-session.md` is
+read-once and reused. The send time comes from the banked filename
+(`next-session-20260805T002443Z-…`) when there is one and from the file's mtime
+otherwise, and the instance from the `Written by operator instance` stamp,
+falling back to the filename only where the filename means something.
+
+Measured on this machine: **27 reports across 7 projects, 108 KB**, all filed
+under the right project via the catalog, and a re-seed adds none.
+
+## What the user gets, and the honest limitation
 Seeding recovers **what the user said** well. It recovers only **24% of what
 agents replied**, because the CLI's own store did not keep the rest. The
 capture extension is what fixes that going forward, and it only applies to
@@ -145,8 +169,18 @@ arrive that way and are filed under their real speaker:
 |---|---|---|
 | The operator launch preamble | `PREAMBLE_MARKER` in the first 400 chars | `system`, sender `operator` |
 | A peer message from `operator send` | `PEER_PREFIX_RE` | declined — mail owns it |
+| Mail appended to a launch preamble | `strip_appended_mail()` | removed — mail owns it |
 | The CLI's `<system_reminder>` blocks | `is_only_machine_text()` | `system`, sender `copilot-cli` |
 | The CLI's `<skill-context>` blocks | `is_only_machine_text()` | `system`, sender `copilot-cli` |
+
+Queued mail is delivered by *appending it to the preamble*, so the turn the
+agent receives is one string holding both. Filed whole, an 80%-mail message is
+labelled "operator preamble" and the peer's words are buried inside something
+that claims to be boilerplate — measured here as one row of 1,029 preamble
+characters and 4,200 of two peer messages. Removing it applies the rule this
+module already had for *live* peer messages to the one delivery path that had
+escaped it; nothing is lost, because the mail store holds that text with the
+sender, recipient and send time this copy does not have.
 
 The last two were found by running the finished feature against the real store:
 **586 of 1918 rows filed as human speech — 31% — were injected blocks and
@@ -180,11 +214,32 @@ about it is ours to revise. Re-seeding the real store moved 586 rows out of
 
 ## The viewer reads as a conversation
 
-Bodies are rendered as Markdown, and the two sides sit on opposite edges:
-**inbound on the right** — what was said *to* the agent, by the human or by a
-peer — and **outbound on the left**, the agent answering. That is the
-arrangement every chat client uses for "me" and "them", and it is what makes a
-long session scannable without reading it.
+Bodies are rendered as Markdown, and messages sit in **three** positions.
+**Inbound on the right** — what was said *to* the agent, by the human or by a
+peer. **Outbound on the left**, the agent answering. **Machine text down the
+middle**: the launch preamble, the CLI's instruction reminders and its skill
+definitions were not said by anybody in the conversation, and on the human's
+side they read as something the human typed.
+
+The speaker label comes from the sender, not from the actor. `system` covers
+more than one voice, and calling all of them "operator preamble" was wrong for
+586 of the 1,964 system rows here — the CLI's reminders and skill definitions
+are not the operator's launch prompt. The store already knew the difference;
+the viewer was throwing it away.
+
+### Text the CLI already escaped is not escaped twice
+
+400 of the 4,440 bodies hold the literal characters `&lt;` where the file said
+`<`, because the CLI HTML-escapes the instruction files it injects. Escaping
+that again put `&lt;` on screen — the transport showing through the message.
+Human-typed bodies are unaffected: 628 of them contain a raw `<` and none
+contains `&lt;`.
+
+Entities are therefore decoded *before* escaping. The order is what makes it
+safe: `esc()` runs over the whole decoded string immediately afterwards, so
+nothing decoded can survive as markup, and it is a single pass, so a decoded
+`&` cannot begin a second round. Text that is genuinely *about* an entity
+still reads as one — `&amp;lt;` decodes once to `&lt;` and is escaped back.
 
 Supported: fenced and inline code, headings, bold, italic, ordered and
 unordered lists, blockquotes, horizontal rules, and links. Tables are *not*

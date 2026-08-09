@@ -47,6 +47,24 @@ MARKDOWN_JS = r"""
 const esc = s => String(s).replace(/[&<>"']/g, c => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 
+// Some of what is stored arrives already HTML-escaped: the CLI escapes the
+// instruction files it injects, so 400 of 4,440 bodies here hold the literal
+// characters `&lt;` where the file said `<`. Escaping those again renders
+// `&lt;` on screen -- the transport showing through the message.
+//
+// Decoding before escaping is safe *because* of the order: `esc` runs over
+// the whole decoded string immediately after, so nothing decoded here can
+// survive as markup. `&amp;lt;` decodes once, to `&lt;`, and is then escaped
+// back to `&amp;lt;` -- so text that really is about an entity still reads as
+// one. One pass, so a decoded `&` cannot start a second round.
+const ENTITIES = {"&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
+                  "&apos;": "'", "&#39;": "'", "&#x27;": "'", "&nbsp;": " "};
+
+function decodeEntities(s){
+  return String(s).replace(/&(?:amp|lt|gt|quot|apos|nbsp|#39|#x27);/gi,
+                           m => ENTITIES[m.toLowerCase()] || m);
+}
+
 // The one place a URL from the message reaches an attribute. Anything not
 // http(s) is left as literal text: `javascript:`, `data:` and `vbscript:` all
 // execute from an href, and no message in a conversation log needs them.
@@ -83,7 +101,8 @@ function md(text){
   // needs one -- and any NUL the body does contain is removed here, so a body
   // cannot spell a sentinel and claim another message's code block.
   const fences = [];
-  let s = String(text == null ? "" : text).replace(/\u0000/g, "").replace(
+  let s = decodeEntities(String(text == null ? "" : text)
+                         .replace(/\u0000/g, "")).replace(
     // The info string (```python) is optional and may not contain a backtick.
     // Without both of those, a single-line ```code``` had its content eaten:
     // `[^\n]*` is happy to swallow `code``` as the language name, and the
@@ -202,17 +221,29 @@ function markMatches(root, term){
 #: to replace both times. Nothing here touches the DOM, so node can call it
 #: directly with a row and be told what the browser would build.
 ROW_JS = r"""
-// Inbound is what was said *to* the agent, so it sits on the right, the side
-// a chat client gives the person doing the typing. Outbound is the agent
-// answering, on the left.
+// Three positions, not two. Inbound is what was said *to* the agent, on the
+// right -- the side a chat client gives the person typing. Outbound is the
+// agent answering, on the left. Machine text is neither: the launch preamble,
+// the CLI's instruction files and its skill definitions were not said by
+// anybody in the conversation, and putting them on the human's side implies
+// they were typed. They go down the middle, where they read as scenery.
 function rowClass(m){
+  if(m.actor === "system") return "row mid";
   return "row " + (m.direction === "inbound" ? "in" : "out");
 }
 
+// `system` covers more than one speaker, and calling all of them "operator
+// preamble" was wrong for 586 of the 1,964 rows on this machine -- the CLI's
+// own reminders and skill definitions are not the operator's launch prompt.
+// The store already knows the difference; it is the sender.
+const SYSTEM_LABELS = {"operator": "operator preamble",
+                       "copilot-cli": "copilot cli"};
+
 function whoLabel(m){
-  return m.actor === "human" ? "you"
-       : m.actor === "system" ? "operator preamble"
-       : (m.sender || "agent");
+  if(m.actor === "human") return "you";
+  if(m.actor === "system")
+    return SYSTEM_LABELS[m.sender] || (m.sender ? m.sender : "system");
+  return m.sender || "agent";
 }
 
 function messageHtml(m){
@@ -266,6 +297,14 @@ flex-direction:column;gap:10px}
 .row{display:flex;width:100%}
 .row.out{justify-content:flex-start}
 .row.in{justify-content:flex-end}
+/* Machine text down the middle, narrower and dimmer: it is scenery, not a
+   turn anybody took. */
+.row.mid{justify-content:center}
+.row.mid .msg{max-width:min(72ch,68%);border-left-width:1px;
+border-right-width:1px;border-top:2px solid var(--system);
+background:#15171f;color:var(--dim);border-radius:8px}
+.row.mid .meta{justify-content:center}
+.row.mid .body{font-size:12px}
 .msg{border:1px solid var(--line);border-left-width:3px;border-radius:10px;
 padding:9px 12px;background:var(--panel);max-width:min(80ch,78%);min-width:0}
 /* Inbound sits on the right, so its coloured edge belongs on the right too --

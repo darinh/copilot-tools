@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import install_manifest
+import project_paths
 from project_paths import operator_home
 
 #: Where the conversation database lives. One per machine, beside the rest of
@@ -66,6 +67,7 @@ AGENT_AGENT = "agent-agent"
 SOURCE_SESSION_STORE = "session-store"
 SOURCE_OPERATOR_MAIL = "operator-mail"
 SOURCE_HOOK = "hook"
+SOURCE_HANDOFF = "handoff"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -281,6 +283,38 @@ _MACHINE_RE = re.compile(
     "|".join(rf"<{tag}\b.*?</{tag}>" for tag in _MACHINE_TAGS), re.S)
 
 
+#: What `operator_mail.render_for_agent` puts at the head of the block it
+#: appends to a session preamble. Distinctive enough to find, and stable
+#: because the same string is what tells the agent the block is mail.
+_APPENDED_MAIL = "operator message(s) waiting from"
+
+
+def strip_appended_mail(body: str) -> str:
+    """A preamble without the mail block appended to the end of it.
+
+    Queued mail is delivered by appending it to the launch preamble, so the
+    turn the agent receives is one string containing both. Filed whole, an
+    80%-mail message is labelled "operator preamble" and the peer's words are
+    buried inside something that claims to be machine boilerplate. Measured on
+    this machine: one such row, 1,029 characters of preamble and 4,200 of two
+    peer messages.
+
+    Removing it is the rule this module already applies to *live* peer
+    messages -- mail owns inter-agent messages, in the seeder and in the hook
+    -- extended to the one delivery path that had escaped it. The content is
+    not lost: it is in the mail store, which is where it was read from, with
+    the sender, recipient and send time this copy does not have.
+    """
+    text = body or ""
+    marker = text.find(_APPENDED_MAIL)
+    if marker < 0:
+        return text
+    start = text.rfind("You have", 0, marker)
+    if start < 0:
+        return text
+    return text[:start].rstrip()
+
+
 def is_only_machine_text(body: str) -> bool:
     """True when nothing is left after removing the CLI's own insertions.
 
@@ -459,6 +493,17 @@ def record(conn: sqlite3.Connection, *, source: str, source_id: str,
         " WHERE source = :source AND source_id = :source_id"
         "   AND (channel != :channel OR actor != :actor"
         "        OR sender != :sender OR asks != :asks)", row)
+    # A body is only ever *shortened*, and only when the removed tail is a
+    # block another row already holds verbatim -- today, the mail appended to
+    # a launch preamble. The condition is the guarantee: the stored text must
+    # start with the new text, so this can truncate and can do nothing else.
+    # Without it a corrected extraction rule could never reach the rows it was
+    # written for, and "delete the database" is not a remedy anyone knows to
+    # reach for.
+    conn.execute(
+        "UPDATE messages SET body = :body"
+        " WHERE source = :source AND source_id = :source_id"
+        "   AND body != :body AND substr(body, 1, length(:body)) = :body", row)
     return False
 
 
@@ -595,7 +640,7 @@ def seed_session_store(conn: sqlite3.Connection,
             "session_id": row["session_id"] or "",
         }
         stamp = row["timestamp"] or ""
-        prompt = row["user_message"] or ""
+        prompt = strip_appended_mail(row["user_message"] or "")
         actor, channel, sender = classify(prompt)
         session = row["session_id"] or ""
         if channel == AGENT_AGENT:
@@ -718,6 +763,138 @@ def seed_operator_mail(conn: sqlite3.Connection,
         report.duplicate += 0 if added else 1
     conn.commit()
     return report
+
+
+# --------------------------------------------------------------------------
+# Seeding: the capture spool
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Seeding: handoffs
+# --------------------------------------------------------------------------
+
+#: The line `handoff` writes to say which instance produced a report.
+_INSTANCE_RE = re.compile(r"operator instance:\s*`([^`]+)`")
+
+#: `next-session-20260805T002443Z-05d2c69.md`, the name a banked handoff gets.
+_BANKED_RE = re.compile(r"(\d{8}T\d{6}Z)")
+
+
+def _project_paths_by_guid(catalog: "Path | None" = None) -> dict:
+    """``{guid: checkout path}``, read from the project catalog.
+
+    The handoff files are filed under a project *id*, and a directory named
+    after a GUID tells a reader nothing. The catalog is the only thing that
+    knows which checkout that id belongs to.
+    """
+    target = (Path(catalog) if catalog is not None
+              else project_paths.projects_root() / "catalog.csv")
+    if install_manifest.file_present(target) is not True:
+        return {}
+    found = {}
+    try:
+        with open(target, "r", encoding="utf-8", errors="replace",
+                  newline="") as fh:
+            for row in project_paths.catalog_rows(fh):
+                if not row or len(row) < 2:
+                    continue
+                path, guid = row[0].strip().strip('"'), row[1].strip().strip('"')
+                if path and guid:
+                    found[guid] = path
+    except OSError:
+        return {}
+    return found
+
+
+def seed_handoffs(conn: sqlite3.Connection,
+                  root: "Path | None" = None) -> SeedReport:
+    """Copy the work summaries agents write when they end a session.
+
+    A handoff is the one place an agent says what it *did* rather than what it
+    was doing, and it is written for a reader -- so it is the highest-value
+    text this store can hold per byte. It is also the half of the record that
+    was missing entirely: the CLI's session store kept no assistant response
+    for 76% of turns, and none of those summaries were anywhere else.
+
+    Three locations, because the mechanism has moved and nothing rewrote the
+    past: ``handoff/<instance>.md`` and its ``.prev.md``, the older read-once
+    ``next-session.md``, and ``superseded/`` -- which is the pile a handoff
+    lands in when it is replaced before anyone read it, and which nothing ever
+    prunes on purpose. All three are read; none is consumed.
+
+    Keyed by content hash rather than by path. A handoff is routinely present
+    in two places at once -- the live file and its banked copy -- and those
+    are one report, not two. Path would also key two *different* handoffs
+    identically, because ``next-session.md`` is read-once and reused.
+    """
+    report = SeedReport(SOURCE_HANDOFF)
+    base = Path(root) if root is not None else operator_home() / "projects"
+    present = install_manifest.dir_present(base)
+    if present is False:
+        report.absent = f"no project directory at {base}"
+        return report
+    if present is None:
+        report.errors.append(
+            f"could not determine whether {base} exists (permissions?)")
+        return report
+
+    by_guid = _project_paths_by_guid(base / "catalog.csv")
+    for project_dir in sorted(base.glob("*")):
+        # `dir_present` rather than `.is_dir()`: a project directory that is
+        # occupied but unexaminable would answer False and be walked past in
+        # silence, which for this seeder means a project's whole run of work
+        # summaries missing with nothing said about it.
+        state = install_manifest.dir_present(project_dir)
+        if state is None:
+            report.errors.append(
+                f"could not examine {project_dir.name} (permissions?)")
+            continue
+        if state is False:
+            continue
+        cwd = by_guid.get(project_dir.name, "")
+        for path in sorted(set(
+                list(project_dir.glob("handoff/*.md"))
+                + list(project_dir.glob("next-session.md"))
+                + list(project_dir.glob("superseded/*.md")))):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                report.errors.append(f"{path.name}: {exc}")
+                continue
+            if not text.strip():
+                report.skip("empty handoff")
+                continue
+            stamp = _BANKED_RE.search(path.name)
+            when = (f"{stamp.group(1)[:4]}-{stamp.group(1)[4:6]}-"
+                    f"{stamp.group(1)[6:8]}T{stamp.group(1)[9:11]}:"
+                    f"{stamp.group(1)[11:13]}:{stamp.group(1)[13:15]}Z"
+                    ) if stamp else _mtime_utc(path)
+            named = _INSTANCE_RE.search(text)
+            # The stamp when the file carries one; otherwise the filename,
+            # which is the instance for `handoff/<instance>.md` and means
+            # nothing for the others -- so it is only used where it does.
+            instance = (named.group(1) if named
+                        else (path.stem.replace(".prev", "")
+                              if path.parent.name == "handoff" else ""))
+            added = record(
+                conn, source=SOURCE_HANDOFF,
+                source_id="sha256:" + hashlib.sha256(
+                    text.encode("utf-8")).hexdigest(),
+                body=text, direction=OUTBOUND, sent_at=when,
+                actor=AGENT, channel=HUMAN_AGENT, sender=instance,
+                instance=instance, cwd=cwd)
+            report.added += 1 if added else 0
+            report.duplicate += 0 if added else 1
+    conn.commit()
+    return report
+
+
+def _mtime_utc(path: Path) -> str:
+    try:
+        return datetime.fromtimestamp(
+            path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except OSError:
+        return ""
 
 
 # --------------------------------------------------------------------------
@@ -853,7 +1030,7 @@ def seed_all(conn: sqlite3.Connection) -> list[SeedReport]:
     anything to answer with. Run the other way round, the very first seed on a
     machine with the extension installed files every captured turn twice.
     """
-    return [ingest_spool(conn), seed_operator_mail(conn),
+    return [ingest_spool(conn), seed_operator_mail(conn), seed_handoffs(conn),
             seed_session_store(conn)]
 
 
