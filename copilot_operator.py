@@ -8002,10 +8002,17 @@ def conversations_command(args: list[str]) -> int:
     path = conversation_log.db_path(OPERATOR_HOME)
     try:
         if verb == "serve":
+            raw = _flag_value(rest, "--port")
+            try:
+                port = int(raw) if raw else 8765
+            except ValueError:
+                die(f"--port wants a number, not {raw!r}")
+            if not 1 <= port <= 65535:
+                die(f"--port must be between 1 and 65535, not {port}")
             return conversation_viewer.serve(
                 path,
                 host=_flag_value(rest, "--host") or "127.0.0.1",
-                port=int(_flag_value(rest, "--port") or 8765),
+                port=port,
                 open_browser="--no-browser" not in rest)
 
         conn = conversation_log.connect(path)

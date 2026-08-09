@@ -30,6 +30,7 @@ returns mostly machine text. :func:`classify` separates them, and
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -543,9 +544,16 @@ def seed_operator_mail(conn: sqlite3.Connection,
         recipient = str(msg.get("to") or "")
         identity = str(msg.get("id") or "")
         if not identity:
-            # Fall back to the filename, which encodes timestamp and a hash.
-            identity = path.stem
-            report.skip("message had no id; used filename")
+            # Not the filename, which is where this went wrong first: a file
+            # moving inbox -> archive is the normal life of every message
+            # here, and a rename during that move makes the same message file
+            # itself a second time under a second key. The content cannot
+            # move, so it is what identifies the message.
+            identity = "sha256:" + hashlib.sha256("\x00".join([
+                str(msg.get("from") or ""), str(msg.get("to") or ""),
+                str(msg.get("sent_at") or ""), str(text),
+            ]).encode("utf-8")).hexdigest()
+            report.skip("message had no id; keyed by content")
         added = record(
             conn, source=SOURCE_OPERATOR_MAIL, source_id=identity,
             body=str(text), direction=INBOUND,
@@ -671,6 +679,19 @@ def _fts_query(text: str) -> str:
     return " AND ".join('"' + t + '"' for t in terms)
 
 
+def _like_term(text: str) -> str:
+    """Escape the wildcards LIKE would otherwise read as syntax.
+
+    ``%`` and ``_`` are LIKE's own metacharacters, so an unescaped search for
+    ``100%`` matches every row whose body contains ``100`` followed by
+    anything, and one for ``a_b`` matches ``axb``. Both return *more* rows
+    than asked for, which is the failure that does not look like one.
+    """
+    return (text.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_"))
+
+
 def query(conn: sqlite3.Connection, *, search: str = "", project: str = "",
           channel: str = "", direction: str = "", actor: str = "",
           instance: str = "", date_from: str = "", date_to: str = "",
@@ -680,15 +701,27 @@ def query(conn: sqlite3.Connection, *, search: str = "", project: str = "",
     params: list[object] = []
 
     if search.strip():
-        if search_mode(conn) == "fts":
-            expr = _fts_query(search)
-            if expr:
-                where.append("m.id IN (SELECT rowid FROM messages_fts "
-                             "WHERE messages_fts MATCH ?)")
-                params.append(expr)
+        expr = _fts_query(search) if search_mode(conn) == "fts" else ""
+        if expr:
+            where.append("m.id IN (SELECT rowid FROM messages_fts "
+                         "WHERE messages_fts MATCH ?)")
+            params.append(expr)
         else:
-            where.append("m.body LIKE ?")
-            params.append(f"%{search.strip()}%")
+            # Either there is no FTS index, or the search is all punctuation
+            # -- `(`, `*`, `-->` -- which FTS5's tokeniser discards entirely,
+            # leaving an empty MATCH expression.
+            #
+            # Dropping the predicate here is what this branch used to do, and
+            # it is the worst of the three options: the user searches for `(`,
+            # every row comes back, and a result set that means "no filter was
+            # applied" is indistinguishable from one that means "everything
+            # matched". Returning nothing would at least be honest, but it is
+            # still wrong -- there really are rows containing `(`, and the
+            # substring path can find them. So punctuation searches take the
+            # same route as a machine with no FTS5, which also keeps the two
+            # modes returning the same rows for the same query.
+            where.append("m.body LIKE ? ESCAPE '\\'")
+            params.append(f"%{_like_term(search.strip())}%")
 
     for column, value in (("project", project), ("instance", instance),
                           ("session_id", session_id)):

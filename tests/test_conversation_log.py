@@ -659,3 +659,85 @@ def test_a_spool_record_the_ingester_cannot_read_is_skipped_not_fatal(tmp_path):
     report = clog.ingest_spool(conn, spool)
     assert report.added == 1
     assert sum(report.skipped.values()) == 1, report.skipped
+
+
+# --- Findings from adversarial review, each pinned by the reproduction ------
+
+def test_a_punctuation_search_filters_rather_than_returning_everything(conn):
+    """The failure that does not look like one.
+
+    ``(`` tokenises to nothing under FTS5, which left an empty MATCH
+    expression, which made the search predicate disappear -- so every row came
+    back and a result set meaning "no filter was applied" was indistinguishable
+    from one meaning "everything matched". The earlier fuzz test asserted only
+    that no exception escaped, which this bug satisfies perfectly.
+    """
+    clog.record(conn, source="hook", source_id="p1", body="a call (here)",
+                direction="inbound", sent_at="2026-08-09T10:00:00Z",
+                channel="human-agent", actor="human")
+    clog.record(conn, source="hook", source_id="p2", body="no punctuation",
+                direction="inbound", sent_at="2026-08-09T10:01:00Z",
+                channel="human-agent", actor="human")
+    hits = [r["source_id"] for r in clog.query(conn, search="(")]
+    assert hits == ["p1"], hits
+
+
+def test_the_punctuation_guard_can_fail(conn):
+    """Positive control: a search matching neither row returns neither."""
+    clog.record(conn, source="hook", source_id="p1", body="a call (here)",
+                direction="inbound", sent_at="2026-08-09T10:00:00Z",
+                channel="human-agent", actor="human")
+    assert clog.query(conn, search="{") == []
+
+
+def test_a_like_wildcard_in_a_search_is_not_treated_as_syntax(conn):
+    """``%`` and ``_`` are LIKE's metacharacters, so an unescaped search for
+    ``100%`` matches every body containing ``100`` followed by anything --
+    more rows than were asked for, silently."""
+    clog.record(conn, source="hook", source_id="w1", body="it hit 100% today",
+                direction="inbound", sent_at="2026-08-09T10:00:00Z",
+                channel="human-agent", actor="human")
+    clog.record(conn, source="hook", source_id="w2", body="it hit 1000 today",
+                direction="inbound", sent_at="2026-08-09T10:01:00Z",
+                channel="human-agent", actor="human")
+    hits = [r["source_id"] for r in clog.query(conn, search="100%")]
+    assert hits == ["w1"], hits
+
+
+def test_an_id_less_message_that_moves_and_is_renamed_is_filed_once(conn,
+                                                                    tmp_path):
+    """A filename is not an identity.
+
+    Mail moves inbox -> archive as its normal life, and the move may rename.
+    Keying an id-less message by ``path.stem`` files the same message twice.
+    Scored by moving *and* renaming between two seeds, which is what the
+    original test's plain copy never exercised.
+    """
+    root = tmp_path / "messages"
+    inbox = root / "copilot-tools"
+    inbox.mkdir(parents=True)
+    body = {k: v for k, v in MAIL.items() if k != "id"}
+    (inbox / "0001-original.json").write_text(json.dumps(body),
+                                              encoding="utf-8")
+    assert clog.seed_operator_mail(conn, root).added == 1
+
+    archive = inbox / "archive"
+    archive.mkdir()
+    (inbox / "0001-original.json").rename(archive / "9999-renamed.json")
+    assert clog.seed_operator_mail(conn, root).added == 0
+
+    stored = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert stored == 1, "the same message was filed under two keys"
+
+
+def test_an_id_less_message_is_keyed_by_content_not_by_path(conn, tmp_path):
+    """Positive control for the guard above: two *different* id-less messages
+    must still be two rows, or the fix has collapsed them instead."""
+    root = tmp_path / "messages"
+    inbox = root / "copilot-tools"
+    inbox.mkdir(parents=True)
+    first = {k: v for k, v in MAIL.items() if k != "id"}
+    second = dict(first, text="a completely different message")
+    (inbox / "a.json").write_text(json.dumps(first), encoding="utf-8")
+    (inbox / "b.json").write_text(json.dumps(second), encoding="utf-8")
+    assert clog.seed_operator_mail(conn, root).added == 2

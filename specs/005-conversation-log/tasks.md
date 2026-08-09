@@ -76,4 +76,13 @@ All tasks complete. Checkboxes reflect delivered state, not intent.
 - [x] T034 — Cross-language seam test for the spool directory name, with a
       positive control.
 - [x] T035 — Full suite green.
-- [x] T036 — Adversarial review.
+- [x] T036 — Adversarial review (gpt-5.3-codex): five findings, all real, all
+      reproduced and fixed, each pinned by a test with a positive control.
+- [x] T037 — Punctuation-only searches filter instead of returning every row.
+- [x] T038 — `_like_term()` escapes LIKE's `%` and `_` wildcards.
+- [x] T039 — `Host` header checked against a loopback allow-list, IPv6
+      literals included.
+- [x] T040 — Id-less mail keyed by content hash, not by filename.
+- [x] T041 — `--port` validated with a range check rather than a bare `int()`.
+- [x] T042 — The fuzz tests, which asserted only "no exception" and "HTTP
+      200", now assert the returned rows. They passed against the bug.

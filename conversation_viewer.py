@@ -271,7 +271,38 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(payload).encode("utf-8"),
                    "application/json; charset=utf-8")
 
+    #: Hostnames a browser may legitimately have used to reach this server.
+    #: A literal loopback address, or the one name that always means it.
+    #: Anything else is a name that resolved here without being ours.
+    LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", ""})
+
+    def _host_is_local(self) -> bool:
+        """Whether the Host header names loopback.
+
+        The port is stripped, but an IPv6 literal is bracketed and full of
+        colons, so splitting on the last colon only works after checking for
+        the bracket -- ``[::1]:8765`` and ``[::1]`` must both survive.
+        """
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):
+            host = host.split("]", 1)[0] + "]"
+        elif host.count(":") == 1:
+            host = host.split(":", 1)[0]
+        return host in self.LOCAL_HOSTS
+
     def do_GET(self) -> None:  # noqa: N802
+        if not self._host_is_local():
+            # Binding to 127.0.0.1 stops a *remote* socket connecting. It does
+            # nothing about DNS rebinding, where a page the user is merely
+            # visiting resolves its own hostname to 127.0.0.1 and then reads
+            # this API from the user's own browser -- a same-origin read of
+            # every word they have ever typed to an agent, from a tab they did
+            # not know was hostile. The Host header is the part of that attack
+            # that cannot be forged away: it names the hostname the browser
+            # believed it was talking to, and that is never ours.
+            self._send(403, b"forbidden: unrecognised Host header",
+                       "text/plain; charset=utf-8")
+            return
         parsed = urlparse(self.path)
         route = parsed.path
         args = {k: v[0] for k, v in parse_qs(parsed.query).items()}

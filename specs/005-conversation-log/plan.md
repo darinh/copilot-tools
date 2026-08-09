@@ -113,3 +113,39 @@ The writer is a live agent session while a human may have the viewer open.
 5. **The extension was undocumented**, which `tests/test_extensions.py` caught
    — `setup` installs every directory under `extensions/`, so an undocumented
    one is deployed to every session on the machine with nothing written down.
+
+## Defects found by adversarial review, after the branch looked finished
+
+The suite was green and mutation-clean when these were found. Each came with
+a reproduction; each reproduction was re-run against the fix.
+
+6. **A punctuation-only search returned every row.** `(`, `*` and `-->`
+   tokenise to nothing under FTS5, leaving an empty MATCH expression — and the
+   code then *dropped the search predicate entirely*. A result set meaning "no
+   filter was applied" is indistinguishable from one meaning "everything
+   matched", so the user reads an unfiltered list as their answer. Punctuation
+   searches now take the substring path, which both finds the rows that
+   genuinely contain the characters and keeps FTS and non-FTS machines
+   returning the same rows for the same query.
+7. **`%` and `_` were live LIKE wildcards** on the substring path — found
+   while fixing the above, not reported. Searching `100%` matched every body
+   containing `100` followed by anything. `_like_term()` escapes them.
+8. **The viewer was readable by DNS rebinding.** Binding `127.0.0.1` stops a
+   remote *socket*; it does nothing about a page the user is merely visiting
+   resolving its own hostname to loopback and then reading the API
+   same-origin, from the user's own browser. Reproduced with `Host:
+   attacker.example` returning 200 and the JSON. The `Host` header is now
+   checked against a loopback allow-list before any route is dispatched.
+9. **An id-less mail message was keyed by its filename.** Mail moves inbox →
+   archive as its normal life, and the move may rename; the same message then
+   filed twice. Reproduced. Keyed by a SHA-256 of `from/to/sent_at/text`
+   instead — the content cannot move.
+10. **`--port abc` raised `ValueError`** out of the CLI instead of failing
+    cleanly. Now a `die()` with the value quoted, plus a 1..65535 range check.
+
+**The review's most useful finding was about the tests, not the code.** The
+existing fuzz tests asserted only that no exception escaped and that HTTP was
+200 — which defect 6 satisfies perfectly. They were the "unfalsifiable by its
+input" shape in a third form: falsifiable in principle, but scored against an
+assertion too weak to see the bug. Both now assert the returned rows.
+

@@ -92,19 +92,30 @@ subscribed to: the ask was for what was said, not how it was arrived at.
 Capture is off when `COPILOT_CONVERSATION_CAPTURE_DISABLE=1`, checked before
 any hook is registered.
 
-### FR-7 — Search survives the input
+### FR-7 — Search survives the input, and filters
 
 `_fts_query` quotes and ANDs every token, because searching for `--force`, for
 `a"b`, or for `C:\path\to.py` is the normal case and each is an FTS5 syntax
-error unquoted. Where FTS5 is unavailable the store falls back to substring
-matching and `search_mode()` *reports which* — a silently degraded search
-returns fewer rows and looks exactly like a quiet week.
+error unquoted.
+
+A search that is *all* punctuation — `(`, `*`, `-->` — tokenises to nothing
+under FTS5. Such a search takes the substring path rather than dropping the
+predicate: a search that silently returns every row is worse than one that
+returns none, because an unfiltered list reads as an answer. `_like_term`
+escapes `%` and `_`, which are LIKE's own wildcards.
+
+Where FTS5 is unavailable the store falls back to substring matching and
+`search_mode()` *reports which* — a silently degraded search returns fewer
+rows and looks exactly like a quiet week.
 
 ### FR-8 — The viewer is local only
 
-`conversation_viewer.serve()` binds `127.0.0.1`. The store holds every word a
-human has typed to an agent on this machine; it is not to be reachable from
-the network.
+`conversation_viewer.serve()` binds `127.0.0.1`, and every request's `Host`
+header must name loopback. The bind stops a remote socket; the header check
+stops DNS rebinding, where a page the user is merely visiting resolves its own
+hostname to `127.0.0.1` and reads the API same-origin from the user's own
+browser. The store holds every word a human has typed to an agent on this
+machine, so both halves are needed.
 
 ## Non-goals
 

@@ -179,3 +179,61 @@ def test_a_concurrent_request_does_not_reuse_one_connection(server):
         t.join(timeout=15)
     assert not errors
     assert results == [200] * 8
+
+
+# --- Findings from adversarial review --------------------------------------
+
+def _with_host(base, path, host):
+    """A request that reaches loopback while *claiming* another hostname.
+
+    That is exactly the shape of a DNS-rebinding read: the socket is local,
+    the Host header is not.
+    """
+    request = urllib.request.Request(base + path)
+    request.add_header("Host", host)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8")
+
+
+def test_a_foreign_host_header_is_refused(server):
+    """Binding 127.0.0.1 stops a remote *socket*. It does nothing about a page
+    the user is merely visiting resolving its own hostname to loopback and
+    then reading this API, same-origin, from the user's own browser -- every
+    word they have typed to an agent, from a tab they did not know was
+    hostile."""
+    status, body = _with_host(server, "/api/messages", "attacker.example")
+    assert status == 403, body
+    assert "source" not in body, "the refusal leaked rows"
+
+
+def test_the_host_guard_lets_the_real_client_through(server):
+    """Positive control. A guard that refuses everything would pass the test
+    above while making the viewer useless, and nothing else would say so."""
+    host = server.split("//", 1)[1]
+    assert _with_host(server, "/api/messages", host)[0] == 200
+    assert _with_host(server, "/api/messages", "localhost:1")[0] == 200
+    assert _with_host(server, "/", "127.0.0.1")[0] == 200
+
+
+def test_an_ipv6_loopback_host_survives_the_port_being_stripped(server):
+    """`[::1]:8765` is full of colons, so stripping the port by splitting on
+    one would mangle it into something the allow-list rejects -- locking a
+    legitimate user out rather than letting an attacker in."""
+    assert _with_host(server, "/api/summary", "[::1]:8765")[0] == 200
+    assert _with_host(server, "/api/summary", "[::1]")[0] == 200
+
+
+def test_a_punctuation_search_filters_rather_than_returning_everything(server):
+    """The viewer's own fuzz test asserted only HTTP 200, which the bug --
+    every row returned for a search of `(` -- satisfies perfectly."""
+    rows = get_json(server, "/api/messages?search=%28")
+    bodies = [r["body"] for r in rows]
+    assert bodies == ["Yes, on (source, source_id)."], bodies
+
+
+def test_the_viewer_punctuation_guard_can_fail(server):
+    """Positive control: punctuation present in no body returns no rows."""
+    assert get_json(server, "/api/messages?search=%7B") == []
