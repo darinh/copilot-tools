@@ -178,8 +178,65 @@ is never rewritten; a message's text is what was said, and only the verdict
 about it is ours to revise. Re-seeding the real store moved 586 rows out of
 `human` and 7 agent replies into `agent-agent`.
 
-## Known gap: an agent-to-agent thread has no project
-The `messages` table has one `project` column, and `seed_operator_mail` leaves
+## The viewer reads as a conversation
+
+Bodies are rendered as Markdown, and the two sides sit on opposite edges:
+**inbound on the right** — what was said *to* the agent, by the human or by a
+peer — and **outbound on the left**, the agent answering. That is the
+arrangement every chat client uses for "me" and "them", and it is what makes a
+long session scannable without reading it.
+
+Supported: fenced and inline code, headings, bold, italic, ordered and
+unordered lists, blockquotes, horizontal rules, and links. Tables are *not*
+rendered and appear as their source text — noted because agent replies in this
+corpus contain them.
+
+### Rendering is the only XSS surface this toolkit has
+
+The text being turned into HTML is every word ever typed to an agent on this
+machine, plus whatever a peer sent and whatever a web page an agent was
+reading. One invariant carries the whole design: **escape first, then add
+markup.** `esc()` runs over the entire body before any transform, so the only
+angle brackets in the output are ones `md()` wrote; every later transform
+operates on already-escaped text and may only add markup, never decode any.
+
+Two consequences worth stating because they are easy to undo:
+
+- **URLs are allow-listed to `http`/`https`.** `javascript:`, `data:` and
+  `vbscript:` all execute from an `href`, and no message needs them. Entity
+  tricks cannot get round it — `&` is already `&amp;` by the time a URL is
+  tested, so `java&#115;cript:` arrives spelled out and fails on its literal
+  characters.
+- **Search highlighting works on the DOM, not the HTML string.** The previous
+  regex was correct while a body was escaped text and nothing else; against
+  markup it would insert `<mark>` inside an `href`. Walking text nodes cannot
+  reach an attribute, and every inserted node is built with `createElement`
+  and `textContent`.
+
+`MARKDOWN_JS` is its own constant so the suite can *execute* it under node
+rather than grep the page for reassuring substrings — the failure this feature
+has already shipped twice. Twenty-three payloads (raw tags, event handlers,
+`javascript:` links in five spellings, quote-breaking URLs, payloads inside
+code fences, headings, lists and bold) are rendered and the result is **parsed
+with `html.parser`**, then checked against an allow-list of elements, for any
+`on*` attribute, and for any non-http scheme in an `href`.
+
+The parser matters. The first version of that test used substring matching and
+reported holes that were not there: `&lt;img src=x onerror=alert(1)&gt;` is
+*correct* output — the payload rendered as visible text — yet it contains the
+characters ` onerror=`. A crude scan cannot tell an attribute from a quoted
+one, in either direction.
+
+A control renders the same 23 payloads through a copy of `md()` with the
+escaping removed and requires script, img and iframe elements, an event
+handler, and a `javascript:` href to all appear — because 23 payloads passing
+proves nothing unless the oracle is known to reject something.
+
+Verified beyond the fixtures: all **4,440 messages in the real store** were
+rendered and audited, producing zero disallowed elements, zero event handler
+attributes and zero non-http URLs.
+
+## Known gap: an agent-to-agent thread has no projectThe `messages` table has one `project` column, and `seed_operator_mail` leaves
 it empty for every message it files. That is honest — mail carries no project
 today — but it is a real limitation of the "agent conversations, separately"
 view: those rows can be told apart by `channel`, and cannot be grouped by

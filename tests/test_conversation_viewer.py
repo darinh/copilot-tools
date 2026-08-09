@@ -9,10 +9,16 @@ direct call skips exactly that.
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import subprocess
+import tempfile
 import threading
 import urllib.error
 import urllib.request
+from html.parser import HTMLParser
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -403,3 +409,265 @@ def test_a_wildcard_bind_with_allowed_hosts_does_not_warn(tmp_path, capsys,
                  allow_hosts=["desktop.local"])
     out = capsys.readouterr().out
     assert "--allow-host" not in out, out
+
+
+# --------------------------------------------------------------------------
+# Markdown rendering: the XSS boundary, executed
+# --------------------------------------------------------------------------
+#
+# This page turns stored text into HTML, and the stored text is every word
+# ever typed to an agent on this machine -- including whatever a peer agent
+# sent and whatever a web page an agent was reading said. That makes `md()`
+# the only place in the toolkit where hostile input meets an HTML sink.
+#
+# So it is run, not read. Grepping `conversation_viewer.py` for reassuring
+# substrings is the exact failure this feature has already shipped twice: a
+# test that scores the source instead of the behaviour.
+
+needs_node = pytest.mark.skipif(shutil.which("node") is None,
+                                reason="node is not installed")
+
+
+def _render(payloads, source=None):
+    """Run the page's real `md()` over each payload under node."""
+    js = (source if source is not None else viewer.MARKDOWN_JS)
+    with tempfile.TemporaryDirectory() as tmp:
+        mod = Path(tmp) / "md.mjs"
+        mod.write_text(js + "\nexport { md, esc };\n", encoding="utf-8")
+        driver = Path(tmp) / "run.mjs"
+        driver.write_text(
+            "import { md } from %s;\n"
+            "const inputs = JSON.parse(process.argv[2]);\n"
+            "process.stdout.write(JSON.stringify(inputs.map(md)));\n"
+            % json.dumps(mod.as_uri()), encoding="utf-8")
+        proc = subprocess.run(
+            ["node", str(driver), json.dumps(list(payloads))],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace")
+        assert proc.returncode == 0, proc.stderr
+        return json.loads(proc.stdout)
+
+
+#: Every one of these is a real way to get script into a page that renders
+#: user text. They are the point of the test file.
+XSS = [
+    "<script>alert(1)</script>",
+    "<img src=x onerror=alert(1)>",
+    "<svg/onload=alert(1)>",
+    "<iframe src=javascript:alert(1)></iframe>",
+    "[click](javascript:alert(1))",
+    "[click](JaVaScRiPt:alert(1))",
+    "[click](java\tscript:alert(1))",
+    "[click](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)",
+    "[click](vbscript:msgbox(1))",
+    "[click](java&#115;cript:alert(1))",
+    '[x](https://ok" onmouseover="alert(1))',
+    "[x](https://ok') onmouseover=alert(1) foo='",
+    "`<script>alert(1)</script>`",
+    "```\n<script>alert(1)</script>\n```",
+    "> <script>alert(1)</script>",
+    "- <img src=x onerror=alert(1)>",
+    "# <script>alert(1)</script>",
+    "**<script>alert(1)</script>**",
+    "<a href=\"javascript:alert(1)\">x</a>",
+    "<<script>script>alert(1)<</script>/script>",
+    "<body onload=alert(1)>",
+    "<style>@import'evil'</style>",
+    "<meta http-equiv=refresh content=0;url=javascript:alert(1)>",
+]
+
+
+#: Tags that can execute or fetch. `md` is only ever allowed to emit
+#: formatting, so the safe set is an allow-list and everything else is a
+#: finding -- naming the dangerous ones instead would pass the first tag
+#: nobody thought of.
+ALLOWED_TAGS = frozenset({
+    "p", "br", "h3", "h4", "h5", "h6", "ul", "ol", "li", "blockquote", "hr",
+    "code", "pre", "strong", "em", "a", "mark"})
+
+SAFE_SCHEMES = ("http://", "https://")
+
+
+class _Audit(HTMLParser):
+    """What a browser would actually build from the rendered string.
+
+    A substring scan is the wrong oracle here and the first draft of this
+    file used one. `&lt;img src=x onerror=alert(1)&gt;` is *correct* output --
+    the payload rendered as visible text -- but it contains the characters
+    ` onerror=`, so a regex looking for an event handler reports a hole that
+    is not there. Worse, the same crudeness fails in the other direction: it
+    cannot tell an `href` from the word "javascript:" in a sentence, so a
+    real finding and a quoted one look identical.
+
+    Parsing answers the question actually being asked: which elements exist,
+    and what are their attributes.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tags = []
+        self.attrs = []
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append(tag)
+        self.attrs.extend((tag, k, v or "") for k, v in attrs)
+
+    handle_startendtag = handle_starttag
+
+
+def _audit(html):
+    parser = _Audit()
+    parser.feed(html)
+    parser.close()
+    return parser
+
+
+@needs_node
+@pytest.mark.parametrize("payload", XSS)
+def test_markdown_never_emits_an_executable_construct(payload):
+    """The whole security case, one payload at a time.
+
+    `esc` runs over the entire body before any transform, so the only angle
+    brackets in the output are ones this code wrote. Everything here must
+    come back as visible text.
+    """
+    html = _render([payload])[0]
+    found = _audit(html)
+    assert not set(found.tags) - ALLOWED_TAGS, (found.tags, html)
+    for tag, name, value in found.attrs:
+        assert not name.lower().startswith("on"), (tag, name, html)
+        if name.lower() in ("href", "src", "action", "formaction", "data"):
+            assert value.lower().startswith(SAFE_SCHEMES), (name, value, html)
+
+
+@needs_node
+def test_the_xss_assertions_can_fail():
+    """Positive control, and the one this file cannot do without.
+
+    Twenty-three payloads all passing proves nothing unless the assertions
+    are known to reject something. This runs the same corpus through a
+    renderer with the escaping removed and requires every check above to
+    fire at least once.
+    """
+    broken = viewer.MARKDOWN_JS.replace(
+        'const esc = s => String(s).replace(/[&<>"\']/g, c => ({',
+        "const esc = s => String(s); const _unused = (c => ({")
+    assert broken != viewer.MARKDOWN_JS, "the mutation did not apply"
+
+    tags, handlers, schemes = set(), [], []
+    for html in _render(XSS, source=broken):
+        found = _audit(html)
+        tags |= set(found.tags)
+        for tag, name, value in found.attrs:
+            if name.lower().startswith("on"):
+                handlers.append((tag, name))
+            if name.lower() in ("href", "src") and not value.lower().startswith(
+                    SAFE_SCHEMES):
+                schemes.append(value)
+    assert "script" in tags, tags
+    assert "img" in tags, tags
+    assert "iframe" in tags, tags
+    assert handlers, "no event-handler attribute was produced"
+    assert any("javascript:" in v.lower() for v in schemes), schemes
+
+
+@needs_node
+def test_a_safe_link_is_still_a_link():
+    """Positive control for the URL allow-list: refusing everything would
+    pass every assertion above and make the feature pointless."""
+    html = _render(["see [the docs](https://example.com/a?b=1&c=2)"])[0]
+    assert '<a href="https://example.com/a?b=1&amp;c=2"' in html, html
+    assert ">the docs</a>" in html, html
+    assert 'rel="noreferrer noopener"' in html, html
+
+
+@needs_node
+def test_a_bare_url_is_linked_once_and_only_once():
+    """The two link forms run in one pass precisely so the bare-URL rule
+    cannot find the URL inside the href the markdown rule just wrote."""
+    html = _render(["ref https://example.com/x and [y](https://example.com/y)"])[0]
+    assert html.count("<a href=") == 2, html
+    assert "href=\"<a" not in html, html
+
+
+@needs_node
+@pytest.mark.parametrize("body,expected", [
+    ("plain words", "<p>plain words</p>"),
+    ("# Title", "<h3>Title</h3>"),
+    ("## Sub", "<h4>Sub</h4>"),
+    ("- one\n- two", "<ul><li>one</li><li>two</li></ul>"),
+    ("1. one\n2. two", "<ol><li>one</li><li>two</li></ol>"),
+    ("> quoted", "<blockquote>quoted</blockquote>"),
+    ("---", "<hr>"),
+    ("**bold**", "<p><strong>bold</strong></p>"),
+    ("*italic*", "<p><em>italic</em></p>"),
+    ("`code`", "<p><code>code</code></p>"),
+    ("a\nb", "<p>a<br>b</p>"),
+])
+def test_markdown_renders_what_it_should(body, expected):
+    """The feature itself. Without these the security tests above are
+    satisfied by a renderer that outputs nothing at all."""
+    assert _render([body])[0] == expected
+
+
+@needs_node
+def test_a_fenced_block_keeps_its_contents_verbatim():
+    html = _render(["```python\nif a < b:\n    x = '**not bold**'\n```"])[0]
+    assert html.startswith("<pre><code>"), html
+    assert "if a &lt; b:" in html, html
+    assert "<strong>" not in html, "markdown was applied inside a code fence"
+
+
+@needs_node
+def test_the_renderer_survives_the_shapes_the_corpus_actually_contains():
+    """Nothing here may throw: a body that crashes the renderer empties the
+    whole list, and the corpus is 4,000 messages of unconstrained text."""
+    odd = ["", "```", "```\nunclosed", "[", "](", "*", "#", ">", "- ",
+           "\u0000F0\u0000", "a" * 20000, "\n\n\n", "![img](x)",
+           "|a|b|\n|-|-|\n|1|2|"]
+    rendered = _render(odd)
+    assert len(rendered) == len(odd)
+    for html in rendered:
+        assert "<script" not in html.lower()
+
+
+@needs_node
+def test_a_sentinel_in_the_body_cannot_forge_a_code_block():
+    """The NUL sentinel is safe only because no stored body can contain one.
+    That is a property of the store, so it is asserted against the store."""
+    assert "\x00" not in viewer.PAGE
+    # Stripped rather than assumed absent. SQLite stores a NUL in TEXT
+    # without complaint, so "no body can contain one" was a guess -- and a
+    # body that spelled the sentinel would have been handed another
+    # message's code block, or `undefined`.
+    rendered = _render(["\u0000F0\u0000 and ```real```"])[0]
+    assert "\u0000" not in rendered, rendered
+    assert "undefined" not in rendered, rendered
+    assert "<pre><code>real</code></pre>" in rendered, rendered
+
+
+def test_the_page_refuses_to_ship_with_its_javascript_missing():
+    """A silent miss renders every body as literal markdown and stops the
+    highlighter -- which reads as a styling regression until somebody puts a
+    <script> in a message. Failing to substitute must be louder than that."""
+    with pytest.raises(viewer.ConversationViewerError):
+        viewer._assemble(template="<html>no placeholders</html>")
+
+
+def test_the_assembled_page_carries_both_blocks():
+    """Positive control for the guard above."""
+    assert "function md(" in viewer.PAGE
+    assert "function markMatches(" in viewer.PAGE
+    assert "/*MARKDOWN_JS*/" not in viewer.PAGE
+
+
+# --------------------------------------------------------------------------
+# Chat layout
+# --------------------------------------------------------------------------
+
+def test_inbound_is_placed_on_the_right_and_outbound_on_the_left():
+    """What was said *to* the agent sits where a chat client puts the person
+    typing; the agent's answer sits opposite."""
+    assert 'm.direction === "inbound" ? "in" : "out"' in viewer.PAGE
+    assert ".row.in{justify-content:flex-end}" in viewer.PAGE
+    assert ".row.out{justify-content:flex-start}" in viewer.PAGE

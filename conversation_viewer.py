@@ -23,7 +23,178 @@ from urllib.parse import parse_qs, urlparse
 
 import conversation_log as clog
 
-PAGE = """<!doctype html>
+#: Markdown rendering, and the search highlighter.
+#:
+#: Its own constant, and a raw string, for two reasons. The suite executes it
+#: under node against adversarial input -- a renderer that turns text into HTML
+#: is the only XSS surface this page has, and the text it renders is every word
+#: ever typed to an agent on this machine, including whatever a peer sent and
+#: whatever a web page an agent read said. Scoring that boundary by grepping the
+#: page source would be the same defect this feature has already shipped twice:
+#: a test that reads code instead of running it.
+#:
+#: The raw string is so the regexes here mean what they say. The surrounding
+#: page is an ordinary triple-quoted string where every backslash is doubled,
+#: and a security-critical character class is the last place to spend attention
+#: on that.
+#:
+#: The invariant everything below rests on: **escape first, then add markup.**
+#: `esc` runs over the whole body before any transform, so `<` and `>` from the
+#: message can never become tags -- the only angle brackets in the output are
+#: ones this code wrote. Every transform after that operates on already-escaped
+#: text and may only add markup, never decode any.
+MARKDOWN_JS = r"""
+const esc = s => String(s).replace(/[&<>"']/g, c => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+
+// The one place a URL from the message reaches an attribute. Anything not
+// http(s) is left as literal text: `javascript:`, `data:` and `vbscript:` all
+// execute from an href, and no message in a conversation log needs them.
+// Entity tricks cannot get round this, because `esc` has already turned `&`
+// into `&amp;`, so a `java&#115;cript:` in the source arrives here spelled
+// `java&amp;#115;cript:` and fails the test on its literal characters.
+const SAFE_URL = /^https?:\/\//i;
+
+function anchor(url, text){
+  return '<a href="' + url + '" target="_blank" rel="noreferrer noopener">'
+       + text + "</a>";
+}
+
+function mdInline(s){
+  s = s.replace(/`([^`\n]+)`/g, (m, code) => "<code>" + code + "</code>");
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[^\w*])\*([^*\n]+)\*(?!\w)/g, "$1<em>$2</em>");
+  s = s.replace(/(^|[^\w_])_([^_\n]+)_(?!\w)/g, "$1<em>$2</em>");
+  // Markdown links and bare URLs in ONE pass. Two passes would find the URL
+  // inside the href the first pass just wrote and wrap it again.
+  s = s.replace(
+    /\[([^\]\n]*)\]\(([^)\s]+)\)|(^|[\s(])(https?:\/\/[^\s<>()]+)/gi,
+    (m, text, url, pre, bare) => {
+      if(url !== undefined)
+        return SAFE_URL.test(url) ? anchor(url, text || url) : m;
+      return pre + anchor(bare, bare);
+    });
+  return s;
+}
+
+function md(text){
+  // Fenced code comes out first and goes back last, so nothing inside a code
+  // block is ever read as markdown. A NUL sentinel is used because no message
+  // needs one -- and any NUL the body does contain is removed here, so a body
+  // cannot spell a sentinel and claim another message's code block.
+  const fences = [];
+  let s = String(text == null ? "" : text).replace(/\u0000/g, "").replace(
+    // The info string (```python) is optional and may not contain a backtick.
+    // Without both of those, a single-line ```code``` had its content eaten:
+    // `[^\n]*` is happy to swallow `code``` as the language name, and the
+    // block came back empty.
+    /```(?:[^\n`]*\n)?([\s\S]*?)```/g, (m, code) => {
+      fences.push(code);
+      return "\u0000F" + (fences.length - 1) + "\u0000";
+    });
+  s = esc(s);
+
+  const out = [];
+  let para = [], list = null;
+  const flushPara = () => {
+    if(para.length){
+      out.push("<p>" + mdInline(para.join("\n")).replace(/\n/g, "<br>")
+               + "</p>");
+      para = [];
+    }
+  };
+  const flushList = () => { if(list){ out.push("</" + list + ">"); list = null; } };
+
+  for(const line of s.split("\n")){
+    let m = line.match(/^\u0000F(\d+)\u0000$/);
+    if(m){
+      flushPara(); flushList();
+      out.push("<pre><code>" + esc(fences[Number(m[1])]) + "</code></pre>");
+      continue;
+    }
+    if(!line.trim()){ flushPara(); flushList(); continue; }
+    if((m = line.match(/^(#{1,6})\s+(.*)$/))){
+      flushPara(); flushList();
+      // Shifted down two levels: a message is not the page, and an <h1> from
+      // somebody's pasted README should not outrank the viewer's own heading.
+      const n = Math.min(m[1].length + 2, 6);
+      out.push("<h" + n + ">" + mdInline(m[2]) + "</h" + n + ">");
+      continue;
+    }
+    if(/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)){
+      flushPara(); flushList(); out.push("<hr>"); continue;
+    }
+    // `&gt;` rather than `>`: this runs on escaped text.
+    if((m = line.match(/^\s*&gt;\s?(.*)$/))){
+      flushPara(); flushList();
+      out.push("<blockquote>" + mdInline(m[1]) + "</blockquote>");
+      continue;
+    }
+    if((m = line.match(/^\s*[-*+]\s+(.*)$/))){
+      flushPara();
+      if(list !== "ul"){ flushList(); out.push("<ul>"); list = "ul"; }
+      out.push("<li>" + mdInline(m[1]) + "</li>");
+      continue;
+    }
+    if((m = line.match(/^\s*\d+[.)]\s+(.*)$/))){
+      flushPara();
+      if(list !== "ol"){ flushList(); out.push("<ol>"); list = "ol"; }
+      out.push("<li>" + mdInline(m[1]) + "</li>");
+      continue;
+    }
+    flushList();
+    para.push(line);
+  }
+  flushPara(); flushList();
+
+  // A fence that opened mid-line leaves its sentinel inside a paragraph.
+  // Restored here so it renders as code rather than as a NUL byte.
+  return out.join("").replace(/\u0000F(\d+)\u0000/g,
+    (m, i) => "<pre><code>" + esc(fences[Number(i)]) + "</code></pre>");
+}
+"""
+
+#: Search highlighting, applied to the DOM rather than to the HTML string.
+#:
+#: The old version ran a regex over escaped text, which was correct while the
+#: body was escaped text and nothing else. Against rendered markup it would
+#: insert `<mark>` in the middle of `<a href="...">` and corrupt the attribute
+#: it landed in. Walking text nodes cannot reach a tag or an attribute at all,
+#: and every inserted node is built with `createElement`/`textContent`, so the
+#: highlighter has no path to producing HTML from the search term either.
+HIGHLIGHT_JS = r"""
+function markMatches(root, term){
+  const parts = String(term || "").split(/[^\w]+/).filter(Boolean).map(
+    t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if(!parts.length) return;
+  const re = new RegExp("(" + parts.join("|") + ")", "gi");
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const targets = [];
+  while(walker.nextNode()) targets.push(walker.currentNode);
+  for(const node of targets){
+    const text = node.nodeValue;
+    re.lastIndex = 0;
+    if(!re.test(text)) continue;
+    re.lastIndex = 0;
+    const frag = document.createDocumentFragment();
+    let last = 0, m;
+    while((m = re.exec(text)) !== null){
+      if(m[0].length === 0){ re.lastIndex++; continue; }
+      if(m.index > last)
+        frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const mk = document.createElement("mark");
+      mk.textContent = m[0];
+      frag.appendChild(mk);
+      last = m.index + m[0].length;
+    }
+    if(last < text.length)
+      frag.appendChild(document.createTextNode(text.slice(last)));
+    node.parentNode.replaceChild(frag, node);
+  }
+}
+"""
+
+_PAGE_TEMPLATE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Conversations</title>
@@ -56,25 +227,59 @@ gap:8px;flex-wrap:wrap;align-items:center}
 input,select{background:#20242e;color:var(--fg);border:1px solid var(--line);
 border-radius:6px;padding:7px 9px;font:inherit}
 input[type=search]{flex:1;min-width:180px}
-#list{overflow-y:auto;padding:12px 16px;flex:1}
-.msg{border:1px solid var(--line);border-left-width:3px;border-radius:7px;
-padding:9px 12px;margin-bottom:9px;background:var(--panel)}
-.msg.human{border-left-color:var(--human)}
-.msg.agent{border-left-color:var(--agent)}
-.msg.system{border-left-color:var(--system)}
-.msg.mail{border-left-color:var(--mail)}
+#list{overflow-y:auto;padding:14px 16px;flex:1;display:flex;
+flex-direction:column;gap:10px}
+.row{display:flex;width:100%}
+.row.out{justify-content:flex-start}
+.row.in{justify-content:flex-end}
+.msg{border:1px solid var(--line);border-left-width:3px;border-radius:10px;
+padding:9px 12px;background:var(--panel);max-width:min(80ch,78%);min-width:0}
+/* Inbound sits on the right, so its coloured edge belongs on the right too --
+   a left border on a right-aligned bubble points at nothing. */
+.row.in .msg{border-left-width:1px;border-right-width:3px;
+background:#1b2231;border-radius:10px 10px 2px 10px}
+.row.out .msg{border-radius:10px 10px 10px 2px}
+.msg.human{border-left-color:var(--human);border-right-color:var(--human)}
+.msg.agent{border-left-color:var(--agent);border-right-color:var(--agent)}
+.msg.system{border-left-color:var(--system);border-right-color:var(--system)}
+.msg.mail{border-left-color:var(--mail);border-right-color:var(--mail)}
 .meta{font-size:11px;color:var(--dim);display:flex;gap:9px;flex-wrap:wrap;
 margin-bottom:5px;align-items:center}
+.row.in .meta{justify-content:flex-end}
 .who{font-weight:600;color:var(--fg)}
 .tag{background:#20242e;border:1px solid var(--line);border-radius:4px;
 padding:0 5px;font-size:10px;text-transform:uppercase;letter-spacing:.05em}
 .q{color:#151821;background:var(--mail);border-radius:4px;padding:0 5px;
 font-size:10px;font-weight:700}
-.body{white-space:pre-wrap;word-break:break-word;font-size:13px;
+.body{word-break:break-word;overflow-wrap:anywhere;font-size:13px;
 max-height:19em;overflow:hidden;position:relative}
 .body.open{max-height:none}
+/* Rendered markdown. Margins are collapsed at the edges so a bubble whose
+   body is a single paragraph is not padded twice. */
+.body>*:first-child{margin-top:0}
+.body>*:last-child{margin-bottom:0}
+.body p{margin:0 0 .55em}
+.body h3,.body h4,.body h5,.body h6{margin:.7em 0 .35em;font-size:13px;
+line-height:1.3}
+.body h3{font-size:15px}
+.body h4{font-size:14px}
+.body ul,.body ol{margin:.3em 0 .6em;padding-left:1.4em}
+.body li{margin:.15em 0}
+.body blockquote{margin:.4em 0;padding:.1em 0 .1em .7em;
+border-left:2px solid var(--line);color:var(--dim)}
+.body hr{border:0;border-top:1px solid var(--line);margin:.7em 0}
+.body code{background:#0b0d12;border:1px solid var(--line);border-radius:4px;
+padding:.05em .35em;font:12px/1.4 ui-monospace,"Cascadia Mono",Consolas,
+monospace}
+.body pre{background:#0b0d12;border:1px solid var(--line);border-radius:6px;
+padding:8px 10px;margin:.5em 0;overflow-x:auto}
+.body pre code{background:none;border:0;padding:0;white-space:pre;
+display:block}
+.body a{color:var(--human)}
+.body strong{color:#fff}
 .more{color:var(--human);cursor:pointer;font-size:12px;
 display:inline-block;margin-top:4px}
+.row.in .more{float:right}
 .empty,.note{color:var(--dim);padding:14px 0}
 .note{color:var(--warn);font-size:12px}
 mark{background:#5a4a00;color:#ffe9a8;border-radius:2px}
@@ -117,17 +322,7 @@ mark{background:#5a4a00;color:#ffe9a8;border-radius:2px}
 const S = {channel:"", project:"", day:"", q:"", actor:"", direction:"",
            asks:false};
 const $ = s => document.querySelector(s);
-const esc = s => s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
-
-function highlight(text, term){
-  const safe = esc(text);
-  if(!term.trim()) return safe;
-  const parts = term.split(/[^\\w]+/).filter(Boolean).map(
-    t => t.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&"));
-  if(!parts.length) return safe;
-  return safe.replace(new RegExp("(" + parts.join("|") + ")", "gi"),
-                      "<mark>$1</mark>");
-}
+/*MARKDOWN_JS*//*HIGHLIGHT_JS*/
 
 async function get(path, params){
   const u = new URL(path, location.origin);
@@ -187,6 +382,11 @@ async function load(){
     const who = m.actor === "human" ? "you"
               : m.actor === "system" ? "operator preamble"
               : (m.sender || (m.direction === "outbound" ? "agent" : "agent"));
+    // Inbound is what was said *to* the agent, so it sits on the right, the
+    // side a chat client gives the person doing the typing. Outbound is the
+    // agent answering, on the left.
+    const row = document.createElement("div");
+    row.className = "row " + (m.direction === "inbound" ? "in" : "out");
     const div = document.createElement("div");
     div.className = "msg " + kind;
     const bits = ["<span class='who'>" + esc(who) + "</span>"];
@@ -198,15 +398,20 @@ async function load(){
     bits.push("<span class='tag'>" + esc(m.source) + "</span>");
     const long = m.body.length > 1400;
     div.innerHTML = "<div class='meta'>" + bits.join("") .replace(/><s/g,"> <s")
-      + "</div><div class='body'>" + highlight(m.body, S.q) + "</div>"
+      + "</div><div class='body'>" + md(m.body) + "</div>"
       + (long ? "<span class='more'>show all</span>" : "");
+    const b = div.querySelector(".body");
+    // After the markup exists, and against the DOM: a regex over rendered
+    // HTML would happily put a <mark> inside an href.
+    if(S.q.trim()) markMatches(b, S.q);
     if(long){
-      const b = div.querySelector(".body"), t = div.querySelector(".more");
+      const t = div.querySelector(".more");
       t.onclick = () => { b.classList.toggle("open");
                           t.textContent = b.classList.contains("open")
                                         ? "show less" : "show all"; };
     }
-    list.appendChild(div);
+    row.appendChild(div);
+    list.appendChild(row);
   }
 }
 
@@ -237,6 +442,33 @@ $("#clear").onclick = () => {
 refreshSidebar(); load();
 </script></body></html>
 """
+
+
+def _assemble(template: str = "", markdown: str = "",
+              highlight: str = "") -> str:
+    """Put the JavaScript into the page, and refuse to ship it if it missed.
+
+    Both placeholders are checked rather than assumed. A silent miss is not a
+    broken page -- it is a page whose bodies render as literal markdown and
+    whose search stops highlighting, which looks like a styling regression and
+    reads as one for as long as nobody tries a `<script>` in a message. The
+    substitution failing must be louder than the feature degrading.
+    """
+    page = template or _PAGE_TEMPLATE
+    for token, block in (("/*MARKDOWN_JS*/", markdown or MARKDOWN_JS),
+                         ("/*HIGHLIGHT_JS*/", highlight or HIGHLIGHT_JS)):
+        if token not in page:
+            raise ConversationViewerError(
+                f"the page template no longer contains {token}")
+        page = page.replace(token, block)
+    return page
+
+
+class ConversationViewerError(RuntimeError):
+    """The page could not be assembled."""
+
+
+PAGE = _assemble()
 
 
 class _Handler(BaseHTTPRequestHandler):
