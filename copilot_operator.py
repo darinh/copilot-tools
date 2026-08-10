@@ -2661,6 +2661,29 @@ def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
     ls`` said nothing, and the output was byte-identical to a machine on
     which every supervisor was current.
     """
+    payload, unusable = _read_loop_record(instance)
+    if payload is None:
+        return unusable, []
+    return _compare_recorded_files(payload.get("files"))
+
+
+def _read_loop_record(instance: Instance) -> "tuple[dict | None, str]":
+    """The supervisor's startup record, or why it could not be had.
+
+    Returns ``(payload, "")`` when the record was read, and
+    ``(None, verdict)`` otherwise, where the verdict distinguishes
+    ``CODE_UNRECORDED`` -- observed absent -- from ``CODE_UNKNOWN``, which is
+    "nobody could look". Keeping those apart is the whole reason this
+    function exists rather than a ``try/except`` at each call site: collapsing
+    them is the defect that made `operator ls` silent for the entire
+    population it was built for, and a second reader that re-derived the
+    distinction would be free to get it wrong again.
+
+    Two questions are asked of this one record -- *which code did the
+    supervisor load* (`loop_code_state`) and *when did it start*
+    (`loop_started_at`) -- and they are printed on the same row, so they must
+    not disagree about whether the record exists.
+    """
     try:
         raw = instance.loop_code_file.read_text(encoding="utf-8")
     except (FileNotFoundError, NotADirectoryError):
@@ -2668,17 +2691,17 @@ def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
         # parent is a file. Distinguished from the denial below because they
         # support different claims -- this one says the supervisor never
         # recorded, that one says nobody could look.
-        return CODE_UNRECORDED, []
+        return None, CODE_UNRECORDED
     except (OSError, ValueError):
         # Something is there and could not be read (a denial, a directory in
         # its place, bytes that are not UTF-8). "Cannot tell" is the only
         # honest answer, and it must not borrow the confidence of the branch
         # above.
-        return CODE_UNKNOWN, []
+        return None, CODE_UNKNOWN
     try:
         payload = json.loads(raw)
     except ValueError:
-        return CODE_UNKNOWN, []
+        return None, CODE_UNKNOWN
     if not isinstance(payload, dict):
         # Valid JSON that is not an object -- `null`, `[]`, a bare string.
         # `json.loads` raises nothing for these, so the guard above lets them
@@ -2686,8 +2709,32 @@ def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
         # taking down the status command for every instance over one damaged
         # file belonging to one. A record we cannot read is the same answer as
         # a record that is not there.
-        return CODE_UNKNOWN, []
-    return _compare_recorded_files(payload.get("files"))
+        return None, CODE_UNKNOWN
+    return payload, ""
+
+
+def loop_started_at(instance: Instance) -> "str | None":
+    """When the *running supervisor process* started, or ``None``.
+
+    Not the same question as ``RUN_STARTED``, and that difference is the
+    point. ``RUN_STARTED`` is persisted in the state file and deliberately
+    carried across supervisor restarts (`launch_loop` reads it back with
+    ``state.get("RUN_STARTED", run_started)``), so it describes the *run*.
+    The supervisor is a process, and a process that died and was relaunched
+    is a new one with the same run behind it.
+
+    `_save_loop_code` already stamps ``recorded`` at startup, so this needs no
+    new state -- only a reader. It was measurable all along and nothing looked.
+
+    Returns ``None`` when the record is absent or unreadable, which the caller
+    must treat as "cannot tell" rather than "did not restart". A missing
+    record is already reported in its own right by `loop_code_state`.
+    """
+    payload, _ = _read_loop_record(instance)
+    if payload is None:
+        return None
+    recorded = payload.get("recorded")
+    return recorded if isinstance(recorded, str) and recorded else None
 
 
 def _compare_recorded_files(files: object) -> "tuple[str, list[str]]":
@@ -3126,6 +3173,28 @@ def list_instances() -> int:
               "up the current code:")
         for name in unrecorded:
             print(f"    operator restart-loop {name}")
+    # No remedy line, deliberately: this reports something that has already
+    # happened rather than a state to correct, and offering a command would
+    # imply the restart is the problem instead of its evidence. What the
+    # reader needs is the meaning -- a supervisor that restarted took the
+    # session it was running with it, unfinished and unhanded-off.
+    restarted = [s["name"] for s in snaps
+                 if s["loop_pid"] and supervisor_restarted_after(
+                     s["run_started"], s.get("loop_started"))]
+    if restarted:
+        print("\nThese supervisors started later than the run they are "
+              "running, so they are not")
+        print("the process that began it. Whatever session each was running "
+              "at that moment died")
+        print("with it, mid-turn and without a handoff. `up` above dates the "
+              "run, which is kept")
+        print("across the restart, so it does not show this:")
+        for name in restarted:
+            print(f"    {name}")
+        print("Several at once means something killed them together — check "
+              "whether the logon")
+        print("session was replaced (Windows: TerminalServices-"
+              "LocalSessionManager event 21).")
     print("\nInspect: operator             (interactive: stats, join, stop)")
     print("Attach:  operator join <name>")
     print("Stop:    operator stop <name>")
@@ -5494,6 +5563,40 @@ def _age_since(stamp: str) -> str:
     return _fmt_elapsed((datetime.now(timezone.utc) - started).total_seconds())
 
 
+#: How much later than the run a supervisor must have started before the
+#: listing will call it a restart.
+#:
+#: A supervisor publishes its records *before* the first session of a run is
+#: launched, and ``RUN_STARTED`` is stamped by that launch -- so on a healthy
+#: fresh run the supervisor is a few seconds *older* than the run, never
+#: younger. Any positive margin therefore only has to clear write ordering,
+#: and the direction of the error is deliberate: too wide misses a restart
+#: that happened within five minutes of a run beginning, too narrow calls a
+#: perfectly ordinary startup a restart. The second is the one that matters,
+#: because a notice that is sometimes wrong stops being read -- which is how
+#: backlog 0001 got where it is.
+SUPERVISOR_RESTART_MARGIN = 5 * 60
+
+
+def supervisor_restarted_after(run_started: str, loop_started: "str | None") -> bool:
+    """Did this supervisor start materially later than the run it is running?
+
+    If so it is not the process that began the run: the original was replaced,
+    and every session in flight at that moment died with it.
+
+    Tri-state inputs collapse to ``False`` on purpose *and only* where ``False``
+    means "no claim made". An unreadable or absent record, or a run with no
+    recorded start, yields nothing to compare -- and the honest answer there is
+    silence, not "it did not restart". `loop_code_state` already reports a
+    missing record in its own right, so the reader is not left with nothing.
+    """
+    began = _parse_utc(run_started)
+    started = _parse_utc(loop_started or "")
+    if began is None or started is None:
+        return False
+    return (started - began).total_seconds() > SUPERVISOR_RESTART_MARGIN
+
+
 def _shorten_home(path: str) -> str:
     home = str(HOME)
     return "~" + path[len(home):] if path.startswith(home) else path
@@ -5530,6 +5633,7 @@ def instance_snapshot(instance: Instance) -> dict:
         "owned": session_live and instance.owns_live_session(),
         "loop_pid": _running_loop_pid(instance),
         "loop_code": loop_code_state(instance)[0],
+        "loop_started": loop_started_at(instance) or "",
         "session_num": session_num,
         "run_started": state.get("RUN_STARTED", "") or owner.get("claimed_at", ""),
         "copilot_session_id": (state.get("COPILOT_SESSION_ID", "")
@@ -5558,6 +5662,18 @@ def _instance_summary(snap: dict) -> str:
         parts.append(_shorten_home(snap["cwd"]))
     if snap["session_live"] and not snap["owned"]:
         parts.append("[unowned session]")
+    # Said next to `up`, which describes the *run* and survives a supervisor
+    # being killed and relaunched. Without this the row for a machine whose
+    # every supervisor had just been destroyed was byte-identical to the row
+    # for a ten-day run that nothing had touched -- measured 2026-08-09T17:27
+    # local, when `operator list` reported all eight instances "up 10d 13h"
+    # ninety seconds after every one of their supervisors had died with the
+    # logon session and been started afresh. That restart is the observable
+    # of the event backlog 0001 is about, and nothing surfaced it.
+    if snap["loop_pid"] and supervisor_restarted_after(
+            snap["run_started"], snap.get("loop_started")):
+        parts.append("[supervisor restarted "
+                     f"{_age_since(snap['loop_started'])} ago]")
     # Only ever said about a supervisor that is actually running: a stopped
     # instance has no loaded code to be stale, and saying so anyway would
     # attach the notice to every row it cannot act on.

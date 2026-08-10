@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import builtins
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -41,12 +42,29 @@ def _record(instance, entries):
         encoding="utf-8")
 
 
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _unreadable(monkeypatch, target: Path):
-    """Make `open()` raise EACCES for one path, as a revoked file does.
+    """Make reads of one path raise EACCES, as a revoked file does.
 
     `conftest.denied` patches `os.stat`/`os.lstat`, which a digest that opens
     the file never reaches -- so it would deny nothing here and the test would
     pass without exercising the branch it names.
+
+    Both `builtins.open` and `io.open` are patched, and the second is not
+    redundant. They are the *same function object* but two separate names, so
+    rebinding one leaves the other pointing at the original -- and
+    `Path.read_text` goes through `io.open`, not through the builtins global.
+    Patching only builtins denied `_digest_file`, which calls `open()`
+    directly, while silently failing to deny every reader that went through
+    `pathlib`. `test_an_unreadable_record_is_unknown_not_unrecorded` was one
+    of those: measured with a probe, its `read_text` succeeded, and the record
+    it wrote (`{}`) has no `files` key, so `CODE_UNKNOWN` came back for a
+    reason that had nothing to do with a denied read. It asserted the right
+    answer and proved nothing, which is why that test now writes a record
+    that would read as `CODE_CURRENT` if this helper ever stopped biting.
     """
     real_open = builtins.open
 
@@ -60,6 +78,7 @@ def _unreadable(monkeypatch, target: Path):
         return real_open(file, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "open", guard)
+    monkeypatch.setattr(io, "open", guard)
 
 
 class _RaisingRecord:
@@ -175,14 +194,25 @@ def test_a_record_that_could_not_be_looked_at_is_unknown():
         == op.CODE_UNKNOWN
 
 
-def test_an_unreadable_record_is_unknown_not_unrecorded(monkeypatch):
+def test_an_unreadable_record_is_unknown_not_unrecorded(tmp_path, monkeypatch):
     """The distinction the whole change rests on, through the real file this
     time. A record behind a denied read exists; saying "unrecorded" about it
     would claim the supervisor never wrote one, which is a different and
-    stronger statement."""
+    stronger statement.
+
+    The record written here agrees with disk, so an implementation -- or a
+    denial helper -- that let the read through would answer `CODE_CURRENT`
+    and fail. Previously it wrote `{}`, which has no `files` key and so
+    yielded `CODE_UNKNOWN` whether or not the read was ever denied.
+    """
+    src = tmp_path / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
     inst = op.Instance("denied")
-    inst.loop_code_file.write_text("{}", encoding="utf-8")
+    _record(inst, [{"path": str(src), "sha256": _sha(src)}])
+    assert op.loop_code_state(inst) == (op.CODE_CURRENT, [])
+
     _unreadable(monkeypatch, inst.loop_code_file)
+
     assert op.loop_code_state(inst)[0] == op.CODE_UNKNOWN
 
 
@@ -585,7 +615,7 @@ def test_a_supervisor_that_just_published_reads_as_current():
 def _snap(**over):
     snap = {"name": "proj", "loop_pid": 123, "session_live": True,
             "owned": True, "session_num": 3, "run_started": "", "cwd": "",
-            "loop_code": op.CODE_CURRENT}
+            "loop_started": "", "loop_code": op.CODE_CURRENT}
     snap.update(over)
     return snap
 
@@ -733,6 +763,146 @@ def test_the_listing_says_nothing_when_every_supervisor_is_current(
     op.list_instances()
 
     assert "restart-loop" not in capsys.readouterr().out
+
+
+# ── a supervisor that is not the one that began the run ─────────
+#
+# Measured 2026-08-09T17:27 local: every supervisor on the machine had been
+# killed with the logon session and relaunched ninety seconds earlier, and
+# `operator list` reported all eight "up 10d 13h" -- output byte-identical to
+# a machine nothing had touched. `RUN_STARTED` is carried across the restart
+# on purpose, so the one field the row showed was the one that could not
+# change. The supervisor's own start instant was already on disk the whole
+# time, stamped as `recorded` by `_save_loop_code`; nothing read it.
+def test_a_supervisor_younger_than_its_run_is_a_restart():
+    assert op.supervisor_restarted_after("2026-07-30T10:36:35Z",
+                                         "2026-08-10T00:26:37Z")
+
+
+def test_a_supervisor_that_began_its_own_run_is_not_a_restart():
+    """The negative control. A supervisor publishes its records before the
+    first session is launched, so on a fresh run it is a few seconds *older*
+    than `RUN_STARTED` -- the margin must not read that as a restart."""
+    assert not op.supervisor_restarted_after("2026-08-09T12:00:05Z",
+                                             "2026-08-09T12:00:00Z")
+
+
+def test_a_restart_inside_the_margin_is_not_claimed():
+    """Bounds the detector from the other side: within the margin the answer
+    is "no claim", and the margin exists to protect the negative control
+    above rather than to be as small as possible."""
+    assert not op.supervisor_restarted_after("2026-08-09T12:00:00Z",
+                                             "2026-08-09T12:04:00Z")
+
+
+def test_a_restart_just_past_the_margin_is_claimed():
+    """The positive control for the boundary itself. Without this the margin
+    could be widened to infinity and every test above would still pass."""
+    assert op.supervisor_restarted_after("2026-08-09T12:00:00Z",
+                                         "2026-08-09T12:05:01Z")
+
+
+@pytest.mark.parametrize("run_started, loop_started", [
+    ("2026-07-30T10:36:35Z", None),      # record absent or unreadable
+    ("2026-07-30T10:36:35Z", ""),        # snapshot's empty-string default
+    ("2026-07-30T10:36:35Z", "garbage"),
+    ("", "2026-08-10T00:26:37Z"),        # no run start to compare against
+    ("garbage", "2026-08-10T00:26:37Z"),
+])
+def test_nothing_to_compare_makes_no_claim(run_started, loop_started):
+    """"Cannot tell" must not be reported as "did not restart" -- but here it
+    collapses to `False` because `False` is *silence*, not an assertion. The
+    missing record is reported in its own right by `loop_code_state`, so the
+    reader is never left with nothing.
+    """
+    assert not op.supervisor_restarted_after(run_started, loop_started)
+
+
+def test_a_restarted_supervisor_is_called_out_in_its_row():
+    summary = op._instance_summary(_snap(run_started="2026-07-30T10:36:35Z",
+                                         loop_started="2026-08-10T00:26:37Z"))
+    assert "[supervisor restarted" in summary
+
+
+def test_a_supervisor_that_began_its_run_is_not_called_out_in_its_row():
+    assert "restarted" not in op._instance_summary(
+        _snap(run_started="2026-08-09T12:00:05Z",
+              loop_started="2026-08-09T12:00:00Z"))
+
+
+def test_the_row_still_shows_the_run_age_next_to_the_restart():
+    """The two are different facts and both are wanted: `up` dates the run,
+    the notice dates the process. Dropping either is how one of them came to
+    stand for the other."""
+    summary = op._instance_summary(_snap(run_started="2026-07-30T10:36:35Z",
+                                         loop_started="2026-08-10T00:26:37Z"))
+    assert "up " in summary
+    assert "[supervisor restarted" in summary
+
+
+def test_a_restarted_supervisor_that_is_not_running_is_not_called_out():
+    """No live supervisor, nothing whose start instant describes anything
+    now -- the record belongs to a process that has since gone."""
+    assert "restarted" not in op._instance_summary(
+        _snap(loop_pid=None, run_started="2026-07-30T10:36:35Z",
+              loop_started="2026-08-10T00:26:37Z"))
+
+
+def test_the_listing_explains_what_a_restart_cost(monkeypatch, capsys):
+    monkeypatch.setattr(op, "active_instances", lambda: [op.Instance("alpha")])
+    monkeypatch.setattr(op, "instance_snapshot",
+                        lambda inst: _snap(name="alpha",
+                                           run_started="2026-07-30T10:36:35Z",
+                                           loop_started="2026-08-10T00:26:37Z"))
+
+    op.list_instances()
+    out = capsys.readouterr().out
+
+    assert "alpha" in out
+    assert "without a handoff" in out
+
+
+def test_the_listing_says_nothing_about_restarts_when_there_were_none(
+        monkeypatch, capsys):
+    """Negative control for the group: a paragraph that is always printed
+    tells the reader nothing when it appears."""
+    monkeypatch.setattr(op, "active_instances", lambda: [op.Instance("alpha")])
+    monkeypatch.setattr(op, "instance_snapshot",
+                        lambda inst: _snap(name="alpha",
+                                           run_started="2026-08-09T12:00:05Z",
+                                           loop_started="2026-08-09T12:00:00Z"))
+
+    op.list_instances()
+
+    assert "without a handoff" not in capsys.readouterr().out
+
+
+def test_the_start_instant_is_read_back_from_a_real_published_record():
+    """End to end through the files a supervisor actually writes. Every test
+    above hands `supervisor_restarted_after` a string; this is the one that
+    checks a real record carries a stamp that `_parse_utc` accepts, so a
+    change to the record's format cannot leave the detector silently unable
+    to read it while every unit test stays green."""
+    inst = op.Instance("stamped")
+    op._publish_supervisor_records(inst, [])
+
+    stamp = op.loop_started_at(inst)
+
+    assert stamp
+    assert op._parse_utc(stamp) is not None
+
+
+def test_no_record_means_the_start_instant_is_unknown_not_absent():
+    assert op.loop_started_at(op.Instance("neverpublished")) is None
+
+
+def test_an_unreadable_record_does_not_report_a_start_instant(monkeypatch):
+    inst = op.Instance("denied")
+    inst.loop_code_file.write_text('{"recorded": "2026-08-10T00:26:37Z"}',
+                                   encoding="utf-8")
+    _unreadable(monkeypatch, inst.loop_code_file)
+
+    assert op.loop_started_at(inst) is None
 
 
 # ── what `operator trace` shows ─────────────────────────────────
