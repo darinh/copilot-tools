@@ -585,6 +585,48 @@ verdict `loop_code_state` returned, and none asked whether anything ever
 printed it. A verdict no reader displays is indistinguishable from a verdict
 that was never computed.
 
+### Three more, from reviewing the remedy for the remedy
+
+A second review round over the fix above, by readers from two more model
+families, found three things independently of each other. All are the same
+family of error — a rule justified by a history, applied one case too wide.
+
+**Damage is not a legacy schema.** The fallback that lets a genuinely older
+record through — one written before `pid_start` existed — also cleared `17`,
+`[]` and `""`. `_save_loop_code` writes a non-empty string or `None`, so no
+version of it produces those: they are corruption, and accepting them
+rubber-stamps exactly the impersonation the token was added to refute. This
+is the mistake corrected two paragraphs above for `pid`, made again one field
+over, which is worth recording because the corrected reasoning was *directly
+adjacent in the same function* and still did not transfer.
+
+**A Windows measurement is not a cost.** Each of the four readers re-opens the
+record and re-probes process identity. That was measured here at 0.021 ms per
+probe and called free — but `operator_liveness._ps_start_token` shells out to
+`ps` with a ten-second timeout on macOS and BSD, so `operator list` would fork
+four subprocesses per instance there. This repository's `os.path` note already
+says a green local Windows result is evidence about one leg; the same error
+was made again with a stopwatch instead of a test suite. `loop_record_facts`
+now answers all four questions from one read and at most one probe.
+
+**A start token is boot-relative on Linux.** `_linux_start_token` is field 22
+of `/proc/<pid>/stat`, counted in ticks since boot, so across a reboot a
+replacement can collide with its predecessor on *both* pid and token — the one
+case the token alone cannot refute. The record now carries `boot` from
+`boot_identity()` and compares it with `same_boot`, which is exact for Linux's
+boot uuid, tolerant for the Windows/macOS instant, and answers "cannot tell"
+across kinds, so it only ever refutes on evidence.
+
+The tests learned two things from the same round. The parametrised verdict
+sweeps in `tests/test_preamble_code_staleness.py` were hand-written lists, so
+`CODE_MISMATCH` could be added to the module without any of them failing —
+they would simply have kept passing over a set that no longer described the
+code. They now derive from one named tuple that is checked against the
+`CODE_*` constants by introspection, verified by adding a constant to a
+scratch copy and watching it go red. And several token tests monkeypatched a
+probe that the branch under test short-circuits before reaching; a patch that
+is never reached looks exactly like one that is, so they now count the calls.
+
 ### A test that was asserting the right answer for the wrong reason
 
 Found while adding the above, and repaired in the same change.
