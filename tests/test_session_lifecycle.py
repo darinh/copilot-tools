@@ -560,8 +560,41 @@ def test_the_recorded_start_token_is_what_detects_pid_reuse(db: Path) -> None:
     ident = osess.runtime_identity(mux_session=None)
     wc.claim(db, item="0007", instance="alpha", **ident)
     held = wc.claim_for_item(db, "0007")
+    # The same *kind* of token with a different value. Two kinds are not
+    # comparable by design -- `psc:` replaced `ps:` when the macOS probe
+    # pinned its rendering -- so a stand-in of the wrong shape would assert
+    # nothing here, and a stand-in of no shape at all would be read as a
+    # broken probe rather than as a recycled pid.
+    kind, _, value = ident["pid_start"].partition(":")
+    recycled_token = f"{kind}:{value}0"
+    assert live.is_start_token(recycled_token)
 
     class Recycled:
+        def boot_identity(self):
+            return ident["boot_id"]
+
+        def process_present(self, pid):
+            return True
+
+        def process_start_token(self, pid):
+            return recycled_token
+
+        def session_present(self, session):
+            return True
+
+    assert live.assess(held, probes=Recycled()).verdict == live.DEAD
+
+
+def test_a_probe_that_answers_nonsense_does_not_condemn_a_claim(db: Path) -> None:
+    """The companion to the case above, and the reason it had to be tightened.
+    DEAD is reclaimable, so a probe returning something no version of
+    `process_start_token` produces -- a broken `ps`, a rendering this code
+    does not know -- must not be spent taking a live agent's worktree."""
+    ident = osess.runtime_identity(mux_session=None)
+    wc.claim(db, item="0008", instance="alpha", **ident)
+    held = wc.claim_for_item(db, "0008")
+
+    class Nonsense:
         def boot_identity(self):
             return ident["boot_id"]
 
@@ -574,7 +607,7 @@ def test_the_recorded_start_token_is_what_detects_pid_reuse(db: Path) -> None:
         def session_present(self, session):
             return True
 
-    assert live.assess(held, probes=Recycled()).verdict == live.DEAD
+    assert live.assess(held, probes=Nonsense()).verdict != live.DEAD
 
 
 def test_runtime_identity_defaults_to_this_process(db: Path) -> None:

@@ -578,14 +578,29 @@ def test_the_code_record_exists_by_the_time_the_pid_file_does(monkeypatch):
     inst = op.Instance("ordering")
     seen = {}
     real_write = op.Path.write_text
+    real_replace = op.os.replace
+
+    def note() -> None:
+        seen["code_present_at_pid_write"] = inst.loop_code_file.exists()
+        seen["args_present_at_pid_write"] = inst.loop_args_file.exists()
 
     def spy(self, *args, **kwargs):
         if self == inst.loop_pid_file:
-            seen["code_present_at_pid_write"] = inst.loop_code_file.exists()
-            seen["args_present_at_pid_write"] = inst.loop_args_file.exists()
+            note()
         return real_write(self, *args, **kwargs)
 
+    def spy_replace(src, dst, *args, **kwargs):
+        # The pid file is published by renaming a temporary over it, so the
+        # rename -- not a write to that path -- is the moment a reader can
+        # first see it. Watching only `write_text` here would leave this
+        # test's dictionary empty and the assertion below raising `KeyError`
+        # about a state that is in fact correct.
+        if op.Path(dst) == inst.loop_pid_file:
+            note()
+        return real_replace(src, dst, *args, **kwargs)
+
     monkeypatch.setattr(op.Path, "write_text", spy)
+    monkeypatch.setattr(op.os, "replace", spy_replace)
     op._publish_supervisor_records(inst, ["--agent", "x"])
 
     assert seen["code_present_at_pid_write"] is True
@@ -609,8 +624,11 @@ def test_publishing_writes_all_three_records(monkeypatch):
     assert inst.loop_pid_file.exists()
     assert inst.loop_code_file.exists()
     assert inst.loop_args_file.exists()
-    assert inst.loop_pid_file.read_text(encoding="utf-8").strip() == str(
-        os.getpid())
+    # First line, not the whole file: the pid file also carries the start
+    # stamp `_running_loop_pid` needs to tell this supervisor from an
+    # unrelated process later handed its pid. See `_loop_pid_stamp`.
+    assert inst.loop_pid_file.read_text(
+        encoding="utf-8").splitlines()[0].strip() == str(os.getpid())
 
 
 def test_a_supervisor_that_just_published_reads_as_current():
@@ -1197,23 +1215,23 @@ def test_a_stopped_instance_is_never_called_mismatched():
 # `operator_work`.
 def test_a_recycled_pid_does_not_make_a_predecessor_record_its_own(monkeypatch):
     monkeypatch.setattr(op.operator_liveness, "process_start_token",
-                        lambda pid: "started-at-9am")
+                        lambda pid: "win:900")
 
     assert not op._record_describes(
-        {"pid": 123, "pid_start": "started-at-8am"}, 123)
+        {"pid": 123, "pid_start": "win:800"}, 123)
 
 
 def test_a_matching_start_token_is_the_supervisors_own_record(monkeypatch):
     """Positive control against the case above: same pid, same everything but
     the token, which is the only thing that may decide it."""
     monkeypatch.setattr(op.operator_liveness, "process_start_token",
-                        lambda pid: "started-at-8am")
+                        lambda pid: "win:800")
 
     assert op._record_describes(
-        {"pid": 123, "pid_start": "started-at-8am"}, 123)
+        {"pid": 123, "pid_start": "win:800"}, 123)
 
 
-def _token_probe(monkeypatch, value="started-at-9am"):
+def _token_probe(monkeypatch, value="win:900"):
     """Patch the live-token probe and count its calls.
 
     Counting matters as much as the value. Adversarial review pointed out
@@ -1260,7 +1278,7 @@ def test_an_unreadable_live_token_falls_back_to_the_pid(monkeypatch):
     calls = _token_probe(monkeypatch, value=None)
 
     assert op._record_describes(
-        {"pid": 123, "pid_start": "started-at-8am"}, 123)
+        {"pid": 123, "pid_start": "win:800"}, 123)
     assert calls["n"] == 1, "this branch is only reachable by probing"
 
 

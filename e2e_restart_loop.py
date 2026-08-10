@@ -51,9 +51,26 @@ def stub_copilot(bindir: Path) -> None:
 
 
 def read_pid(path: Path) -> int | None:
+    """The pid from a pid file whose later lines may carry identity stamps.
+
+    `copilot_operator._loop_pid_stamp` writes the pid on the first line and
+    `key=value` stamps after it, so reading the whole file as one integer
+    would fail on every stamped supervisor and report the loop as never
+    coming up.
+
+    ``ValueError`` covers the read as well as the parse: a file damaged into
+    invalid UTF-8 raises ``UnicodeDecodeError``, which is a ``ValueError``
+    rather than an ``OSError``.
+    """
     try:
-        return int(path.read_text(encoding="utf-8").strip())
+        lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, ValueError):
+        return None
+    if not lines:
+        return None
+    try:
+        return int(lines[0].strip())
+    except ValueError:
         return None
 
 

@@ -1,8 +1,10 @@
 ---
 id: 29
 title: A recycled pid makes a dead supervisor read as looping
-status: open
+status: closed
 opened: 2026-08-09
+closed: 2026-08-09
+commit: 5699c3bc380d6bc61f083c050c31ab9466957180
 spec: specs/003-windows-native-operator/spec.md
 requirement: User Story 2 - Autonomous loop mode and handoff on Windows
 ---
@@ -81,3 +83,61 @@ failure direction needs choosing explicitly and is not obvious — a pid file
 predating the stamp, or a token that cannot be read, must not silently
 convert a live supervisor into a stopped one, because that would make
 `active_instances` drop it and take every notice about it with it.
+
+## Resolution, 2026-08-09
+
+Done as suggested, with the failure direction chosen explicitly: **only
+positive evidence refutes.** `_loop_pid_stamp` writes the pid on the first
+line and `pid_start=` / `boot=` on the lines after it, in one write;
+`_running_loop_pid` (via `_running_loop_identity`) returns `None` and prunes
+only when the live token is a well-formed token of the same kind as the
+recorded one and differs from it. An unstamped file, an unreadable token, a
+damaged stamp and a token whose kind cannot be compared all answer exactly as
+they did before.
+
+Measured on this machine against copies of the ten real
+`~/.operator/restart/*.loop.pid` files (copies, so the pruning branch could
+not touch live state):
+
+    ac-unreal    pid=21428 alive=True stamps={} -> _running_loop_pid=21428
+    ...  9 live unstamped supervisors, all still read as running
+    probe        pid=54968 alive=False        -> _running_loop_pid=None
+    ac-unreal    stamped win:1343079519667171280 -> None, pruned=True
+    ac-unreal    stamped with the true token     -> 21428
+    ac-unreal    stamped win:...-damaged         -> 21428
+
+Full suite 4827 passed / 9 skipped, against 4742 / 9 on `main`. Three
+mutation harnesses run from a temp directory: 12 mutants over the round-three
+guards, 14 still-applicable round-two mutants, and 3 respelled where round
+three rewrote the anchor. No survivors.
+
+Three adversarial review rounds across GPT-5.6 Sol, Gemini 3.1 Pro and
+Grok 4.5 produced eleven findings, all fixed. Two are worth recording because
+they were not visible from the diff:
+
+* **The locale pin nearly cost a worktree.** `ps -o lstart=` renders through
+  `LC_TIME` and `TZ`, so the token was a property of the *caller*; pinning it
+  was necessary once a mismatch deletes a pid file. But
+  `process_start_token` is shared with `operator_liveness.assess`, which
+  returns DEAD — *reclaimable* — when a claim's recorded token differs from
+  the live one. Every claim already on disk carries the pre-pin rendering, so
+  the first sweep after upgrade would have read a live agent's owner as dead
+  and offered its worktree to somebody else. Fixed the way `boot_identity`
+  already handles its two shapes: the pinned rendering is tagged `psc:`, and
+  `same_start_token` answers `None` across kinds rather than `False`. Found
+  by Grok 4.5 and, on the pid-file path, independently by Gemini 3.1 Pro.
+* **A damaged stamp hid a readable pid.** The first fix for the
+  `UnicodeDecodeError` crash decoded the whole file, so invalid UTF-8 in an
+  optional stamp threw the pid away — and a reader that finds no pid
+  concludes no supervisor, which is what invites a second one. The file is
+  read as bytes and decoded a line at a time now. Found by GPT-5.6 Sol,
+  reviewing its own round-one finding's fix.
+
+**Left open deliberately:** `_prune_loop_pid_file` re-reads and compares
+before unlinking, which narrows the window between deciding and deleting from
+seconds (a macOS `ps` probe) to microseconds, but does not close it — nothing
+takes a lock. A lock would close it and would also introduce a failure the
+current shape cannot have: a stale lock blocks *publication*, and an
+unwritten pid file costs the session its `stop`, its `restart-loop` and its
+row in the listing. Not worth it for a window that requires a replacement
+supervisor to publish inside a parse.

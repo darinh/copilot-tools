@@ -114,6 +114,39 @@ def test_a_matching_start_time_is_not_death() -> None:
     assert verdict.verdict == ol.LIVE
 
 
+def test_a_pre_pin_rendering_is_not_death() -> None:
+    """The most destructive path in this module, pinned directly.
+
+    The macOS/BSD probe changed its tag from ``ps`` to ``psc`` when it pinned
+    its locale and timezone, so every claim recorded before that carries the
+    old rendering of a process that has not moved. DEAD is reclaimable, so
+    reading those two strings as a difference would have handed a live
+    agent's worktree to somebody else on the first sweep after the upgrade --
+    and the pid, mux and heartbeat probes all say the owner is fine, so
+    nothing downstream would have objected.
+    """
+    verdict = ol.assess(
+        make_claim(age_seconds=1, pid_start="ps:Sat Aug  9 17:25:00 2026"),
+        probes=FakeProbes(boot="uuid:same", session=True, running=True,
+                          start="psc:Sat Aug  9 17:25:00 2026"),
+        now=NOW)
+    assert verdict.verdict == ol.LIVE
+    assert verdict.reclaimable is False
+
+
+def test_two_pinned_renderings_that_differ_are_still_death() -> None:
+    """Negative control for the case above: within one kind the comparison is
+    exactly as sharp as it was, or the migration rule would have retired the
+    check it exists to protect."""
+    verdict = ol.assess(
+        make_claim(age_seconds=1, pid_start="psc:Sat Aug  9 17:25:00 2026"),
+        probes=FakeProbes(boot="uuid:same", session=True, running=True,
+                          start="psc:Sat Aug  9 18:00:00 2026"),
+        now=NOW)
+    assert verdict.verdict == ol.DEAD
+    assert "reused" in verdict.reason
+
+
 # ── the cascade: the fourth signal is never conclusive ───────────
 @pytest.mark.parametrize("probes", [
     FakeProbes(),                                    # nothing could be read
@@ -337,6 +370,40 @@ def test_a_malformed_pid_is_unknown_rather_than_absent(pid) -> None:
     is a process, and the answer to a malformed question is "cannot tell"."""
     assert ol.process_present(pid) is None
     assert ol.process_start_token(pid) is None
+
+
+def test_the_ps_probe_pins_its_rendering(monkeypatch) -> None:
+    """``ps -o lstart=`` prints a wall-clock date through ``LC_TIME`` and
+    ``TZ``, so an inherited environment makes the token a property of the
+    *caller*. `copilot_operator._loop_pid_reused` spends a token mismatch on
+    deleting a supervisor's pid file and `assess` spends one on declaring a
+    claim's owner DEAD, so two shells with different settings could disown
+    each other's live process. Found by adversarial review."""
+    seen = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = "Sat Aug  9 17:25:00 2026"
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["env"] = kwargs.get("env")
+        return _Proc()
+
+    monkeypatch.setattr(ol.subprocess, "run", fake_run)
+
+    # `psc`, not `ps`: the pin changes the string for a process that has not
+    # moved, so the tag is what stops a pre-pin record comparing unequal to
+    # its own live owner. See `same_start_token`.
+    assert ol._ps_start_token(4242) == "psc:Sat Aug  9 17:25:00 2026"
+    assert seen["cmd"][:2] == ["ps", "-p"]
+    assert seen["env"] is not None, "an inherited environment carries a locale"
+    assert seen["env"]["LC_ALL"] == "C"
+    assert seen["env"]["LC_TIME"] == "C"
+    assert seen["env"]["TZ"] == "UTC"
+    # The rest of the environment still has to reach `ps`, or the probe stops
+    # finding it on a machine whose PATH is not the default.
+    assert "PATH" in seen["env"] or "PATH" not in os.environ
 
 
 def test_a_float_pid_is_refused_rather_than_truncated() -> None:
