@@ -113,6 +113,13 @@ RESTART_PAUSE_SECONDS = 3
 HEALTHY_SESSION_SECONDS = 120
 SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
+# How long the attached single-session path will wait for the runner to finish
+# writing metrics before printing its summary. It is a display concern only --
+# the metrics are not lost, just late, and `operator ingest` collects them --
+# so this is chosen to be short enough that a terminal always comes back.
+# Deliberately not open-ended: the capture is a parse of a Copilot log, and
+# those reach 1.4 GB on this machine.
+METRICS_GRACE_SECONDS = 15
 # How long a supervisor's startup record may be believed on its age alone,
 # once the pid it names is no longer alive. It bounds one specific unknown:
 # on Windows `sys.executable` is often a launcher shim that re-execs the real
@@ -3522,8 +3529,10 @@ def is_copilot_running(instance: Instance) -> bool:
 
     Three signals, because any one alone can lie:
 
-    * the runner's ``.exit`` marker is authoritative when present, but the
-      runner writes it last and may be killed before it does;
+    * the runner's ``.exit`` marker is authoritative when present. It is
+      written the instant ``proc.wait()`` returns, before metrics capture, so
+      it is prompt -- but a runner killed alongside its Copilot never reaches
+      even that, which is the overwhelmingly common case here;
     * ``has_session`` stays true after the program exits when
       ``remain-on-exit`` is on, which loop mode sets;
     * ``pane_dead`` catches exactly that case.
@@ -3549,6 +3558,78 @@ def wait_for_exit(instance: Instance, timeout: int = EXIT_GRACE_SECONDS) -> bool
             return True
         time.sleep(1)
     return False
+
+
+def wait_for_metrics_capture(instance: Instance,
+                             timeout: int = METRICS_GRACE_SECONDS) -> bool:
+    """Wait for the runner to finish capturing metrics, bounded. True if it did.
+
+    Copilot's exit and the runner's exit used to be the same event to anyone
+    watching from here, because the runner published its exit marker only
+    after the capture. It now publishes the marker first -- deliberately, so a
+    dead session is relaunched in seconds rather than the measured average of
+    95 minutes -- which means the marker no longer implies the metrics for
+    that session are in the database.
+
+    Only shutdown paths care, and every one of them does. The attached
+    single-session path prints a run summary straight out of the metrics DB,
+    and reading it a moment too early reports a session that used no credits,
+    which is a wrong number rather than a missing one. Loop mode has six ways
+    to end -- ``operator stop``, Ctrl+C, both giving-up limits, the no-change
+    breaker and the unaccounted breaker -- and each of them summarises too,
+    with three of them destroying the pane immediately afterwards and taking
+    an unfinished capture with it. Every one waits.
+
+    What deliberately does *not* wait is the relaunch path, which is the whole
+    point of the change: a supervisor that pauses for a log parse before
+    starting the next session is the 95-minute delay this removed. A capture
+    cut short there is recoverable with `operator ingest`; the wait is not
+    recoverable at all.
+
+    The pane going away is *not* the signal on its own, and assuming it was
+    is how the first draft of this quietly did nothing. Loop mode sets
+    ``remain_on_exit``, so the multiplexer session outlives the runner and
+    ``has_session`` stays true until the supervisor kills it — which happens
+    *after* this wait. On the seven loop-mode paths the session check can
+    therefore never fire, and every one of them blocked for the full timeout
+    whether the capture had finished seconds earlier or not. ``pane_dead`` is
+    what distinguishes them there, exactly as it does in
+    :func:`is_copilot_running`, and for the same reason. Only
+    ``run_single_session`` passes ``remain_on_exit=False``, and the session
+    check is what answers for it.
+
+    Both are asked, because neither alone covers both callers: a session that
+    is gone has no pane to interrogate, and a pane that is dead is still in a
+    session.
+
+    Bounded, and the bound is what makes this safe to add. The capture is a
+    parse of a log with no ceiling on its size -- 1.4 GB on this machine, and
+    one capture measured at 13.3 hours -- so waiting for it unconditionally
+    would hang a terminal indefinitely. A thin summary is recoverable; a
+    session that never returns the prompt is not.
+
+    A multiplexer that cannot be asked ends the wait rather than spending the
+    whole timeout on a question nobody can answer. ``OSError`` as well as
+    ``MuxError``, and that is not belt and braces: :meth:`Mux.has_session`
+    shells out through ``subprocess.run`` and raises no ``MuxError`` of its
+    own, so a missing or unexecutable multiplexer binary arrives here as
+    ``OSError`` alone. Catching only the library's own exception would have
+    left the documented behaviour unreachable and ended an attached session
+    with a traceback instead of a summary. ``_session_live_probe`` catches the
+    same pair, for the same reason.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            if not MUX.has_session(instance.session):
+                return True
+            if MUX.pane_dead(instance.session):
+                return True
+        except (MuxError, OSError):
+            return False
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
 
 
 def stop_session_gracefully(instance: Instance) -> None:
@@ -3754,7 +3835,8 @@ def list_instances() -> int:
     return 0
 
 
-def _request_supervisor_stop(instance: Instance, timeout: float = 20.0) -> None:
+def _request_supervisor_stop(instance: Instance,
+                             timeout: float = 20.0 + METRICS_GRACE_SECONDS) -> None:
     """If a background loop supervisor is running for instance, ask it to
     shut down (and take the session with it) before we touch anything else.
 
@@ -3771,6 +3853,15 @@ def _request_supervisor_stop(instance: Instance, timeout: float = 20.0) -> None:
     ``RESTART_DIR`` until some future supervisor started and immediately
     stopped itself. The invariant on return is that either a supervisor holds
     the marker, or it is gone because we removed it.
+
+    The default budget carries ``METRICS_GRACE_SECONDS`` for the same reason
+    ``_do_restart_loop`` derives its own from ``POLL_INTERVAL``: the
+    supervisor's stop branch waits for the runner's metrics capture before it
+    exits, so a budget that does not know that expires while the supervisor is
+    still doing what it was asked to do. The caller then kills the session
+    itself, out from under a supervisor mid-shutdown. Spelled as a sum rather
+    than folded into one number so that tuning the wait cannot silently
+    un-tune this.
     """
     instance.stop_marker.touch()
     pid, starting = _supervisor_status(instance)
@@ -5032,8 +5123,12 @@ def run_single_session(instance: Instance, copilot_args: list[str],
         print("  Metrics are captured by the session supervisor when copilot exits.")
         return 0
 
-    # Session finished; the runner has already ingested metrics.
+    # Copilot has finished. Its exit marker is now published *before* metrics
+    # capture, so the runner is probably still parsing the log; wait for the
+    # pane to go before reading the database, or the summary reports a session
+    # that used nothing.
     wait_for_exit(instance, 10)
+    wait_for_metrics_capture(instance)
     show_run_summary(run_started)
     instance.cleanup_files()
     return 0
@@ -5419,6 +5514,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                         remove_file(instance.stop_marker)
                         log(f"Session #{session_num}: stop requested — shutting down")
                         stop_session_gracefully(instance)
+                        wait_for_metrics_capture(instance)
                         show_run_summary(run_started)
                         if MUX.has_session(instance.session):
                             MUX.kill_session(instance.session)
@@ -5454,6 +5550,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                             if unknown_markers >= MAX_LAUNCH_FAILURES:
                                 log(f"  Giving up after {unknown_markers} consecutive "
                                     f"unreadable checks — leaving the session alone")
+                                wait_for_metrics_capture(instance)
                                 show_run_summary(run_started)
                                 return 1
                             continue
@@ -5505,6 +5602,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                             if crash_failures >= MAX_LAUNCH_FAILURES:
                                 log(f"  Giving up after {crash_failures} consecutive "
                                     f"unexpected exits")
+                                wait_for_metrics_capture(instance)
                                 show_run_summary(run_started)
                                 instance.cleanup_files()
                                 return 1
@@ -5593,6 +5691,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                                 f"--kind session_exit")
                             log(f"  Resume with: operator --loop --name "
                                 f"{instance.display_name}")
+                            wait_for_metrics_capture(instance)
                             show_run_summary(run_started)
                             instance.cleanup_files()
                             return EXIT_UNACCOUNTED
@@ -5607,6 +5706,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                                 f"#{session_num + 1}.")
                             log(f"  Resume with: operator --loop --name "
                                 f"{instance.display_name}")
+                            wait_for_metrics_capture(instance)
                             show_run_summary(run_started)
                             instance.cleanup_files()
                             return EXIT_NO_PROGRESS
@@ -5634,12 +5734,14 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                 run_started,
                 discovered or resume_id or resume_id_used,
             )
+            wait_for_metrics_capture(instance)
             show_run_summary(run_started)
             if MUX.has_session(instance.session):
                 MUX.kill_session(instance.session)
             instance.cleanup_files()
             return 0
 
+        wait_for_metrics_capture(instance)
         show_run_summary(run_started)
         if MUX.has_session(instance.session):
             MUX.kill_session(instance.session)
@@ -7234,6 +7336,14 @@ def read_exit_code(instance) -> int | None:
     killed wholesale — the runner dies with it and never gets to write a code
     — as opposed to one whose process ended under a runner that survived to
     write it down.
+
+    That inference is only sound because the runner publishes the code the
+    instant ``proc.wait()`` returns, ahead of metrics capture. While the write
+    came last, ``None`` also meant "the runner is alive and busy parsing a
+    log", which on this machine averaged 95 minutes and reached 13.3 hours —
+    so the one fact separating a crash from an external kill was absent for
+    most of the window in which somebody would ask. Of 1042 recorded session
+    endings, 3 carried a code. Do not move that write back.
 
     Only call this once the session is gone. `start_session` clears the file
     at launch, but a clearing that failed would let a previous session's code

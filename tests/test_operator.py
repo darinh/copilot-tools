@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1657,6 +1659,211 @@ def test_is_copilot_running_false_when_exit_marker_present(monkeypatch):
     monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
     monkeypatch.setattr(op.MUX, "pane_dead", lambda s: False)
     assert op.is_copilot_running(inst) is False
+
+
+# ── waiting for the runner's metrics capture ────────────────────
+#
+# The runner publishes its exit marker the instant copilot terminates, ahead
+# of metrics capture, so a supervised session is relaunched in seconds rather
+# than the 95 minutes measured on this machine. The cost lands on exactly one
+# caller: the attached single-session path prints a summary straight out of
+# the metrics DB, and the marker no longer implies that session is in it.
+def test_waiting_for_metrics_capture_ends_when_the_pane_goes(monkeypatch):
+    inst = op.Instance("proj")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: False)
+    assert op.wait_for_metrics_capture(inst, timeout=5) is True
+
+
+def test_waiting_for_metrics_capture_ends_when_a_kept_pane_dies(monkeypatch):
+    """Loop mode's shape, and the one the first draft could not see.
+
+    Loop mode sets remain-on-exit, so the multiplexer session outlives the
+    runner and `has_session` stays true until the supervisor kills it -- which
+    happens after this wait. A session-only check therefore never fires on any
+    of the seven loop-mode paths, and every one of them burned the whole
+    timeout however long ago the capture had finished. `pane_dead` is what
+    answers there, exactly as in `is_copilot_running`.
+    """
+    inst = op.Instance("proj")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    monkeypatch.setattr(op.MUX, "pane_dead", lambda s: True)
+    started = time.time()
+    assert op.wait_for_metrics_capture(inst, timeout=30) is True
+    assert time.time() - started < 5, (
+        "the runner had already finished and the wait sat out its timeout "
+        "anyway, which is the loop-mode delay this is supposed to avoid"
+    )
+
+
+def test_waiting_for_metrics_capture_keeps_waiting_while_the_runner_works(
+    monkeypatch,
+):
+    """The control: a live pane must not be mistaken for a finished capture.
+
+    Without this, the test above is satisfied by a function that returns True
+    immediately in every case, which would put the summary back in front of
+    the capture it exists to wait for.
+    """
+    inst = op.Instance("proj")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    monkeypatch.setattr(op.MUX, "pane_dead", lambda s: False)
+    assert op.wait_for_metrics_capture(inst, timeout=1) is False
+
+
+def test_the_supervisor_stop_budget_covers_the_metrics_wait():
+    """`operator stop` must outlast what it just asked the supervisor to do.
+
+    The supervisor's stop branch waits for the runner's capture before it
+    exits. A budget that does not know that expires while the supervisor is
+    still obeying, and the caller then kills the session out from under it.
+    """
+    default = inspect.signature(op._request_supervisor_stop).parameters["timeout"].default
+    assert default >= op.METRICS_GRACE_SECONDS + op.EXIT_GRACE_SECONDS, (
+        f"the stop budget is {default}s but the supervisor can spend "
+        f"{op.EXIT_GRACE_SECONDS}s ending the session and "
+        f"{op.METRICS_GRACE_SECONDS}s waiting for its metrics capture"
+    )
+
+
+def test_waiting_for_metrics_capture_is_bounded(monkeypatch):
+    """A capture with no ceiling on it must not hold the terminal.
+
+    Copilot logs reach 1.4 GB on this machine and one capture measured 13.3
+    hours, so an unbounded wait here would be indistinguishable from a hang.
+    """
+    inst = op.Instance("proj")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    started = time.time()
+    assert op.wait_for_metrics_capture(inst, timeout=1) is False
+    assert time.time() - started < 10, (
+        "the wait outran its own timeout, so the bound is not a bound"
+    )
+
+
+def test_waiting_for_metrics_capture_gives_up_on_an_unusable_multiplexer(
+    monkeypatch,
+):
+    """A question nobody can answer is not worth the whole timeout."""
+    inst = op.Instance("proj")
+    calls = {"n": 0}
+
+    def refuses(_s):
+        calls["n"] += 1
+        raise op.MuxError("no server")
+
+    monkeypatch.setattr(op.MUX, "has_session", refuses)
+    started = time.time()
+    assert op.wait_for_metrics_capture(inst, timeout=30) is False
+    assert time.time() - started < 5
+    assert calls["n"] == 1, (
+        "the multiplexer was asked again after it had already said it could "
+        "not answer"
+    )
+
+
+def test_waiting_for_metrics_capture_survives_a_missing_multiplexer_binary(
+    monkeypatch,
+):
+    """`Mux.has_session` shells out and raises OSError, never MuxError.
+
+    Catching only the library's own exception left the documented give-up
+    behaviour unreachable for the one failure that actually reaches it, and
+    ended an attached session with a traceback instead of a summary.
+    """
+    inst = op.Instance("proj")
+
+    def missing_binary(_s):
+        raise FileNotFoundError(2, "No such file or directory", "tmux")
+
+    monkeypatch.setattr(op.MUX, "has_session", missing_binary)
+    assert op.wait_for_metrics_capture(inst, timeout=30) is False
+
+
+def test_the_single_session_path_waits_for_capture_before_summarising(
+    monkeypatch, isolated_state
+):
+    """The wait is only worth having if the summary is on the other side of it.
+
+    A helper nothing calls, or one called after the read it exists to protect,
+    reads exactly like a working one from the test suite's point of view.
+    """
+    order: list[str] = []
+
+    def fake_start_session(instance, args, session_num, remain_on_exit=False,
+                           preamble=""):
+        instance.exit_file.write_text("0", encoding="utf-8")
+        instance.stop_marker.touch()
+
+    monkeypatch.setattr(op, "start_session", fake_start_session)
+    monkeypatch.setattr(op, "handle_existing_session", lambda instance: None)
+    monkeypatch.setattr(op.MUX, "attach", lambda session: None)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
+    monkeypatch.setattr(op, "wait_for_exit", lambda instance, timeout=10: True)
+    monkeypatch.setattr(
+        op, "wait_for_metrics_capture",
+        lambda instance, timeout=op.METRICS_GRACE_SECONDS: order.append("wait"))
+    monkeypatch.setattr(op, "show_run_summary",
+                        lambda run_started: order.append("summary"))
+
+    op.run_single_session(op.Instance("exp-single"), [], headless=False)
+
+    assert order == ["wait", "summary"], (
+        f"expected the capture wait to precede the summary, got {order}"
+    )
+
+
+def test_every_run_summary_waits_for_the_capture_first():
+    """No shutdown path may read the metrics DB without waiting for the runner.
+
+    Loop mode has six ways to end and three of them destroy the pane straight
+    after summarising, so a path that forgets the wait prints a session that
+    used no credits and then deletes the process that was about to record it.
+    Asserted structurally rather than by exercising all seven call sites: a
+    per-path test is a list that a newly added seventh path is simply absent
+    from, which is the shape of a guard that reports the tree clean because it
+    is looking at yesterday's tree.
+    """
+    source = Path(op.__file__).read_text(encoding="utf-8").splitlines()
+    offenders = []
+    for i, line in enumerate(source):
+        if "show_run_summary(" not in line:
+            continue
+        stripped = line.strip()
+        if stripped.startswith(("#", "def ", "*", '"', "'")):
+            continue
+        if stripped != "show_run_summary(run_started)":
+            # Not skipped: a call this scan cannot read is a call it cannot
+            # vouch for, and silently dropping it is how a guard reports a
+            # tree clean that it never looked at. Reformatting one across two
+            # lines must fail here and be fixed here.
+            offenders.append(f"{i + 1}: {stripped} (unrecognised call shape)")
+            continue
+        previous = source[i - 1].strip() if i else ""
+        if previous != "wait_for_metrics_capture(instance)":
+            offenders.append(f"{i + 1}: {stripped} (preceded by {previous!r})")
+    assert offenders == [], (
+        "the runner publishes its exit marker before metrics capture, so these "
+        "summaries can read the database before the session is in it:\n  "
+        + "\n  ".join(offenders)
+    )
+    assert len(source) > 100, "read the wrong file"
+
+
+def test_the_relaunch_path_does_not_wait_for_the_capture():
+    """The control for the test above, and the reason the change exists.
+
+    Waiting before a *relaunch* is precisely the 95-minute delay this removed,
+    so the wait must appear only on paths that are ending. If the two ever
+    converge, the guard above would keep passing while the fix was undone.
+    """
+    source = Path(op.__file__).read_text(encoding="utf-8")
+    loop_body = source.split("def run_loop_mode(", 1)[1]
+    relaunch = loop_body.split("if restart_requested:", 1)[1].split(
+        "current = workspace_fingerprint(workdir)", 1)[0]
+    assert "wait_for_metrics_capture" not in relaunch, (
+        "the relaunch path waits for metrics capture again, which is the delay "
+        "the exit-marker reordering exists to remove"
+    )
 
 
 def test_reload_without_name_errors(capsys):

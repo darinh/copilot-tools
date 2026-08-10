@@ -659,3 +659,168 @@ broadcast, not several coincidences. A single instance named on its own is far
 more likely to be an `operator restart-loop` from a supervisor predating the
 `adopted` stamp than a kill — the flag only distinguishes them for supervisors
 started after this change.
+
+## Re-measurement, 2026-08-10: a sixth instrument, and this one was the discriminator
+
+Run by the recipe above. Two separate findings: the kills are live but have
+changed shape, and the one measurement that could tell a crash from a kill has
+been disarmed on every ending since the toolkit was written.
+
+### The kills have not stopped, but they are no longer waves
+
+`operator.log`, exclusive of the 2026-08-09 17:25 wave already recorded above:
+
+- **Five more `copilot exited unexpectedly`**, at 18:46:33, 22:19:19, 22:20:06,
+  22:29:00 and 22:31:20 local, hitting `copilot-tools`, `snes-ghosts`,
+  `ac-unreal` (twice) and `copilot-tools` again.
+- They are **not** a broadcast. The five span 3h45m, and the four in the last
+  twelve minutes hit three different instances at 47s, 8m54s and 2m20s apart —
+  nothing like the 5-second, six-instance signature of a wave.
+- The `TerminalServices-LocalSessionManager` log holds **no event 21** in that
+  window, only routine event 24/25 disconnect-reconnect pairs. So the logon
+  replacement that explains the 17:25 wave explains none of these.
+- Uptimes were 4794s, 1005s, 17606s, 529s and 8629s — no common lifetime.
+
+Recorded as a boundary for the next reader, not as a hypothesis. Five isolated
+endings across three instances is equally consistent with five independent
+causes, and the section below is why that could not be settled either way.
+
+### The exit code was the discriminator, and it was queued behind a log parse
+
+`markers.exit_code` in a `session_exit` record is the one field that separates
+*Copilot crashed on its own* from *something took the whole pane*. Measured
+across `trace.jsonl`:
+
+- **1042 `session_exit` records. Three carry an exit code.**
+
+The reason is in `operator_runner.run`, and it is a fact about ordering rather
+than about kills. The runner learns the code at `proc.wait()` and logs it
+immediately — `copilot exited rc=...` — but it wrote the `{id}.exit` marker
+*after* `time.sleep(2)` and `operator_ingest.ingest_file`. Measured across
+every `*.runner.log` on this machine, 11 endings reached that capture:
+
+- the gap between Copilot's death and the marker ran **7s to 47947s (13.3
+  hours), averaging 5692s (95 minutes)**;
+- **10 of the 11 read `rc=3221225477`** — `0xC0000005`, an access violation.
+  That is Copilot faulting in its own process, not an external kill.
+
+Both instruments agree on the clearest case. For `copilot-tools` session #240
+the runner logged `copilot exited rc=3221225477` at 18:20:38 and `operator.log`
+recorded `copilot exited unexpectedly after 4794s` at **18:46:33**. A
+supervised agent was dead for 25m55s with nothing relaunching it — and that is
+the *good* case, the one where the runner survived to write anything at all.
+
+So the marker was doing two jobs and was late for both. It is the signal that
+ends the supervisor's poll, so a dead session went unrelaunched for an average
+of 95 minutes; and it is the only durable record of *how* the session ended, so
+anything killing the runner inside that window destroyed the evidence. The
+runner observed 18 endings across its whole history; 11 survived to the capture;
+3 reached a trace record. Every other ending was filed as `exit_code: null`,
+which reads identically to an external kill and is exactly how this item's
+opening evidence read it — *"939 of the 940 carry no exit code at all; the
+single exception is 3221225477"*. That single exception was never the outlier.
+It was the only one that got through.
+
+**This is the item's signature failure for the seventh time, and the first
+found outside the operator.** An instrument that cannot report the thing it is
+read as reporting: `None` meant "nobody observed Copilot terminate", and it was
+being returned for "the runner is alive and busy parsing a 1.4 GB log".
+
+**Fixed here.** `operator_runner.run` writes the exit marker the instant
+`proc.wait()` returns, before the capture. Metrics are the right side of that
+trade to lose, and they are not actually lost: a relaunch that kills the pane
+mid-capture leaves the Copilot log on disk, `ingest_file` keys on path plus
+mtime and skips what it has done, so `operator ingest` collects anything cut
+short. An exit code is recoverable from nothing — the process is gone.
+
+Three tests pin the ordering (`tests/test_runner.py`), each verified by
+restoring the old ordering and watching it go red: the marker is on disk when
+`ingest_file` is entered; a runner killed mid-capture still leaves the code
+(raised as `BaseException`, because `run` catches `Exception` around the
+capture and an `Exception` would prove nothing about a kill); and the capture
+still happens when nothing interrupts it, without which the first two are
+satisfied by a runner that never ingests at all.
+
+One caller paid for it and is handled rather than left to rot. The attached
+single-session path printed its summary straight out of the metrics database
+on the strength of the exit marker, which no longer implies the capture is
+done — it would have reported a session that used no credits, a wrong number
+rather than a missing one. `copilot_operator.wait_for_metrics_capture` waits
+for the pane instead, bounded at 15s: the capture has no ceiling, and a summary
+that is thin is recoverable where a terminal that never returns is not. Loop
+mode deliberately does not call it, because relaunching promptly is the whole
+point there.
+
+### What the next reader should do differently
+
+**The re-measurement recipe now has a fourth instrument, and it is the one to
+read first.** `markers.exit_code` in `trace.jsonl`, for records written by a
+supervisor started after this change:
+
+- **`3221225477`** (`0xC0000005`) means Copilot faulted in its own process.
+  That is not a kill and does not belong in a wave count, however much the
+  timing suggests one.
+- **`null`** still means nobody observed the ending, which remains the
+  signature of the whole pane going — but it now means that *only*, rather
+  than also meaning "the runner is still busy".
+
+Everything this item concluded about kills before 2026-08-10 was reached with
+that field blank, so **it cannot distinguish a Copilot crash from an external
+kill in any population above.** The nine `copilot exited unexpectedly` lines
+from 2026-08-09, the 979 from the original window: none of them is refuted, and
+none is confirmed either. Ten of the eleven codes ever recovered say the
+process faulted on its own, which is a reason to suspect the population is
+mixed and not a reason to conclude it. Re-count from post-change records only.
+
+### The remedy for the remedy did it again, in the compensating wait
+
+The change above moved the exit marker ahead of metrics capture and, because
+that stops the marker implying the metrics are in the database, added
+`wait_for_metrics_capture` in front of all eight `show_run_summary` calls. Its
+early-return asked `MUX.has_session`, and its docstring justified that with
+"the multiplexer session outlives Copilot exactly as long as the runner does".
+
+**That sentence is true of exactly one of the eight callers.**
+`run_single_session` launches with `remain_on_exit=False`. Loop mode sets
+`remain_on_exit=True` — `is_copilot_running` has a comment saying so, three
+functions further up the same file, and it is why that function consults
+`pane_dead` at all. So on all seven loop-mode paths the session check could
+never fire, and every one of them sat out the full 15-second timeout however
+long ago the runner had finished. The wait was doing nothing except waiting.
+
+**This item's signature failure, for the eighth time and the fourth inside a
+remedy for a previous one.** What makes it worth recording rather than just
+fixing is *why the tests agreed it worked*:
+`test_every_run_summary_waits_for_the_capture_first` reads the source and
+asserts each summary is preceded by the wait. It is a real guard and it
+catches a real regression — but it asserts the wait is **present**, never that
+it **works**, and a wait that returns only on timeout is present. The three
+first-round reviewers, on three model families, all confirmed the change was
+sound; none of them ran the wait under `remain_on_exit=True` either, because
+nothing in the diff says which mode a caller is in.
+
+Two things fixed here, both derived from constants rather than restated:
+
+- `wait_for_metrics_capture` asks `pane_dead` as well as `has_session`, for the
+  same reason `is_copilot_running` does. Both are needed: a session that is
+  gone has no pane to interrogate, and a pane that is dead is still in a
+  session. `test_waiting_for_metrics_capture_ends_when_a_kept_pane_dies` pins
+  it *by elapsed time*, and reverting the check makes that test take 36
+  seconds and then fail — the defect reproduced, not merely described.
+- `_request_supervisor_stop`'s budget is `20.0 + METRICS_GRACE_SECONDS`.
+  `operator stop` blocks on the supervisor, whose stop branch now waits for the
+  capture, so a budget that does not know that expires while the supervisor is
+  still doing what it was told and the caller then kills the session out from
+  under it. `_do_restart_loop` already derived its budget from `POLL_INTERVAL`
+  for this exact reason; the stop path had not been given the same treatment.
+
+And the structural guard was hardened against the failure it was one edit away
+from having: it matched only single-line `show_run_summary(run_started)`, so a
+call reformatted across two lines would have dropped silently out of the scan
+and gone unguarded while the test stayed green. Any call shape it cannot read
+is now reported rather than skipped, verified by reformatting one and watching
+it go red.
+
+**For the next reader.** The instrument to distrust here is a test that asserts
+a call is *made*. Presence is not behaviour, and the gap between them is
+exactly wide enough to hold this item's entire history.
