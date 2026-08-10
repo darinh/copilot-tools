@@ -726,9 +726,16 @@ def test_an_unexaminable_log_directory_is_not_an_empty_one(
         "an unexaminable log directory was reported as a successful census"
 
 
-def test_reload_refuses_to_rewrite_a_spec_it_could_not_read(tmp_path, monkeypatch):
-    """``reload`` writes the spec back from what it read. A failed read that
-    became ``{}`` would leave an instance that launches nothing."""
+def test_reload_leaves_a_spec_it_cannot_read_alone(tmp_path, monkeypatch):
+    """The concern outlives the code that had it.
+
+    `reload` used to write the spec back from what it read, so a failed read
+    becoming ``{}`` would have left an instance that launches nothing. It now
+    neither reads nor writes the file -- the spec is regenerated at every
+    launch, so editing it achieved nothing -- which settles that concern by
+    removing its subject. Asserted rather than deleted: an unreadable spec
+    must still not cost the file its contents.
+    """
     inst = op.Instance("reloadable")
     original = json.dumps({"argv": ["--agent", "a"], "cwd": str(tmp_path)})
     inst.spec_file.write_text(original, encoding="utf-8")
@@ -741,18 +748,17 @@ def test_reload_refuses_to_rewrite_a_spec_it_could_not_read(tmp_path, monkeypatc
         return real_read_text(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", unreadable)
-    with pytest.raises(SystemExit):
-        op.reload_instance("reloadable")
+    assert op.reload_instance("reloadable") == 1
     monkeypatch.setattr(Path, "read_text", real_read_text)
 
     assert inst.spec_file.read_text(encoding="utf-8") == original
 
 
-def test_reload_rejects_a_spec_that_is_not_an_object(tmp_path):
+def test_reload_leaves_a_malformed_spec_alone(tmp_path):
     inst = op.Instance("listy")
     inst.spec_file.write_text("[1, 2, 3]", encoding="utf-8")
-    with pytest.raises(SystemExit):
-        op.reload_instance("listy")
+    assert op.reload_instance("listy") == 1
+    assert inst.spec_file.read_text(encoding="utf-8") == "[1, 2, 3]"
 
 
 # ── metrics: sqlite creates what it cannot find ─────────────────

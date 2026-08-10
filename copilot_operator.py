@@ -4343,40 +4343,52 @@ def join_instance(target: str | None) -> int:
 
 
 def reload_instance(target: str | None) -> int:
-    if not target:
-        print("Usage: operator reload NAME", file=sys.stderr)
-        print("Re-generates the launch spec for an instance using the current operator.",
-              file=sys.stderr)
-        return 1
-    instance = Instance(target)
-    if path_present(instance.spec_file) is False:
-        die(f"No launch spec found for '{target}' at {instance.spec_file}")
-    try:
-        spec = json.loads(instance.spec_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        # The spec is about to be rewritten from what was read. Reading it as
-        # "empty" would replace a working launch spec with one that launches
-        # nothing, so a failed read has to stop the command instead.
-        die(f"Could not read the launch spec at {instance.spec_file}: {exc}")
-    if not isinstance(spec, dict):
-        die(f"The launch spec at {instance.spec_file} is not a JSON object.")
-    argv = list(spec.get("argv", []))
-    agent = extract_agent_from_args(argv)
-    preamble = build_preamble(agent, instance)
-    if "-i" in argv:
-        idx = argv.index("-i")
-        argv = argv[:idx]
-    if "--effort" not in argv:
-        argv += ["--effort", "high"]
-    argv += ["-i", preamble]
-    spec["argv"] = argv
-    tmp = instance.spec_file.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(spec, indent=2), encoding="utf-8")
-    os.replace(tmp, instance.spec_file)
-    log(f"Reloaded launch spec for {target}")
-    print(f"✅ Launch spec updated: {instance.spec_file}")
-    print("   Changes take effect on next copilot restart.")
-    return 0
+    """Refuse, and name what actually picks up new operator code.
+
+    This used to rewrite ``{id}.launch.json`` with a freshly built preamble and
+    print ``✅ Launch spec updated``. Nothing ever read what it wrote.
+
+    The launch spec is a derived artifact, not configuration.
+    ``start_session`` calls :func:`write_launch_spec` and then hands the path
+    it returns to :func:`runner_argv` ten lines later, and that is the only
+    ``MUX.new_session`` in the operator -- so every launch regenerates the file
+    immediately before the only thing that reads it. An edit made between two
+    launches is overwritten by the next one before anybody looks, and an edit
+    made during a session is overwritten before the session after it starts.
+    There is no interleaving in which the write survives to be used.
+
+    So the command could not work in any mode, and said ``✅`` anyway. That is
+    this repository's signature failure -- an instrument reporting success for
+    something that did not happen -- and the reason it survived is that the
+    only test of it asserted the file's *contents* afterwards, which is a fact
+    about `reload` and not about anything that launches Copilot.
+    ``test_a_loop_launch_overwrites_the_spec_that_reload_wrote`` had already
+    pinned half of it, with a rationale ("`reload` serves the non-loop path")
+    that is also wrong: the non-loop path goes through ``start_session`` too.
+
+    Kept as a named refusal rather than deleted, because a removed subcommand
+    falls through to the dispatcher's unknown-command path and tells the reader
+    nothing about what to run instead. What they wanted is a supervisor holding
+    current code, which is `restart-loop`.
+    """
+    print("`operator reload` cannot do anything, and no longer pretends to.",
+          file=sys.stderr)
+    print(file=sys.stderr)
+    print("It rewrote the launch spec, but the launch spec is regenerated from "
+          "the running", file=sys.stderr)
+    print("operator on every single launch — `start_session` writes it and "
+          "hands that same", file=sys.stderr)
+    print("path to the runner ten lines later — so nothing ever read the "
+          "version this wrote.", file=sys.stderr)
+    print(file=sys.stderr)
+    print("To pick up new operator code, replace the supervisor that is "
+          "holding the old copy:", file=sys.stderr)
+    print("    operator restart-loop --all      every supervisor on this "
+          "machine", file=sys.stderr)
+    if target:
+        print(f"    operator restart-loop {target}"
+              f"{' ' * max(1, 12 - len(target))}just this one", file=sys.stderr)
+    return 1
 
 
 def ingest_all_logs(force: bool = False) -> int:
@@ -5881,7 +5893,7 @@ USAGE
     operator ownership check [--project SUB]                   Refuse a branch that changed files outside its subproject
     operator NAME                                              Join a running instance
     operator join [NAME]                                       Join (explicit form)
-    operator reload NAME                                       Hot-reload launch spec
+    operator reload NAME                                       Removed — see restart-loop
     operator list                                              Show running instances
     operator projects                                          Per-project feature configuration
     operator projects retire [--yes]                           Move conventions into each project's AGENTS.md

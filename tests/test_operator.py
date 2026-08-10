@@ -1871,11 +1871,20 @@ def test_reload_without_name_errors(capsys):
 
 
 def test_reload_rebuilds_preamble(tmp_path, isolated_state):
+    """It does not, and no longer says it did.
+
+    `reload` rewrote the launch spec with a fresh preamble and printed a green
+    tick. `start_session` regenerates that file immediately before the only
+    thing that reads it, so the rewrite was overwritten before any launch could
+    use it — in every mode, with no interleaving where it survived. The command
+    now refuses and names `restart-loop`, which replaces the supervisor holding
+    the stale code and is what rebuilds the preamble for real.
+    """
     inst = op.Instance("proj")
     op.write_launch_spec(
         inst, ["copilot", "--agent", "anvil:anvil", "-i", "old preamble"], tmp_path, 1)
-    assert op.reload_instance("proj") == 0
-    spec = json.loads(inst.spec_file.read_text(encoding="utf-8"))
-    assert spec["argv"][-2] == "-i"
-    assert "blanket human approval" in spec["argv"][-1]
-    assert "--effort" in spec["argv"]
+    before = inst.spec_file.read_text(encoding="utf-8")
+
+    assert op.reload_instance("proj") == 1
+    assert inst.spec_file.read_text(encoding="utf-8") == before, \
+        "reload still rewrites a file that every launch regenerates"

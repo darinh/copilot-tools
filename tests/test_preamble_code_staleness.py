@@ -549,35 +549,45 @@ def test_a_failed_check_degrades_to_unknown_rather_than_current():
 # cure here remains `restart-loop`.
 
 
-def test_reload_cannot_write_the_clause_that_was_wrong(tmp_path):
-    """`reload_instance` builds its preamble with no crash-recovery argument,
-    so a reloaded spec never contains that claim at all. It cannot correct a
-    sentence it is structurally incapable of writing."""
+def test_reload_cannot_correct_a_stale_preamble_at_all(tmp_path):
+    """It never could, and it used to report success for trying.
+
+    The original claim here was narrower and true: `reload_instance` built its
+    preamble with no crash-recovery argument, so it could not correct that one
+    sentence. The wider fact is that it could not correct any of them — every
+    launch regenerates the spec, so nothing it wrote was ever read. The cure
+    was always `restart-loop`.
+    """
     inst = op.Instance("reloaded-claim")
     op.write_launch_spec(
         inst, ["copilot", "--agent", "a:b", "-i", "old"], tmp_path, 1)
+    before = inst.spec_file.read_text(encoding="utf-8")
 
-    assert op.reload_instance("reloaded-claim") == 0
-
-    written = json.loads(inst.spec_file.read_text(encoding="utf-8"))["argv"][-1]
-    assert "blanket human approval" in written, "control: reload did write a preamble"
-    assert "handoff file could not be found" not in written
+    assert op.reload_instance("reloaded-claim") == 1
+    assert inst.spec_file.read_text(encoding="utf-8") == before
 
 
-def test_a_loop_launch_overwrites_the_spec_that_reload_wrote(tmp_path, monkeypatch):
-    """In loop mode `reload`'s work does not survive to be read.
+def test_a_loop_launch_regenerates_the_launch_spec(tmp_path, monkeypatch):
+    """Why editing the spec on disk can never matter.
 
     The supervisor builds its own preamble per launch and `start_session`
-    rewrites the spec from it, so the next launch replaces whatever `reload`
-    put there -- with text built by the same stale code. `reload` serves the
-    non-loop path, where the spec is what the runner actually reads.
+    rewrites the spec from it, so whatever is on disk beforehand is replaced
+    before the runner is handed the path. This used to be recorded as a fact
+    about loop mode, with the note that "`reload` serves the non-loop path,
+    where the spec is what the runner actually reads" -- which is wrong for
+    the same reason: the non-loop path calls `start_session` too, and there is
+    only one `MUX.new_session` in the operator. `reload` was reported as
+    working because the test asked what the file contained afterwards rather
+    than whether anything read it.
+
+    `tests/test_launch_spec_is_derived.py` asserts the same property
+    statically, over every launch site. This is the runtime half.
     """
     inst = op.Instance("reloaded-spec")
     op.write_launch_spec(
-        inst, ["copilot", "--agent", "a:b", "-i", "old"], tmp_path, 1)
-    assert op.reload_instance("reloaded-spec") == 0
-    reloaded = json.loads(inst.spec_file.read_text(encoding="utf-8"))["argv"][-1]
-    assert "blanket human approval" in reloaded, "control: reload did write a preamble"
+        inst, ["copilot", "--agent", "a:b", "-i", "hand-edited"], tmp_path, 1)
+    edited = json.loads(inst.spec_file.read_text(encoding="utf-8"))["argv"][-1]
+    assert edited == "hand-edited", "control: the spec really did say that"
 
     monkeypatch.setattr(op, "copilot_executable", lambda: "copilot")
     monkeypatch.setattr(op.time, "sleep", lambda _s: None)
@@ -589,5 +599,5 @@ def test_a_loop_launch_overwrites_the_spec_that_reload_wrote(tmp_path, monkeypat
 
     argv = json.loads(inst.spec_file.read_text(encoding="utf-8"))["argv"]
     assert "built by the supervisor that is running" in argv
-    assert reloaded not in argv, \
-        "the launch spec reload wrote was replaced, not read"
+    assert edited not in argv, \
+        "an edit made to the launch spec survived a launch"
