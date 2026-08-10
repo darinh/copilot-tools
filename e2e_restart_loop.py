@@ -57,10 +57,14 @@ def read_pid(path: Path) -> int | None:
     `key=value` stamps after it, so reading the whole file as one integer
     would fail on every stamped supervisor and report the loop as never
     coming up.
+
+    ``ValueError`` covers the read as well as the parse: a file damaged into
+    invalid UTF-8 raises ``UnicodeDecodeError``, which is a ``ValueError``
+    rather than an ``OSError``.
     """
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, ValueError):
         return None
     if not lines:
         return None

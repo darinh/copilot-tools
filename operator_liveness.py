@@ -358,12 +358,28 @@ def _ps_start_token(pid: int) -> "str | None":
     Not parsed: the format is locale-dependent, and every parse of it is a
     chance to turn one process into another. Two reads of the same process
     give byte-identical strings, and that is the entire requirement.
+
+    Which is why the locale is pinned rather than inherited. ``lstart`` is
+    rendered through ``LC_TIME``, so the *same* process read from two shells
+    with different locales yields two different strings -- and since
+    `copilot_operator._loop_pid_reused` now spends a token mismatch on
+    deleting a supervisor's pid file, an inherited locale would let a
+    perfectly live supervisor be declared stopped by whichever command
+    happened to run under the other locale. ``LC_ALL=C`` makes the token a
+    property of the process rather than of the caller's environment.
+
+    The cost of pinning it is one cosmetic notice on macOS at upgrade: a
+    record stamped under a localised ``lstart`` compares unequal to the C
+    rendering, so `_record_describes` reports that supervisor's record as not
+    its own until it restarts. That is a printed line, against a pid file
+    pruned out from under a running supervisor.
     """
     try:
         proc = subprocess.run(
             ["ps", "-p", str(int(pid)), "-o", "lstart="],
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=10,
+            env={**os.environ, "LC_ALL": "C", "LC_TIME": "C", "LANG": "C"},
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
@@ -417,6 +433,33 @@ def process_present(pid: "int | None") -> "bool | None":
     if IS_WINDOWS:
         return _win_process_present(pid)
     return _posix_process_present(pid)
+
+
+#: The kinds of start token `process_start_token` can return, as the tag
+#: before the first ``:``. Named here rather than at the readers, so a fourth
+#: producer cannot be added without the classifiers above and below seeing it.
+START_TOKEN_KINDS = ("win", "linux", "ps")
+
+
+def is_start_token(token: "str | None") -> bool:
+    """Is this a value `process_start_token` could actually have produced?
+
+    A reader that spends a token mismatch on something destructive needs to
+    know the difference between "a token that names a different run" and "a
+    damaged field", because only the first is evidence. Every token this
+    module produces is ``kind:value`` with a non-empty value and a kind from
+    :data:`START_TOKEN_KINDS`, so anything else was not written by any
+    version of this code.
+
+    Not a substitute for writing the file atomically: a *truncated* token is
+    still well-formed by this test -- ``win:13430`` is a prefix of
+    ``win:134308020110986193`` and both pass. It only rules out values that
+    never came from here at all.
+    """
+    if not isinstance(token, str):
+        return False
+    kind, sep, value = token.partition(":")
+    return bool(sep) and kind in START_TOKEN_KINDS and bool(value)
 
 
 def start_token_is_boot_relative(token: "str | None") -> bool:
@@ -602,10 +645,12 @@ __all__ = [
     "LIVE",
     "Liveness",
     "STALE",
+    "START_TOKEN_KINDS",
     "SystemProbes",
     "assess",
     "boot_identity",
     "heartbeat_age",
+    "is_start_token",
     "process_present",
     "process_start_token",
     "same_boot",

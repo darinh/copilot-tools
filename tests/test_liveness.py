@@ -339,6 +339,35 @@ def test_a_malformed_pid_is_unknown_rather_than_absent(pid) -> None:
     assert ol.process_start_token(pid) is None
 
 
+def test_the_ps_probe_pins_the_locale(monkeypatch) -> None:
+    """``ps -o lstart=`` renders through ``LC_TIME``, so an inherited locale
+    makes the token a property of the *caller* rather than of the process.
+    `copilot_operator._loop_pid_reused` spends a token mismatch on deleting a
+    supervisor's pid file, so two shells with different locales could declare
+    each other's live supervisor stopped. Found by adversarial review."""
+    seen = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = "Sat Aug  9 17:25:00 2026"
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["env"] = kwargs.get("env")
+        return _Proc()
+
+    monkeypatch.setattr(ol.subprocess, "run", fake_run)
+
+    assert ol._ps_start_token(4242) == "ps:Sat Aug  9 17:25:00 2026"
+    assert seen["cmd"][:2] == ["ps", "-p"]
+    assert seen["env"] is not None, "an inherited environment carries a locale"
+    assert seen["env"]["LC_ALL"] == "C"
+    assert seen["env"]["LC_TIME"] == "C"
+    # The rest of the environment still has to reach `ps`, or the probe stops
+    # finding it on a machine whose PATH is not the default.
+    assert "PATH" in seen["env"] or "PATH" not in os.environ
+
+
 def test_a_float_pid_is_refused_rather_than_truncated() -> None:
     """``int(1.5)`` is ``1``, so truncating does not refuse the question -- it
     answers a different one, about a real process, and sounds certain."""

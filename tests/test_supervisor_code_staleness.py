@@ -578,14 +578,29 @@ def test_the_code_record_exists_by_the_time_the_pid_file_does(monkeypatch):
     inst = op.Instance("ordering")
     seen = {}
     real_write = op.Path.write_text
+    real_replace = op.os.replace
+
+    def note() -> None:
+        seen["code_present_at_pid_write"] = inst.loop_code_file.exists()
+        seen["args_present_at_pid_write"] = inst.loop_args_file.exists()
 
     def spy(self, *args, **kwargs):
         if self == inst.loop_pid_file:
-            seen["code_present_at_pid_write"] = inst.loop_code_file.exists()
-            seen["args_present_at_pid_write"] = inst.loop_args_file.exists()
+            note()
         return real_write(self, *args, **kwargs)
 
+    def spy_replace(src, dst, *args, **kwargs):
+        # The pid file is published by renaming a temporary over it, so the
+        # rename -- not a write to that path -- is the moment a reader can
+        # first see it. Watching only `write_text` here would leave this
+        # test's dictionary empty and the assertion below raising `KeyError`
+        # about a state that is in fact correct.
+        if op.Path(dst) == inst.loop_pid_file:
+            note()
+        return real_replace(src, dst, *args, **kwargs)
+
     monkeypatch.setattr(op.Path, "write_text", spy)
+    monkeypatch.setattr(op.os, "replace", spy_replace)
     op._publish_supervisor_records(inst, ["--agent", "x"])
 
     assert seen["code_present_at_pid_write"] is True

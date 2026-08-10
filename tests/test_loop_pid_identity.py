@@ -18,6 +18,7 @@ below that pins a *fallback* matters as much as the ones that pin a refusal.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 
@@ -27,6 +28,10 @@ import copilot_operator as op
 import operator_liveness as ol
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _raise_oserror(*args, **kwargs):
+    raise OSError("rename refused")
 
 
 @pytest.fixture(autouse=True)
@@ -132,6 +137,20 @@ def test_an_absent_file_is_no_supervisor():
     assert op._read_loop_pid_stamp(op.Instance("nobody")) is None
 
 
+def test_a_file_that_is_not_utf8_is_no_supervisor():
+    """`read_text` raises `UnicodeDecodeError` -- a `ValueError`, not an
+    `OSError` -- for a file damaged into invalid UTF-8. Letting that escape
+    would take `operator list`, `stop` and `restart-loop` down for every
+    instance over one corrupt file belonging to one. Caught by adversarial
+    review: splitting the old single `except (OSError, ValueError)` into a
+    read and a parse dropped exactly this case."""
+    inst = op.Instance("mojibake")
+    inst.loop_pid_file.write_bytes(b"\xff\xfe4242\n")
+
+    assert op._read_loop_pid_stamp(inst) is None
+    assert op._running_loop_pid(inst) is None
+
+
 def test_a_stamp_value_is_kept_verbatim():
     """Not stripped. The tokens are already stripped where they are produced,
     and re-stripping here would silently rewrite any future token that ended
@@ -166,9 +185,9 @@ def test_a_recycled_pid_is_not_a_running_supervisor(monkeypatch):
     """The bug, in one assertion. The pid is held by a live process and that
     process is not the supervisor that wrote the file."""
     inst = op.Instance("recycled")
-    _write(inst, "4242", "pid_start=started-at-8am")
+    _write(inst, "4242", "pid_start=win:8am")
     _alive(monkeypatch, 4242)
-    calls = _token_probe(monkeypatch, "started-at-9am")
+    calls = _token_probe(monkeypatch, "win:9am")
 
     assert op._running_loop_pid(inst) is None
     assert calls["n"] == 1, "the refusal is only reachable by probing"
@@ -179,9 +198,9 @@ def test_a_refuted_pid_file_is_pruned(monkeypatch):
     outlive anybody's patience. Pruned for the same reason the dead-pid
     branch prunes."""
     inst = op.Instance("pruned")
-    _write(inst, "4242", "pid_start=started-at-8am")
+    _write(inst, "4242", "pid_start=win:8am")
     _alive(monkeypatch, 4242)
-    _token_probe(monkeypatch, "started-at-9am")
+    _token_probe(monkeypatch, "win:9am")
 
     op._running_loop_pid(inst)
 
@@ -192,9 +211,9 @@ def test_a_matching_token_is_the_running_supervisor(monkeypatch):
     """Positive control for the refusal above: same file, same pid, and the
     only thing allowed to decide it agrees."""
     inst = op.Instance("genuine")
-    _write(inst, "4242", "pid_start=started-at-8am")
+    _write(inst, "4242", "pid_start=win:8am")
     _alive(monkeypatch, 4242)
-    calls = _token_probe(monkeypatch, "started-at-8am")
+    calls = _token_probe(monkeypatch, "win:8am")
 
     assert op._running_loop_pid(inst) == 4242
     assert inst.loop_pid_file.exists()
@@ -206,9 +225,9 @@ def test_a_recycled_pid_stops_being_a_looping_instance(monkeypatch):
     in the listing are gated on this predicate, so a refusal has to reach
     them rather than stopping at the function under test."""
     inst = op.Instance("listed")
-    _write(inst, "4242", "pid_start=started-at-8am")
+    _write(inst, "4242", "pid_start=win:8am")
     _alive(monkeypatch, 4242)
-    _token_probe(monkeypatch, "started-at-9am")
+    _token_probe(monkeypatch, "win:9am")
     monkeypatch.setattr(op, "managed_instances",
                         lambda: {inst.id: {"display_name": "listed"}})
     monkeypatch.setattr(op.MUX, "available", lambda: False)
@@ -220,9 +239,9 @@ def test_a_live_supervisor_stays_a_looping_instance(monkeypatch):
     """Negative control for the case above: the same wiring, with the token
     agreeing, must still list the instance."""
     inst = op.Instance("listed")
-    _write(inst, "4242", "pid_start=started-at-8am")
+    _write(inst, "4242", "pid_start=win:8am")
     _alive(monkeypatch, 4242)
-    _token_probe(monkeypatch, "started-at-8am")
+    _token_probe(monkeypatch, "win:8am")
     monkeypatch.setattr(op, "managed_instances",
                         lambda: {inst.id: {"display_name": "listed"}})
     monkeypatch.setattr(op.MUX, "available", lambda: False)
@@ -243,7 +262,7 @@ def test_a_pid_file_predating_the_stamp_is_still_believed(monkeypatch):
     inst = op.Instance("legacy")
     inst.loop_pid_file.write_text("4242", encoding="utf-8")
     _alive(monkeypatch, 4242)
-    calls = _token_probe(monkeypatch, "started-at-9am")
+    calls = _token_probe(monkeypatch, "win:9am")
 
     assert op._running_loop_pid(inst) == 4242
     assert calls["n"] == 0, "no recorded token, so nothing to probe against"
@@ -254,7 +273,7 @@ def test_an_unreadable_live_token_leaves_the_pid_believed(monkeypatch):
     That is an absence of evidence, and it must not be spent refuting a
     supervisor that is running."""
     inst = op.Instance("opaque")
-    _write(inst, "4242", "pid_start=started-at-8am")
+    _write(inst, "4242", "pid_start=win:8am")
     _alive(monkeypatch, 4242)
     calls = _token_probe(monkeypatch, None)
 
@@ -271,7 +290,7 @@ def test_a_damaged_stamp_leaves_the_pid_believed(monkeypatch, line):
     inst = op.Instance("damaged")
     _write(inst, "4242", line)
     _alive(monkeypatch, 4242)
-    calls = _token_probe(monkeypatch, "started-at-9am")
+    calls = _token_probe(monkeypatch, "win:9am")
 
     assert op._running_loop_pid(inst) == 4242
     assert calls["n"] == 0
@@ -282,13 +301,185 @@ def test_a_dead_pid_is_pruned_without_probing(monkeypatch):
     already an answer, and probing a pid nothing holds would fork `ps` on
     macOS for a question that is settled."""
     inst = op.Instance("dead")
-    _write(inst, "4242", "pid_start=started-at-8am")
+    _write(inst, "4242", "pid_start=win:8am")
     _alive(monkeypatch)
-    calls = _token_probe(monkeypatch, "started-at-9am")
+    calls = _token_probe(monkeypatch, "win:9am")
 
     assert op._running_loop_pid(inst) is None
     assert not inst.loop_pid_file.exists()
     assert calls["n"] == 0
+
+
+@pytest.mark.parametrize("recorded", ["pid_start=garbage",
+                                      "pid_start=win:",
+                                      "pid_start=:1234",
+                                      "pid_start=8am"])
+def test_a_stamp_no_probe_could_have_written_is_not_evidence(monkeypatch, recorded):
+    """A value outside `operator_liveness.START_TOKEN_KINDS` was written by no
+    version of this code, so it is damage rather than a different process --
+    and damage must not be spent deleting a live supervisor's pid file."""
+    inst = op.Instance("nonsense")
+    _write(inst, "4242", recorded)
+    _alive(monkeypatch, 4242)
+    _token_probe(monkeypatch, "win:9am")
+
+    assert op._running_loop_pid(inst) == 4242
+    assert inst.loop_pid_file.exists()
+
+
+def test_a_live_token_of_an_unknown_shape_is_not_evidence(monkeypatch):
+    """The other side of the same rule. If the probe starts returning
+    something this module does not recognise, the honest reading is that it
+    stopped answering -- not that every supervisor on the machine is a
+    stranger."""
+    inst = op.Instance("futuretoken")
+    _write(inst, "4242", "pid_start=win:8am")
+    _alive(monkeypatch, 4242)
+    _token_probe(monkeypatch, "quantum-9am")
+
+    assert op._running_loop_pid(inst) == 4242
+    assert inst.loop_pid_file.exists()
+
+
+# ── publishing, and the window a reader must not widen ──────────
+
+def test_the_pid_file_is_published_by_rename(monkeypatch):
+    """`write_text` truncates first, so a concurrent `operator list` can read
+    a file that stops in the middle of the start token -- and a truncated
+    token is a *well-formed* one that differs from the live process's, which
+    is the one input that would delete a running supervisor's pid file. The
+    rename makes a reader see the old file or the new one."""
+    inst = op.Instance("atomic")
+    written: list[str] = []
+    real_write = op.Path.write_text
+
+    def spy(self, *args, **kwargs):
+        written.append(str(self))
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(op.Path, "write_text", spy)
+    op._write_loop_pid_file(inst, 4242)
+
+    assert str(inst.loop_pid_file) not in written, \
+        "the live path must never be the one being written into"
+    assert op._read_loop_pid_stamp(inst)[0] == 4242
+    assert not list(op.RESTART_DIR.glob("*.tmp")), "the temporary is renamed away"
+
+
+def test_publishing_falls_back_when_the_rename_fails(monkeypatch):
+    """An unwritten pid file costs the session its `stop`, its `restart-loop`
+    and its row in the listing. That is worse than the narrow window the
+    rename closes, so the fallback is deliberate."""
+    inst = op.Instance("fallback")
+    monkeypatch.setattr(op.os, "replace", _raise_oserror)
+
+    op._write_loop_pid_file(inst, 4242)
+
+    assert op._read_loop_pid_stamp(inst)[0] == 4242
+
+
+def test_a_stale_reader_does_not_delete_a_replacements_pid_file(monkeypatch):
+    """Deciding costs a probe, and on macOS that probe can take ten seconds.
+    A replacement supervisor can publish inside that window, and an
+    unconditional unlink would then delete a *live* supervisor's file on the
+    strength of a verdict about its predecessor. Found by adversarial
+    review."""
+    inst = op.Instance("replaced")
+    _write(inst, "4242", "pid_start=win:8am")
+    _alive(monkeypatch, 4242, 5353)
+
+    def probe_then_replace(pid):
+        # The replacement lands while the OS is being asked about the old pid.
+        _write(inst, "5353", "pid_start=win:10am")
+        return "win:9am"
+
+    monkeypatch.setattr(op.operator_liveness, "process_start_token",
+                        probe_then_replace)
+
+    assert op._running_loop_pid(inst) is None, \
+        "the verdict about the pid it read is still the right one"
+    assert inst.loop_pid_file.exists(), \
+        "but it is not a verdict about the file that is there now"
+    assert op._read_loop_pid_stamp(inst) == (5353, {"pid_start": "win:10am"})
+
+
+def test_a_stale_reader_does_not_delete_a_replacement_after_a_dead_pid(monkeypatch):
+    """The same guard on the other prune. `_pid_alive` is cheap, but it is
+    not instantaneous, and the file it read may already have been replaced."""
+    inst = op.Instance("deadreplaced")
+    _write(inst, "4242", "pid_start=win:8am")
+
+    def alive_then_replace(pid):
+        _write(inst, "5353", "pid_start=win:10am")
+        return False
+
+    monkeypatch.setattr(op, "_pid_alive", alive_then_replace)
+
+    assert op._running_loop_pid(inst) is None
+    assert inst.loop_pid_file.exists()
+
+
+# ── one probe per instance ──────────────────────────────────────
+
+def test_the_listing_asks_who_holds_a_pid_once(monkeypatch):
+    """`instance_snapshot` asks `_running_loop_identity` and then asks the
+    record reader a related question about the same pid. Probing twice is one
+    `ps` fork per instance too many on macOS, which is the cost complaint
+    `loop_record_facts` already exists to answer."""
+    inst = op.Instance("snapped")
+    _write(inst, "4242", "pid_start=win:8am")
+    _alive(monkeypatch, 4242)
+    calls = _token_probe(monkeypatch, "win:8am")
+    inst.loop_code_file.write_text(
+        json.dumps({"pid": 4242, "pid_start": "win:8am", "files": []}),
+        encoding="utf-8")
+    monkeypatch.setattr(op.MUX, "available", lambda: False)
+
+    snap = op.instance_snapshot(inst)
+
+    assert snap["loop_pid"] == 4242
+    assert snap["loop_code"] != op.CODE_MISMATCH, \
+        "the record is the supervisor's own, so the handed-over token agreed"
+    assert calls["n"] == 1
+
+
+def test_an_unprobed_pid_still_gets_the_record_reader_to_look(monkeypatch):
+    """The sentinel exists so "nobody looked" and "looked, and the OS would
+    not say" stay apart. An unstamped pid file leaves the first, and the
+    record reader must still probe -- passing ``None`` instead would silently
+    retire the record's own pid-reuse check."""
+    inst = op.Instance("unprobed")
+    inst.loop_pid_file.write_text("4242\n", encoding="utf-8")
+    _alive(monkeypatch, 4242)
+    calls = _token_probe(monkeypatch, "win:9am")
+    inst.loop_code_file.write_text(
+        json.dumps({"pid": 4242, "pid_start": "win:8am", "files": []}),
+        encoding="utf-8")
+    monkeypatch.setattr(op.MUX, "available", lambda: False)
+
+    snap = op.instance_snapshot(inst)
+
+    assert snap["loop_pid"] == 4242
+    assert snap["loop_code"] == op.CODE_MISMATCH
+    assert calls["n"] == 1, "the record reader had to ask, because nobody had"
+
+
+def test_a_probe_that_could_not_answer_is_not_asked_twice(monkeypatch):
+    """``None`` is an answer -- "the OS would not say" -- and asking again
+    costs a second fork for a result already known to be unavailable."""
+    inst = op.Instance("silentos")
+    _write(inst, "4242", "pid_start=win:8am")
+    _alive(monkeypatch, 4242)
+    calls = _token_probe(monkeypatch, None)
+    inst.loop_code_file.write_text(
+        json.dumps({"pid": 4242, "pid_start": "win:8am", "files": []}),
+        encoding="utf-8")
+    monkeypatch.setattr(op.MUX, "available", lambda: False)
+
+    snap = op.instance_snapshot(inst)
+
+    assert snap["loop_pid"] == 4242
+    assert calls["n"] == 1
 
 
 # ── across a reboot ─────────────────────────────────────────────
@@ -381,12 +572,22 @@ def test_a_supervisor_that_just_published_reads_as_running():
 
 def test_a_published_stamp_refuses_a_different_process(monkeypatch):
     """The other half of the end-to-end pair: the same real file, read while
-    the pid belongs to something that started at a different moment."""
+    the pid belongs to something that started at a different moment.
+
+    The token is asserted rather than skipped on. Every platform this runs on
+    has a `process_start_token` implementation -- ``win:``, ``linux:`` or
+    ``ps:`` -- so ``None`` here does not mean "not applicable", it means the
+    probe broke and the recycled-pid protection is off on that platform. A
+    skip would retire the guarantee while staying green, which is how the
+    silent all-clear gets back in.
+    """
     inst = op.Instance("realrecycled")
     op._publish_supervisor_records(inst, [])
     real_token = op._read_loop_pid_stamp(inst)[1].get("pid_start")
-    if not real_token:
-        pytest.skip("this platform records no start token to compare")
+
+    assert real_token, \
+        "no start token on this platform: pid reuse is undetectable here"
+
     monkeypatch.setattr(op.operator_liveness, "process_start_token",
                         lambda pid: real_token + "-different")
 
@@ -408,6 +609,9 @@ def test_the_e2e_harness_reads_a_stamped_pid_file(monkeypatch):
 
     assert module.read_pid(inst.loop_pid_file) == 4242
     assert module.read_pid(inst.loop_pid_file.with_name("absent.pid")) is None
+    inst.loop_pid_file.write_bytes(b"\xff\xfe4242\n")
+    assert module.read_pid(inst.loop_pid_file) is None, \
+        "a file damaged into invalid UTF-8 must not abort the harness"
 
 
 # ── the boot-relativity predicate ───────────────────────────────
@@ -425,9 +629,17 @@ def test_only_the_linux_token_is_boot_relative(token, expected):
 
 
 def test_this_machines_own_token_is_classified():
-    """A control against the table above drifting from the producers: every
-    shape `process_start_token` can return is one of the three, so whatever
-    this machine produces must be answerable without an exception."""
+    """A control against the table above drifting from the producers.
+
+    Asserting the *shape* rather than that the answer is a bool: the
+    predicate returns a bool for every input including ``None``, so an
+    isinstance check passes against a classifier that is simply wrong, and
+    against a machine whose probe has stopped answering at all. Both of those
+    switch the reboot half of `_loop_pid_reused` off silently.
+    """
     token = ol.process_start_token(os.getpid())
 
-    assert isinstance(ol.start_token_is_boot_relative(token), bool)
+    assert token, "no start token here: pid reuse is undetectable"
+    kind = token.split(":", 1)[0]
+    assert kind in {"win", "linux", "ps"}, f"unclassified token shape {token!r}"
+    assert ol.start_token_is_boot_relative(token) is (kind == "linux")
