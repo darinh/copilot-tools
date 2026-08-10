@@ -339,12 +339,13 @@ def test_a_malformed_pid_is_unknown_rather_than_absent(pid) -> None:
     assert ol.process_start_token(pid) is None
 
 
-def test_the_ps_probe_pins_the_locale(monkeypatch) -> None:
-    """``ps -o lstart=`` renders through ``LC_TIME``, so an inherited locale
-    makes the token a property of the *caller* rather than of the process.
-    `copilot_operator._loop_pid_reused` spends a token mismatch on deleting a
-    supervisor's pid file, so two shells with different locales could declare
-    each other's live supervisor stopped. Found by adversarial review."""
+def test_the_ps_probe_pins_its_rendering(monkeypatch) -> None:
+    """``ps -o lstart=`` prints a wall-clock date through ``LC_TIME`` and
+    ``TZ``, so an inherited environment makes the token a property of the
+    *caller*. `copilot_operator._loop_pid_reused` spends a token mismatch on
+    deleting a supervisor's pid file and `assess` spends one on declaring a
+    claim's owner DEAD, so two shells with different settings could disown
+    each other's live process. Found by adversarial review."""
     seen = {}
 
     class _Proc:
@@ -358,11 +359,15 @@ def test_the_ps_probe_pins_the_locale(monkeypatch) -> None:
 
     monkeypatch.setattr(ol.subprocess, "run", fake_run)
 
-    assert ol._ps_start_token(4242) == "ps:Sat Aug  9 17:25:00 2026"
+    # `psc`, not `ps`: the pin changes the string for a process that has not
+    # moved, so the tag is what stops a pre-pin record comparing unequal to
+    # its own live owner. See `same_start_token`.
+    assert ol._ps_start_token(4242) == "psc:Sat Aug  9 17:25:00 2026"
     assert seen["cmd"][:2] == ["ps", "-p"]
     assert seen["env"] is not None, "an inherited environment carries a locale"
     assert seen["env"]["LC_ALL"] == "C"
     assert seen["env"]["LC_TIME"] == "C"
+    assert seen["env"]["TZ"] == "UTC"
     # The rest of the environment still has to reach `ps`, or the probe stops
     # finding it on a machine whose PATH is not the default.
     assert "PATH" in seen["env"] or "PATH" not in os.environ

@@ -1215,23 +1215,23 @@ def test_a_stopped_instance_is_never_called_mismatched():
 # `operator_work`.
 def test_a_recycled_pid_does_not_make_a_predecessor_record_its_own(monkeypatch):
     monkeypatch.setattr(op.operator_liveness, "process_start_token",
-                        lambda pid: "started-at-9am")
+                        lambda pid: "win:900")
 
     assert not op._record_describes(
-        {"pid": 123, "pid_start": "started-at-8am"}, 123)
+        {"pid": 123, "pid_start": "win:800"}, 123)
 
 
 def test_a_matching_start_token_is_the_supervisors_own_record(monkeypatch):
     """Positive control against the case above: same pid, same everything but
     the token, which is the only thing that may decide it."""
     monkeypatch.setattr(op.operator_liveness, "process_start_token",
-                        lambda pid: "started-at-8am")
+                        lambda pid: "win:800")
 
     assert op._record_describes(
-        {"pid": 123, "pid_start": "started-at-8am"}, 123)
+        {"pid": 123, "pid_start": "win:800"}, 123)
 
 
-def _token_probe(monkeypatch, value="started-at-9am"):
+def _token_probe(monkeypatch, value="win:900"):
     """Patch the live-token probe and count its calls.
 
     Counting matters as much as the value. Adversarial review pointed out
@@ -1278,7 +1278,7 @@ def test_an_unreadable_live_token_falls_back_to_the_pid(monkeypatch):
     calls = _token_probe(monkeypatch, value=None)
 
     assert op._record_describes(
-        {"pid": 123, "pid_start": "started-at-8am"}, 123)
+        {"pid": 123, "pid_start": "win:800"}, 123)
     assert calls["n"] == 1, "this branch is only reachable by probing"
 
 

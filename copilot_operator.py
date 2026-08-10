@@ -2958,12 +2958,20 @@ def _record_describes(payload: dict, loop_pid: "int | None",
     machine as a leftover the day it shipped.
 
     A `pid_start` that is *present but malformed* -- a number, a list, an
-    empty string -- is a mismatch rather than a fallback, for exactly the
-    reason a missing `pid` is. No version of `_save_loop_code` can produce
-    one: it writes either a non-empty token or ``None``, and ``None`` is the
-    absent case above. So a malformed value is damage, and the leniency here
-    is owed to a real earlier schema, not to corruption. Adversarial review
-    caught the first draft accepting ``17`` and ``""``.
+    empty string, or any value `operator_liveness.is_start_token` does not
+    recognise -- is a mismatch rather than a fallback, for exactly the reason
+    a missing `pid` is. No version of `_save_loop_code` can produce one: it
+    writes either a real token or ``None``, and ``None`` is the absent case
+    above. So a malformed value is damage, and the leniency here is owed to a
+    real earlier schema, not to corruption. Adversarial review caught the
+    first draft accepting ``17`` and ``""``.
+
+    Two tokens of *different kinds* are not a mismatch, though, which is why
+    the comparison goes through `same_start_token` rather than ``==``. The
+    macOS/BSD probe changed its tag from ``ps`` to ``psc`` when it pinned its
+    locale and timezone, and a record written before that describes the same
+    process in another rendering. Comparing those for equality would report
+    every macOS supervisor's record as not its own on the day the pin landed.
 
     ``boot`` closes the last gap the token leaves: `_linux_start_token` counts
     clock ticks *since boot*, so across a reboot a replacement can collide
@@ -2996,13 +3004,13 @@ def _record_describes(payload: dict, loop_pid: "int | None",
     recorded_start = payload.get("pid_start")
     if recorded_start is None:
         return True
-    if not isinstance(recorded_start, str) or not recorded_start:
+    if not operator_liveness.is_start_token(recorded_start):
         return False
     if live_start is _UNPROBED:
         live_start = operator_liveness.process_start_token(loop_pid)
     if not live_start:
         return True
-    return live_start == recorded_start
+    return operator_liveness.same_start_token(recorded_start, live_start) is not False
 
 
 def _compare_recorded_files(files: object) -> "tuple[str, list[str]]":
@@ -3176,32 +3184,49 @@ def _read_loop_pid_stamp(instance: Instance) -> "tuple[int, dict[str, str]] | No
     unreadable one can say. A file whose first line is not an integer is in
     that class too: it names no process, so there is nothing to ask about.
 
+    Read as bytes and decoded a line at a time, because the pid and the
+    stamps fail differently. A stamp damaged into invalid UTF-8 is *dropped*
+    and the pid still answers -- decoding the whole file would have thrown
+    away a perfectly readable pid over an optional field, and a reader that
+    finds no pid concludes no supervisor, which is the direction that invites
+    a second one. Adversarial review caught the first fix doing exactly that.
+
+    A trailing line with no newline after it is dropped for the same reason:
+    a torn write ends mid-line, and a *truncated* token is well-formed -- it
+    would compare unequal to the live process and delete a running
+    supervisor's pid file. Complete stamps always end in a newline, so
+    nothing real is lost. The pid line itself is exempt, because every
+    pre-stamp supervisor wrote a bare pid with no newline at all.
+
     Stamp values are taken verbatim after the first ``=``, unstripped. The
     tokens they carry are already stripped where they are produced, and
     stripping again here would silently rewrite any future token that ended
     in a space -- turning "this is the same process" into "this is a
     different one", which is the expensive direction.
-
-    ``ValueError`` is caught around the *read* as well as the parse, because
-    ``read_text(encoding="utf-8")`` raises ``UnicodeDecodeError`` -- a
-    ``ValueError``, not an ``OSError`` -- for a file damaged into invalid
-    UTF-8. Letting that escape would take `operator list`, `stop` and
-    `restart-loop` down for every instance over one corrupt file belonging to
-    one, which is the shape `_read_loop_record` already refuses to have.
     """
     try:
-        text = instance.loop_pid_file.read_text(encoding="utf-8")
-    except (OSError, ValueError):
+        data = instance.loop_pid_file.read_bytes()
+    except OSError:
         return None
-    lines = text.splitlines()
+    lines = data.splitlines()
     if not lines:
         return None
     try:
-        pid = int(lines[0].strip())
-    except ValueError:
+        pid = int(lines[0].decode("utf-8").strip())
+    except (UnicodeDecodeError, ValueError):
         return None
+    stamp_lines = lines[1:]
+    if stamp_lines and not data.endswith((b"\n", b"\r")):
+        stamp_lines = stamp_lines[:-1]
     stamps: dict[str, str] = {}
-    for line in lines[1:]:
+    for raw in stamp_lines:
+        try:
+            line = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # A stamp nobody can read is not a stamp saying somebody else
+            # holds this pid. Dropped, so the pid falls back to the answer it
+            # gave before stamps existed.
+            continue
         key, sep, value = line.partition("=")
         key = key.strip()
         if sep and key:
@@ -3228,10 +3253,15 @@ def _loop_pid_reused(stamps: dict, live_start: "str | None") -> bool:
     caveat, so refusing on damage is cheap and safe. Here it costs the
     session's supervisor.
 
-    Both sides must be well-formed tokens (`operator_liveness.is_start_token`)
-    before a difference between them counts. A value no version of
-    `process_start_token` could have produced is damage, and damage is not a
-    different process -- it is no information at all.
+    Both sides must be well-formed tokens of the *same* kind before a
+    difference between them counts, which is what
+    `operator_liveness.same_start_token` decides. A value no probe could have
+    produced is damage, and damage is not a different process -- it is no
+    information at all. Two different kinds are not a difference either: the
+    macOS/BSD probe changed its tag from ``ps`` to ``psc`` when it pinned its
+    locale and timezone, and comparing the two renderings for equality would
+    have deleted the pid file of every macOS supervisor running at the moment
+    that landed.
 
     The live token is passed in rather than probed here, because the caller
     that already has one must not pay for a second: on macOS every probe
@@ -3250,12 +3280,14 @@ def _loop_pid_reused(stamps: dict, live_start: "str | None") -> bool:
     list`'s per-instance path and `restart-loop`'s twice-a-second poll.
     """
     recorded_start = stamps.get(LOOP_PID_START_KEY)
-    if not operator_liveness.is_start_token(recorded_start):
-        return False
-    if not operator_liveness.is_start_token(live_start):
-        return False
-    if live_start != recorded_start:
+    same = operator_liveness.same_start_token(recorded_start, live_start)
+    if same is False:
         return True
+    if same is None:
+        return False
+    # The tokens agree. Only a boot-relative one can still be two processes:
+    # `_linux_start_token` counts ticks since boot, so a replacement from
+    # another boot can carry its predecessor's exact value.
     if not operator_liveness.start_token_is_boot_relative(recorded_start):
         return False
     recorded_boot = stamps.get(LOOP_PID_BOOT_KEY)

@@ -359,34 +359,40 @@ def _ps_start_token(pid: int) -> "str | None":
     chance to turn one process into another. Two reads of the same process
     give byte-identical strings, and that is the entire requirement.
 
-    Which is why the locale is pinned rather than inherited. ``lstart`` is
-    rendered through ``LC_TIME``, so the *same* process read from two shells
-    with different locales yields two different strings -- and since
-    `copilot_operator._loop_pid_reused` now spends a token mismatch on
-    deleting a supervisor's pid file, an inherited locale would let a
-    perfectly live supervisor be declared stopped by whichever command
-    happened to run under the other locale. ``LC_ALL=C`` makes the token a
-    property of the process rather than of the caller's environment.
+    Which is why the *rendering* is pinned rather than inherited. ``lstart``
+    is a wall-clock date printed through ``LC_TIME`` and ``TZ``, so the same
+    process read from two shells with different settings yields two different
+    strings -- and since `copilot_operator._loop_pid_reused` spends a token
+    mismatch on deleting a supervisor's pid file, and `assess` spends one on
+    declaring a claim's owner DEAD, an inherited environment would let a
+    perfectly live process be disowned by whichever command happened to run
+    under the other locale. ``LC_ALL``/``LC_TIME``/``TZ`` make the token a
+    property of the process instead of of the caller.
 
-    The cost of pinning it is one cosmetic notice on macOS at upgrade: a
-    record stamped under a localised ``lstart`` compares unequal to the C
-    rendering, so `_record_describes` reports that supervisor's record as not
-    its own until it restarts. That is a printed line, against a pid file
-    pruned out from under a running supervisor.
+    Tagged ``psc:`` rather than ``ps:`` for the same reason `boot_identity`
+    tags its two shapes: the pin *changes the string* for a process that has
+    not moved, and every reader of a pre-pin ``ps:`` token compares for
+    equality. Untagged, a claim recorded before the upgrade would compare
+    unequal to its own live owner and `assess` would return DEAD -- which is
+    reclaimable, so a live agent's worktree could be handed to somebody else.
+    Tagged, `same_start_token` answers "cannot tell" across the two kinds and
+    the migration costs a probe's worth of evidence instead of a session.
+    Found by adversarial review.
     """
     try:
         proc = subprocess.run(
             ["ps", "-p", str(int(pid)), "-o", "lstart="],
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=10,
-            env={**os.environ, "LC_ALL": "C", "LC_TIME": "C", "LANG": "C"},
+            env={**os.environ, "LC_ALL": "C", "LC_TIME": "C", "LANG": "C",
+                 "TZ": "UTC"},
         )
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
         return None
     token = (proc.stdout or "").strip()
-    return f"ps:{token}" if token else None
+    return f"psc:{token}" if token else None
 
 
 def _coerce_pid(pid) -> "int | None":
@@ -438,7 +444,17 @@ def process_present(pid: "int | None") -> "bool | None":
 #: The kinds of start token `process_start_token` can return, as the tag
 #: before the first ``:``. Named here rather than at the readers, so a fourth
 #: producer cannot be added without the classifiers above and below seeing it.
-START_TOKEN_KINDS = ("win", "linux", "ps")
+#:
+#: ``ps`` is read but never written any more: it is the pre-pin macOS/BSD
+#: rendering, made through whatever ``LC_TIME`` and ``TZ`` the caller
+#: happened to have. Tokens recorded under it are still real evidence about
+#: the process that wrote them -- they simply cannot be compared with a
+#: ``psc`` one, which is what `same_start_token` is for.
+START_TOKEN_KINDS = ("win", "linux", "ps", "psc")
+
+#: Kinds whose value is a machine number, so a damaged one is recognisable.
+#: ``ps``/``psc`` carry a date string and cannot be checked this way.
+_NUMERIC_TOKEN_KINDS = ("win", "linux")
 
 
 def is_start_token(token: "str | None") -> bool:
@@ -448,18 +464,47 @@ def is_start_token(token: "str | None") -> bool:
     know the difference between "a token that names a different run" and "a
     damaged field", because only the first is evidence. Every token this
     module produces is ``kind:value`` with a non-empty value and a kind from
-    :data:`START_TOKEN_KINDS`, so anything else was not written by any
-    version of this code.
+    :data:`START_TOKEN_KINDS`, and the two numeric kinds carry digits.
 
     Not a substitute for writing the file atomically: a *truncated* token is
     still well-formed by this test -- ``win:13430`` is a prefix of
-    ``win:134308020110986193`` and both pass. It only rules out values that
-    never came from here at all.
+    ``win:134308020110986193`` and both are digits. It rules out values that
+    never came from here at all, which is the corruption a reader can
+    recognise on its own.
     """
     if not isinstance(token, str):
         return False
     kind, sep, value = token.partition(":")
-    return bool(sep) and kind in START_TOKEN_KINDS and bool(value)
+    if not sep or kind not in START_TOKEN_KINDS or not value:
+        return False
+    if kind in _NUMERIC_TOKEN_KINDS:
+        return value.isdigit()
+    return True
+
+
+def same_start_token(recorded: "str | None", live: "str | None") -> "bool | None":
+    """Do two start tokens name the same run of a pid? ``None`` if unknowable.
+
+    Equality, with the same tri-state discipline `same_boot` uses and for the
+    same reason: the caller must not read "these were rendered differently"
+    as "this is a different process". Either side missing, either side
+    damaged, or the two carrying different kinds is ``None``.
+
+    Different kinds is the case that matters. ``psc`` replaced ``ps`` when the
+    macOS/BSD probe pinned its locale and timezone, so a token recorded before
+    that change describes the same process in another rendering -- and every
+    reader here compares tokens for equality to decide something destructive.
+    `assess` would have returned DEAD for a live claim owner, which is
+    reclaimable, so an agent still working could have had its worktree handed
+    to somebody else; `copilot_operator._loop_pid_reused` would have deleted a
+    running supervisor's pid file. Neither has any evidence to act on: the two
+    strings were never comparable.
+    """
+    if not is_start_token(recorded) or not is_start_token(live):
+        return None
+    if recorded.partition(":")[0] != live.partition(":")[0]:
+        return None
+    return recorded == live
 
 
 def start_token_is_boot_relative(token: "str | None") -> bool:
@@ -612,7 +657,12 @@ def assess(claim, *, probes=None, now=None,
             recorded = getattr(claim, "pid_start", None)
             token = probes.process_start_token(pid)
             signals["start"] = token
-            if recorded and token and token != recorded:
+            # `same_start_token` and not `!=`, because two tokens of different
+            # kinds are not a different process -- they are the same process
+            # rendered by two versions of the probe, and only `False` here is
+            # evidence. DEAD is reclaimable, so reading "cannot compare" as
+            # "gone" hands a live agent's worktree to somebody else.
+            if same_start_token(recorded, token) is False:
                 return Liveness(
                     DEAD, f"pid {pid} was reused: it started at {token}, the "
                           f"claim recorded {recorded}", signals)
