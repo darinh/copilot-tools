@@ -1,8 +1,10 @@
 ---
 id: 29
 title: A recycled pid makes a dead supervisor read as looping
-status: open
+status: closed
 opened: 2026-08-09
+closed: 2026-08-09
+commit: 5699c3bc380d6bc61f083c050c31ab9466957180
 spec: specs/003-windows-native-operator/spec.md
 requirement: User Story 2 - Autonomous loop mode and handoff on Windows
 ---
