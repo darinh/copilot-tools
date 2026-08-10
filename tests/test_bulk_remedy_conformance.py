@@ -44,14 +44,23 @@ def first_party() -> list[Path]:
     return sorted(p for p in REPO.glob("*.py"))
 
 
-def _literal_prefix(node: ast.JoinedStr) -> str:
-    """The f-string's text up to its first interpolation."""
+def _literal_text(node: ast.JoinedStr) -> str:
+    """The f-string's literal parts, with interpolations as a placeholder.
+
+    Reading only the text *before* the first interpolation is what the first
+    draft did, and it left the scan blind to
+    ``f"{name}: operator restart-loop {name}"`` -- a per-instance remedy whose
+    line happens to open with the instance. A guard with a hole in the exact
+    shape it refuses reads like coverage. Interpolations become a marker
+    rather than vanishing, so ``operator {verb}`` cannot be spelled into
+    existence across a gap that was never there.
+    """
     parts = []
     for value in node.values:
         if isinstance(value, ast.Constant) and isinstance(value.value, str):
             parts.append(value.value)
         else:
-            break
+            parts.append("\x00")
     return "".join(parts)
 
 
@@ -89,7 +98,7 @@ def per_instance_remedies(source: str) -> list[tuple[int, str]]:
             for arg in call.args:
                 if not isinstance(arg, ast.JoinedStr):
                     continue
-                match = _REMEDY.search(_literal_prefix(arg))
+                match = _REMEDY.search(_literal_text(arg))
                 if not match:
                     continue
                 if not (_interpolated_names(arg) & targets):
@@ -141,6 +150,16 @@ POSITIVE = [
         'for name in stale:\n'
         '    print(f"    operator restart-loop {name.strip()}")\n',
         id="interpolation is an attribute call on the loop variable",
+    ),
+    pytest.param(
+        'for name in stale:\n'
+        '    print(f"{name}: operator restart-loop {name}")\n',
+        id="command sits after an interpolation — the hole review found",
+    ),
+    pytest.param(
+        'for name in stale:\n'
+        '    print(f"{prefix}{name} — run operator reload {name} to fix")\n',
+        id="two interpolations before the command",
     ),
 ]
 

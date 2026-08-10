@@ -57,15 +57,41 @@ def launch_sites(source: str) -> list[tuple[str, int]]:
 
 
 def regenerating_launch_sites(source: str) -> list[tuple[str, int]]:
-    """Launch sites whose function also calls ``write_launch_spec`` first."""
+    """Launch sites that launch from the spec this function just wrote.
+
+    Data flow, not proximity. The first draft asked only whether the enclosing
+    function contained an earlier ``write_launch_spec`` call, which a reviewer
+    showed accepts the exact regression it exists to refuse::
+
+        def start(a, b):
+            spec = write_launch_spec(a, args)
+            MUX.new_session(b.session, cwd, runner_argv(b.spec_file))
+
+    The write happens, the launch ignores it, and the scan reports the tree
+    clean. So the returned name has to be the one handed to ``runner_argv``.
+    """
     ok = []
     for func in _functions(source):
-        writes = _calls(func, "write_launch_spec")
-        if not writes:
+        bound: dict[str, int] = {}
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not _calls(node.value, "write_launch_spec") if node.value else True:
+                continue
+            for target in node.targets:
+                for name in ast.walk(target):
+                    if isinstance(name, ast.Name):
+                        bound[name.id] = node.lineno
+        if not bound:
             continue
-        earliest = min(w.lineno for w in writes)
         for call in _calls(func, "new_session"):
-            if call.lineno > earliest:
+            fed = set()
+            for inner in _calls(call, "runner_argv"):
+                for name in ast.walk(inner):
+                    if isinstance(name, ast.Name):
+                        fed.add(name.id)
+            used = {n for n in fed if n in bound and call.lineno > bound[n]}
+            if used:
                 ok.append((func.name, call.lineno))
     return ok
 
@@ -147,12 +173,21 @@ def resume_session(instance):
 '''
 
 
+BAD_LAUNCHES_ANOTHER_SPEC = '''
+def start(a, b):
+    spec = write_launch_spec(a, args)
+    MUX.new_session(b.session, cwd, runner_argv(b.spec_file))
+'''
+
+
 @pytest.mark.parametrize("source, expected", [
-    pytest.param(GOOD, [], id="write then launch"),
+    pytest.param(GOOD, [], id="write then launch from what was written"),
     pytest.param(BAD_NO_WRITE, [("resume_session", 3)], id="launch with no write"),
     pytest.param(BAD_WRITE_AFTER, [("start_session", 3)], id="write after launch"),
     pytest.param(BAD_OTHER_FUNCTION, [("resume_session", 8)],
                  id="a second launch path that reuses the file"),
+    pytest.param(BAD_LAUNCHES_ANOTHER_SPEC, [("start", 4)],
+                 id="writes one spec and launches a different one"),
 ])
 def test_the_scan_separates_regenerating_launches_from_stale_ones(source, expected):
     stale = sorted(set(launch_sites(source)) - set(regenerating_launch_sites(source)))

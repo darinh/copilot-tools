@@ -273,27 +273,41 @@ def test_stale_and_cannot_tell_are_not_reported_in_the_same_words():
     assert "absence of evidence" in unknown
 
 
-def test_the_stale_notice_names_the_command_that_fixes_it():
-    """The sweep, not the single instance.
+def test_the_stale_notice_claims_nothing_about_other_instances():
+    """The verdict is process-local, so the claim has to be too.
 
-    Every supervisor on the machine imported its code at startup, so one
-    operator change makes all of them stale at the same moment. A preamble
-    naming only this agent's own instance describes a fix that leaves the
-    other seven exactly as they were.
+    An earlier version told every agent that `restart-loop --all` was "what an
+    operator change needs — they all went stale together". Two reviewers
+    independently caught it: the verdict reaching this text comes from
+    `own_code_state`, which compares *this* process's loaded code against
+    disk and never looks at another instance. Supervisors start at different
+    times — a fresh instance, a single `restart-loop` — so a mixed fleet is
+    ordinary, and that sentence was a machine-wide assertion sourced from one
+    process. It was injected verbatim into every agent on the box.
     """
     text = op.build_preamble("a:b", op.Instance("my.proj"), code_state=op.CODE_STALE)
-    assert "operator restart-loop --all" in text
-    assert "operator restart-loop my.proj" not in text, \
-        "naming one instance understates a fault that is machine-wide"
+    assert "they all went stale together" not in text
+    assert "every supervisor on the machine" not in text
+    assert "YOUR supervisor only" in text, \
+        "the notice does not scope its claim to the observation it is made from"
 
 
-def test_the_stale_notice_does_not_tell_the_agent_to_restart_unprompted():
-    """A supervisor restart is a decision about the process the agent is
-    running under. Naming the command is information; instructing an
-    unattended agent to run it would have every session restart its own
-    wrapper as a side effect of reading its preamble."""
+def test_the_stale_notice_forbids_the_agent_from_restarting_anything():
+    """A supervisor restart is a decision about the process the agent runs under.
+
+    The previous assertion was that "raise it with the human" appears, which a
+    reviewer pointed out would still pass if the notice ALSO said to run the
+    command immediately — presence of a caution is not absence of an
+    instruction. What matters is that no runnable restart command appears at
+    all, so there is nothing for an autonomous agent to lift out and execute.
+    """
     text = _preamble(code_state=op.CODE_STALE)
-    assert "raise it with the human" in text
+    assert "DO NOT run any restart command yourself" in text
+    assert "Report this to the human" in text
+    assert "restart-loop" not in text, (
+        "the notice still contains a runnable restart command; an autonomous "
+        "agent reading its own preamble will run it"
+    )
 
 
 def test_the_notice_points_at_the_crash_claim_when_there_is_one():
