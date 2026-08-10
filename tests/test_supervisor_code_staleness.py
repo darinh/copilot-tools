@@ -1010,7 +1010,7 @@ def test_a_caller_that_names_no_pid_still_gets_the_record():
     assert op.loop_started_at(inst) == "2026-08-10T00:26:37Z"
 
 
-def test_a_record_predating_the_pid_stamp_is_not_a_mismatch():
+def test_a_record_without_a_pid_is_a_mismatch():
     """A record with no pid cannot establish that it describes the live
     process, and there is no pre-pid schema to be lenient towards: the pid
     field landed in the same commit as the record itself (7b5b58d, verified
@@ -1039,7 +1039,13 @@ def test_a_record_with_a_non_integer_pid_is_a_mismatch():
 def test_a_leftover_record_does_not_decide_the_code_verdict(tmp_path):
     """The sibling hole to the one above. A predecessor's record compared
     against disk answers about a process that has gone -- it can call a
-    current supervisor stale, or clear one that is genuinely behind."""
+    current supervisor stale, or clear one that is genuinely behind.
+
+    The verdict is `CODE_MISMATCH` and not `CODE_UNKNOWN` because
+    `list_instances` prints nothing for `unknown`: answering that would swap a
+    wrong verdict for no verdict, which is this item's signature failure. An
+    earlier draft did exactly that and adversarial review caught it.
+    """
     src = tmp_path / "mod.py"
     src.write_text("x = 1\n", encoding="utf-8")
     inst = op.Instance("codemismatch")
@@ -1049,7 +1055,7 @@ def test_a_leftover_record_does_not_decide_the_code_verdict(tmp_path):
         encoding="utf-8")
 
     assert op.loop_code_state(inst, 111) == (op.CODE_CURRENT, [])
-    assert op.loop_code_state(inst, 222) == (op.CODE_UNKNOWN, [])
+    assert op.loop_code_state(inst, 222) == (op.CODE_MISMATCH, [])
 
 
 def test_the_code_verdict_is_unchanged_when_no_pid_is_supplied(tmp_path):
@@ -1108,7 +1114,7 @@ def test_the_snapshot_asks_the_record_readers_about_the_live_supervisor(
     snap = op.instance_snapshot(inst)
 
     assert snap["loop_pid"] == os.getpid()
-    assert snap["loop_code"] == op.CODE_UNKNOWN
+    assert snap["loop_code"] == op.CODE_MISMATCH
     assert snap["loop_started"] == ""
     assert snap["loop_adopted"] is None
     assert snap["loop_began_run"] is None
@@ -1130,6 +1136,136 @@ def test_the_snapshot_reads_a_matching_record_in_full(tmp_path, monkeypatch):
     assert snap["loop_started"] == "2026-08-10T00:26:37Z"
     assert snap["loop_adopted"] is False
     assert snap["loop_began_run"] is True
+
+
+# ── a mismatched record must be reported, not merely withheld ───
+#
+# `list_instances` prints a group for `stale` and one for `unrecorded` and
+# nothing at all for `unknown`. So answering "unknown" on a mismatch replaces
+# a wrong verdict with an absent one, and the row goes back to being
+# byte-identical to a healthy machine -- which is the failure this whole item
+# is about, reproduced inside its own remedy. Caught by adversarial review.
+def test_a_mismatched_record_is_named_in_the_listing(monkeypatch, capsys):
+    monkeypatch.setattr(op, "active_instances", lambda: [op.Instance("alpha")])
+    monkeypatch.setattr(op, "instance_snapshot",
+                        lambda inst: _snap(name="alpha",
+                                           loop_code=op.CODE_MISMATCH))
+
+    op.list_instances()
+    out = capsys.readouterr().out
+
+    assert "belongs to a different" in out
+    assert "operator restart-loop alpha" in out
+
+
+def test_the_listing_says_nothing_about_mismatches_when_there_are_none(
+        monkeypatch, capsys):
+    """Negative control: a paragraph that is always printed says nothing."""
+    monkeypatch.setattr(op, "active_instances", lambda: [op.Instance("alpha")])
+    monkeypatch.setattr(op, "instance_snapshot", lambda inst: _snap(name="alpha"))
+
+    op.list_instances()
+
+    assert "belongs to a different" not in capsys.readouterr().out
+
+
+def test_a_mismatched_record_is_named_on_the_row(monkeypatch):
+    assert "record is not its own" in op._instance_summary(
+        _snap(loop_code=op.CODE_MISMATCH))
+
+
+def test_a_current_supervisor_is_not_named_on_the_row():
+    """Negative control for the row marker."""
+    assert "record is not its own" not in op._instance_summary(_snap())
+
+
+def test_a_stopped_instance_is_never_called_mismatched():
+    """No live supervisor means no record to be anybody's: the marker must
+    not attach to a row it cannot act on, which is how the sibling markers
+    behave."""
+    assert "record is not its own" not in op._instance_summary(
+        _snap(loop_pid=None, loop_code=op.CODE_MISMATCH))
+
+
+# ── a pid is not an identity ────────────────────────────────────
+#
+# Windows recycles pids aggressively. `_save_loop_code` tolerates a failed
+# write, so a supervisor that could not replace its predecessor's record can
+# be handed that predecessor's pid by the OS -- and a pid-only check reads the
+# dead process's record as its own. `process_start_token` is the discrimination
+# the repository already uses for exactly this, in `operator_session` and
+# `operator_work`.
+def test_a_recycled_pid_does_not_make_a_predecessor_record_its_own(monkeypatch):
+    monkeypatch.setattr(op.operator_liveness, "process_start_token",
+                        lambda pid: "started-at-9am")
+
+    assert not op._record_describes(
+        {"pid": 123, "pid_start": "started-at-8am"}, 123)
+
+
+def test_a_matching_start_token_is_the_supervisors_own_record(monkeypatch):
+    """Positive control against the case above: same pid, same everything but
+    the token, which is the only thing that may decide it."""
+    monkeypatch.setattr(op.operator_liveness, "process_start_token",
+                        lambda pid: "started-at-8am")
+
+    assert op._record_describes(
+        {"pid": 123, "pid_start": "started-at-8am"}, 123)
+
+
+def test_a_record_predating_the_token_falls_back_to_the_pid(monkeypatch):
+    """Unlike `pid`, `pid_start` has a real pre-stamp history: every
+    supervisor running when it landed wrote a record without one. Refusing
+    those would have reported every supervisor on the machine as a leftover
+    on day one."""
+    monkeypatch.setattr(op.operator_liveness, "process_start_token",
+                        lambda pid: "started-at-9am")
+
+    assert op._record_describes({"pid": 123}, 123)
+    assert not op._record_describes({"pid": 999}, 123)
+
+
+def test_an_unreadable_live_token_falls_back_to_the_pid(monkeypatch):
+    """`process_start_token` returns None for a pid it cannot inspect. That
+    is an absence of evidence, and it must not be spent refuting a record."""
+    monkeypatch.setattr(op.operator_liveness, "process_start_token",
+                        lambda pid: None)
+
+    assert op._record_describes(
+        {"pid": 123, "pid_start": "started-at-8am"}, 123)
+
+
+def test_a_non_string_token_in_the_record_falls_back_to_the_pid(monkeypatch):
+    monkeypatch.setattr(op.operator_liveness, "process_start_token",
+                        lambda pid: "started-at-9am")
+
+    assert op._record_describes({"pid": 123, "pid_start": 17}, 123)
+    assert op._record_describes({"pid": 123, "pid_start": ""}, 123)
+
+
+def test_the_start_token_is_stamped_by_a_real_publish():
+    """End to end: the refutation above is worth nothing if no supervisor
+    ever writes the field. Asserts against this process's own live token
+    rather than a constant, so it fails if the value written is fabricated."""
+    inst = op.Instance("tokenstamp")
+    op._publish_supervisor_records(inst, [])
+
+    payload = json.loads(inst.loop_code_file.read_text(encoding="utf-8"))
+
+    assert payload["pid"] == os.getpid()
+    assert payload["pid_start"] == \
+        op.operator_liveness.process_start_token(os.getpid())
+
+
+def test_a_real_published_record_is_its_own_writers(monkeypatch):
+    """The whole chain, unmocked: a record this process wrote must read as
+    describing this process, token and all."""
+    inst = op.Instance("tokenroundtrip")
+    op._publish_supervisor_records(inst, [])
+
+    payload = json.loads(inst.loop_code_file.read_text(encoding="utf-8"))
+
+    assert op._record_describes(payload, os.getpid())
 
 
 # ── whether it began the run, recorded rather than estimated ────

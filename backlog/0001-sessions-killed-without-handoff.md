@@ -543,6 +543,48 @@ running supervisor's pid and report "cannot tell" on a mismatch.
 An absent or unreadable record yields no claim rather than "did not restart";
 the missing record is already reported in its own right by `loop_code_state`.
 
+**And a pid is not an identity.** All three adversarial reviewers
+independently reached this, which is the strongest signal any of them
+produced. Windows recycles pids aggressively, and `_save_loop_code` tolerates
+a failed write, so a supervisor that could not replace its predecessor's
+record can be handed that predecessor's pid by the OS — and a pid-only check
+reads a dead process's record as its own, which is the hole this section
+claimed to close. `_save_loop_code` now also stamps `pid_start`, from
+`operator_liveness.process_start_token`, which the repository already uses for
+exactly this in `operator_session` and `operator_work`: it is compared only
+for equality and only for the same pid, so a recycled pid carries a different
+token. Measured on this machine — `win:134308020110986193` for the live
+process, its own record reading `True` and a forged token `False`.
+
+Absence is treated differently from the `pid` above, and deliberately.
+`pid_start` has a real pre-stamp history where `pid` had none, so a record
+without a token, or a live process whose token cannot be read, falls back to
+the pid comparison. Refusing those instead would have reported every
+supervisor on the machine as a leftover the day it shipped.
+
+### The remedy reproduced the failure it was built for
+
+The first draft answered `CODE_UNKNOWN` on a pid mismatch. `list_instances`
+prints a group for `stale` and a group for `unrecorded` and **nothing at all
+for `unknown`** — and a mismatched record also silences `loop_started_at`,
+`loop_adopted` and `loop_began_run`, so `supervisor_took_over` goes quiet too.
+Every question about that row therefore went unanswered, and the row printed
+byte-identical to a healthy one. That is this item's signature failure, for
+the sixth time, inside the remedy for the fifth.
+
+It is now `CODE_MISMATCH`: a fifth verdict rather than a shade of "cannot
+tell", for the same reason `_read_loop_record` keeps "absent" and "could not
+look" apart. It is a *positive* observation — a record was read and it names
+somebody else — so filing it as an absence of evidence is a category error as
+well as a silence. `operator list` names those instances in their own group
+with the same restart remedy, and the row carries `[supervisor record is not
+its own]`.
+
+Caught by adversarial review, not by the suite: every test asserted on the
+verdict `loop_code_state` returned, and none asked whether anything ever
+printed it. A verdict no reader displays is indistinguishable from a verdict
+that was never computed.
+
 ### A test that was asserting the right answer for the wrong reason
 
 Found while adding the above, and repaired in the same change.

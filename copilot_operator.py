@@ -49,6 +49,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import operator_ingest                                       # noqa: E402
+import operator_liveness                                     # noqa: E402
 import mail_affiliation                                      # noqa: E402
 import operator_mail                                         # noqa: E402
 import operator_session                                      # noqa: E402
@@ -261,6 +262,19 @@ CODE_CURRENT = "current"
 CODE_STALE = "stale"
 CODE_UNKNOWN = "unknown"
 CODE_UNRECORDED = "unrecorded"
+#: The record on disk was not written by the supervisor that is running now.
+#:
+#: A fifth answer rather than a shade of ``CODE_UNKNOWN``, for the reason
+#: `_read_loop_record` keeps "absent" and "could not look" apart: they support
+#: different claims and the remedy text differs. This one is a *positive*
+#: observation -- we read a record and it names somebody else -- so collapsing
+#: it into "cannot tell" would file evidence as an absence of evidence.
+#:
+#: It also has to be reported, and that is the whole point. Adversarial review
+#: caught the first draft returning ``CODE_UNKNOWN`` here, which `operator
+#: list` prints nothing for: the row went completely silent, and this item
+#: exists because a silent row reads exactly like a healthy one.
+CODE_MISMATCH = "mismatch"
 
 #: How many numbered clauses the unconditional part of the preamble already
 #: spends, so the optional ones know where to start counting.
@@ -2579,6 +2593,14 @@ def _save_loop_code(instance: Instance, adopted: bool = False,
     """
     payload = dict(running_code_fingerprint())
     payload["pid"] = os.getpid()
+    # A pid is not an identity. Windows recycles them aggressively, so a
+    # supervisor whose own write failed can keep a predecessor's record whose
+    # pid the OS has since handed to it -- and the pid check would then read
+    # that record as its own. The start token is compared only for equality
+    # and only against a token recorded for the same pid, which is exactly the
+    # discrimination missing here; `operator_session` and `operator_work`
+    # already use it for the same reason.
+    payload["pid_start"] = operator_liveness.process_start_token(os.getpid())
     payload["recorded"] = utcnow()
     payload["adopted"] = bool(adopted)
     payload["began_run"] = bool(began_run)
@@ -2678,19 +2700,24 @@ def loop_code_state(instance: Instance,
     which every supervisor was current.
 
     ``loop_pid``, when given, must match the pid the record carries or the
-    verdict is ``CODE_UNKNOWN``. `_save_loop_code` tolerates a failed write,
+    verdict is ``CODE_MISMATCH``. `_save_loop_code` tolerates a failed write,
     so a supervisor whose record could not be replaced keeps its
     predecessor's -- and comparing *that* record's digests against disk
     answers about a process that has gone. It can read ``stale`` and send a
     perfectly current supervisor to be restarted, or read ``current`` and
     clear one that is genuinely behind. Both are verdicts about the wrong
     process, which is not a weaker version of the right one.
+
+    ``CODE_MISMATCH`` rather than ``CODE_UNKNOWN`` because `list_instances`
+    prints nothing for ``unknown``, so answering that here would replace a
+    wrong verdict with no verdict -- and this whole item exists because a row
+    that says nothing is indistinguishable from a healthy one.
     """
     payload, unusable = _read_loop_record(instance)
     if payload is None:
         return unusable, []
     if not _record_describes(payload, loop_pid):
-        return CODE_UNKNOWN, []
+        return CODE_MISMATCH, []
     return _compare_recorded_files(payload.get("files"))
 
 
@@ -2821,11 +2848,36 @@ def _record_describes(payload: dict, loop_pid: "int | None") -> bool:
     record (7b5b58d, verified with `git log -S`), so a record without one was
     never written by any version of this code: it is damaged, and treating
     damage as agreement is exactly the leftover-record hole this closes.
+
+    An equal pid is necessary and not sufficient, because a pid is not an
+    identity: Windows recycles them, so a supervisor whose own write failed
+    can inherit a predecessor's record bearing a pid the OS has since given to
+    it. ``pid_start`` refutes that when both sides have one -- it is compared
+    only for equality and only for the same pid, so a recycled pid carries a
+    different token.
+
+    The two ways it can be absent are deliberately *not* treated like the
+    missing pid above, because unlike `pid`, `pid_start` has a real pre-stamp
+    history: every supervisor running when it landed wrote a record without
+    one. A record with no token, or a live process whose token cannot be read
+    (`process_start_token` returns ``None`` for a pid it cannot inspect), is
+    left to the pid comparison alone. So this only ever *adds* a refusal on
+    positive evidence of recycling, and never converts a genuine older record
+    into a mismatch -- which would have reported every supervisor on the
+    machine as a leftover the day this shipped.
     """
     if loop_pid is None:
         return True
     recorded_pid = payload.get("pid")
-    return isinstance(recorded_pid, int) and recorded_pid == loop_pid
+    if not isinstance(recorded_pid, int) or recorded_pid != loop_pid:
+        return False
+    recorded_start = payload.get("pid_start")
+    if not isinstance(recorded_start, str) or not recorded_start:
+        return True
+    live_start = operator_liveness.process_start_token(loop_pid)
+    if not live_start:
+        return True
+    return live_start == recorded_start
 
 
 def _compare_recorded_files(files: object) -> "tuple[str, list[str]]":
@@ -3263,6 +3315,27 @@ def list_instances() -> int:
         print("or could not write one. The same restart fixes it and picks "
               "up the current code:")
         for name in unrecorded:
+            print(f"    operator restart-loop {name}")
+    # A third group with the same remedy, and the reason differs again. The
+    # record on disk names a process that is not the one running, so it
+    # cannot be asked anything: not which code was loaded, not when the
+    # supervisor started, not whether it adopted. Every one of those questions
+    # therefore goes unanswered for this row, which is why it needs a line of
+    # its own -- the first draft returned "unknown" here and printed nothing
+    # at all, recreating this item's signature failure inside its own remedy.
+    mismatched = [s["name"] for s in snaps
+                  if s["loop_pid"] and s.get("loop_code") == CODE_MISMATCH]
+    if mismatched:
+        print("\nThese supervisors are running with a startup record that "
+              "belongs to a different")
+        print("process. A supervisor writes that record at startup and "
+              "tolerates the write")
+        print("failing, so one that could not replace its predecessor's keeps "
+              "it -- and nothing")
+        print("in it describes the supervisor you are looking at, including "
+              "whether it is")
+        print("current and when it started. A restart writes a fresh one:")
+        for name in mismatched:
             print(f"    operator restart-loop {name}")
     # No remedy line, deliberately: this reports something that has already
     # happened rather than a state to correct, and offering a command would
@@ -5834,6 +5907,11 @@ def _instance_summary(snap: dict) -> str:
         # known -- but that it cannot be checked is itself the finding, and
         # the fix is the same restart.
         parts.append("[supervisor code unrecorded]")
+    elif snap["loop_pid"] and snap.get("loop_code") == CODE_MISMATCH:
+        # The record belongs to a process that is gone, so every question it
+        # answers is answered about the wrong supervisor. Printed rather than
+        # left silent for the reason the whole item exists.
+        parts.append("[supervisor record is not its own]")
     return "  ·  ".join(parts)
 
 
