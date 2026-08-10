@@ -51,7 +51,7 @@ def _detail_snap(**over):
     more keys than the one-line summary does."""
     snap = {"name": "proj", "id": "op-proj", "loop_pid": 123,
             "session_live": True, "owned": True, "session_num": 3,
-            "run_started": "", "loop_started": "", "loop_adopted": None,
+            "run_started": "", "loop_started": "", "loop_adopted": None, "loop_began_run": None,
             "cwd": "", "loop_code": op.CODE_CURRENT, "copilot_pid": None,
             "copilot_session_id": "", "argv": []}
     snap.update(over)
@@ -627,7 +627,7 @@ def test_a_supervisor_that_just_published_reads_as_current():
 def _snap(**over):
     snap = {"name": "proj", "loop_pid": 123, "session_live": True,
             "owned": True, "session_num": 3, "run_started": "", "cwd": "",
-            "loop_started": "", "loop_adopted": None,
+            "loop_started": "", "loop_adopted": None, "loop_began_run": None,
             "loop_code": op.CODE_CURRENT}
     snap.update(over)
     return snap
@@ -1011,14 +1011,178 @@ def test_a_caller_that_names_no_pid_still_gets_the_record():
 
 
 def test_a_record_predating_the_pid_stamp_is_not_a_mismatch():
-    """No pid in the record is not evidence that it belongs to somebody
-    else -- it is evidence the record is old."""
+    """A record with no pid cannot establish that it describes the live
+    process, and there is no pre-pid schema to be lenient towards: the pid
+    field landed in the same commit as the record itself (7b5b58d, verified
+    with `git log -S`). So a pid-less record is damaged, not old, and damage
+    must not read as agreement -- that is the leftover-record hole. An earlier
+    draft accepted it on the strength of a history that never existed, and
+    adversarial review caught the invented data."""
     inst = op.Instance("nopidfield")
     inst.loop_code_file.write_text(
         json.dumps({"recorded": "2026-08-10T00:26:37Z", "files": []}),
         encoding="utf-8")
 
-    assert op.loop_started_at(inst, 222) == "2026-08-10T00:26:37Z"
+    assert op.loop_started_at(inst, 222) is None
+
+
+def test_a_record_with_a_non_integer_pid_is_a_mismatch():
+    inst = op.Instance("junkpid")
+    inst.loop_code_file.write_text(
+        json.dumps({"pid": "222", "recorded": "2026-08-10T00:26:37Z",
+                    "files": []}), encoding="utf-8")
+
+    assert op.loop_started_at(inst, 222) is None
+
+
+# ── the code verdict must answer about the live supervisor too ──
+def test_a_leftover_record_does_not_decide_the_code_verdict(tmp_path):
+    """The sibling hole to the one above. A predecessor's record compared
+    against disk answers about a process that has gone -- it can call a
+    current supervisor stale, or clear one that is genuinely behind."""
+    src = tmp_path / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    inst = op.Instance("codemismatch")
+    inst.loop_code_file.write_text(
+        json.dumps({"pid": 111, "recorded": "2026-08-10T00:26:37Z",
+                    "files": [{"path": str(src), "sha256": _sha(src)}]}),
+        encoding="utf-8")
+
+    assert op.loop_code_state(inst, 111) == (op.CODE_CURRENT, [])
+    assert op.loop_code_state(inst, 222) == (op.CODE_UNKNOWN, [])
+
+
+def test_the_code_verdict_is_unchanged_when_no_pid_is_supplied(tmp_path):
+    """Negative control: every existing caller passes no pid and must keep
+    its answer."""
+    src = tmp_path / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    inst = op.Instance("codenopid")
+    inst.loop_code_file.write_text(
+        json.dumps({"pid": 111, "recorded": "2026-08-10T00:26:37Z",
+                    "files": [{"path": str(src), "sha256": _sha(src)}]}),
+        encoding="utf-8")
+
+    assert op.loop_code_state(inst) == (op.CODE_CURRENT, [])
+
+
+def _live_supervisor(monkeypatch, name):
+    """An instance whose supervisor pid file names *this* process.
+
+    Uses the running interpreter's own pid rather than a fabricated one so
+    `_running_loop_pid` finds a genuinely live process and returns it. A made
+    up pid is pruned as dead, `loop_pid` comes back ``None``, and every
+    record reader then takes its "caller named no pid" path -- which is the
+    one path these tests must not exercise.
+    """
+    inst = op.Instance(name)
+    inst.claim("tok")
+    inst.save_state(3, "2026-07-30T09:00:00Z")
+    inst.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setattr(op.MUX, "available", lambda: False)
+    return inst
+
+
+def _snapshot_record(inst, pid, src):
+    inst.loop_code_file.write_text(
+        json.dumps({"pid": pid, "recorded": "2026-08-10T00:26:37Z",
+                    "adopted": False, "began_run": True,
+                    "files": [{"path": str(src), "sha256": _sha(src)}]}),
+        encoding="utf-8")
+
+
+def test_the_snapshot_asks_the_record_readers_about_the_live_supervisor(
+        tmp_path, monkeypatch):
+    """The wiring, not the predicate. Every reader above is exercised
+    directly, so all of them keep answering correctly even if
+    `instance_snapshot` stops handing them the running pid -- and that one
+    argument is the whole reason the fix reaches `operator list`. Mutation
+    testing found this gap: dropping the pid from the `loop_code_state` call
+    left the suite green.
+    """
+    src = tmp_path / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    inst = _live_supervisor(monkeypatch, "snapmismatch")
+    _snapshot_record(inst, os.getpid() + 1, src)
+
+    snap = op.instance_snapshot(inst)
+
+    assert snap["loop_pid"] == os.getpid()
+    assert snap["loop_code"] == op.CODE_UNKNOWN
+    assert snap["loop_started"] == ""
+    assert snap["loop_adopted"] is None
+    assert snap["loop_began_run"] is None
+
+
+def test_the_snapshot_reads_a_matching_record_in_full(tmp_path, monkeypatch):
+    """Positive control for the test above. Identical record but for the pid,
+    so a snapshot that reported ``unknown`` for everything -- which would pass
+    the mismatch test on its own -- fails here.
+    """
+    src = tmp_path / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    inst = _live_supervisor(monkeypatch, "snapmatch")
+    _snapshot_record(inst, os.getpid(), src)
+
+    snap = op.instance_snapshot(inst)
+
+    assert snap["loop_code"] == op.CODE_CURRENT
+    assert snap["loop_started"] == "2026-08-10T00:26:37Z"
+    assert snap["loop_adopted"] is False
+    assert snap["loop_began_run"] is True
+
+
+# ── whether it began the run, recorded rather than estimated ────
+def test_a_supervisor_that_recorded_beginning_the_run_is_not_a_takeover():
+    """The recorded answer outranks the timestamps. These timestamps are the
+    ones that would otherwise read as a restart, so this fails if the record
+    is ignored."""
+    assert not op.supervisor_took_over(
+        _snap(run_started="2026-07-30T10:36:35Z",
+              loop_started="2026-08-10T00:26:37Z", loop_began_run=True))
+
+
+def test_a_supervisor_that_recorded_inheriting_the_run_is_a_takeover():
+    """The case the margin could not see: a supervisor destroyed and
+    relaunched seconds into a run. The timestamps are inside
+    `SUPERVISOR_RESTART_MARGIN`, so this fails if the record is ignored."""
+    assert op.supervisor_took_over(
+        _snap(run_started="2026-08-09T12:00:00Z",
+              loop_started="2026-08-09T12:00:30Z", loop_began_run=False))
+
+
+def test_an_adopted_handover_is_not_a_takeover_even_when_it_inherited():
+    """`restart-loop` inherits the run by definition; the adoption flag is
+    what keeps it quiet."""
+    assert not op.supervisor_took_over(
+        _snap(run_started="2026-08-09T12:00:00Z",
+              loop_started="2026-08-09T12:00:30Z",
+              loop_began_run=False, loop_adopted=True))
+
+
+def test_without_the_record_the_timestamps_still_decide():
+    """The fallback for supervisors predating the stamp, which is the whole
+    population on this machine today."""
+    assert op.supervisor_took_over(
+        _snap(run_started="2026-07-30T10:36:35Z",
+              loop_started="2026-08-10T00:26:37Z", loop_began_run=None))
+
+
+def test_the_began_run_flag_is_recorded_by_a_real_publish():
+    fresh = op.Instance("freshrun")
+    op._publish_supervisor_records(fresh, [], began_run=True)
+    inherited = op.Instance("inheritedrun")
+    op._publish_supervisor_records(inherited, [], began_run=False)
+
+    assert op.loop_began_run(fresh) is True
+    assert op.loop_began_run(inherited) is False
+
+
+def test_a_record_without_the_began_run_flag_reads_as_unknown():
+    inst = op.Instance("prebeganflag")
+    _record(inst, [])
+
+    assert op.loop_began_run(inst) is None
 
 
 def test_the_start_instant_is_read_back_from_a_real_published_record():

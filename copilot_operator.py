@@ -2561,15 +2561,18 @@ def running_code_fingerprint() -> dict:
     return _RUNNING_CODE
 
 
-def _save_loop_code(instance: Instance, adopted: bool = False) -> None:
+def _save_loop_code(instance: Instance, adopted: bool = False,
+                    began_run: bool = True) -> None:
     """Record which operator source this supervisor started with.
 
     ``adopted`` says whether this supervisor took over a session that was
     already running (`operator restart-loop`) rather than starting one of its
-    own. Recorded here because it is only knowable at startup, and because
-    without it a deliberate supervisor handover is indistinguishable on disk
-    from one caused by every process in the logon session being destroyed:
-    both leave a supervisor younger than the run it is running.
+    own. ``began_run`` says whether it began the run at all, or inherited a
+    ``RUN_STARTED`` written by a predecessor. Both are recorded because both
+    are only knowable at startup, and because without them a deliberate
+    supervisor handover is indistinguishable on disk from one caused by every
+    process in the logon session being destroyed: they leave the same trace, a
+    supervisor younger than the run it is running.
 
     Losing this costs a staleness verdict, never the running session, so it
     warns and carries on for the same reason ``_save_loop_args`` does.
@@ -2578,6 +2581,7 @@ def _save_loop_code(instance: Instance, adopted: bool = False) -> None:
     payload["pid"] = os.getpid()
     payload["recorded"] = utcnow()
     payload["adopted"] = bool(adopted)
+    payload["began_run"] = bool(began_run)
     tmp = instance.loop_code_file.with_suffix(".json.tmp")
     try:
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -2587,7 +2591,8 @@ def _save_loop_code(instance: Instance, adopted: bool = False) -> None:
 
 
 def _publish_supervisor_records(instance: Instance, user_args: list[str],
-                                adopted: bool = False) -> None:
+                                adopted: bool = False,
+                                began_run: bool = True) -> None:
     """Write this supervisor's startup records, pid file last.
 
     The order is the point, which is why these three writes live in one named
@@ -2629,7 +2634,7 @@ def _publish_supervisor_records(instance: Instance, user_args: list[str],
     # took over a session rather than starting one. A supervisor keeps the
     # code it imported for the whole run, so this is the only place either
     # answer is still knowable.
-    _save_loop_code(instance, adopted=adopted)
+    _save_loop_code(instance, adopted=adopted, began_run=began_run)
     instance.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
     # The pid file now answers the liveness question, so the startup record
     # has nothing left to say. Removed after the pid file exists, never
@@ -2638,7 +2643,8 @@ def _publish_supervisor_records(instance: Instance, user_args: list[str],
     remove_file(instance.loop_startup_file)
 
 
-def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
+def loop_code_state(instance: Instance,
+                    loop_pid: "int | None" = None) -> "tuple[str, list[str]]":
     """Is the supervisor running the code that is on disk now?
 
     Returns ``(verdict, changed_paths)`` where verdict is ``CODE_CURRENT``,
@@ -2670,10 +2676,21 @@ def loop_code_state(instance: Instance) -> "tuple[str, list[str]]":
     supervisors predated the record, so all six read ``unknown``, ``operator
     ls`` said nothing, and the output was byte-identical to a machine on
     which every supervisor was current.
+
+    ``loop_pid``, when given, must match the pid the record carries or the
+    verdict is ``CODE_UNKNOWN``. `_save_loop_code` tolerates a failed write,
+    so a supervisor whose record could not be replaced keeps its
+    predecessor's -- and comparing *that* record's digests against disk
+    answers about a process that has gone. It can read ``stale`` and send a
+    perfectly current supervisor to be restarted, or read ``current`` and
+    clear one that is genuinely behind. Both are verdicts about the wrong
+    process, which is not a weaker version of the right one.
     """
     payload, unusable = _read_loop_record(instance)
     if payload is None:
         return unusable, []
+    if not _record_describes(payload, loop_pid):
+        return CODE_UNKNOWN, []
     return _compare_recorded_files(payload.get("files"))
 
 
@@ -2728,7 +2745,7 @@ def loop_started_at(instance: Instance, loop_pid: "int | None" = None) -> "str |
 
     Not the same question as ``RUN_STARTED``, and that difference is the
     point. ``RUN_STARTED`` is persisted in the state file and deliberately
-    carried across supervisor restarts (`launch_loop` reads it back with
+    carried across supervisor restarts (`run_loop_mode` reads it back with
     ``state.get("RUN_STARTED", run_started)``), so it describes the *run*.
     The supervisor is a process, and a process that died and was relaunched
     is a new one with the same run behind it.
@@ -2772,21 +2789,43 @@ def loop_adopted(instance: Instance, loop_pid: "int | None" = None) -> "bool | N
     return adopted if isinstance(adopted, bool) else None
 
 
+def loop_began_run(instance: Instance, loop_pid: "int | None" = None) -> "bool | None":
+    """Did this supervisor begin the run it is running, or inherit it?
+
+    ``False`` means it read a ``RUN_STARTED`` written by a predecessor, which
+    is the exact question `supervisor_took_over` needs and which the margin
+    could only estimate. ``None`` when nobody recorded it -- every supervisor
+    started before this stamp -- and the caller falls back to comparing
+    timestamps.
+    """
+    payload, _ = _read_loop_record(instance)
+    if payload is None or not _record_describes(payload, loop_pid):
+        return None
+    began = payload.get("began_run")
+    return began if isinstance(began, bool) else None
+
+
 def _record_describes(payload: dict, loop_pid: "int | None") -> bool:
     """Is this record the running supervisor's own, rather than a leftover?
 
     A caller that does not know which pid is running (``loop_pid`` is
     ``None``) gets ``True``: it asked a question about whatever record is
     there, and inventing a mismatch it cannot check would be its own kind of
-    false answer. A record with no pid in it is likewise not evidence of a
-    mismatch -- it predates the stamp.
+    false answer.
+
+    When a pid *is* supplied, an integer record pid equal to it is required.
+    A record carrying no pid, or a non-integer one, cannot establish that it
+    describes the live process, and "cannot establish" is a mismatch here
+    rather than a pass -- there is no pre-pid schema to be lenient towards.
+    `_save_loop_code` has stamped `pid` since the commit that introduced the
+    record (7b5b58d, verified with `git log -S`), so a record without one was
+    never written by any version of this code: it is damaged, and treating
+    damage as agreement is exactly the leftover-record hole this closes.
     """
     if loop_pid is None:
         return True
     recorded_pid = payload.get("pid")
-    if not isinstance(recorded_pid, int):
-        return True
-    return recorded_pid == loop_pid
+    return isinstance(recorded_pid, int) and recorded_pid == loop_pid
 
 
 def _compare_recorded_files(files: object) -> "tuple[str, list[str]]":
@@ -4578,6 +4617,12 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
 
     start_session_num = 1
     run_started = utcnow()
+    # Whether *this* supervisor is the one that began the run, recorded rather
+    # than later inferred from how far apart two timestamps are. It is only
+    # knowable here, and knowing it exactly is what lets `supervisor_took_over`
+    # stop guessing -- see `SUPERVISOR_RESTART_MARGIN`, which is the fallback
+    # for supervisors that predate this stamp.
+    began_run = True
     resume_id = ""
     if not is_fresh:
         state = instance.load_state()
@@ -4585,6 +4630,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
             # Adoption joins the session that is already running, so it keeps
             # that session's number. Only a launch moves to the next one.
             start_session_num = int(state.get("SESSION_NUM", 0) or 0) + (0 if adopt else 1)
+            if "RUN_STARTED" in state:
+                began_run = False
             run_started = state.get("RUN_STARTED", run_started)
             candidate = state.get("COPILOT_SESSION_ID", "")
             if UUID_RE.match(candidate or ""):
@@ -4688,7 +4735,8 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
     unknown_markers = 0
     resume_id_used = ""
     adopting = adopt
-    _publish_supervisor_records(instance, user_args, adopted=adopt)
+    _publish_supervisor_records(instance, user_args, adopted=adopt,
+                                began_run=began_run)
     operator_trace.record_supervisor_start(
         OPERATOR_HOME, instance=instance.display_name,
         session=start_session_num, code=running_code_fingerprint())
@@ -5625,7 +5673,7 @@ def _age_since(stamp: str) -> str:
 #: listing will call it a restart.
 #:
 #: Load-bearing rather than merely defensive, and the ordering is the reason.
-#: `launch_loop` stamps ``run_started = utcnow()`` and only afterwards reaches
+#: `run_loop_mode` stamps ``run_started = utcnow()`` and only afterwards reaches
 #: `_publish_supervisor_records`, so on a perfectly healthy *fresh* run the
 #: supervisor's recorded instant is a little **later** than the run's -- the
 #: two differ by however long startup takes. Without a margin every new run
@@ -5664,14 +5712,19 @@ def supervisor_took_over(snap: dict) -> bool:
 
     Two conditions, and the second is what keeps the notice honest.
 
-    The supervisor must not be the process that began the run
-    (`supervisor_restarted_after`) -- and it must not have *adopted* the
-    session it found. `operator restart-loop` retires one supervisor and hands
-    the live session to another on purpose, leaving exactly the same trace on
-    disk as a supervisor that was destroyed: younger than the run it is
-    running. Reporting that would fire on a deliberate, routine action, and
-    would claim a session was lost when `restart_loop` exists precisely to
-    keep it running.
+    **Did it begin the run?** Answered from the record when the supervisor
+    wrote one (``loop_began_run``), which is exact, and otherwise by comparing
+    its start instant against the run's with `supervisor_restarted_after`,
+    which is not. The recorded answer is preferred wherever it exists because
+    the timestamp comparison has a blind spot the record does not: a
+    supervisor destroyed and relaunched within `SUPERVISOR_RESTART_MARGIN` of
+    a run beginning looks exactly like the supervisor that began it.
+
+    **Did it adopt?** `operator restart-loop` retires one supervisor and hands
+    the live session to another on purpose, leaving the identical trace on
+    disk: younger than the run it is running. Reporting that would fire on a
+    deliberate, routine action, and would claim a session was lost when
+    `restart_loop` exists precisely to keep it running.
 
     ``None`` -- nobody recorded whether it adopted -- is still reported,
     because every supervisor predating the stamp is in that state and silence
@@ -5679,10 +5732,13 @@ def supervisor_took_over(snap: dict) -> bool:
     row must not carry is a claim about what the takeover *cost*, which is why
     the wording keeps the observation and the consequence apart.
     """
-    return (bool(snap.get("loop_pid"))
-            and supervisor_restarted_after(snap.get("run_started", ""),
-                                           snap.get("loop_started"))
-            and snap.get("loop_adopted") is not True)
+    if not snap.get("loop_pid"):
+        return False
+    began = snap.get("loop_began_run")
+    inherited = (not began) if isinstance(began, bool) else \
+        supervisor_restarted_after(snap.get("run_started", ""),
+                                   snap.get("loop_started"))
+    return inherited and snap.get("loop_adopted") is not True
 
 
 def _shorten_home(path: str) -> str:
@@ -5724,9 +5780,10 @@ def instance_snapshot(instance: Instance) -> dict:
         # surface it: a same-named session we did not start is look-only.
         "owned": session_live and instance.owns_live_session(),
         "loop_pid": loop_pid,
-        "loop_code": loop_code_state(instance)[0],
+        "loop_code": loop_code_state(instance, loop_pid)[0],
         "loop_started": loop_started_at(instance, loop_pid) or "",
         "loop_adopted": loop_adopted(instance, loop_pid),
+        "loop_began_run": loop_began_run(instance, loop_pid),
         "session_num": session_num,
         "run_started": state.get("RUN_STARTED", "") or owner.get("claimed_at", ""),
         "copilot_session_id": (state.get("COPILOT_SESSION_ID", "")

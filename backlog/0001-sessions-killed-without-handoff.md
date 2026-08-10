@@ -483,7 +483,7 @@ on the machine had been destroyed and relaunched:
     copilot-tools  ·  looping · session #240  ·  up 10d 13h  ·  ~\repos\copilot-tools
 
 `up` is `_age_since(RUN_STARTED)`, and `RUN_STARTED` is persisted in the state
-file and deliberately carried across a supervisor restart — `launch_loop`
+file and deliberately carried across a supervisor restart — `run_loop_mode`
 reads it back with `state.get("RUN_STARTED", run_started)`. So the one field
 on the row was the one field that a mass kill cannot change, and the output
 was **byte-identical to a machine where nothing had happened**. That is this
@@ -509,7 +509,7 @@ The margin (5 minutes) errs towards silence, and it is load-bearing rather
 than merely defensive. The first draft justified it with the claim that a
 supervisor publishes its records *before* the run's first session is launched,
 so on a fresh run it is older than `RUN_STARTED`. **That is backwards.**
-`launch_loop` stamps `run_started = utcnow()` and only afterwards reaches
+`run_loop_mode` stamps `run_started = utcnow()` and only afterwards reaches
 `_publish_supervisor_records`, so a healthy fresh supervisor is recorded
 *later* than its run by however long startup takes. Without a margin every new
 run would announce itself as a restart. The direction of the remaining error
