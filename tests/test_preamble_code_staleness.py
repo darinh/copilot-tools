@@ -22,6 +22,33 @@ import copilot_operator as op
 import operator_session
 import work_claims
 
+#: Every verdict `loop_code_state` and `own_code_state` can return, and the
+#: non-current subset the preamble must caveat.
+#:
+#: Named once and swept by `test_the_verdict_lists_here_name_every_constant`
+#: rather than written out at each `parametrize`. A hand-written list is how a
+#: new enum member acquires a silent wrong default: `CODE_MISMATCH` was added
+#: to the module long after these sweeps were written, and nothing existing
+#: would have failed had it been left out of them -- the sweeps would simply
+#: have kept passing over a set that no longer described the code.
+ALL_CODE_STATES = (op.CODE_CURRENT, op.CODE_STALE, op.CODE_UNKNOWN,
+                   op.CODE_UNRECORDED, op.CODE_MISMATCH)
+NON_CURRENT_CODE_STATES = tuple(s for s in ALL_CODE_STATES
+                                if s != op.CODE_CURRENT)
+
+
+def test_the_verdict_lists_here_name_every_constant():
+    """The guard that makes the two sweeps below mean what they say.
+
+    Discovers the constants by introspection instead of restating them, so
+    adding a `CODE_*` to `copilot_operator` without adding it here fails
+    rather than silently narrowing every parametrised sweep in this file.
+    """
+    declared = {v for k, v in vars(op).items()
+                if k.startswith("CODE_") and isinstance(v, str)}
+
+    assert declared == set(ALL_CODE_STATES)
+
 
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
@@ -201,13 +228,37 @@ def test_current_code_is_the_default_so_untouched_callers_are_unaffected():
     assert "CAUTION" not in op.build_preamble("a:b", op.Instance("one-shot"))
 
 
-@pytest.mark.parametrize("state", [op.CODE_STALE, op.CODE_UNKNOWN, op.CODE_UNRECORDED])
+@pytest.mark.parametrize("state", NON_CURRENT_CODE_STATES)
 def test_every_non_current_verdict_reaches_the_agent(state):
     """Backlog 0011's question was about a launch that "cannot show it is
     running current code" -- which is three verdicts, not just the definite
     one. `unrecorded` in particular described four of the five live
-    supervisors on this machine when the item was corrected."""
+    supervisors on this machine when the item was corrected.
+
+    Four now. `CODE_MISMATCH` was added later, and a verdict added to the set
+    without being added here is the classic way a new enum member acquires a
+    silent wrong default -- which for this function would mean an agent
+    launched by an undescribable supervisor being told nothing at all.
+    """
     assert "CAUTION" in _preamble(code_state=state)
+
+
+def test_a_mismatched_record_is_not_reported_as_an_absent_one():
+    """The generic "cannot show" text says the supervisor "either recorded
+    nothing [...] or that record could not be compared". Both are false for
+    `CODE_MISMATCH`: a record was read and it names a different process.
+    Reporting the two in the same words is the enum-extension defect -- a new
+    member silently acquiring an existing branch's wrong prose, which
+    `test_every_non_current_verdict_reaches_the_agent` cannot see because
+    every branch says CAUTION."""
+    mismatch = _preamble(code_state=op.CODE_MISMATCH)
+    unknown = _preamble(code_state=op.CODE_UNKNOWN)
+
+    assert "CANNOT SHOW" in mismatch
+    assert "belongs to a different process" in mismatch
+    assert "recorded nothing" not in mismatch
+    assert "recorded nothing" in unknown
+    assert "belongs to a different process" not in unknown
 
 
 def test_stale_and_cannot_tell_are_not_reported_in_the_same_words():
@@ -346,8 +397,7 @@ def _clause_numbers(text: str) -> "list[int]":
 
 
 @pytest.mark.parametrize("crash", [False, True])
-@pytest.mark.parametrize("state", [op.CODE_CURRENT, op.CODE_STALE,
-                                   op.CODE_UNKNOWN, op.CODE_UNRECORDED])
+@pytest.mark.parametrize("state", ALL_CODE_STATES)
 @pytest.mark.parametrize("assigned", [False, True])
 def test_the_numbering_is_contiguous_from_one_in_every_combination(
         crash, state, assigned):

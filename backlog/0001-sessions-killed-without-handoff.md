@@ -397,3 +397,265 @@ before being caught:
   the match against the log's restart-signal count, which is the whole
   corroboration.
 
+
+## Re-measurement, 2026-08-09: the kills have resumed, and this one has a cause
+
+Run by the recipe above, which needed no unshipped fix. **The fault is live
+again**, and for the first time a wave was measured 90 seconds after it
+happened rather than hours or days later — this session was launched by it.
+
+`operator.log`, exclusive of the 2026-08-05T01:02:59Z boundary:
+
+- **9 `copilot exited unexpectedly` against 188 `restart signal detected!`.**
+  Six of the nine are one wave, at 2026-08-09 17:25:44–49 local, hitting six
+  distinct instances in five seconds. The other three are isolated singles
+  (08-07 21:54, 08-08 16:22, and one more inside the wave second) and are not
+  claimed here as anything.
+- Uptimes in the wave were 90220s to 238902s — **1.0 to 2.8 days**, against a
+  median of 344s in the original population. These sessions were not dying of
+  anything of their own.
+
+So the 11.1-hour quiet period the previous correction recorded held for about
+four and a half days and then ended.
+
+### The cause of this wave: the interactive logon session was replaced
+
+Measured from the Windows event logs, which no previous iteration of this item
+consulted:
+
+- `Microsoft-Windows-TerminalServices-LocalSessionManager/Operational`:
+  **17:25:08 session 2 disconnected**; 17:25:30 begin session arbitration;
+  **17:25:54 event 21, "Session logon succeeded: User: CABRO\darin Session
+  ID: 4, Source Network Address: 192.168.88.4"**. A new logon session, not a
+  reconnection to the existing one.
+- `System`: twelve **per-user services** — the `_4c456a` suffix is the logon
+  session's LUID — logged 7031 "terminated unexpectedly" together at
+  17:25:52, followed by Winlogon 7001 at 17:25:54. That is a logon session
+  being torn down and another built, not a service fault.
+- No reboot: `LastBootUpTime` is 2026-08-04 10:02:54 and unchanged, and there
+  is no `Kernel-Power` boot event.
+
+Everything in a torn-down session dies, which accounts for the signature that
+refuted the first four hypotheses without needing any of them: consoles are
+disjoint because the session teardown does not travel through a console; each
+instance's own multiplexer server dies because it is *in* the session; no
+operator command coincides because none is involved. It also matches the
+original copilot debug log evidence — `0xC000013A`,
+`STATUS_CONTROL_C_EXIT`, across all seven extension hosts within 22ms — which
+is what console processes report when the session they belong to goes away.
+
+**The discriminating evidence, which is why this is offered as a cause at all
+and not a fifth thing that fits.** The same log holds *dozens* of
+`event 25 — Session reconnection succeeded` to session 2 across 08-07, 08-08
+and 08-09, several of them minutes apart. **None of them killed anything.**
+The single event 21 in the entire history — a new session ID for the same
+user — is the one that coincides with a kill wave, to the second. A
+reconnection preserves the session and costs nothing; a new logon replaces it
+and takes every process with it.
+
+### It does *not* explain the original waves, and is not offered as doing so
+
+Checked before claiming anything, because this item has already survived four
+explanations that fitted:
+
+- Across 2026-08-04 12:00 → 2026-08-05 01:03 local, the window holding ~175
+  waves and 979 `session_exit` records, the same log holds **only event-25
+  reconnections to session 2 — no event 21, no new session at all.** Kills
+  every 6–7 minutes for 30 hours cannot be logon replacements that did not
+  happen.
+- The two populations differ in a second, independent way. The previous
+  correction established by measurement that **the supervisors survived** the
+  original waves — same pids throughout. On 2026-08-09 **every supervisor
+  died too**: `~/.operator/restart/*.loop.pid` and the loopcode records were
+  all rewritten at 17:26:36–37, in the new session 4, and the copilot-tools
+  supervisor's `Win32_Process` creation time is 2026-08-09 17:26:36. A
+  session teardown cannot spare a supervisor that lives in that session.
+
+So there are **two distinct phenomena** under this item. This one is
+explained; the original waves are not, and the fifth hypothesis for them is
+still owed. The item stays open.
+
+### A fifth instrument that could not report what it was read as reporting
+
+`operator list` printed this at 17:27, ninety seconds after every supervisor
+on the machine had been destroyed and relaunched:
+
+    copilot-tools  ·  looping · session #240  ·  up 10d 13h  ·  ~\repos\copilot-tools
+
+`up` is `_age_since(RUN_STARTED)`, and `RUN_STARTED` is persisted in the state
+file and deliberately carried across a supervisor restart — `run_loop_mode`
+reads it back with `state.get("RUN_STARTED", run_started)`. So the one field
+on the row was the one field that a mass kill cannot change, and the output
+was **byte-identical to a machine where nothing had happened**. That is this
+item's signature failure for the fifth time, and the third time inside the
+remedy for a previous one: the staleness notice added last time stayed silent
+too, correctly — a supervisor relaunched from current code *is* current.
+
+The supervisor's own start instant was on disk the whole time.
+`_save_loop_code` has always stamped `recorded` into `{instance}.loopcode.json`
+(`"recorded": "2026-08-10T00:26:37Z"` for the supervisor in question). Nothing
+read it. **Fixed here** by `loop_started_at` and `supervisor_restarted_after`:
+a supervisor that started materially later than the run it is running is not
+the process that began that run, so the session it was running died with it,
+and `operator list` now says so per row and explains the cost in a group at
+the foot. Verified against this machine rather than only in tests — the
+patched `operator list` names all eight instances as
+`[supervisor restarted 19m 43s ago]`, where the shipped one printed nothing.
+
+Three things about the fix are deliberate, and **two of them are corrections
+made after adversarial review, not part of the first draft.**
+
+The margin (5 minutes) errs towards silence, and it is load-bearing rather
+than merely defensive. The first draft justified it with the claim that a
+supervisor publishes its records *before* the run's first session is launched,
+so on a fresh run it is older than `RUN_STARTED`. **That is backwards.**
+`run_loop_mode` stamps `run_started = utcnow()` and only afterwards reaches
+`_publish_supervisor_records`, so a healthy fresh supervisor is recorded
+*later* than its run by however long startup takes. Without a margin every new
+run would announce itself as a restart. The direction of the remaining error
+is chosen: too wide misses a restart within five minutes of a run beginning,
+too narrow calls every ordinary startup a restart, and a notice that is
+sometimes wrong stops being read — which is how this item got here.
+
+**A deliberate handover leaves the identical trace and had to be excluded.**
+`operator restart-loop` retires one supervisor and hands the live session to a
+new one on purpose — its docstring is "Replace an instance's loop supervisor,
+leaving its session running" — and the result on disk is exactly what a
+destroyed supervisor leaves: one younger than the run it is running. The first
+draft reported those too, and told the reader the session had "died mid-turn
+and without a handoff" when `restart_loop` exists precisely to keep it alive.
+`_save_loop_code` now stamps `adopted`, and `supervisor_took_over` requires
+both that the supervisor did not begin the run and that it did not record
+adopting a session. A supervisor that recorded *nothing* about adopting is
+still reported — every one predating the stamp is in that state, and skipping
+them would be the same silence-as-all-clear — so the wording stops at what the
+record establishes and makes no claim about cost. Whether a handoff was
+written is a separate question with its own instrument
+(`crash_recovery_verdict`).
+
+**A leftover record must not describe the live supervisor.** `_save_loop_code`
+tolerates a failed write by design, so a supervisor whose record could not be
+rewritten keeps its predecessor's — which would date a live process by a dead
+one and hide the very restart this reports. The record already carried a
+`pid`; nothing checked it. `loop_started_at` and `loop_adopted` now take the
+running supervisor's pid and report "cannot tell" on a mismatch.
+
+An absent or unreadable record yields no claim rather than "did not restart";
+the missing record is already reported in its own right by `loop_code_state`.
+
+**And a pid is not an identity.** All three adversarial reviewers
+independently reached this, which is the strongest signal any of them
+produced. Windows recycles pids aggressively, and `_save_loop_code` tolerates
+a failed write, so a supervisor that could not replace its predecessor's
+record can be handed that predecessor's pid by the OS — and a pid-only check
+reads a dead process's record as its own, which is the hole this section
+claimed to close. `_save_loop_code` now also stamps `pid_start`, from
+`operator_liveness.process_start_token`, which the repository already uses for
+exactly this in `operator_session` and `operator_work`: it is compared only
+for equality and only for the same pid, so a recycled pid carries a different
+token. Measured on this machine — `win:134308020110986193` for the live
+process, its own record reading `True` and a forged token `False`.
+
+Absence is treated differently from the `pid` above, and deliberately.
+`pid_start` has a real pre-stamp history where `pid` had none, so a record
+without a token, or a live process whose token cannot be read, falls back to
+the pid comparison. Refusing those instead would have reported every
+supervisor on the machine as a leftover the day it shipped.
+
+### The remedy reproduced the failure it was built for
+
+The first draft answered `CODE_UNKNOWN` on a pid mismatch. `list_instances`
+prints a group for `stale` and a group for `unrecorded` and **nothing at all
+for `unknown`** — and a mismatched record also silences `loop_started_at`,
+`loop_adopted` and `loop_began_run`, so `supervisor_took_over` goes quiet too.
+Every question about that row therefore went unanswered, and the row printed
+byte-identical to a healthy one. That is this item's signature failure, for
+the sixth time, inside the remedy for the fifth.
+
+It is now `CODE_MISMATCH`: a fifth verdict rather than a shade of "cannot
+tell", for the same reason `_read_loop_record` keeps "absent" and "could not
+look" apart. It is a *positive* observation — a record was read and it names
+somebody else — so filing it as an absence of evidence is a category error as
+well as a silence. `operator list` names those instances in their own group
+with the same restart remedy, and the row carries `[supervisor record is not
+its own]`.
+
+Caught by adversarial review, not by the suite: every test asserted on the
+verdict `loop_code_state` returned, and none asked whether anything ever
+printed it. A verdict no reader displays is indistinguishable from a verdict
+that was never computed.
+
+### Three more, from reviewing the remedy for the remedy
+
+A second review round over the fix above, by readers from two more model
+families, found three things independently of each other. All are the same
+family of error — a rule justified by a history, applied one case too wide.
+
+**Damage is not a legacy schema.** The fallback that lets a genuinely older
+record through — one written before `pid_start` existed — also cleared `17`,
+`[]` and `""`. `_save_loop_code` writes a non-empty string or `None`, so no
+version of it produces those: they are corruption, and accepting them
+rubber-stamps exactly the impersonation the token was added to refute. This
+is the mistake corrected two paragraphs above for `pid`, made again one field
+over, which is worth recording because the corrected reasoning was *directly
+adjacent in the same function* and still did not transfer.
+
+**A Windows measurement is not a cost.** Each of the four readers re-opens the
+record and re-probes process identity. That was measured here at 0.021 ms per
+probe and called free — but `operator_liveness._ps_start_token` shells out to
+`ps` with a ten-second timeout on macOS and BSD, so `operator list` would fork
+four subprocesses per instance there. This repository's `os.path` note already
+says a green local Windows result is evidence about one leg; the same error
+was made again with a stopwatch instead of a test suite. `loop_record_facts`
+now answers all four questions from one read and at most one probe.
+
+**A start token is boot-relative on Linux.** `_linux_start_token` is field 22
+of `/proc/<pid>/stat`, counted in ticks since boot, so across a reboot a
+replacement can collide with its predecessor on *both* pid and token — the one
+case the token alone cannot refute. The record now carries `boot` from
+`boot_identity()` and compares it with `same_boot`, which is exact for Linux's
+boot uuid, tolerant for the Windows/macOS instant, and answers "cannot tell"
+across kinds, so it only ever refutes on evidence.
+
+The tests learned two things from the same round. The parametrised verdict
+sweeps in `tests/test_preamble_code_staleness.py` were hand-written lists, so
+`CODE_MISMATCH` could be added to the module without any of them failing —
+they would simply have kept passing over a set that no longer described the
+code. They now derive from one named tuple that is checked against the
+`CODE_*` constants by introspection, verified by adding a constant to a
+scratch copy and watching it go red. And several token tests monkeypatched a
+probe that the branch under test short-circuits before reaching; a patch that
+is never reached looks exactly like one that is, so they now count the calls.
+
+### A test that was asserting the right answer for the wrong reason
+
+Found while adding the above, and repaired in the same change.
+`tests/test_supervisor_code_staleness.py::_unreadable` simulates a revoked
+file by patching `builtins.open`. `_digest_file` calls `open()` directly so it
+was genuinely denied — but `Path.read_text` goes through **`io.open`**, which
+is the *same function object under a different name*, so rebinding one leaves
+the other untouched. Measured with a probe: under `_unreadable`, `read_text`
+succeeded and the direct `open` was refused.
+
+`test_an_unreadable_record_is_unknown_not_unrecorded` therefore never had its
+read denied. It passed because the record it wrote, `{}`, has no `files` key,
+and a record with no files is `CODE_UNKNOWN` anyway — the assertion held for
+any implementation, including one with the branch it names deleted. The helper
+now patches both names, and that test writes a record agreeing with disk, so
+it would answer `CODE_CURRENT` and fail if the denial ever stopped biting.
+
+**Recipe for the next reader, unchanged except for one addition.** When a wave
+is found, check the Windows event log before anything else:
+
+    Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'; Id=21,25}
+
+An **event 21** (new session ID for the same user) at the wave's timestamp is
+this cause. An **event 25** (reconnection) is not — those are frequent and
+harmless, and treating them as suspicious would bury the one that matters.
+`operator list` now names any supervisor that restarted without recording that
+it adopted a session, which is the cheapest available detector for a wave that
+has already happened: several instances reporting the same restart age is one
+broadcast, not several coincidences. A single instance named on its own is far
+more likely to be an `operator restart-loop` from a supervisor predating the
+`adopted` stamp than a kill — the flag only distinguishes them for supervisors
+started after this change.
