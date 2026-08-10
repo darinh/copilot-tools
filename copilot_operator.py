@@ -3524,6 +3524,34 @@ def _supervisor_where(pid: int | None, still_starting: bool) -> str:
     return f"still starting; spawned as pid {pid}"
 
 
+def pane_program_running(instance: Instance) -> bool:
+    """Whether the program the multiplexer launched -- the runner -- is going.
+
+    Two signals, because neither alone answers:
+
+    * ``has_session`` is False once the session is gone, which is how a pane
+      started with ``remain_on_exit=False`` ends (single-session mode);
+    * ``pane_dead`` is what answers under ``remain_on_exit=True``, which loop
+      mode sets: there the session outlives the program in it, so
+      ``has_session`` stays true long after the runner has exited and a
+      session-only check can never fire.
+
+    Kept as one function because two callers ask this same question for
+    different reasons and had drifted apart when it was written out twice:
+    :func:`is_copilot_running` adds the exit marker to decide whether *Copilot*
+    is up, and :func:`wait_for_metrics_capture` asks it bare, because the
+    runner outlives Copilot by however long its metrics capture takes.
+
+    Probe failures propagate. Every caller has to decide what an unanswerable
+    question means for it, and they do not agree: the supervisor's poll must
+    not read a failed probe as "exited" and tear down a healthy session, while
+    a shutdown wait has nothing to gain by asking again.
+    """
+    if not MUX.has_session(instance.session):
+        return False
+    return not MUX.pane_dead(instance.session)
+
+
 def is_copilot_running(instance: Instance) -> bool:
     """True while the session's Copilot process is still alive.
 
@@ -3533,103 +3561,75 @@ def is_copilot_running(instance: Instance) -> bool:
       written the instant ``proc.wait()`` returns, before metrics capture, so
       it is prompt -- but a runner killed alongside its Copilot never reaches
       even that, which is the overwhelmingly common case here;
-    * ``has_session`` stays true after the program exits when
-      ``remain-on-exit`` is on, which loop mode sets;
-    * ``pane_dead`` catches exactly that case.
-
-    Omitting ``pane_dead`` lets loop mode poll forever when the runner dies
-    without writing its marker.
+    * the pane's program still being up, which is the two probes in
+      :func:`pane_program_running` and covers both ``remain_on_exit`` modes.
 
     Only a marker we can actually see ends the session. A probe that fails
     says nothing about whether Copilot is alive, and answering "exited" would
-    make the supervisor tear down and relaunch a perfectly healthy session.
+    make the supervisor tear down and relaunch a perfectly healthy session --
+    so the failure is left to propagate rather than resolved to a guess here.
     """
     if path_present(instance.exit_file) is True:
         return False
-    if not MUX.has_session(instance.session):
-        return False
-    return not MUX.pane_dead(instance.session)
+    return pane_program_running(instance)
+
+
+def _wait_until(satisfied, timeout: float, interval: float) -> bool:
+    """Poll ``satisfied`` until it holds or ``timeout`` elapses. True if it did.
+
+    The condition is tested before the deadline, so a wait that is already
+    over answers True rather than being reported as a timeout.
+    """
+    deadline = time.time() + timeout
+    while True:
+        if satisfied():
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(interval)
 
 
 def wait_for_exit(instance: Instance, timeout: int = EXIT_GRACE_SECONDS) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not is_copilot_running(instance):
-            return True
-        time.sleep(1)
-    return False
+    return _wait_until(lambda: not is_copilot_running(instance), timeout, 1)
 
 
 def wait_for_metrics_capture(instance: Instance,
                              timeout: int = METRICS_GRACE_SECONDS) -> bool:
     """Wait for the runner to finish capturing metrics, bounded. True if it did.
 
-    Copilot's exit and the runner's exit used to be the same event to anyone
-    watching from here, because the runner published its exit marker only
-    after the capture. It now publishes the marker first -- deliberately, so a
-    dead session is relaunched in seconds rather than the measured average of
-    95 minutes -- which means the marker no longer implies the metrics for
-    that session are in the database.
+    The runner publishes its exit marker the instant Copilot terminates and
+    captures metrics afterwards -- deliberately, so a dead session is
+    relaunched in seconds rather than the 95 minutes measured on this machine.
+    The marker therefore no longer implies that session's metrics are in the
+    database, and everything that reads the database on the way out has to
+    wait for the runner itself, which is :func:`pane_program_running`.
 
-    Only shutdown paths care, and every one of them does. The attached
-    single-session path prints a run summary straight out of the metrics DB,
-    and reading it a moment too early reports a session that used no credits,
-    which is a wrong number rather than a missing one. Loop mode has six ways
-    to end -- ``operator stop``, Ctrl+C, both giving-up limits, the no-change
-    breaker and the unaccounted breaker -- and each of them summarises too,
-    with three of them destroying the pane immediately afterwards and taking
-    an unfinished capture with it. Every one waits.
+    Every shutdown path waits: the attached single-session summary, and loop
+    mode's six endings, three of which destroy the pane immediately afterwards
+    and would take an unfinished capture with them. The relaunch path
+    deliberately does not -- pausing for a log parse before starting the next
+    session is the delay this removed, and a capture cut short there is
+    recoverable with `operator ingest` where the wait is not recoverable at
+    all.
 
-    What deliberately does *not* wait is the relaunch path, which is the whole
-    point of the change: a supervisor that pauses for a log parse before
-    starting the next session is the 95-minute delay this removed. A capture
-    cut short there is recoverable with `operator ingest`; the wait is not
-    recoverable at all.
-
-    The pane going away is *not* the signal on its own, and assuming it was
-    is how the first draft of this quietly did nothing. Loop mode sets
-    ``remain_on_exit``, so the multiplexer session outlives the runner and
-    ``has_session`` stays true until the supervisor kills it — which happens
-    *after* this wait. On the seven loop-mode paths the session check can
-    therefore never fire, and every one of them blocked for the full timeout
-    whether the capture had finished seconds earlier or not. ``pane_dead`` is
-    what distinguishes them there, exactly as it does in
-    :func:`is_copilot_running`, and for the same reason. Only
-    ``run_single_session`` passes ``remain_on_exit=False``, and the session
-    check is what answers for it.
-
-    Both are asked, because neither alone covers both callers: a session that
-    is gone has no pane to interrogate, and a pane that is dead is still in a
-    session.
-
-    Bounded, and the bound is what makes this safe to add. The capture is a
-    parse of a log with no ceiling on its size -- 1.4 GB on this machine, and
-    one capture measured at 13.3 hours -- so waiting for it unconditionally
-    would hang a terminal indefinitely. A thin summary is recoverable; a
-    session that never returns the prompt is not.
+    Bounded, and the bound is what makes it safe: the capture is a parse of a
+    log with no ceiling on its size -- 1.4 GB on this machine, one capture
+    measured at 13.3 hours -- so waiting unconditionally would hang a
+    terminal. A thin summary is recoverable; a prompt that never returns is
+    not.
 
     A multiplexer that cannot be asked ends the wait rather than spending the
     whole timeout on a question nobody can answer. ``OSError`` as well as
-    ``MuxError``, and that is not belt and braces: :meth:`Mux.has_session`
-    shells out through ``subprocess.run`` and raises no ``MuxError`` of its
-    own, so a missing or unexecutable multiplexer binary arrives here as
-    ``OSError`` alone. Catching only the library's own exception would have
-    left the documented behaviour unreachable and ended an attached session
-    with a traceback instead of a summary. ``_session_live_probe`` catches the
-    same pair, for the same reason.
+    ``MuxError``: :meth:`Mux.has_session` shells out through ``subprocess.run``
+    and raises no ``MuxError`` of its own, so a missing multiplexer binary
+    arrives as ``OSError`` alone and catching only the library's exception
+    would end an attached session with a traceback instead of a summary.
     """
-    deadline = time.time() + timeout
-    while True:
-        try:
-            if not MUX.has_session(instance.session):
-                return True
-            if MUX.pane_dead(instance.session):
-                return True
-        except (MuxError, OSError):
-            return False
-        if time.time() >= deadline:
-            return False
-        time.sleep(0.5)
+    try:
+        return _wait_until(lambda: not pane_program_running(instance),
+                           timeout, 0.5)
+    except (MuxError, OSError):
+        return False
 
 
 def stop_session_gracefully(instance: Instance) -> None:
