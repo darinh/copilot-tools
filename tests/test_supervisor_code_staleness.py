@@ -46,6 +46,18 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _detail_snap(**over):
+    """A snapshot complete enough for `_print_instance_detail`, which reads
+    more keys than the one-line summary does."""
+    snap = {"name": "proj", "id": "op-proj", "loop_pid": 123,
+            "session_live": True, "owned": True, "session_num": 3,
+            "run_started": "", "loop_started": "", "loop_adopted": None,
+            "cwd": "", "loop_code": op.CODE_CURRENT, "copilot_pid": None,
+            "copilot_session_id": "", "argv": []}
+    snap.update(over)
+    return snap
+
+
 def _unreadable(monkeypatch, target: Path):
     """Make reads of one path raise EACCES, as a revoked file does.
 
@@ -615,7 +627,8 @@ def test_a_supervisor_that_just_published_reads_as_current():
 def _snap(**over):
     snap = {"name": "proj", "loop_pid": 123, "session_live": True,
             "owned": True, "session_num": 3, "run_started": "", "cwd": "",
-            "loop_started": "", "loop_code": op.CODE_CURRENT}
+            "loop_started": "", "loop_adopted": None,
+            "loop_code": op.CODE_CURRENT}
     snap.update(over)
     return snap
 
@@ -848,7 +861,7 @@ def test_a_restarted_supervisor_that_is_not_running_is_not_called_out():
               loop_started="2026-08-10T00:26:37Z"))
 
 
-def test_the_listing_explains_what_a_restart_cost(monkeypatch, capsys):
+def test_the_listing_explains_what_a_restart_means(monkeypatch, capsys):
     monkeypatch.setattr(op, "active_instances", lambda: [op.Instance("alpha")])
     monkeypatch.setattr(op, "instance_snapshot",
                         lambda inst: _snap(name="alpha",
@@ -859,7 +872,24 @@ def test_the_listing_explains_what_a_restart_cost(monkeypatch, capsys):
     out = capsys.readouterr().out
 
     assert "alpha" in out
-    assert "without a handoff" in out
+    assert "the process that began it" in out
+
+
+def test_the_listing_does_not_claim_a_session_was_lost(monkeypatch, capsys):
+    """The record establishes that the supervisor was replaced. It does not
+    establish that a session died without a handoff -- `restart_loop` hands
+    its session over intact, and whether a handoff was written is a separate
+    question with its own instrument. An earlier draft asserted the cost, and
+    adversarial review caught it."""
+    monkeypatch.setattr(op, "active_instances", lambda: [op.Instance("alpha")])
+    monkeypatch.setattr(op, "instance_snapshot",
+                        lambda inst: _snap(name="alpha",
+                                           run_started="2026-07-30T10:36:35Z",
+                                           loop_started="2026-08-10T00:26:37Z"))
+
+    op.list_instances()
+
+    assert "without a handoff" not in capsys.readouterr().out
 
 
 def test_the_listing_says_nothing_about_restarts_when_there_were_none(
@@ -874,7 +904,121 @@ def test_the_listing_says_nothing_about_restarts_when_there_were_none(
 
     op.list_instances()
 
-    assert "without a handoff" not in capsys.readouterr().out
+    assert "the process that began it" not in capsys.readouterr().out
+
+
+# ── a deliberate handover is not a takeover ─────────────────────
+#
+# `operator restart-loop` retires one supervisor and hands the live session to
+# a new one on purpose, and leaves the identical trace on disk: a supervisor
+# younger than the run it is running. Reporting it would fire the notice on a
+# routine action and claim a loss that did not happen -- caught by adversarial
+# review before this shipped.
+def _adopted(**over):
+    snap = {"run_started": "2026-07-30T10:36:35Z",
+            "loop_started": "2026-08-10T00:26:37Z", "loop_adopted": True}
+    snap.update(over)
+    return _snap(**snap)
+
+
+def test_a_supervisor_that_adopted_its_session_is_not_a_takeover():
+    assert not op.supervisor_took_over(_adopted())
+
+
+def test_a_supervisor_that_started_its_own_session_is_a_takeover():
+    """The positive control against the case above: same timestamps, and only
+    the adoption flag differs."""
+    assert op.supervisor_took_over(_adopted(loop_adopted=False))
+
+
+def test_an_unrecorded_adoption_is_still_reported():
+    """`None` is not `False`, but here it must not buy silence either. Every
+    supervisor started before the flag existed records `None`, and a notice
+    that skipped them would be the same all-clear-nobody-checked this whole
+    item is about."""
+    assert op.supervisor_took_over(_adopted(loop_adopted=None))
+
+
+def test_an_adopted_handover_is_not_called_out_in_its_row():
+    assert "restarted" not in op._instance_summary(_adopted())
+
+
+def test_an_adopted_handover_is_absent_from_the_listing(monkeypatch, capsys):
+    monkeypatch.setattr(op, "active_instances", lambda: [op.Instance("alpha")])
+    monkeypatch.setattr(op, "instance_snapshot",
+                        lambda inst: _adopted(name="alpha"))
+
+    op.list_instances()
+
+    assert "the process that began it" not in capsys.readouterr().out
+
+
+def test_the_adoption_flag_is_recorded_by_a_real_publish():
+    """End to end: a unit test asserting on `loop_adopted` proves nothing if
+    the supervisor never writes the field."""
+    adopted_inst = op.Instance("adopted")
+    op._publish_supervisor_records(adopted_inst, [], adopted=True)
+    own_inst = op.Instance("ownsession")
+    op._publish_supervisor_records(own_inst, [], adopted=False)
+
+    assert op.loop_adopted(adopted_inst) is True
+    assert op.loop_adopted(own_inst) is False
+
+
+def test_a_record_without_the_flag_reads_as_unknown_not_false():
+    inst = op.Instance("preflag")
+    _record(inst, [])
+
+    assert op.loop_adopted(inst) is None
+
+
+# ── a leftover record must not describe the live supervisor ─────
+#
+# `_save_loop_code` tolerates a failed write by design, so a supervisor whose
+# record could not be replaced keeps its predecessor's -- which would date a
+# live process by a dead one and hide the very restart this reports.
+def test_a_record_belonging_to_another_process_dates_nothing():
+    inst = op.Instance("mismatch")
+    inst.loop_code_file.write_text(
+        json.dumps({"pid": 111, "recorded": "2026-08-10T00:26:37Z",
+                    "adopted": True, "files": []}), encoding="utf-8")
+
+    assert op.loop_started_at(inst, 222) is None
+    assert op.loop_adopted(inst, 222) is None
+
+
+def test_a_record_matching_the_running_supervisor_is_used():
+    """The positive control: the same record, read with the pid it names."""
+    inst = op.Instance("match")
+    inst.loop_code_file.write_text(
+        json.dumps({"pid": 222, "recorded": "2026-08-10T00:26:37Z",
+                    "adopted": True, "files": []}), encoding="utf-8")
+
+    assert op.loop_started_at(inst, 222) == "2026-08-10T00:26:37Z"
+    assert op.loop_adopted(inst, 222) is True
+
+
+def test_a_caller_that_names_no_pid_still_gets_the_record():
+    """Asking without a pid is asking about whatever record is there.
+    Inventing a mismatch that was never checked would be its own false
+    answer."""
+    inst = op.Instance("nopid")
+    inst.loop_code_file.write_text(
+        json.dumps({"pid": 111, "recorded": "2026-08-10T00:26:37Z",
+                    "files": []}), encoding="utf-8")
+
+    assert op.loop_started_at(inst) == "2026-08-10T00:26:37Z"
+
+
+def test_a_record_predating_the_pid_stamp_is_not_a_mismatch():
+    """No pid in the record is not evidence that it belongs to somebody
+    else -- it is evidence the record is old."""
+    inst = op.Instance("nopidfield")
+    inst.loop_code_file.write_text(
+        json.dumps({"recorded": "2026-08-10T00:26:37Z", "files": []}),
+        encoding="utf-8")
+
+    assert op.loop_started_at(inst, 222) == "2026-08-10T00:26:37Z"
 
 
 def test_the_start_instant_is_read_back_from_a_real_published_record():
@@ -903,6 +1047,29 @@ def test_an_unreadable_record_does_not_report_a_start_instant(monkeypatch):
     _unreadable(monkeypatch, inst.loop_code_file)
 
     assert op.loop_started_at(inst) is None
+
+
+def test_the_detail_view_dates_the_supervisor_as_well_as_the_run(capsys):
+    """`operator stats` shows "Running for", which is kept across a restart.
+    On its own it reports a healthy ten-day run on a machine where every
+    session died ninety seconds ago."""
+    op._print_instance_detail(_detail_snap(
+        run_started="2026-07-30T10:36:35Z",
+        loop_started="2026-08-10T00:26:37Z"))
+    out = capsys.readouterr().out
+
+    assert "Running for" in out
+    assert "Supervisor started" in out
+
+
+def test_the_detail_view_says_nothing_when_the_supervisor_began_the_run(capsys):
+    """Negative control: a row that is always printed carries no information
+    when it appears."""
+    op._print_instance_detail(_detail_snap(
+        run_started="2026-08-09T12:00:05Z",
+        loop_started="2026-08-09T12:00:00Z"))
+
+    assert "Supervisor started" not in capsys.readouterr().out
 
 
 # ── what `operator trace` shows ─────────────────────────────────

@@ -502,13 +502,46 @@ the foot. Verified against this machine rather than only in tests — the
 patched `operator list` names all eight instances as
 `[supervisor restarted 19m 43s ago]`, where the shipped one printed nothing.
 
-Two things about the fix are deliberate. The margin (5 minutes) errs towards
-silence: a supervisor publishes its records *before* the run's first session
-is launched, so on a healthy fresh run it is a few seconds older than
-`RUN_STARTED` and must never be called a restart — a notice that is sometimes
-wrong stops being read, which is how this item got here. And an absent or
-unreadable record yields no claim rather than "did not restart"; the missing
-record is already reported in its own right by `loop_code_state`.
+Three things about the fix are deliberate, and **two of them are corrections
+made after adversarial review, not part of the first draft.**
+
+The margin (5 minutes) errs towards silence, and it is load-bearing rather
+than merely defensive. The first draft justified it with the claim that a
+supervisor publishes its records *before* the run's first session is launched,
+so on a fresh run it is older than `RUN_STARTED`. **That is backwards.**
+`launch_loop` stamps `run_started = utcnow()` and only afterwards reaches
+`_publish_supervisor_records`, so a healthy fresh supervisor is recorded
+*later* than its run by however long startup takes. Without a margin every new
+run would announce itself as a restart. The direction of the remaining error
+is chosen: too wide misses a restart within five minutes of a run beginning,
+too narrow calls every ordinary startup a restart, and a notice that is
+sometimes wrong stops being read — which is how this item got here.
+
+**A deliberate handover leaves the identical trace and had to be excluded.**
+`operator restart-loop` retires one supervisor and hands the live session to a
+new one on purpose — its docstring is "Replace an instance's loop supervisor,
+leaving its session running" — and the result on disk is exactly what a
+destroyed supervisor leaves: one younger than the run it is running. The first
+draft reported those too, and told the reader the session had "died mid-turn
+and without a handoff" when `restart_loop` exists precisely to keep it alive.
+`_save_loop_code` now stamps `adopted`, and `supervisor_took_over` requires
+both that the supervisor did not begin the run and that it did not record
+adopting a session. A supervisor that recorded *nothing* about adopting is
+still reported — every one predating the stamp is in that state, and skipping
+them would be the same silence-as-all-clear — so the wording stops at what the
+record establishes and makes no claim about cost. Whether a handoff was
+written is a separate question with its own instrument
+(`crash_recovery_verdict`).
+
+**A leftover record must not describe the live supervisor.** `_save_loop_code`
+tolerates a failed write by design, so a supervisor whose record could not be
+rewritten keeps its predecessor's — which would date a live process by a dead
+one and hide the very restart this reports. The record already carried a
+`pid`; nothing checked it. `loop_started_at` and `loop_adopted` now take the
+running supervisor's pid and report "cannot tell" on a mismatch.
+
+An absent or unreadable record yields no claim rather than "did not restart";
+the missing record is already reported in its own right by `loop_code_state`.
 
 ### A test that was asserting the right answer for the wrong reason
 
@@ -535,6 +568,10 @@ is found, check the Windows event log before anything else:
 An **event 21** (new session ID for the same user) at the wave's timestamp is
 this cause. An **event 25** (reconnection) is not — those are frequent and
 harmless, and treating them as suspicious would bury the one that matters.
-`operator list` now names any supervisor that restarted, which is the cheapest
-available detector for a wave that has already happened: several instances
-reporting the same restart age is one broadcast, not several coincidences.
+`operator list` now names any supervisor that restarted without recording that
+it adopted a session, which is the cheapest available detector for a wave that
+has already happened: several instances reporting the same restart age is one
+broadcast, not several coincidences. A single instance named on its own is far
+more likely to be an `operator restart-loop` from a supervisor predating the
+`adopted` stamp than a kill — the flag only distinguishes them for supervisors
+started after this change.
