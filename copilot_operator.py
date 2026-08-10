@@ -2284,11 +2284,13 @@ def _code_state_notice(code_state: str, instance: Instance,
             "unverified rather than false, and verify anything you would otherwise "
             "have taken on this wrapper's word before acting on it — in particular, "
             "check for a handoff file yourself rather than trusting a claim that none "
-            f"exists. `operator list` names the changed files; `operator restart-loop "
-            f"--all` picks up the current code for every supervisor on the machine, "
-            "which is what an operator change needs — they all went stale together. "
-            "It restarts the supervisor you are running under too, so raise it with "
-            "the human rather than doing it as a side effect of some other task."
+            "exists. This is an observation about YOUR supervisor only — it is made by "
+            "comparing this process's own loaded code against disk, and says nothing "
+            "about any other instance, which may have started at a different time. "
+            "DO NOT run any restart command yourself, not even as a step in a larger "
+            "task: restarting a supervisor is a decision about the process you are "
+            "running under. Report this to the human and let them decide; "
+            "`operator list` names the changed files and every instance affected."
         )
     if code_state == CODE_MISMATCH:
         # Deliberately not the fall-through below, which says the supervisor
@@ -4019,27 +4021,43 @@ def _own_instance_id() -> "str | None":
     """The instance whose Copilot session this process is running inside.
 
     ``None`` when that cannot be established, which is the answer for a human
-    at a terminal and for any process table that could not be read. Callers
-    must treat it as "not known to be self" rather than "known not to be
-    self": every use here only reorders work, so a wrong ``None`` costs the
-    ordering, not correctness.
+    at a terminal and for any process table that could not be read.
 
-    Established by walking our own ancestry and matching it against the
-    Copilot pid each instance recorded, because that pid is the one thing tying
-    a running process back to an instance. Nothing is passed down the
-    environment that could answer this -- the runner spawns Copilot with the
-    inherited environment and stamps no instance name into it.
+    Established by walking our own ancestry and matching it against the Copilot
+    pid each instance recorded. The match requires the *ancestor's own name* to
+    look like Copilot as well, and that is not belt and braces: pids are
+    recycled, and every ancestry contains long-lived shells and multiplexers
+    whose pids a dead session's record could collide with. A pid-only test made
+    that collision decide which row is called "this session's own".
+
+    Both directions of a wrong answer are bounded, and they are not equally
+    bounded, which is why the name check is here. A wrong ``None`` costs only
+    the ordering -- the sweep still restarts everything. A wrong *positive*
+    costs more: the instance falsely identified is deferred, and the real one
+    is left near the front where a catastrophic restart can take this process
+    down before it has reported on the rest. It also prints "this session's own
+    supervisor" against somebody else's name.
     """
     chain = operator_trace.ancestry()
     if not chain:
         return None
-    mine = {entry.get("pid") for entry in chain if entry.get("pid")}
-    mine.add(os.getpid())
+    mine = {}
+    for entry in chain:
+        pid = entry.get("pid")
+        if pid:
+            mine[pid] = ntpath.basename(entry.get("name") or "").lower()
+    own = ntpath.basename(sys.executable or "").lower()
+    mine.setdefault(os.getpid(), own)
     for ident, meta in managed_instances().items():
         inst = Instance(meta.get("display_name", ident))
         pid = inst.copilot_pid()
-        if pid is not None and pid in mine:
-            return inst.id
+        if pid is None or pid not in mine:
+            continue
+        if not mine[pid].startswith("copilot"):
+            # The pid matches an ancestor that is not Copilot, so the record
+            # names a process that has died and had its number reissued.
+            continue
+        return inst.id
     return None
 
 
@@ -4066,9 +4084,15 @@ def restart_all_loops() -> int:
     * **It reports a census rather than a count.** Which instances were
       restarted, which refused and why. A bare "restarted 6 of 8" leaves the
       reader to work out which two, which is the state that gets ignored.
+
+    The census is taken with ``_supervisor_status`` rather than
+    ``_running_loop_pid``, so a supervisor that is still starting is included.
+    The narrower probe answered ``None`` for those, and a sweep run seconds
+    after a start would have silently skipped exactly the instance most likely
+    to need it.
     """
     instances = [inst for inst in active_instances()
-                 if _running_loop_pid(inst) is not None]
+                 if _supervisor_status(inst)[0] is not None]
     if not instances:
         print("No loop supervisors are running.")
         return 0
@@ -4092,6 +4116,14 @@ def restart_all_loops() -> int:
             # `die` is reachable from the restart path and would otherwise end
             # the whole sweep on the first instance that refused.
             rc = exc.code if isinstance(exc.code, int) else 1
+        except (OSError, MuxError) as exc:
+            # And so would a multiplexer that stopped answering, or a state
+            # directory that went away underneath one instance. Catching only
+            # `SystemExit` covered the refusals this code raises itself and
+            # none of the failures the machine raises at it, which is the
+            # narrower half of "keeps going".
+            print(f"  Failed: {exc}", file=sys.stderr)
+            rc = 1
         if rc != 0:
             failed.append(label)
 

@@ -117,6 +117,46 @@ def test_nothing_running_is_not_a_failure(monkeypatch):
     assert op.restart_all_loops() == 0
 
 
+# ── self-detection must not be fooled by a recycled pid ─────────
+def _ancestry(monkeypatch, chain):
+    monkeypatch.setattr(op.operator_trace, "ancestry", lambda: chain)
+
+
+def test_self_detection_matches_a_copilot_ancestor(monkeypatch):
+    inst = op.Instance("alpha")
+    inst.claim("tok")
+    monkeypatch.setattr(op.Instance, "copilot_pid", lambda self: 4242)
+    _ancestry(monkeypatch, [{"pid": 999, "name": "pwsh.exe"},
+                            {"pid": 4242, "name": "copilot.EXE"}])
+    assert op._own_instance_id() == inst.id
+
+
+def test_a_recycled_pid_on_an_unrelated_ancestor_is_not_self(monkeypatch):
+    """The cost of a wrong positive is worse than a wrong None.
+
+    Every ancestry holds long-lived shells and multiplexers, and a dead
+    session's recorded pid can be reissued to one of them. A pid-only test let
+    that collision decide which row is "this session's own" -- which defers the
+    wrong instance and leaves the real one near the front, where a failing
+    restart can take this process down before it reports on the rest. It also
+    prints "this session's own supervisor" against somebody else's name.
+    """
+    inst = op.Instance("alpha")
+    inst.claim("tok")
+    monkeypatch.setattr(op.Instance, "copilot_pid", lambda self: 8400)
+    _ancestry(monkeypatch, [{"pid": 8400, "name": "tmux.exe"},
+                            {"pid": 777, "name": "pwsh.exe"}])
+    assert op._own_instance_id() is None, \
+        "a recycled pid on a multiplexer was accepted as this agent's session"
+
+
+def test_self_detection_answers_none_when_the_process_table_is_unreadable(
+    monkeypatch,
+):
+    monkeypatch.setattr(op.operator_trace, "ancestry", lambda: None)
+    assert op._own_instance_id() is None
+
+
 def test_the_cli_routes_all_to_the_sweep(monkeypatch):
     for flag in ("--all", "-a"):
         called = {"n": 0}
