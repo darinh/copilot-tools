@@ -113,6 +113,13 @@ RESTART_PAUSE_SECONDS = 3
 HEALTHY_SESSION_SECONDS = 120
 SESSION_ID_WAIT = 20
 EXIT_GRACE_SECONDS = 20
+# How long the attached single-session path will wait for the runner to finish
+# writing metrics before printing its summary. It is a display concern only --
+# the metrics are not lost, just late, and `operator ingest` collects them --
+# so this is chosen to be short enough that a terminal always comes back.
+# Deliberately not open-ended: the capture is a parse of a Copilot log, and
+# those reach 1.4 GB on this machine.
+METRICS_GRACE_SECONDS = 15
 # How long a supervisor's startup record may be believed on its age alone,
 # once the pid it names is no longer alive. It bounds one specific unknown:
 # on Windows `sys.executable` is often a launcher shim that re-execs the real
@@ -3522,8 +3529,10 @@ def is_copilot_running(instance: Instance) -> bool:
 
     Three signals, because any one alone can lie:
 
-    * the runner's ``.exit`` marker is authoritative when present, but the
-      runner writes it last and may be killed before it does;
+    * the runner's ``.exit`` marker is authoritative when present. It is
+      written the instant ``proc.wait()`` returns, before metrics capture, so
+      it is prompt -- but a runner killed alongside its Copilot never reaches
+      even that, which is the overwhelmingly common case here;
     * ``has_session`` stays true after the program exits when
       ``remain-on-exit`` is on, which loop mode sets;
     * ``pane_dead`` catches exactly that case.
@@ -3549,6 +3558,49 @@ def wait_for_exit(instance: Instance, timeout: int = EXIT_GRACE_SECONDS) -> bool
             return True
         time.sleep(1)
     return False
+
+
+def wait_for_metrics_capture(instance: Instance,
+                             timeout: int = METRICS_GRACE_SECONDS) -> bool:
+    """Wait for the runner to finish capturing metrics, bounded. True if it did.
+
+    Copilot's exit and the runner's exit used to be the same event to anyone
+    watching from here, because the runner published its exit marker only
+    after the capture. It now publishes the marker first -- deliberately, so a
+    dead session is relaunched in seconds rather than the measured average of
+    95 minutes -- which means the marker no longer implies the metrics for
+    that session are in the database.
+
+    Only the attached single-session path cares. It prints a run summary
+    straight out of the metrics DB, and reading it a moment too early reports
+    a session that used no credits at all, which is a wrong number rather than
+    a missing one. Loop mode does not call this: relaunching promptly is the
+    entire point there, and it summarises a whole run rather than one session.
+
+    The pane going away is the signal, not the exit marker: in single-session
+    mode ``remain_on_exit`` is False, so the multiplexer session outlives
+    Copilot exactly as long as the runner does.
+
+    Bounded, and the bound is what makes this safe to add. The capture is a
+    parse of a log with no ceiling on its size -- 1.4 GB on this machine, and
+    one capture measured at 13.3 hours -- so waiting for it unconditionally
+    would hang a terminal indefinitely on the ordinary path. A thin summary is
+    recoverable (`operator ingest` folds in whatever lands late); a session
+    that never returns the prompt is not.
+
+    A multiplexer that cannot be asked ends the wait rather than spending the
+    whole timeout on a question nobody can answer.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            if not MUX.has_session(instance.session):
+                return True
+        except MuxError:
+            return False
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
 
 
 def stop_session_gracefully(instance: Instance) -> None:
@@ -5032,8 +5084,12 @@ def run_single_session(instance: Instance, copilot_args: list[str],
         print("  Metrics are captured by the session supervisor when copilot exits.")
         return 0
 
-    # Session finished; the runner has already ingested metrics.
+    # Copilot has finished. Its exit marker is now published *before* metrics
+    # capture, so the runner is probably still parsing the log; wait for the
+    # pane to go before reading the database, or the summary reports a session
+    # that used nothing.
     wait_for_exit(instance, 10)
+    wait_for_metrics_capture(instance)
     show_run_summary(run_started)
     instance.cleanup_files()
     return 0
@@ -7234,6 +7290,14 @@ def read_exit_code(instance) -> int | None:
     killed wholesale — the runner dies with it and never gets to write a code
     — as opposed to one whose process ended under a runner that survived to
     write it down.
+
+    That inference is only sound because the runner publishes the code the
+    instant ``proc.wait()`` returns, ahead of metrics capture. While the write
+    came last, ``None`` also meant "the runner is alive and busy parsing a
+    log", which on this machine averaged 95 minutes and reached 13.3 hours —
+    so the one fact separating a crash from an external kill was absent for
+    most of the window in which somebody would ask. Of 1042 recorded session
+    endings, 3 carried a code. Do not move that write back.
 
     Only call this once the session is gone. `start_session` clears the file
     at launch, but a clearing that failed would let a previous session's code

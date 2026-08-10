@@ -29,7 +29,9 @@ State written to the instance state directory:
 
 ``{id}.pid``      Copilot's real process id, removed on exit
 ``{id}.session``  Copilot CLI session UUID, once discovered
-``{id}.exit``     Exit code, written after metrics capture completes
+``{id}.exit``     Exit code, written as soon as Copilot terminates and before
+                  metrics capture -- see :func:`run` for why the ordering is
+                  load-bearing rather than incidental
 
 A malformed launch spec exits ``EXIT_BAD_SPEC`` and is still reported through
 those files: see :func:`_load_spec`.
@@ -512,6 +514,40 @@ def run(spec_path: Path) -> int:
     _log(state_dir, instance, f"copilot exited rc={returncode}")
     pid_file.unlink(missing_ok=True)
 
+    # The marker goes down here, before metrics capture, and the ordering is
+    # the whole point of it.
+    #
+    # This file is two things at once: the signal that ends the supervisor's
+    # poll (`copilot_operator.is_copilot_running` returns False the moment it
+    # appears) and the only durable record of *how* Copilot ended. Writing it
+    # after the capture held both hostage to a best-effort step with no bound
+    # on it, and the cost was measured rather than imagined. Across every
+    # `*.runner.log` on this machine, 11 exits reached the capture: the gap
+    # between Copilot's death and the marker ran from 7s to **47947s (13.3
+    # hours)**, averaging 95 minutes. For `copilot-tools` session #240 the two
+    # logs agree to the second -- `copilot exited rc=3221225477` at 18:20:38,
+    # and the supervisor did not notice until 18:46:33. A supervised agent was
+    # dead for 26 minutes with nothing relaunching it, and that is the *good*
+    # case, the one where the runner survived.
+    #
+    # The evidence cost is worse than the delay, and it is why backlog item
+    # 0001 could not be answered. The exit code is the single fact that
+    # separates "Copilot crashed on its own" from "something took the whole
+    # pane" -- and 10 of those 11 read 3221225477 (0xC0000005), which is the
+    # former. Anything killing the runner during that 95-minute window
+    # destroys it, so of 1042 recorded session endings exactly **3** carry an
+    # exit code at all. A crash and an external kill were being filed
+    # identically, because the discriminator was queued behind a log parse.
+    #
+    # Metrics are the right thing to lose in the trade, because they are the
+    # only one of the two that is recoverable. A relaunch kills this pane
+    # mid-capture, but the Copilot log it was reading persists, `ingest_file`
+    # keys on path plus mtime and skips what it has already done, so
+    # `operator ingest` picks up anything cut short. The exit code is
+    # recoverable from nothing: the process is gone, and no later pass can go
+    # and ask it.
+    exit_file.write_text(str(returncode), encoding="utf-8")
+
     # Give Copilot a moment to flush its shutdown telemetry before parsing.
     time.sleep(2)
 
@@ -532,7 +568,6 @@ def run(spec_path: Path) -> int:
         except Exception as exc:  # pragma: no cover - defensive
             _log(state_dir, instance, f"metrics capture failed: {exc}")
 
-    exit_file.write_text(str(returncode), encoding="utf-8")
     return returncode
 
 

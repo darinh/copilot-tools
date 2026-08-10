@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1657,6 +1658,88 @@ def test_is_copilot_running_false_when_exit_marker_present(monkeypatch):
     monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
     monkeypatch.setattr(op.MUX, "pane_dead", lambda s: False)
     assert op.is_copilot_running(inst) is False
+
+
+# ── waiting for the runner's metrics capture ────────────────────
+#
+# The runner publishes its exit marker the instant copilot terminates, ahead
+# of metrics capture, so a supervised session is relaunched in seconds rather
+# than the 95 minutes measured on this machine. The cost lands on exactly one
+# caller: the attached single-session path prints a summary straight out of
+# the metrics DB, and the marker no longer implies that session is in it.
+def test_waiting_for_metrics_capture_ends_when_the_pane_goes(monkeypatch):
+    inst = op.Instance("proj")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: False)
+    assert op.wait_for_metrics_capture(inst, timeout=5) is True
+
+
+def test_waiting_for_metrics_capture_is_bounded(monkeypatch):
+    """A capture with no ceiling on it must not hold the terminal.
+
+    Copilot logs reach 1.4 GB on this machine and one capture measured 13.3
+    hours, so an unbounded wait here would be indistinguishable from a hang.
+    """
+    inst = op.Instance("proj")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    started = time.time()
+    assert op.wait_for_metrics_capture(inst, timeout=1) is False
+    assert time.time() - started < 10, (
+        "the wait outran its own timeout, so the bound is not a bound"
+    )
+
+
+def test_waiting_for_metrics_capture_gives_up_on_an_unusable_multiplexer(
+    monkeypatch,
+):
+    """A question nobody can answer is not worth the whole timeout."""
+    inst = op.Instance("proj")
+    calls = {"n": 0}
+
+    def refuses(_s):
+        calls["n"] += 1
+        raise op.MuxError("no server")
+
+    monkeypatch.setattr(op.MUX, "has_session", refuses)
+    started = time.time()
+    assert op.wait_for_metrics_capture(inst, timeout=30) is False
+    assert time.time() - started < 5
+    assert calls["n"] == 1, (
+        "the multiplexer was asked again after it had already said it could "
+        "not answer"
+    )
+
+
+def test_the_single_session_path_waits_for_capture_before_summarising(
+    monkeypatch, isolated_state
+):
+    """The wait is only worth having if the summary is on the other side of it.
+
+    A helper nothing calls, or one called after the read it exists to protect,
+    reads exactly like a working one from the test suite's point of view.
+    """
+    order: list[str] = []
+
+    def fake_start_session(instance, args, session_num, remain_on_exit=False,
+                           preamble=""):
+        instance.exit_file.write_text("0", encoding="utf-8")
+        instance.stop_marker.touch()
+
+    monkeypatch.setattr(op, "start_session", fake_start_session)
+    monkeypatch.setattr(op, "handle_existing_session", lambda instance: None)
+    monkeypatch.setattr(op.MUX, "attach", lambda session: None)
+    monkeypatch.setattr(op.MUX, "has_session", lambda session: False)
+    monkeypatch.setattr(op, "wait_for_exit", lambda instance, timeout=10: True)
+    monkeypatch.setattr(
+        op, "wait_for_metrics_capture",
+        lambda instance, timeout=op.METRICS_GRACE_SECONDS: order.append("wait"))
+    monkeypatch.setattr(op, "show_run_summary",
+                        lambda run_started: order.append("summary"))
+
+    op.run_single_session(op.Instance("exp-single"), [], headless=False)
+
+    assert order == ["wait", "summary"], (
+        f"expected the capture wait to precede the summary, got {order}"
+    )
 
 
 def test_reload_without_name_errors(capsys):

@@ -54,6 +54,27 @@ def _wait(predicate, timeout=30.0, interval=0.25):
     return False
 
 
+def _ingested_session_nums(db) -> list[int]:
+    """Session numbers the runner has recorded so far.
+
+    The exit marker used to be the end of everything the runner did, so
+    waiting for it was also waiting for metrics. It is now published the
+    instant the child terminates and the capture follows it — deliberately,
+    because a supervisor that must wait for a log parse before relaunching
+    waited an average of 95 minutes on this machine (see
+    ``operator_runner.run``). These tests are about the capture, so they wait
+    for the capture rather than for a marker that no longer implies it.
+
+    An absent database or table is "not yet", not a failure: the runner
+    creates both, and polling starts before it gets there.
+    """
+    operator_ingest.init_db(db)
+    with operator_ingest.connect(db) as conn:
+        return sorted(row["session_num"] for row in
+                      conn.execute("SELECT session_num FROM sessions "
+                                   "WHERE no_op = 0"))
+
+
 # ── backend behavior ────────────────────────────────────────────
 def test_create_query_and_kill(session, tmp_path):
     MUX.new_session(session, str(tmp_path),
@@ -165,7 +186,9 @@ def test_runner_in_real_session_records_pid_and_metrics(session, tmp_path):
     assert _wait(exit_file.exists, timeout=60), "runner never recorded an exit"
     assert exit_file.read_text(encoding="utf-8").strip() == "0"
 
-    operator_ingest.init_db(db)
+    assert _wait(lambda: _ingested_session_nums(db) == [11], timeout=60), (
+        "metrics were not captured for the launched process"
+    )
     with operator_ingest.connect(db) as conn:
         rows = conn.execute(
             "SELECT session_num, no_op, premium_requests FROM sessions"
@@ -216,9 +239,9 @@ def test_runner_captures_metrics_after_detach(session, tmp_path):
 
     # Never attach at all — the strongest form of "detached".
     assert _wait((state_dir / "detached.exit").exists, timeout=60)
-    with operator_ingest.connect(db) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM sessions WHERE no_op = 0").fetchone()[0] == 1
+    assert _wait(lambda: _ingested_session_nums(db) == [2], timeout=60), (
+        "nothing captured metrics for a session no operator was watching"
+    )
 
 
 def test_concurrent_instances_do_not_cross_contaminate(tmp_path):
@@ -264,13 +287,10 @@ def test_concurrent_instances_do_not_cross_contaminate(tmp_path):
             lambda: all((state_dir / f"inst{i}.exit").exists() for i in (1, 2)),
             timeout=90,
         )
-        with operator_ingest.connect(db) as conn:
-            nums = sorted(
-                r["session_num"] for r in
-                conn.execute("SELECT session_num FROM sessions WHERE no_op = 0")
-            )
         # Each runner attributed its own log; neither stole the other's.
-        assert nums == [10, 20]
+        assert _wait(lambda: _ingested_session_nums(db) == [10, 20], timeout=90), (
+            f"expected [10, 20], got {_ingested_session_nums(db)}"
+        )
     finally:
         for name in names:
             MUX.kill_session(name)
