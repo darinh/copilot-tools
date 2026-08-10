@@ -293,6 +293,98 @@ def test_metrics_are_still_captured_when_nothing_interrupts_the_runner(
     )
 
 
+# ── the marker is published whole, never half-written ───────────
+def test_the_exit_marker_is_never_observable_empty(tmp_path, monkeypatch):
+    """A marker that exists but is empty is read two different ways.
+
+    `is_copilot_running` treats presence alone as authoritative and reports
+    the session over; `read_exit_code` parses an empty file as None, which
+    `ending_was_observed` reads as "nobody saw this end" -- the signature of
+    an externally killed pane. A supervisor polling into the window between
+    `write_text`'s truncate and its write would file a clean exit as an
+    unexplained kill, which is the exact misclassification this whole change
+    exists to remove.
+
+    Asserted by watching every write that lands under the marker's own name:
+    with an atomic publish there is none, because the content is written to a
+    temporary and renamed into place.
+    """
+    marker = tmp_path / "inst.exit"
+    real_write = Path.write_text
+    direct_writes = []
+
+    def spy(self, data, *args, **kwargs):
+        if self == marker:
+            direct_writes.append(data)
+        return real_write(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    operator_runner._publish_exit_code(marker, 42)
+
+    assert marker.read_text(encoding="utf-8").strip() == "42"
+    assert direct_writes == [], (
+        "the marker was written in place, so a reader can see it exist while "
+        "it is still empty"
+    )
+
+
+def test_a_failed_exit_publish_leaves_no_temporary_behind(tmp_path, monkeypatch):
+    """The state dir is polled by name; litter there is read by other code."""
+    marker = tmp_path / "inst.exit"
+
+    def refuse(_src, _dst):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(operator_runner.os, "replace", refuse)
+    with pytest.raises(OSError):
+        operator_runner._publish_exit_code(marker, 7)
+
+    assert not marker.exists()
+    assert list(tmp_path.iterdir()) == [], (
+        f"left behind {[p.name for p in tmp_path.iterdir()]}"
+    )
+
+
+def test_a_runner_that_cannot_publish_its_code_still_captures_metrics(
+    tmp_path, state_dir, db_path, launch_spec, monkeypatch
+):
+    """The write used to come last, so a failure cost only the marker.
+
+    Publishing first puts the capture downstream of it, and an unwritable
+    state directory must not silently become lost metrics as well as a lost
+    exit code.
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    spec = launch_spec([sys.executable, "-c", "pass"], session_num=13,
+                       log_dir=logs)
+
+    real_popen = operator_runner.subprocess.Popen
+
+    class SpyPopen(real_popen):  # type: ignore[misc,valid-type]
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            make_log(logs / f"process-{int(time.time() * 1000)}-{self.pid}.log")
+
+    monkeypatch.setattr(operator_runner.subprocess, "Popen", SpyPopen)
+    monkeypatch.setattr(operator_runner.time, "sleep", lambda s: None)
+
+    def refuse(_exit_file, _code):
+        raise OSError("state directory is read-only")
+
+    monkeypatch.setattr(operator_runner, "_publish_exit_code", refuse)
+
+    assert operator_runner.run(spec) == 0
+
+    import operator_ingest
+    operator_ingest.init_db(db_path)
+    with operator_ingest.connect(db_path) as conn:
+        row = conn.execute("SELECT session_num FROM sessions").fetchone()
+    assert row is not None and row["session_num"] == 13, (
+        "a marker that could not be written took the metrics capture with it"
+    )
+
+
 # ── launch spec validation ──────────────────────────────────────
 def _write_spec(path: Path, spec) -> Path:
     path.write_text(json.dumps(spec), encoding="utf-8")

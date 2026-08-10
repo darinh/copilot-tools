@@ -1709,6 +1709,24 @@ def test_waiting_for_metrics_capture_gives_up_on_an_unusable_multiplexer(
     )
 
 
+def test_waiting_for_metrics_capture_survives_a_missing_multiplexer_binary(
+    monkeypatch,
+):
+    """`Mux.has_session` shells out and raises OSError, never MuxError.
+
+    Catching only the library's own exception left the documented give-up
+    behaviour unreachable for the one failure that actually reaches it, and
+    ended an attached session with a traceback instead of a summary.
+    """
+    inst = op.Instance("proj")
+
+    def missing_binary(_s):
+        raise FileNotFoundError(2, "No such file or directory", "tmux")
+
+    monkeypatch.setattr(op.MUX, "has_session", missing_binary)
+    assert op.wait_for_metrics_capture(inst, timeout=30) is False
+
+
 def test_the_single_session_path_waits_for_capture_before_summarising(
     monkeypatch, isolated_state
 ):
@@ -1739,6 +1757,51 @@ def test_the_single_session_path_waits_for_capture_before_summarising(
 
     assert order == ["wait", "summary"], (
         f"expected the capture wait to precede the summary, got {order}"
+    )
+
+
+def test_every_run_summary_waits_for_the_capture_first():
+    """No shutdown path may read the metrics DB without waiting for the runner.
+
+    Loop mode has six ways to end and three of them destroy the pane straight
+    after summarising, so a path that forgets the wait prints a session that
+    used no credits and then deletes the process that was about to record it.
+    Asserted structurally rather than by exercising all seven call sites: a
+    per-path test is a list that a newly added seventh path is simply absent
+    from, which is the shape of a guard that reports the tree clean because it
+    is looking at yesterday's tree.
+    """
+    source = Path(op.__file__).read_text(encoding="utf-8").splitlines()
+    offenders = []
+    for i, line in enumerate(source):
+        if "show_run_summary(run_started)" not in line:
+            continue
+        if line.lstrip().startswith(("#", "def ", "*")):
+            continue
+        previous = source[i - 1].strip() if i else ""
+        if previous != "wait_for_metrics_capture(instance)":
+            offenders.append(f"{i + 1}: {line.strip()} (preceded by {previous!r})")
+    assert not offenders, (
+        "the runner publishes its exit marker before metrics capture, so these "
+        "summaries can read the database before the session is in it:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_the_relaunch_path_does_not_wait_for_the_capture():
+    """The control for the test above, and the reason the change exists.
+
+    Waiting before a *relaunch* is precisely the 95-minute delay this removed,
+    so the wait must appear only on paths that are ending. If the two ever
+    converge, the guard above would keep passing while the fix was undone.
+    """
+    source = Path(op.__file__).read_text(encoding="utf-8")
+    loop_body = source.split("def run_loop_mode(", 1)[1]
+    relaunch = loop_body.split("if restart_requested:", 1)[1].split(
+        "current = workspace_fingerprint(workdir)", 1)[0]
+    assert "wait_for_metrics_capture" not in relaunch, (
+        "the relaunch path waits for metrics capture again, which is the delay "
+        "the exit-marker reordering exists to remove"
     )
 
 

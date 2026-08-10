@@ -3571,32 +3571,46 @@ def wait_for_metrics_capture(instance: Instance,
     95 minutes -- which means the marker no longer implies the metrics for
     that session are in the database.
 
-    Only the attached single-session path cares. It prints a run summary
-    straight out of the metrics DB, and reading it a moment too early reports
-    a session that used no credits at all, which is a wrong number rather than
-    a missing one. Loop mode does not call this: relaunching promptly is the
-    entire point there, and it summarises a whole run rather than one session.
+    Only shutdown paths care, and every one of them does. The attached
+    single-session path prints a run summary straight out of the metrics DB,
+    and reading it a moment too early reports a session that used no credits,
+    which is a wrong number rather than a missing one. Loop mode has six ways
+    to end -- ``operator stop``, Ctrl+C, both giving-up limits, the no-change
+    breaker and the unaccounted breaker -- and each of them summarises too,
+    with three of them destroying the pane immediately afterwards and taking
+    an unfinished capture with it. Every one waits.
 
-    The pane going away is the signal, not the exit marker: in single-session
-    mode ``remain_on_exit`` is False, so the multiplexer session outlives
-    Copilot exactly as long as the runner does.
+    What deliberately does *not* wait is the relaunch path, which is the whole
+    point of the change: a supervisor that pauses for a log parse before
+    starting the next session is the 95-minute delay this removed. A capture
+    cut short there is recoverable with `operator ingest`; the wait is not
+    recoverable at all.
+
+    The pane going away is the signal, not the exit marker: the multiplexer
+    session outlives Copilot exactly as long as the runner does.
 
     Bounded, and the bound is what makes this safe to add. The capture is a
     parse of a log with no ceiling on its size -- 1.4 GB on this machine, and
     one capture measured at 13.3 hours -- so waiting for it unconditionally
-    would hang a terminal indefinitely on the ordinary path. A thin summary is
-    recoverable (`operator ingest` folds in whatever lands late); a session
-    that never returns the prompt is not.
+    would hang a terminal indefinitely. A thin summary is recoverable; a
+    session that never returns the prompt is not.
 
     A multiplexer that cannot be asked ends the wait rather than spending the
-    whole timeout on a question nobody can answer.
+    whole timeout on a question nobody can answer. ``OSError`` as well as
+    ``MuxError``, and that is not belt and braces: :meth:`Mux.has_session`
+    shells out through ``subprocess.run`` and raises no ``MuxError`` of its
+    own, so a missing or unexecutable multiplexer binary arrives here as
+    ``OSError`` alone. Catching only the library's own exception would have
+    left the documented behaviour unreachable and ended an attached session
+    with a traceback instead of a summary. ``_session_live_probe`` catches the
+    same pair, for the same reason.
     """
     deadline = time.time() + timeout
     while True:
         try:
             if not MUX.has_session(instance.session):
                 return True
-        except MuxError:
+        except (MuxError, OSError):
             return False
         if time.time() >= deadline:
             return False
@@ -5475,6 +5489,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                         remove_file(instance.stop_marker)
                         log(f"Session #{session_num}: stop requested — shutting down")
                         stop_session_gracefully(instance)
+                        wait_for_metrics_capture(instance)
                         show_run_summary(run_started)
                         if MUX.has_session(instance.session):
                             MUX.kill_session(instance.session)
@@ -5510,6 +5525,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                             if unknown_markers >= MAX_LAUNCH_FAILURES:
                                 log(f"  Giving up after {unknown_markers} consecutive "
                                     f"unreadable checks — leaving the session alone")
+                                wait_for_metrics_capture(instance)
                                 show_run_summary(run_started)
                                 return 1
                             continue
@@ -5561,6 +5577,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                             if crash_failures >= MAX_LAUNCH_FAILURES:
                                 log(f"  Giving up after {crash_failures} consecutive "
                                     f"unexpected exits")
+                                wait_for_metrics_capture(instance)
                                 show_run_summary(run_started)
                                 instance.cleanup_files()
                                 return 1
@@ -5649,6 +5666,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                                 f"--kind session_exit")
                             log(f"  Resume with: operator --loop --name "
                                 f"{instance.display_name}")
+                            wait_for_metrics_capture(instance)
                             show_run_summary(run_started)
                             instance.cleanup_files()
                             return EXIT_UNACCOUNTED
@@ -5663,6 +5681,7 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                                 f"#{session_num + 1}.")
                             log(f"  Resume with: operator --loop --name "
                                 f"{instance.display_name}")
+                            wait_for_metrics_capture(instance)
                             show_run_summary(run_started)
                             instance.cleanup_files()
                             return EXIT_NO_PROGRESS
@@ -5690,12 +5709,14 @@ def run_loop_mode(instance: Instance, user_args: list[str], is_fresh: bool,
                 run_started,
                 discovered or resume_id or resume_id_used,
             )
+            wait_for_metrics_capture(instance)
             show_run_summary(run_started)
             if MUX.has_session(instance.session):
                 MUX.kill_session(instance.session)
             instance.cleanup_files()
             return 0
 
+        wait_for_metrics_capture(instance)
         show_run_summary(run_started)
         if MUX.has_session(instance.session):
             MUX.kill_session(instance.session)

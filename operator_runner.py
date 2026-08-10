@@ -340,8 +340,7 @@ def _report_bad_spec(spec_path: Path, spec: object, message: str) -> int:
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         _log(state_dir, instance, detail)
-        (state_dir / f"{instance}.exit").write_text(str(EXIT_BAD_SPEC),
-                                                    encoding="utf-8")
+        _publish_exit_code(state_dir / f"{instance}.exit", EXIT_BAD_SPEC)
     except (OSError, ValueError) as exc:
         print(f"operator-runner: cannot write exit marker under {state_dir}: {exc}",
               file=sys.stderr)
@@ -409,6 +408,44 @@ def _load_spec(spec_path: Path) -> dict:
     return spec
 
 
+def _publish_exit_code(exit_file: Path, code: int) -> None:
+    """Put the exit code where the operator can see it, all at once.
+
+    ``Path.write_text`` creates and truncates before it writes, so there is an
+    instant where the marker *exists and is empty*. The two readers disagree
+    about what that means and the disagreement is exactly the misclassification
+    this file exists to prevent: `copilot_operator.is_copilot_running` treats
+    presence alone as authoritative and reports the session ended, while
+    `read_exit_code` parses an empty file as ``None``, which
+    `ending_was_observed` reads as "nobody saw this end" -- the signature of an
+    externally killed pane. A supervisor polling into that window would file a
+    clean exit as an unexplained kill.
+
+    ``os.replace`` is atomic on both POSIX and Windows for a rename within one
+    directory, so the marker goes from absent to complete with no observable
+    state in between. The temporary sits in the state directory rather than in
+    the system temp area precisely so the rename stays inside one filesystem,
+    where the atomicity guarantee holds.
+
+    It raises what ``write_text`` raised, having cleaned up the temporary
+    first: every existing caller either lets that propagate exactly as before
+    or, in :func:`_report_bad_spec`, wraps it in the handler written for that.
+    ``ValueError`` is caught alongside ``OSError`` only to remove the
+    temporary, because a path carrying an embedded NUL raises the former and
+    that reporter may not raise under any circumstances.
+    """
+    tmp = exit_file.with_name(exit_file.name + f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(str(code), encoding="utf-8")
+        os.replace(tmp, exit_file)
+    except (OSError, ValueError):
+        try:
+            tmp.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
+        raise
+
+
 def run(spec_path: Path) -> int:
     spec_path = Path(spec_path)
     try:
@@ -442,12 +479,12 @@ def run(spec_path: Path) -> int:
         proc = subprocess.Popen(argv, cwd=cwd)
     except FileNotFoundError:
         _log(state_dir, instance, f"executable not found: {argv[0]}")
-        exit_file.write_text("127", encoding="utf-8")
+        _publish_exit_code(exit_file, 127)
         print(f"operator: cannot find {argv[0]!r} on PATH", file=sys.stderr)
         return 127
     except OSError as exc:
         _log(state_dir, instance, f"spawn failed: {exc}")
-        exit_file.write_text("126", encoding="utf-8")
+        _publish_exit_code(exit_file, 126)
         return 126
     except ValueError as exc:
         # Belt and braces: validation rejects the argument shapes known to
@@ -455,7 +492,7 @@ def run(spec_path: Path) -> int:
         # anything missed here would escape both handlers above and kill the
         # supervisor without a marker.
         _log(state_dir, instance, f"invalid launch arguments: {exc}")
-        exit_file.write_text(str(EXIT_BAD_SPEC), encoding="utf-8")
+        _publish_exit_code(exit_file, EXIT_BAD_SPEC)
         print(f"operator-runner: invalid launch arguments: {exc}", file=sys.stderr)
         return EXIT_BAD_SPEC
 
@@ -546,7 +583,15 @@ def run(spec_path: Path) -> int:
     # `operator ingest` picks up anything cut short. The exit code is
     # recoverable from nothing: the process is gone, and no later pass can go
     # and ask it.
-    exit_file.write_text(str(returncode), encoding="utf-8")
+    #
+    # Tolerant of its own failure, which the old ordering never had to be: a
+    # write that raised used to happen after the capture and cost nothing but
+    # the marker. Here it would take the capture down with it, turning an
+    # unwritable state directory into lost metrics as well as a lost code.
+    try:
+        _publish_exit_code(exit_file, returncode)
+    except (OSError, ValueError) as exc:
+        _log(state_dir, instance, f"could not publish exit marker: {exc}")
 
     # Give Copilot a moment to flush its shutdown telemetry before parsing.
     time.sleep(2)
