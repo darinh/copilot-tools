@@ -4383,11 +4383,12 @@ def reload_instance(target: str | None) -> int:
     print(file=sys.stderr)
     print("To pick up new operator code, replace the supervisor that is "
           "holding the old copy:", file=sys.stderr)
-    print("    operator restart-loop --all      every supervisor on this "
-          "machine", file=sys.stderr)
+    print("    operator restart-loop --all", file=sys.stderr)
+    print("        every supervisor on this machine — an operator change "
+          "stales them all at once", file=sys.stderr)
     if target:
-        print(f"    operator restart-loop {target}"
-              f"{' ' * max(1, 12 - len(target))}just this one", file=sys.stderr)
+        print(f"    operator restart-loop {target}", file=sys.stderr)
+        print("        just this one", file=sys.stderr)
     return 1
 
 
