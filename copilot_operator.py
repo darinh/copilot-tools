@@ -2285,9 +2285,10 @@ def _code_state_notice(code_state: str, instance: Instance,
             "have taken on this wrapper's word before acting on it — in particular, "
             "check for a handoff file yourself rather than trusting a claim that none "
             f"exists. `operator list` names the changed files; `operator restart-loop "
-            f"{instance.display_name}` picks up the current code, but that restarts "
-            "the supervisor you are running under, so raise it with the human rather "
-            "than doing it as a side effect of some other task."
+            f"--all` picks up the current code for every supervisor on the machine, "
+            "which is what an operator change needs — they all went stale together. "
+            "It restarts the supervisor you are running under too, so raise it with "
+            "the human rather than doing it as a side effect of some other task."
         )
     if code_state == CODE_MISMATCH:
         # Deliberately not the fall-through below, which says the supervisor
@@ -3750,8 +3751,11 @@ def list_instances() -> int:
         print(f"  {_instance_summary(snap)}")
     if not instances:
         print("  (none)")
-    # Named individually rather than counted: the remedy is per-instance, and
-    # a bare count would leave the reader to work out which ones it meant.
+    # Named individually rather than counted: a bare count would leave the
+    # reader to work out which ones it meant. The remedy offered is the sweep,
+    # because an operator change staleness *every* supervisor at once -- this
+    # notice used to print one command per instance, which is a remedy people
+    # apply to some of them.
     stale = [s["name"] for s in snaps
              if s["loop_pid"] and s.get("loop_code") == CODE_STALE]
     if stale:
@@ -3761,9 +3765,11 @@ def list_instances() -> int:
               "run, so a fix that")
         print("landed afterwards is not running in them, and the records they "
               "write still describe")
-        print("the older code. Pick it up without stopping the session:")
+        print("the older code:")
         for name in stale:
-            print(f"    operator restart-loop {name}")
+            print(f"    {name}")
+        print("Pick it up everywhere without stopping any session:")
+        print("    operator restart-loop --all")
     # A separate group with the same remedy, because the reason differs and
     # merging them would say something false about one of the two. Reported
     # at all because silence here is indistinguishable from every supervisor
@@ -3779,7 +3785,9 @@ def list_instances() -> int:
         print("or could not write one. The same restart fixes it and picks "
               "up the current code:")
         for name in unrecorded:
-            print(f"    operator restart-loop {name}")
+            print(f"    {name}")
+        print("Pick it up everywhere without stopping any session:")
+        print("    operator restart-loop --all")
     # A third group with the same remedy, and the reason differs again. The
     # record on disk names a process that is not the one running, so it
     # cannot be asked anything: not which code was loaded, not when the
@@ -3800,7 +3808,9 @@ def list_instances() -> int:
               "whether it is")
         print("current and when it started. A restart writes a fresh one:")
         for name in mismatched:
-            print(f"    operator restart-loop {name}")
+            print(f"    {name}")
+        print("Pick it up everywhere without stopping any session:")
+        print("    operator restart-loop --all")
     # No remedy line, deliberately: this reports something that has already
     # happened rather than a state to correct, and offering a command would
     # imply the restart is the problem instead of its evidence.
@@ -4005,6 +4015,97 @@ def _restart_handoff_lock(instance: Instance):
         yield acquired
 
 
+def _own_instance_id() -> "str | None":
+    """The instance whose Copilot session this process is running inside.
+
+    ``None`` when that cannot be established, which is the answer for a human
+    at a terminal and for any process table that could not be read. Callers
+    must treat it as "not known to be self" rather than "known not to be
+    self": every use here only reorders work, so a wrong ``None`` costs the
+    ordering, not correctness.
+
+    Established by walking our own ancestry and matching it against the
+    Copilot pid each instance recorded, because that pid is the one thing tying
+    a running process back to an instance. Nothing is passed down the
+    environment that could answer this -- the runner spawns Copilot with the
+    inherited environment and stamps no instance name into it.
+    """
+    chain = operator_trace.ancestry()
+    if not chain:
+        return None
+    mine = {entry.get("pid") for entry in chain if entry.get("pid")}
+    mine.add(os.getpid())
+    for ident, meta in managed_instances().items():
+        inst = Instance(meta.get("display_name", ident))
+        pid = inst.copilot_pid()
+        if pid is not None and pid in mine:
+            return inst.id
+    return None
+
+
+def restart_all_loops() -> int:
+    """Replace every running supervisor, leaving each session running.
+
+    The per-instance command is the one that had to exist first, but it is
+    almost never what is actually needed: operator code lands on `main` and
+    *every* supervisor on the machine is instantly running something that is
+    no longer in the tree. `operator list` said so, named all eight, and then
+    printed eight commands to type. A remedy that has to be applied by hand
+    once per instance is a remedy people apply to some of them.
+
+    Three things this does that a shell loop over the names would not:
+
+    * **It keeps going.** One instance that cannot be restarted -- no recorded
+      loop arguments, a session somebody else owns -- must not decide the fate
+      of the other seven. Each is attempted and each result is reported.
+    * **It does the caller's own instance last.** `restart-loop` deliberately
+      leaves the Copilot session running, so an agent restarting its own
+      supervisor survives it; but if that one goes wrong the agent is the
+      process least able to report it, so it goes after the ones it can still
+      speak for.
+    * **It reports a census rather than a count.** Which instances were
+      restarted, which refused and why. A bare "restarted 6 of 8" leaves the
+      reader to work out which two, which is the state that gets ignored.
+    """
+    instances = [inst for inst in active_instances()
+                 if _running_loop_pid(inst) is not None]
+    if not instances:
+        print("No loop supervisors are running.")
+        return 0
+
+    mine = _own_instance_id()
+    ordered = [i for i in instances if i.id != mine]
+    ordered += [i for i in instances if i.id == mine]
+
+    print(f"Restarting {len(ordered)} loop supervisor"
+          f"{'' if len(ordered) == 1 else 's'}, keeping every session running.")
+    failed: list[str] = []
+    for inst in ordered:
+        label = inst.display_name
+        if inst.id == mine:
+            print(f"\n── {label} (this session's own supervisor — done last) ──")
+        else:
+            print(f"\n── {label} ──")
+        try:
+            rc = restart_loop(label)
+        except SystemExit as exc:
+            # `die` is reachable from the restart path and would otherwise end
+            # the whole sweep on the first instance that refused.
+            rc = exc.code if isinstance(exc.code, int) else 1
+        if rc != 0:
+            failed.append(label)
+
+    print()
+    done = len(ordered) - len(failed)
+    print(f"Restarted {done}/{len(ordered)}.")
+    if failed:
+        print(f"Not restarted: {', '.join(failed)}")
+        print("  Each reported its reason above; they are still running their "
+              "old supervisor.")
+        return 1
+    return 0
+
+
 def restart_loop(target: str | None) -> int:
     """Replace an instance's loop supervisor, leaving its session running.
 
@@ -4013,11 +4114,17 @@ def restart_loop(target: str | None) -> int:
     would pick up new code but takes the Copilot session down with it. This
     swaps only the supervisor: the old one is asked to detach, and a new one
     adopts the still-running session.
+
+    See :func:`restart_all_loops` for the sweep: an operator change makes
+    every supervisor on the machine stale at once, so one at a time is the
+    exception rather than the normal case.
     """
     if not target:
-        print("Usage: operator restart-loop NAME", file=sys.stderr)
+        print("Usage: operator restart-loop NAME | --all", file=sys.stderr)
         print("Replaces the loop supervisor (picking up new operator code) "
               "without stopping the Copilot session.", file=sys.stderr)
+        print("  --all  every running supervisor, which is what an operator "
+              "change needs.", file=sys.stderr)
         return 1
     instance = Instance(target)
 
@@ -5780,7 +5887,7 @@ USAGE
     operator projects retire [--yes]                           Move conventions into each project's AGENTS.md
     operator stop [NAME]                                       Stop instance(s) — loop + session
     operator stop-loop NAME                                    Stop only the background loop
-    operator restart-loop NAME                                 Replace the loop supervisor (new code), keep session
+    operator restart-loop NAME|--all                           Replace the loop supervisor (new code), keep session
     operator stop-session NAME                                 Stop only the Copilot session
     operator forget NAME                                       Drop operator state only
     operator report [type]                                     View usage reports
@@ -5851,6 +5958,14 @@ LOOP VS. SESSION
                                       operator's code when it started, so this is
                                       how a running instance picks up an updated
                                       operator without losing its session.
+        operator restart-loop --all   The same, for every running supervisor.
+                                      This is normally the one you want: operator
+                                      code lands once and every supervisor on the
+                                      machine goes stale together, so restarting
+                                      them one at a time means restarting some of
+                                      them. Keeps going past an instance that
+                                      refuses, reports which, and does the caller's
+                                      own supervisor last.
         operator stop-session NAME    Stop the session; if a supervisor is still
                                       running it relaunches a fresh one shortly.
         operator stop NAME            Stop both, cleanly, with no relaunch.
@@ -8637,7 +8752,10 @@ def _dispatch_command(args: list[str]) -> int:
     if head == "stop-loop":
         return stop_loop_only(args[1] if len(args) > 1 else None)
     if head == "restart-loop":
-        return restart_loop(args[1] if len(args) > 1 else None)
+        rest = args[1:]
+        if rest and rest[0] in ("--all", "-a"):
+            return restart_all_loops()
+        return restart_loop(rest[0] if rest else None)
     if head == "stop-session":
         return stop_session_only(args[1] if len(args) > 1 else None)
     if head == "join":
