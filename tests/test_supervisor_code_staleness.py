@@ -609,8 +609,11 @@ def test_publishing_writes_all_three_records(monkeypatch):
     assert inst.loop_pid_file.exists()
     assert inst.loop_code_file.exists()
     assert inst.loop_args_file.exists()
-    assert inst.loop_pid_file.read_text(encoding="utf-8").strip() == str(
-        os.getpid())
+    # First line, not the whole file: the pid file also carries the start
+    # stamp `_running_loop_pid` needs to tell this supervisor from an
+    # unrelated process later handed its pid. See `_loop_pid_stamp`.
+    assert inst.loop_pid_file.read_text(
+        encoding="utf-8").splitlines()[0].strip() == str(os.getpid())
 
 
 def test_a_supervisor_that_just_published_reads_as_current():

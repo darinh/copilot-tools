@@ -419,6 +419,28 @@ def process_present(pid: "int | None") -> "bool | None":
     return _posix_process_present(pid)
 
 
+def start_token_is_boot_relative(token: "str | None") -> bool:
+    """Is this start token only meaningful within the boot that produced it?
+
+    ``_linux_start_token`` is field 22 of ``/proc/<pid>/stat`` -- clock ticks
+    **since boot** -- so two processes from different boots can carry the same
+    token with no relationship to each other. The other two shapes are
+    absolute instants: ``win:`` is a FILETIME and ``ps:`` is a wall-clock
+    date, and neither can collide across a reboot.
+
+    Lives here rather than at the call sites because the token formats are
+    this module's, and a reader elsewhere testing for ``"linux:"`` would be a
+    copy of that knowledge that no change to the format could reach. Callers
+    use it to decide whether the extra `boot_identity` probe buys anything --
+    on macOS that probe forks ``sysctl``, so asking for it where it cannot
+    discriminate is a subprocess per call for nothing.
+
+    An unreadable or absent token is *not* boot-relative: there is nothing for
+    the boot identity to qualify, so the caller has no comparison to make.
+    """
+    return isinstance(token, str) and token.startswith("linux:")
+
+
 def process_start_token(pid: "int | None") -> "str | None":
     """An opaque token identifying *this* run of ``pid``, or ``None``.
 
@@ -587,4 +609,5 @@ __all__ = [
     "process_present",
     "process_start_token",
     "same_boot",
+    "start_token_is_boot_relative",
 ]

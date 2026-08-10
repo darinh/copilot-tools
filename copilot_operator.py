@@ -758,7 +758,12 @@ class Instance:
 
     @property
     def loop_pid_file(self) -> Path:
-        """PID of the *background loop supervisor* process (not Copilot's)."""
+        """PID of the *background loop supervisor* process (not Copilot's).
+
+        Also carries the stamps that say which *run* of that pid wrote it;
+        `_loop_pid_stamp` defines the format and `_running_loop_pid` is the
+        only reader that needs more than the first line.
+        """
         return RESTART_DIR / f"{self.id}.loop.pid"
 
     @property
@@ -2688,7 +2693,8 @@ def _publish_supervisor_records(instance: Instance, user_args: list[str],
     # code it imported for the whole run, so this is the only place either
     # answer is still knowable.
     _save_loop_code(instance, adopted=adopted, began_run=began_run)
-    instance.loop_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    instance.loop_pid_file.write_text(_loop_pid_stamp(os.getpid()),
+                                      encoding="utf-8")
     # The pid file now answers the liveness question, so the startup record
     # has nothing left to say. Removed after the pid file exists, never
     # before: the two together are what make the supervisor continuously
@@ -3072,20 +3078,159 @@ def _launch_code_state() -> str:
         return CODE_UNKNOWN
 
 
+#: Key under which the loop pid file carries the supervisor's start token.
+LOOP_PID_START_KEY = "pid_start"
+#: Key under which it carries the boot the supervisor started in.
+LOOP_PID_BOOT_KEY = "boot"
+
+
+def _loop_pid_stamp(pid: int) -> str:
+    """The loop pid file's contents: the pid, plus who that pid *was*.
+
+    Line-oriented, first line the bare decimal pid, and both of those are
+    load-bearing. A pid file written by any earlier version of this code is
+    exactly that first line, so every stamped reader keeps working on one --
+    and a reader that only wants the pid can take `splitlines()[0]` without
+    knowing this format exists. The stamps are ``key=value`` lines after it.
+
+    Newline-separated rather than space-separated because a start token may
+    contain spaces: `operator_liveness._ps_start_token` keeps ``ps -o
+    lstart=`` verbatim on macOS and BSD, which is a date like
+    ``Sat Aug  9 17:25:00 2026``. Splitting that on whitespace would truncate
+    the token and make a live supervisor compare unequal to itself.
+
+    Written in the *same* write as the pid, never as a sibling file, and that
+    is the whole reason this is one string rather than two paths. A separate
+    token file can be a predecessor's while the pid file is this process's --
+    a recycled pid plus a failed write is precisely the state being guarded
+    against -- and the mismatch would then refute a *live* supervisor. One
+    write cannot disagree with itself.
+
+    Either stamp may be absent when the probe cannot answer; see
+    `_running_loop_pid` for what a reader is allowed to conclude from that.
+    """
+    lines = [str(pid)]
+    token = operator_liveness.process_start_token(pid)
+    if token:
+        lines.append(f"{LOOP_PID_START_KEY}={token}")
+    boot = operator_liveness.boot_identity()
+    if boot:
+        lines.append(f"{LOOP_PID_BOOT_KEY}={boot}")
+    return "\n".join(lines) + "\n"
+
+
+def _read_loop_pid_stamp(instance: Instance) -> "tuple[int, dict[str, str]] | None":
+    """``(pid, stamps)`` from the loop pid file, or ``None`` if there is none.
+
+    ``None`` means "no usable pid file", which is the only thing an absent or
+    unreadable one can say. A file whose first line is not an integer is in
+    that class too: it names no process, so there is nothing to ask about.
+
+    Stamp values are taken verbatim after the first ``=``, unstripped. The
+    tokens they carry are already stripped where they are produced, and
+    stripping again here would silently rewrite any future token that ended
+    in a space -- turning "this is the same process" into "this is a
+    different one", which is the expensive direction.
+    """
+    try:
+        text = instance.loop_pid_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    lines = text.splitlines()
+    if not lines:
+        return None
+    try:
+        pid = int(lines[0].strip())
+    except ValueError:
+        return None
+    stamps: dict[str, str] = {}
+    for line in lines[1:]:
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if sep and key:
+            stamps[key] = value
+    return pid, stamps
+
+
+def _loop_pid_reused(pid: int, stamps: dict) -> bool:
+    """Is the process now holding ``pid`` a *different* one from the writer?
+
+    ``True`` only on positive evidence, and the asymmetry is the whole design.
+    Answering "yes, reused" for a supervisor that is in fact running is not a
+    missing notice, it is a destructive one: `active_instances` drops the
+    instance, every notice `_instance_summary` prints is gated on the loop
+    pid and so goes silent with it, and `restart-loop` would start a second
+    supervisor on top of the first. Answering "no" wrongly leaves the
+    pid-reuse blindness that was there before this stamp existed. So anything
+    short of evidence -- an unstamped file from an older supervisor, a token
+    the OS will not give up, a stamp damaged past reading -- is "no".
+
+    That is deliberately *not* how `_record_describes` treats damage in the
+    loop code record, and the two must not be unified without noticing why.
+    There, a malformed field costs a staleness verdict and gains a printed
+    caveat, so refusing on damage is cheap and safe. Here it costs the
+    session's supervisor.
+
+    The boot identity is consulted only when it can discriminate: a token
+    that is already an absolute instant cannot collide across a reboot, and
+    `operator_liveness.start_token_is_boot_relative` is what knows which
+    shapes are which. Skipping it is a real saving rather than a micro
+    one -- `boot_identity` forks ``sysctl`` on macOS, and this function is on
+    `operator list`'s per-instance path and `restart-loop`'s twice-a-second
+    poll.
+    """
+    recorded_start = stamps.get(LOOP_PID_START_KEY)
+    if not isinstance(recorded_start, str) or not recorded_start:
+        return False
+    live_start = operator_liveness.process_start_token(pid)
+    if not live_start:
+        return False
+    if live_start != recorded_start:
+        return True
+    if not operator_liveness.start_token_is_boot_relative(recorded_start):
+        return False
+    recorded_boot = stamps.get(LOOP_PID_BOOT_KEY)
+    if not isinstance(recorded_boot, str) or not recorded_boot:
+        return False
+    return operator_liveness.same_boot(
+        recorded_boot, operator_liveness.boot_identity()) is False
+
+
 def _running_loop_pid(instance: Instance) -> int | None:
     """PID of instance's background loop supervisor, if one is alive.
 
-    Prunes the pid file when it points at a dead process, so callers never
-    have to special-case a stale record.
+    Prunes the pid file when it no longer describes a running supervisor, so
+    callers never have to special-case a stale record.
+
+    Two questions, not one. ``_pid_alive`` asks whether *some* process holds
+    the pid, and on Windows -- where pids are recycled aggressively -- an
+    unrelated process handed a dead supervisor's pid answers yes. That row
+    then prints as ``looping``, with a session number and an age, and is
+    byte-identical to a healthy one, which is the silent all-clear this
+    instrument exists to stop. `_loop_pid_reused` asks the second question,
+    against the start token the supervisor stamped beside its own pid.
+
+    A pid file predating the stamp, or one whose token cannot be checked,
+    still answers exactly as it did before: alive means running. Turning
+    those into "stopped" would take out `active_instances`, every supervisor
+    notice in `_instance_summary`, and `restart-loop`'s refusal to start a
+    second supervisor, all at once.
     """
-    try:
-        pid = int(instance.loop_pid_file.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+    parsed = _read_loop_pid_stamp(instance)
+    if parsed is None:
         return None
-    if _pid_alive(pid):
-        return pid
-    remove_file(instance.loop_pid_file)
-    return None
+    pid, stamps = parsed
+    if not _pid_alive(pid):
+        remove_file(instance.loop_pid_file)
+        return None
+    if _loop_pid_reused(pid, stamps):
+        # The pid is held by something that is not the supervisor, so this
+        # file describes a process that is gone. Pruned for the same reason
+        # the dead-pid branch above prunes: left in place it would keep
+        # answering, and a recycled pid can outlive the machine's patience.
+        remove_file(instance.loop_pid_file)
+        return None
+    return pid
 
 
 def _record_supervisor_starting(instance: Instance, pid: int) -> None:
