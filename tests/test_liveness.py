@@ -114,6 +114,39 @@ def test_a_matching_start_time_is_not_death() -> None:
     assert verdict.verdict == ol.LIVE
 
 
+def test_a_pre_pin_rendering_is_not_death() -> None:
+    """The most destructive path in this module, pinned directly.
+
+    The macOS/BSD probe changed its tag from ``ps`` to ``psc`` when it pinned
+    its locale and timezone, so every claim recorded before that carries the
+    old rendering of a process that has not moved. DEAD is reclaimable, so
+    reading those two strings as a difference would have handed a live
+    agent's worktree to somebody else on the first sweep after the upgrade --
+    and the pid, mux and heartbeat probes all say the owner is fine, so
+    nothing downstream would have objected.
+    """
+    verdict = ol.assess(
+        make_claim(age_seconds=1, pid_start="ps:Sat Aug  9 17:25:00 2026"),
+        probes=FakeProbes(boot="uuid:same", session=True, running=True,
+                          start="psc:Sat Aug  9 17:25:00 2026"),
+        now=NOW)
+    assert verdict.verdict == ol.LIVE
+    assert verdict.reclaimable is False
+
+
+def test_two_pinned_renderings_that_differ_are_still_death() -> None:
+    """Negative control for the case above: within one kind the comparison is
+    exactly as sharp as it was, or the migration rule would have retired the
+    check it exists to protect."""
+    verdict = ol.assess(
+        make_claim(age_seconds=1, pid_start="psc:Sat Aug  9 17:25:00 2026"),
+        probes=FakeProbes(boot="uuid:same", session=True, running=True,
+                          start="psc:Sat Aug  9 18:00:00 2026"),
+        now=NOW)
+    assert verdict.verdict == ol.DEAD
+    assert "reused" in verdict.reason
+
+
 # ── the cascade: the fourth signal is never conclusive ───────────
 @pytest.mark.parametrize("probes", [
     FakeProbes(),                                    # nothing could be read
