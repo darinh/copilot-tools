@@ -274,9 +274,17 @@ def test_stale_and_cannot_tell_are_not_reported_in_the_same_words():
 
 
 def test_the_stale_notice_names_the_command_that_fixes_it():
+    """The sweep, not the single instance.
+
+    Every supervisor on the machine imported its code at startup, so one
+    operator change makes all of them stale at the same moment. A preamble
+    naming only this agent's own instance describes a fix that leaves the
+    other seven exactly as they were.
+    """
     text = op.build_preamble("a:b", op.Instance("my.proj"), code_state=op.CODE_STALE)
-    assert "operator restart-loop my.proj" in text, \
-        "the display name, not the internal id -- that is what the CLI takes"
+    assert "operator restart-loop --all" in text
+    assert "operator restart-loop my.proj" not in text, \
+        "naming one instance understates a fault that is machine-wide"
 
 
 def test_the_stale_notice_does_not_tell_the_agent_to_restart_unprompted():

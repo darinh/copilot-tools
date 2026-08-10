@@ -708,6 +708,30 @@ def test_a_stopped_instance_is_not_called_out():
         _snap(loop_pid=None, loop_code=op.CODE_STALE))
 
 
+def _named_under(out: str, reason: str) -> list[str]:
+    """Instance names the listing printed under ``reason``.
+
+    The remedy used to be one command per instance, so a test could look for
+    ``operator restart-loop alpha``. It is now the sweep -- every supervisor
+    goes stale on the same operator change, and a command per instance is one
+    people run against some of them -- so the names are printed bare under
+    their reason and the remedy is printed once. What these tests are about is
+    unchanged: the affected instance is named under the reason that applies to
+    it, and an unaffected one is not.
+    """
+    lines = out.splitlines()
+    start = next(i for i, line in enumerate(lines) if reason in line)
+    names = []
+    for line in lines[start + 1:]:
+        if not line.startswith("    "):
+            continue
+        name = line.strip()
+        if name.startswith("operator "):
+            break
+        names.append(name)
+    return names
+
+
 def test_the_listing_names_the_remedy_for_each_stale_instance(
         monkeypatch, capsys):
     monkeypatch.setattr(op, "active_instances", lambda: [op.Instance("alpha"),
@@ -720,8 +744,8 @@ def test_the_listing_names_the_remedy_for_each_stale_instance(
     op.list_instances()
     out = capsys.readouterr().out
 
-    assert "operator restart-loop alpha" in out
-    assert "operator restart-loop beta" not in out
+    assert _named_under(out, "changed on disk") == ["alpha"]
+    assert "operator restart-loop --all" in out
 
 
 def test_the_listing_names_the_remedy_for_each_unrecorded_instance(
@@ -739,8 +763,8 @@ def test_the_listing_names_the_remedy_for_each_unrecorded_instance(
     op.list_instances()
     out = capsys.readouterr().out
 
-    assert "operator restart-loop alpha" in out
-    assert "operator restart-loop beta" not in out
+    assert _named_under(out, "did not record") == ["alpha"]
+    assert "operator restart-loop --all" in out
 
 
 def test_an_unreadable_record_does_not_produce_the_notice(monkeypatch, capsys):
@@ -779,8 +803,8 @@ def test_stale_and_unrecorded_are_reported_as_separate_reasons(
 
     assert "changed on disk" in out
     assert "did not record" in out
-    assert out.index("operator restart-loop alpha") > out.index("changed on disk")
-    assert out.index("operator restart-loop beta") > out.index("did not record")
+    assert _named_under(out, "changed on disk") == ["alpha"]
+    assert _named_under(out, "did not record") == ["beta"]
 
 
 def test_the_listing_says_nothing_when_every_supervisor_is_current(
@@ -1173,7 +1197,8 @@ def test_a_mismatched_record_is_named_in_the_listing(monkeypatch, capsys):
     out = capsys.readouterr().out
 
     assert "belongs to a different" in out
-    assert "operator restart-loop alpha" in out
+    assert _named_under(out, "belongs to a different") == ["alpha"]
+    assert "operator restart-loop --all" in out
 
 
 def test_the_listing_says_nothing_about_mismatches_when_there_are_none(

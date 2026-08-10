@@ -2285,9 +2285,10 @@ def _code_state_notice(code_state: str, instance: Instance,
             "have taken on this wrapper's word before acting on it — in particular, "
             "check for a handoff file yourself rather than trusting a claim that none "
             f"exists. `operator list` names the changed files; `operator restart-loop "
-            f"{instance.display_name}` picks up the current code, but that restarts "
-            "the supervisor you are running under, so raise it with the human rather "
-            "than doing it as a side effect of some other task."
+            f"--all` picks up the current code for every supervisor on the machine, "
+            "which is what an operator change needs — they all went stale together. "
+            "It restarts the supervisor you are running under too, so raise it with "
+            "the human rather than doing it as a side effect of some other task."
         )
     if code_state == CODE_MISMATCH:
         # Deliberately not the fall-through below, which says the supervisor
@@ -3524,6 +3525,34 @@ def _supervisor_where(pid: int | None, still_starting: bool) -> str:
     return f"still starting; spawned as pid {pid}"
 
 
+def pane_program_running(instance: Instance) -> bool:
+    """Whether the program the multiplexer launched -- the runner -- is going.
+
+    Two signals, because neither alone answers:
+
+    * ``has_session`` is False once the session is gone, which is how a pane
+      started with ``remain_on_exit=False`` ends (single-session mode);
+    * ``pane_dead`` is what answers under ``remain_on_exit=True``, which loop
+      mode sets: there the session outlives the program in it, so
+      ``has_session`` stays true long after the runner has exited and a
+      session-only check can never fire.
+
+    Kept as one function because two callers ask this same question for
+    different reasons and had drifted apart when it was written out twice:
+    :func:`is_copilot_running` adds the exit marker to decide whether *Copilot*
+    is up, and :func:`wait_for_metrics_capture` asks it bare, because the
+    runner outlives Copilot by however long its metrics capture takes.
+
+    Probe failures propagate. Every caller has to decide what an unanswerable
+    question means for it, and they do not agree: the supervisor's poll must
+    not read a failed probe as "exited" and tear down a healthy session, while
+    a shutdown wait has nothing to gain by asking again.
+    """
+    if not MUX.has_session(instance.session):
+        return False
+    return not MUX.pane_dead(instance.session)
+
+
 def is_copilot_running(instance: Instance) -> bool:
     """True while the session's Copilot process is still alive.
 
@@ -3533,103 +3562,75 @@ def is_copilot_running(instance: Instance) -> bool:
       written the instant ``proc.wait()`` returns, before metrics capture, so
       it is prompt -- but a runner killed alongside its Copilot never reaches
       even that, which is the overwhelmingly common case here;
-    * ``has_session`` stays true after the program exits when
-      ``remain-on-exit`` is on, which loop mode sets;
-    * ``pane_dead`` catches exactly that case.
-
-    Omitting ``pane_dead`` lets loop mode poll forever when the runner dies
-    without writing its marker.
+    * the pane's program still being up, which is the two probes in
+      :func:`pane_program_running` and covers both ``remain_on_exit`` modes.
 
     Only a marker we can actually see ends the session. A probe that fails
     says nothing about whether Copilot is alive, and answering "exited" would
-    make the supervisor tear down and relaunch a perfectly healthy session.
+    make the supervisor tear down and relaunch a perfectly healthy session --
+    so the failure is left to propagate rather than resolved to a guess here.
     """
     if path_present(instance.exit_file) is True:
         return False
-    if not MUX.has_session(instance.session):
-        return False
-    return not MUX.pane_dead(instance.session)
+    return pane_program_running(instance)
+
+
+def _wait_until(satisfied, timeout: float, interval: float) -> bool:
+    """Poll ``satisfied`` until it holds or ``timeout`` elapses. True if it did.
+
+    The condition is tested before the deadline, so a wait that is already
+    over answers True rather than being reported as a timeout.
+    """
+    deadline = time.time() + timeout
+    while True:
+        if satisfied():
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(interval)
 
 
 def wait_for_exit(instance: Instance, timeout: int = EXIT_GRACE_SECONDS) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not is_copilot_running(instance):
-            return True
-        time.sleep(1)
-    return False
+    return _wait_until(lambda: not is_copilot_running(instance), timeout, 1)
 
 
 def wait_for_metrics_capture(instance: Instance,
                              timeout: int = METRICS_GRACE_SECONDS) -> bool:
     """Wait for the runner to finish capturing metrics, bounded. True if it did.
 
-    Copilot's exit and the runner's exit used to be the same event to anyone
-    watching from here, because the runner published its exit marker only
-    after the capture. It now publishes the marker first -- deliberately, so a
-    dead session is relaunched in seconds rather than the measured average of
-    95 minutes -- which means the marker no longer implies the metrics for
-    that session are in the database.
+    The runner publishes its exit marker the instant Copilot terminates and
+    captures metrics afterwards -- deliberately, so a dead session is
+    relaunched in seconds rather than the 95 minutes measured on this machine.
+    The marker therefore no longer implies that session's metrics are in the
+    database, and everything that reads the database on the way out has to
+    wait for the runner itself, which is :func:`pane_program_running`.
 
-    Only shutdown paths care, and every one of them does. The attached
-    single-session path prints a run summary straight out of the metrics DB,
-    and reading it a moment too early reports a session that used no credits,
-    which is a wrong number rather than a missing one. Loop mode has six ways
-    to end -- ``operator stop``, Ctrl+C, both giving-up limits, the no-change
-    breaker and the unaccounted breaker -- and each of them summarises too,
-    with three of them destroying the pane immediately afterwards and taking
-    an unfinished capture with it. Every one waits.
+    Every shutdown path waits: the attached single-session summary, and loop
+    mode's six endings, three of which destroy the pane immediately afterwards
+    and would take an unfinished capture with them. The relaunch path
+    deliberately does not -- pausing for a log parse before starting the next
+    session is the delay this removed, and a capture cut short there is
+    recoverable with `operator ingest` where the wait is not recoverable at
+    all.
 
-    What deliberately does *not* wait is the relaunch path, which is the whole
-    point of the change: a supervisor that pauses for a log parse before
-    starting the next session is the 95-minute delay this removed. A capture
-    cut short there is recoverable with `operator ingest`; the wait is not
-    recoverable at all.
-
-    The pane going away is *not* the signal on its own, and assuming it was
-    is how the first draft of this quietly did nothing. Loop mode sets
-    ``remain_on_exit``, so the multiplexer session outlives the runner and
-    ``has_session`` stays true until the supervisor kills it — which happens
-    *after* this wait. On the seven loop-mode paths the session check can
-    therefore never fire, and every one of them blocked for the full timeout
-    whether the capture had finished seconds earlier or not. ``pane_dead`` is
-    what distinguishes them there, exactly as it does in
-    :func:`is_copilot_running`, and for the same reason. Only
-    ``run_single_session`` passes ``remain_on_exit=False``, and the session
-    check is what answers for it.
-
-    Both are asked, because neither alone covers both callers: a session that
-    is gone has no pane to interrogate, and a pane that is dead is still in a
-    session.
-
-    Bounded, and the bound is what makes this safe to add. The capture is a
-    parse of a log with no ceiling on its size -- 1.4 GB on this machine, and
-    one capture measured at 13.3 hours -- so waiting for it unconditionally
-    would hang a terminal indefinitely. A thin summary is recoverable; a
-    session that never returns the prompt is not.
+    Bounded, and the bound is what makes it safe: the capture is a parse of a
+    log with no ceiling on its size -- 1.4 GB on this machine, one capture
+    measured at 13.3 hours -- so waiting unconditionally would hang a
+    terminal. A thin summary is recoverable; a prompt that never returns is
+    not.
 
     A multiplexer that cannot be asked ends the wait rather than spending the
     whole timeout on a question nobody can answer. ``OSError`` as well as
-    ``MuxError``, and that is not belt and braces: :meth:`Mux.has_session`
-    shells out through ``subprocess.run`` and raises no ``MuxError`` of its
-    own, so a missing or unexecutable multiplexer binary arrives here as
-    ``OSError`` alone. Catching only the library's own exception would have
-    left the documented behaviour unreachable and ended an attached session
-    with a traceback instead of a summary. ``_session_live_probe`` catches the
-    same pair, for the same reason.
+    ``MuxError``: :meth:`Mux.has_session` shells out through ``subprocess.run``
+    and raises no ``MuxError`` of its own, so a missing multiplexer binary
+    arrives as ``OSError`` alone and catching only the library's exception
+    would end an attached session with a traceback instead of a summary.
     """
-    deadline = time.time() + timeout
-    while True:
-        try:
-            if not MUX.has_session(instance.session):
-                return True
-            if MUX.pane_dead(instance.session):
-                return True
-        except (MuxError, OSError):
-            return False
-        if time.time() >= deadline:
-            return False
-        time.sleep(0.5)
+    try:
+        return _wait_until(lambda: not pane_program_running(instance),
+                           timeout, 0.5)
+    except (MuxError, OSError):
+        return False
 
 
 def stop_session_gracefully(instance: Instance) -> None:
@@ -3750,8 +3751,11 @@ def list_instances() -> int:
         print(f"  {_instance_summary(snap)}")
     if not instances:
         print("  (none)")
-    # Named individually rather than counted: the remedy is per-instance, and
-    # a bare count would leave the reader to work out which ones it meant.
+    # Named individually rather than counted: a bare count would leave the
+    # reader to work out which ones it meant. The remedy offered is the sweep,
+    # because an operator change staleness *every* supervisor at once -- this
+    # notice used to print one command per instance, which is a remedy people
+    # apply to some of them.
     stale = [s["name"] for s in snaps
              if s["loop_pid"] and s.get("loop_code") == CODE_STALE]
     if stale:
@@ -3761,9 +3765,11 @@ def list_instances() -> int:
               "run, so a fix that")
         print("landed afterwards is not running in them, and the records they "
               "write still describe")
-        print("the older code. Pick it up without stopping the session:")
+        print("the older code:")
         for name in stale:
-            print(f"    operator restart-loop {name}")
+            print(f"    {name}")
+        print("Pick it up everywhere without stopping any session:")
+        print("    operator restart-loop --all")
     # A separate group with the same remedy, because the reason differs and
     # merging them would say something false about one of the two. Reported
     # at all because silence here is indistinguishable from every supervisor
@@ -3779,7 +3785,9 @@ def list_instances() -> int:
         print("or could not write one. The same restart fixes it and picks "
               "up the current code:")
         for name in unrecorded:
-            print(f"    operator restart-loop {name}")
+            print(f"    {name}")
+        print("Pick it up everywhere without stopping any session:")
+        print("    operator restart-loop --all")
     # A third group with the same remedy, and the reason differs again. The
     # record on disk names a process that is not the one running, so it
     # cannot be asked anything: not which code was loaded, not when the
@@ -3800,7 +3808,9 @@ def list_instances() -> int:
               "whether it is")
         print("current and when it started. A restart writes a fresh one:")
         for name in mismatched:
-            print(f"    operator restart-loop {name}")
+            print(f"    {name}")
+        print("Pick it up everywhere without stopping any session:")
+        print("    operator restart-loop --all")
     # No remedy line, deliberately: this reports something that has already
     # happened rather than a state to correct, and offering a command would
     # imply the restart is the problem instead of its evidence.
@@ -4005,6 +4015,97 @@ def _restart_handoff_lock(instance: Instance):
         yield acquired
 
 
+def _own_instance_id() -> "str | None":
+    """The instance whose Copilot session this process is running inside.
+
+    ``None`` when that cannot be established, which is the answer for a human
+    at a terminal and for any process table that could not be read. Callers
+    must treat it as "not known to be self" rather than "known not to be
+    self": every use here only reorders work, so a wrong ``None`` costs the
+    ordering, not correctness.
+
+    Established by walking our own ancestry and matching it against the
+    Copilot pid each instance recorded, because that pid is the one thing tying
+    a running process back to an instance. Nothing is passed down the
+    environment that could answer this -- the runner spawns Copilot with the
+    inherited environment and stamps no instance name into it.
+    """
+    chain = operator_trace.ancestry()
+    if not chain:
+        return None
+    mine = {entry.get("pid") for entry in chain if entry.get("pid")}
+    mine.add(os.getpid())
+    for ident, meta in managed_instances().items():
+        inst = Instance(meta.get("display_name", ident))
+        pid = inst.copilot_pid()
+        if pid is not None and pid in mine:
+            return inst.id
+    return None
+
+
+def restart_all_loops() -> int:
+    """Replace every running supervisor, leaving each session running.
+
+    The per-instance command is the one that had to exist first, but it is
+    almost never what is actually needed: operator code lands on `main` and
+    *every* supervisor on the machine is instantly running something that is
+    no longer in the tree. `operator list` said so, named all eight, and then
+    printed eight commands to type. A remedy that has to be applied by hand
+    once per instance is a remedy people apply to some of them.
+
+    Three things this does that a shell loop over the names would not:
+
+    * **It keeps going.** One instance that cannot be restarted -- no recorded
+      loop arguments, a session somebody else owns -- must not decide the fate
+      of the other seven. Each is attempted and each result is reported.
+    * **It does the caller's own instance last.** `restart-loop` deliberately
+      leaves the Copilot session running, so an agent restarting its own
+      supervisor survives it; but if that one goes wrong the agent is the
+      process least able to report it, so it goes after the ones it can still
+      speak for.
+    * **It reports a census rather than a count.** Which instances were
+      restarted, which refused and why. A bare "restarted 6 of 8" leaves the
+      reader to work out which two, which is the state that gets ignored.
+    """
+    instances = [inst for inst in active_instances()
+                 if _running_loop_pid(inst) is not None]
+    if not instances:
+        print("No loop supervisors are running.")
+        return 0
+
+    mine = _own_instance_id()
+    ordered = [i for i in instances if i.id != mine]
+    ordered += [i for i in instances if i.id == mine]
+
+    print(f"Restarting {len(ordered)} loop supervisor"
+          f"{'' if len(ordered) == 1 else 's'}, keeping every session running.")
+    failed: list[str] = []
+    for inst in ordered:
+        label = inst.display_name
+        if inst.id == mine:
+            print(f"\n── {label} (this session's own supervisor — done last) ──")
+        else:
+            print(f"\n── {label} ──")
+        try:
+            rc = restart_loop(label)
+        except SystemExit as exc:
+            # `die` is reachable from the restart path and would otherwise end
+            # the whole sweep on the first instance that refused.
+            rc = exc.code if isinstance(exc.code, int) else 1
+        if rc != 0:
+            failed.append(label)
+
+    print()
+    done = len(ordered) - len(failed)
+    print(f"Restarted {done}/{len(ordered)}.")
+    if failed:
+        print(f"Not restarted: {', '.join(failed)}")
+        print("  Each reported its reason above; they are still running their "
+              "old supervisor.")
+        return 1
+    return 0
+
+
 def restart_loop(target: str | None) -> int:
     """Replace an instance's loop supervisor, leaving its session running.
 
@@ -4013,11 +4114,17 @@ def restart_loop(target: str | None) -> int:
     would pick up new code but takes the Copilot session down with it. This
     swaps only the supervisor: the old one is asked to detach, and a new one
     adopts the still-running session.
+
+    See :func:`restart_all_loops` for the sweep: an operator change makes
+    every supervisor on the machine stale at once, so one at a time is the
+    exception rather than the normal case.
     """
     if not target:
-        print("Usage: operator restart-loop NAME", file=sys.stderr)
+        print("Usage: operator restart-loop NAME | --all", file=sys.stderr)
         print("Replaces the loop supervisor (picking up new operator code) "
               "without stopping the Copilot session.", file=sys.stderr)
+        print("  --all  every running supervisor, which is what an operator "
+              "change needs.", file=sys.stderr)
         return 1
     instance = Instance(target)
 
@@ -5780,7 +5887,7 @@ USAGE
     operator projects retire [--yes]                           Move conventions into each project's AGENTS.md
     operator stop [NAME]                                       Stop instance(s) — loop + session
     operator stop-loop NAME                                    Stop only the background loop
-    operator restart-loop NAME                                 Replace the loop supervisor (new code), keep session
+    operator restart-loop NAME|--all                           Replace the loop supervisor (new code), keep session
     operator stop-session NAME                                 Stop only the Copilot session
     operator forget NAME                                       Drop operator state only
     operator report [type]                                     View usage reports
@@ -5851,6 +5958,14 @@ LOOP VS. SESSION
                                       operator's code when it started, so this is
                                       how a running instance picks up an updated
                                       operator without losing its session.
+        operator restart-loop --all   The same, for every running supervisor.
+                                      This is normally the one you want: operator
+                                      code lands once and every supervisor on the
+                                      machine goes stale together, so restarting
+                                      them one at a time means restarting some of
+                                      them. Keeps going past an instance that
+                                      refuses, reports which, and does the caller's
+                                      own supervisor last.
         operator stop-session NAME    Stop the session; if a supervisor is still
                                       running it relaunches a fresh one shortly.
         operator stop NAME            Stop both, cleanly, with no relaunch.
@@ -8637,7 +8752,10 @@ def _dispatch_command(args: list[str]) -> int:
     if head == "stop-loop":
         return stop_loop_only(args[1] if len(args) > 1 else None)
     if head == "restart-loop":
-        return restart_loop(args[1] if len(args) > 1 else None)
+        rest = args[1:]
+        if rest and rest[0] in ("--all", "-a"):
+            return restart_all_loops()
+        return restart_loop(rest[0] if rest else None)
     if head == "stop-session":
         return stop_session_only(args[1] if len(args) > 1 else None)
     if head == "join":
