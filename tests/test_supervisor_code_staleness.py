@@ -1213,34 +1213,215 @@ def test_a_matching_start_token_is_the_supervisors_own_record(monkeypatch):
         {"pid": 123, "pid_start": "started-at-8am"}, 123)
 
 
+def _token_probe(monkeypatch, value="started-at-9am"):
+    """Patch the live-token probe and count its calls.
+
+    Counting matters as much as the value. Adversarial review pointed out
+    that the fallback branches short-circuit *before* probing, so a plain
+    monkeypatch in those tests is dead code that asserts nothing -- and a
+    patch that is never reached looks identical to one that is. Asserting
+    the count pins which branch actually ran.
+    """
+    calls = {"n": 0}
+
+    def probe(pid):
+        calls["n"] += 1
+        return value
+
+    monkeypatch.setattr(op.operator_liveness, "process_start_token", probe)
+    return calls
+
+
 def test_a_record_predating_the_token_falls_back_to_the_pid(monkeypatch):
     """Unlike `pid`, `pid_start` has a real pre-stamp history: every
     supervisor running when it landed wrote a record without one. Refusing
     those would have reported every supervisor on the machine as a leftover
     on day one."""
-    monkeypatch.setattr(op.operator_liveness, "process_start_token",
-                        lambda pid: "started-at-9am")
+    calls = _token_probe(monkeypatch)
 
     assert op._record_describes({"pid": 123}, 123)
     assert not op._record_describes({"pid": 999}, 123)
+    assert calls["n"] == 0, "no token to compare, so nothing to probe for"
+
+
+def test_a_null_token_falls_back_to_the_pid(monkeypatch):
+    """`_save_loop_code` writes whatever `process_start_token` returned, and
+    that is ``None`` on a machine where the probe cannot answer. A record
+    saying "I could not tell either" is the absent case, not damage."""
+    calls = _token_probe(monkeypatch)
+
+    assert op._record_describes({"pid": 123, "pid_start": None}, 123)
+    assert calls["n"] == 0
 
 
 def test_an_unreadable_live_token_falls_back_to_the_pid(monkeypatch):
     """`process_start_token` returns None for a pid it cannot inspect. That
     is an absence of evidence, and it must not be spent refuting a record."""
-    monkeypatch.setattr(op.operator_liveness, "process_start_token",
-                        lambda pid: None)
+    calls = _token_probe(monkeypatch, value=None)
 
     assert op._record_describes(
         {"pid": 123, "pid_start": "started-at-8am"}, 123)
+    assert calls["n"] == 1, "this branch is only reachable by probing"
 
 
-def test_a_non_string_token_in_the_record_falls_back_to_the_pid(monkeypatch):
+@pytest.mark.parametrize("junk", [17, "", [], {}, True])
+def test_a_malformed_token_is_a_mismatch(monkeypatch, junk):
+    """Present but impossible. `_save_loop_code` writes a non-empty string or
+    ``None``, so no version of it produces these -- they are damage, and the
+    leniency above is owed to a real earlier schema, not to corruption. The
+    first draft accepted `17` and `""`; adversarial review caught it."""
+    calls = _token_probe(monkeypatch)
+
+    assert not op._record_describes({"pid": 123, "pid_start": junk}, 123)
+    assert calls["n"] == 0, "refused on the record alone, without probing"
+
+
+# ── the token is boot-relative on Linux ─────────────────────────
+#
+# `_linux_start_token` is field 22 of /proc/<pid>/stat: clock ticks *since
+# boot*. Across a reboot a replacement can therefore collide with its
+# predecessor on both pid and token, which is the one case the token alone
+# cannot refute. `same_boot` compares the tagged forms correctly and answers
+# None for anything it cannot compare, so only a definite False refutes.
+def _tokens(monkeypatch, live_boot):
     monkeypatch.setattr(op.operator_liveness, "process_start_token",
-                        lambda pid: "started-at-9am")
+                        lambda pid: "linux:900")
+    monkeypatch.setattr(op.operator_liveness, "boot_identity",
+                        lambda: live_boot)
 
-    assert op._record_describes({"pid": 123, "pid_start": 17}, 123)
-    assert op._record_describes({"pid": 123, "pid_start": ""}, 123)
+
+def test_a_record_from_another_boot_is_a_mismatch(monkeypatch):
+    _tokens(monkeypatch, "uuid:bbb")
+
+    assert not op._record_describes(
+        {"pid": 123, "pid_start": "linux:900", "boot": "uuid:aaa"}, 123)
+
+
+def test_a_record_from_this_boot_is_its_own(monkeypatch):
+    """Positive control: identical but for the boot id, which is the only
+    thing that may decide it."""
+    _tokens(monkeypatch, "uuid:aaa")
+
+    assert op._record_describes(
+        {"pid": 123, "pid_start": "linux:900", "boot": "uuid:aaa"}, 123)
+
+
+def test_a_boot_identity_that_cannot_be_compared_does_not_refute(monkeypatch):
+    """`same_boot` answers None across tag kinds -- a record written on
+    another platform, or a machine whose exact source stopped answering. An
+    absence of evidence must not be spent as a refutation."""
+    _tokens(monkeypatch, "instant:1000")
+
+    assert op._record_describes(
+        {"pid": 123, "pid_start": "linux:900", "boot": "uuid:aaa"}, 123)
+
+
+def test_a_record_predating_the_boot_stamp_falls_back(monkeypatch):
+    """Same pre-stamp history argument as `pid_start`: records without the
+    key exist right now."""
+    _tokens(monkeypatch, "uuid:bbb")
+
+    assert op._record_describes({"pid": 123, "pid_start": "linux:900"}, 123)
+
+
+def test_a_null_boot_identity_in_the_record_falls_back(monkeypatch):
+    _tokens(monkeypatch, "uuid:bbb")
+
+    assert op._record_describes(
+        {"pid": 123, "pid_start": "linux:900", "boot": None}, 123)
+
+
+@pytest.mark.parametrize("junk", [17, "", []])
+def test_a_malformed_boot_identity_is_a_mismatch(monkeypatch, junk):
+    _tokens(monkeypatch, "uuid:aaa")
+
+    assert not op._record_describes(
+        {"pid": 123, "pid_start": "linux:900", "boot": junk}, 123)
+
+
+def test_the_boot_identity_is_stamped_by_a_real_publish():
+    inst = op.Instance("bootstamp")
+    op._publish_supervisor_records(inst, [])
+
+    payload = json.loads(inst.loop_code_file.read_text(encoding="utf-8"))
+
+    assert payload["boot"] == op.operator_liveness.boot_identity()
+
+
+# ── the record is read once per snapshot ────────────────────────
+#
+# Each of the four readers opens the file and runs `_record_describes`, which
+# probes process identity. That is free on Windows (0.021 ms measured) and is
+# not on macOS/BSD, where `operator_liveness._ps_start_token` spawns `ps` with
+# a ten-second timeout -- four subprocesses per instance per `operator list`.
+# Found by adversarial review; the same "measured on Windows, therefore free"
+# shape the repository's `os.path` note warns about.
+def test_the_snapshot_reads_the_record_once(tmp_path, monkeypatch):
+    src = tmp_path / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    inst = _live_supervisor(monkeypatch, "readonce")
+    _snapshot_record(inst, os.getpid(), src)
+
+    reads = {"n": 0}
+    real = op._read_loop_record
+    monkeypatch.setattr(op, "_read_loop_record",
+                        lambda i: (reads.__setitem__("n", reads["n"] + 1),
+                                   real(i))[1])
+    probes = {"n": 0}
+    real_token = op.operator_liveness.process_start_token
+    monkeypatch.setattr(op.operator_liveness, "process_start_token",
+                        lambda pid: (probes.__setitem__("n", probes["n"] + 1),
+                                     real_token(pid))[1])
+
+    op.instance_snapshot(inst)
+
+    assert reads["n"] == 1
+    assert probes["n"] <= 1
+
+
+def test_reading_once_gives_the_same_answers_as_reading_four_times(
+        tmp_path, monkeypatch):
+    """The refactor's negative control. Cutting four reads to one is only
+    safe if it changed no answer, so this asserts the batch reader agrees
+    with each individual reader rather than merely that it returns
+    something."""
+    src = tmp_path / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    inst = _live_supervisor(monkeypatch, "agreeonce")
+    _snapshot_record(inst, os.getpid(), src)
+    pid = os.getpid()
+
+    facts = op.loop_record_facts(inst, pid)
+
+    assert facts["code"] == op.loop_code_state(inst, pid)[0]
+    assert facts["changed"] == op.loop_code_state(inst, pid)[1]
+    assert facts["started"] == op.loop_started_at(inst, pid)
+    assert facts["adopted"] == op.loop_adopted(inst, pid)
+    assert facts["began_run"] == op.loop_began_run(inst, pid)
+
+
+@pytest.mark.parametrize("pid_used", ["match", "mismatch"])
+def test_the_batch_reader_agrees_on_a_mismatch_too(tmp_path, monkeypatch,
+                                                   pid_used):
+    src = tmp_path / "mod.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    inst = _live_supervisor(monkeypatch, f"agree{pid_used}")
+    _snapshot_record(inst, os.getpid(), src)
+    pid = os.getpid() if pid_used == "match" else os.getpid() + 1
+
+    facts = op.loop_record_facts(inst, pid)
+
+    assert facts["code"] == op.loop_code_state(inst, pid)[0]
+    assert facts["started"] == op.loop_started_at(inst, pid)
+    assert facts["adopted"] == op.loop_adopted(inst, pid)
+    assert facts["began_run"] == op.loop_began_run(inst, pid)
+
+
+def test_the_batch_reader_reports_an_absent_record_as_unrecorded():
+    """The verdict from `_read_loop_record` must survive the batch path --
+    `unrecorded` and `unknown` are kept apart everywhere else."""
+    assert op.loop_record_facts(op.Instance("nobatchrecord"))["code"] == \
+        op.CODE_UNRECORDED
 
 
 def test_the_start_token_is_stamped_by_a_real_publish():

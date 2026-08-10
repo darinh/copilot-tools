@@ -2277,6 +2277,29 @@ def _code_state_notice(code_state: str, instance: Instance,
             "the supervisor you are running under, so raise it with the human rather "
             "than doing it as a side effect of some other task."
         )
+    if code_state == CODE_MISMATCH:
+        # Deliberately not the fall-through below, which says the supervisor
+        # "either recorded nothing [...] or that record could not be compared".
+        # Both are false here: a record was read, and it names a different
+        # process. Reaching this branch is currently impossible -- the
+        # preamble's verdict comes from `own_code_state`, which compares this
+        # process's in-memory fingerprint and never consults a pid -- but a
+        # wrong default that is merely unreachable today is the enum-extension
+        # defect waiting to happen, and adversarial review asked for it by
+        # name.
+        return (
+            "CAUTION — this operator wrapper CANNOT SHOW that it is running current "
+            "code. The startup record for the supervisor that launched you belongs to "
+            "a different process: one supervisor was replaced by another that could "
+            f"not overwrite it. So {claims} cannot be attributed to the code you are "
+            "actually running, and nothing in that record describes it — not which "
+            "source it loaded, nor when it started. Verify anything load-bearing — in "
+            "particular, check for a handoff file yourself rather than trusting a "
+            f"claim that none exists. `operator restart-loop {instance.display_name}` "
+            "writes a fresh record, but that restarts the supervisor you are running "
+            "under, so raise it with the human rather than doing it as a side effect "
+            "of some other task."
+        )
     return (
         "CAUTION — this operator wrapper CANNOT SHOW that it is running current code. "
         "The supervisor that launched you either recorded nothing about the operator "
@@ -2601,6 +2624,14 @@ def _save_loop_code(instance: Instance, adopted: bool = False,
     # discrimination missing here; `operator_session` and `operator_work`
     # already use it for the same reason.
     payload["pid_start"] = operator_liveness.process_start_token(os.getpid())
+    # And the start token is boot-relative on Linux -- `_linux_start_token` is
+    # field 22 of /proc/<pid>/stat, in clock ticks *since boot*. Across a
+    # reboot a replacement can therefore collide with its predecessor on both
+    # pid and token, which is the one case the token alone cannot refute.
+    # `same_boot` handles the tagged forms correctly: exact for Linux's boot
+    # uuid, tolerant for the Windows/macOS instant, and "cannot tell" across
+    # kinds -- so this only ever refutes on evidence.
+    payload["boot"] = operator_liveness.boot_identity()
     payload["recorded"] = utcnow()
     payload["adopted"] = bool(adopted)
     payload["began_run"] = bool(began_run)
@@ -2767,6 +2798,44 @@ def _read_loop_record(instance: Instance) -> "tuple[dict | None, str]":
     return payload, ""
 
 
+def loop_record_facts(instance: Instance,
+                      loop_pid: "int | None" = None) -> dict:
+    """Everything the record answers, read once.
+
+    The four readers below each open the file and re-run `_record_describes`,
+    which is four reads and four identity probes per instance. That was free
+    on Windows (`process_start_token` measures 0.021 ms there) and is not
+    elsewhere: on macOS and BSD `operator_liveness._ps_start_token` spawns
+    ``ps`` with a ten-second timeout, so `operator list` would fork four
+    subprocesses per instance and could block for a long time on a machine
+    with several. Found by adversarial review, which is the second time in
+    this change that a Windows-only measurement said "free" about something
+    that is not -- the same shape the repository's `os.path` note warns about.
+
+    The readers stay, because they are the honest unit of the question for
+    every other caller and for the tests. This is the one path that asks all
+    four at once.
+    """
+    payload, unusable = _read_loop_record(instance)
+    if payload is None:
+        return {"code": unusable, "changed": [], "started": None,
+                "adopted": None, "began_run": None}
+    if not _record_describes(payload, loop_pid):
+        return {"code": CODE_MISMATCH, "changed": [], "started": None,
+                "adopted": None, "began_run": None}
+    verdict, changed = _compare_recorded_files(payload.get("files"))
+    recorded = payload.get("recorded")
+    adopted = payload.get("adopted")
+    began = payload.get("began_run")
+    return {
+        "code": verdict,
+        "changed": changed,
+        "started": recorded if isinstance(recorded, str) and recorded else None,
+        "adopted": adopted if isinstance(adopted, bool) else None,
+        "began_run": began if isinstance(began, bool) else None,
+    }
+
+
 def loop_started_at(instance: Instance, loop_pid: "int | None" = None) -> "str | None":
     """When the *running supervisor process* started, or ``None``.
 
@@ -2859,21 +2928,48 @@ def _record_describes(payload: dict, loop_pid: "int | None") -> bool:
     The two ways it can be absent are deliberately *not* treated like the
     missing pid above, because unlike `pid`, `pid_start` has a real pre-stamp
     history: every supervisor running when it landed wrote a record without
-    one. A record with no token, or a live process whose token cannot be read
-    (`process_start_token` returns ``None`` for a pid it cannot inspect), is
-    left to the pid comparison alone. So this only ever *adds* a refusal on
-    positive evidence of recycling, and never converts a genuine older record
+    one. A record where the key is *absent*, or a live process whose token
+    cannot be read (`process_start_token` returns ``None`` for a pid it cannot
+    inspect), is left to the pid comparison alone. So this only ever *adds* a
+    refusal on positive evidence, and never converts a genuine older record
     into a mismatch -- which would have reported every supervisor on the
-    machine as a leftover the day this shipped.
+    machine as a leftover the day it shipped.
+
+    A `pid_start` that is *present but malformed* -- a number, a list, an
+    empty string -- is a mismatch rather than a fallback, for exactly the
+    reason a missing `pid` is. No version of `_save_loop_code` can produce
+    one: it writes either a non-empty token or ``None``, and ``None`` is the
+    absent case above. So a malformed value is damage, and the leniency here
+    is owed to a real earlier schema, not to corruption. Adversarial review
+    caught the first draft accepting ``17`` and ``""``.
+
+    ``boot`` closes the last gap the token leaves: `_linux_start_token` counts
+    clock ticks *since boot*, so across a reboot a replacement can collide
+    with its predecessor on both pid and token. `same_boot` returns ``None``
+    for anything it cannot compare -- an untagged value, a record written on
+    another platform, a machine whose boot source stopped answering -- and
+    only ``False`` refutes.
     """
     if loop_pid is None:
         return True
     recorded_pid = payload.get("pid")
     if not isinstance(recorded_pid, int) or recorded_pid != loop_pid:
         return False
-    recorded_start = payload.get("pid_start")
-    if not isinstance(recorded_start, str) or not recorded_start:
+    if "boot" in payload:
+        recorded_boot = payload.get("boot")
+        if recorded_boot is not None:
+            if not isinstance(recorded_boot, str) or not recorded_boot:
+                return False
+            if operator_liveness.same_boot(
+                    recorded_boot, operator_liveness.boot_identity()) is False:
+                return False
+    if "pid_start" not in payload:
         return True
+    recorded_start = payload.get("pid_start")
+    if recorded_start is None:
+        return True
+    if not isinstance(recorded_start, str) or not recorded_start:
+        return False
     live_start = operator_liveness.process_start_token(loop_pid)
     if not live_start:
         return True
@@ -5844,6 +5940,10 @@ def instance_snapshot(instance: Instance) -> dict:
     # pid the record carries, so a supervisor whose record could not be
     # rewritten is not described by its predecessor's.
     loop_pid = _running_loop_pid(instance)
+    # Read once. Asking the four readers separately costs four file reads and
+    # four process-identity probes per instance, and on macOS/BSD each probe
+    # is a `ps` subprocess with a ten-second timeout.
+    record = loop_record_facts(instance, loop_pid)
     return {
         "instance": instance,
         "name": instance.display_name,
@@ -5853,10 +5953,10 @@ def instance_snapshot(instance: Instance) -> dict:
         # surface it: a same-named session we did not start is look-only.
         "owned": session_live and instance.owns_live_session(),
         "loop_pid": loop_pid,
-        "loop_code": loop_code_state(instance, loop_pid)[0],
-        "loop_started": loop_started_at(instance, loop_pid) or "",
-        "loop_adopted": loop_adopted(instance, loop_pid),
-        "loop_began_run": loop_began_run(instance, loop_pid),
+        "loop_code": record["code"],
+        "loop_started": record["started"] or "",
+        "loop_adopted": record["adopted"],
+        "loop_began_run": record["began_run"],
         "session_num": session_num,
         "run_started": state.get("RUN_STARTED", "") or owner.get("claimed_at", ""),
         "copilot_session_id": (state.get("COPILOT_SESSION_ID", "")
