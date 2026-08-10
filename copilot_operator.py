@@ -3586,8 +3586,21 @@ def wait_for_metrics_capture(instance: Instance,
     cut short there is recoverable with `operator ingest`; the wait is not
     recoverable at all.
 
-    The pane going away is the signal, not the exit marker: the multiplexer
-    session outlives Copilot exactly as long as the runner does.
+    The pane going away is *not* the signal on its own, and assuming it was
+    is how the first draft of this quietly did nothing. Loop mode sets
+    ``remain_on_exit``, so the multiplexer session outlives the runner and
+    ``has_session`` stays true until the supervisor kills it — which happens
+    *after* this wait. On the seven loop-mode paths the session check can
+    therefore never fire, and every one of them blocked for the full timeout
+    whether the capture had finished seconds earlier or not. ``pane_dead`` is
+    what distinguishes them there, exactly as it does in
+    :func:`is_copilot_running`, and for the same reason. Only
+    ``run_single_session`` passes ``remain_on_exit=False``, and the session
+    check is what answers for it.
+
+    Both are asked, because neither alone covers both callers: a session that
+    is gone has no pane to interrogate, and a pane that is dead is still in a
+    session.
 
     Bounded, and the bound is what makes this safe to add. The capture is a
     parse of a log with no ceiling on its size -- 1.4 GB on this machine, and
@@ -3609,6 +3622,8 @@ def wait_for_metrics_capture(instance: Instance,
     while True:
         try:
             if not MUX.has_session(instance.session):
+                return True
+            if MUX.pane_dead(instance.session):
                 return True
         except (MuxError, OSError):
             return False
@@ -3820,7 +3835,8 @@ def list_instances() -> int:
     return 0
 
 
-def _request_supervisor_stop(instance: Instance, timeout: float = 20.0) -> None:
+def _request_supervisor_stop(instance: Instance,
+                             timeout: float = 20.0 + METRICS_GRACE_SECONDS) -> None:
     """If a background loop supervisor is running for instance, ask it to
     shut down (and take the session with it) before we touch anything else.
 
@@ -3837,6 +3853,15 @@ def _request_supervisor_stop(instance: Instance, timeout: float = 20.0) -> None:
     ``RESTART_DIR`` until some future supervisor started and immediately
     stopped itself. The invariant on return is that either a supervisor holds
     the marker, or it is gone because we removed it.
+
+    The default budget carries ``METRICS_GRACE_SECONDS`` for the same reason
+    ``_do_restart_loop`` derives its own from ``POLL_INTERVAL``: the
+    supervisor's stop branch waits for the runner's metrics capture before it
+    exits, so a budget that does not know that expires while the supervisor is
+    still doing what it was asked to do. The caller then kills the session
+    itself, out from under a supervisor mid-shutdown. Spelled as a sum rather
+    than folded into one number so that tuning the wait cannot silently
+    un-tune this.
     """
     instance.stop_marker.touch()
     pid, starting = _supervisor_status(instance)

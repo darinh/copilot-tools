@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import re
 import shutil
@@ -1673,6 +1674,57 @@ def test_waiting_for_metrics_capture_ends_when_the_pane_goes(monkeypatch):
     assert op.wait_for_metrics_capture(inst, timeout=5) is True
 
 
+def test_waiting_for_metrics_capture_ends_when_a_kept_pane_dies(monkeypatch):
+    """Loop mode's shape, and the one the first draft could not see.
+
+    Loop mode sets remain-on-exit, so the multiplexer session outlives the
+    runner and `has_session` stays true until the supervisor kills it -- which
+    happens after this wait. A session-only check therefore never fires on any
+    of the seven loop-mode paths, and every one of them burned the whole
+    timeout however long ago the capture had finished. `pane_dead` is what
+    answers there, exactly as in `is_copilot_running`.
+    """
+    inst = op.Instance("proj")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    monkeypatch.setattr(op.MUX, "pane_dead", lambda s: True)
+    started = time.time()
+    assert op.wait_for_metrics_capture(inst, timeout=30) is True
+    assert time.time() - started < 5, (
+        "the runner had already finished and the wait sat out its timeout "
+        "anyway, which is the loop-mode delay this is supposed to avoid"
+    )
+
+
+def test_waiting_for_metrics_capture_keeps_waiting_while_the_runner_works(
+    monkeypatch,
+):
+    """The control: a live pane must not be mistaken for a finished capture.
+
+    Without this, the test above is satisfied by a function that returns True
+    immediately in every case, which would put the summary back in front of
+    the capture it exists to wait for.
+    """
+    inst = op.Instance("proj")
+    monkeypatch.setattr(op.MUX, "has_session", lambda s: True)
+    monkeypatch.setattr(op.MUX, "pane_dead", lambda s: False)
+    assert op.wait_for_metrics_capture(inst, timeout=1) is False
+
+
+def test_the_supervisor_stop_budget_covers_the_metrics_wait():
+    """`operator stop` must outlast what it just asked the supervisor to do.
+
+    The supervisor's stop branch waits for the runner's capture before it
+    exits. A budget that does not know that expires while the supervisor is
+    still obeying, and the caller then kills the session out from under it.
+    """
+    default = inspect.signature(op._request_supervisor_stop).parameters["timeout"].default
+    assert default >= op.METRICS_GRACE_SECONDS + op.EXIT_GRACE_SECONDS, (
+        f"the stop budget is {default}s but the supervisor can spend "
+        f"{op.EXIT_GRACE_SECONDS}s ending the session and "
+        f"{op.METRICS_GRACE_SECONDS}s waiting for its metrics capture"
+    )
+
+
 def test_waiting_for_metrics_capture_is_bounded(monkeypatch):
     """A capture with no ceiling on it must not hold the terminal.
 
@@ -1774,18 +1826,27 @@ def test_every_run_summary_waits_for_the_capture_first():
     source = Path(op.__file__).read_text(encoding="utf-8").splitlines()
     offenders = []
     for i, line in enumerate(source):
-        if "show_run_summary(run_started)" not in line:
+        if "show_run_summary(" not in line:
             continue
-        if line.lstrip().startswith(("#", "def ", "*")):
+        stripped = line.strip()
+        if stripped.startswith(("#", "def ", "*", '"', "'")):
+            continue
+        if stripped != "show_run_summary(run_started)":
+            # Not skipped: a call this scan cannot read is a call it cannot
+            # vouch for, and silently dropping it is how a guard reports a
+            # tree clean that it never looked at. Reformatting one across two
+            # lines must fail here and be fixed here.
+            offenders.append(f"{i + 1}: {stripped} (unrecognised call shape)")
             continue
         previous = source[i - 1].strip() if i else ""
         if previous != "wait_for_metrics_capture(instance)":
-            offenders.append(f"{i + 1}: {line.strip()} (preceded by {previous!r})")
-    assert not offenders, (
+            offenders.append(f"{i + 1}: {stripped} (preceded by {previous!r})")
+    assert offenders == [], (
         "the runner publishes its exit marker before metrics capture, so these "
         "summaries can read the database before the session is in it:\n  "
         + "\n  ".join(offenders)
     )
+    assert len(source) > 100, "read the wrong file"
 
 
 def test_the_relaunch_path_does_not_wait_for_the_capture():

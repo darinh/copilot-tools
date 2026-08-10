@@ -771,3 +771,56 @@ from 2026-08-09, the 979 from the original window: none of them is refuted, and
 none is confirmed either. Ten of the eleven codes ever recovered say the
 process faulted on its own, which is a reason to suspect the population is
 mixed and not a reason to conclude it. Re-count from post-change records only.
+
+### The remedy for the remedy did it again, in the compensating wait
+
+The change above moved the exit marker ahead of metrics capture and, because
+that stops the marker implying the metrics are in the database, added
+`wait_for_metrics_capture` in front of all eight `show_run_summary` calls. Its
+early-return asked `MUX.has_session`, and its docstring justified that with
+"the multiplexer session outlives Copilot exactly as long as the runner does".
+
+**That sentence is true of exactly one of the eight callers.**
+`run_single_session` launches with `remain_on_exit=False`. Loop mode sets
+`remain_on_exit=True` — `is_copilot_running` has a comment saying so, three
+functions further up the same file, and it is why that function consults
+`pane_dead` at all. So on all seven loop-mode paths the session check could
+never fire, and every one of them sat out the full 15-second timeout however
+long ago the runner had finished. The wait was doing nothing except waiting.
+
+**This item's signature failure, for the eighth time and the fourth inside a
+remedy for a previous one.** What makes it worth recording rather than just
+fixing is *why the tests agreed it worked*:
+`test_every_run_summary_waits_for_the_capture_first` reads the source and
+asserts each summary is preceded by the wait. It is a real guard and it
+catches a real regression — but it asserts the wait is **present**, never that
+it **works**, and a wait that returns only on timeout is present. The three
+first-round reviewers, on three model families, all confirmed the change was
+sound; none of them ran the wait under `remain_on_exit=True` either, because
+nothing in the diff says which mode a caller is in.
+
+Two things fixed here, both derived from constants rather than restated:
+
+- `wait_for_metrics_capture` asks `pane_dead` as well as `has_session`, for the
+  same reason `is_copilot_running` does. Both are needed: a session that is
+  gone has no pane to interrogate, and a pane that is dead is still in a
+  session. `test_waiting_for_metrics_capture_ends_when_a_kept_pane_dies` pins
+  it *by elapsed time*, and reverting the check makes that test take 36
+  seconds and then fail — the defect reproduced, not merely described.
+- `_request_supervisor_stop`'s budget is `20.0 + METRICS_GRACE_SECONDS`.
+  `operator stop` blocks on the supervisor, whose stop branch now waits for the
+  capture, so a budget that does not know that expires while the supervisor is
+  still doing what it was told and the caller then kills the session out from
+  under it. `_do_restart_loop` already derived its budget from `POLL_INTERVAL`
+  for this exact reason; the stop path had not been given the same treatment.
+
+And the structural guard was hardened against the failure it was one edit away
+from having: it matched only single-line `show_run_summary(run_started)`, so a
+call reformatted across two lines would have dropped silently out of the scan
+and gone unguarded while the test stayed green. Any call shape it cannot read
+is now reported rather than skipped, verified by reformatting one and watching
+it go red.
+
+**For the next reader.** The instrument to distrust here is a test that asserts
+a call is *made*. Presence is not behaviour, and the gap between them is
+exactly wide enough to hold this item's entire history.
