@@ -824,3 +824,179 @@ it go red.
 **For the next reader.** The instrument to distrust here is a test that asserts
 a call is *made*. Presence is not behaviour, and the gap between them is
 exactly wide enough to hold this item's entire history.
+
+## Re-measurement, 2026-08-15: no kills in 5.7 days, and the recipe reads the wrong field
+
+Run by the recipe above. Two findings: the fault is quiet again, on a window
+whose evidential power is a hundredth of what the previous ones had; and the
+fourth instrument the previous re-measurement introduced is described in a way
+that misreads 35 of the 36 records it applies to.
+
+### The boundary, in both time zones
+
+The window opens at the last ending the 2026-08-10 re-measurement recorded:
+**2026-08-09 22:31:20 local**, which is **2026-08-10T05:31:20Z**. That section
+states its five endings in local time and `trace.jsonl` stamps everything in
+UTC, and the first pass here compared the log's local stamps against
+`2026-08-10 22:31:20` — a day late — and reported a clean window that was
+really 152 log lines wide. It is the third arithmetic trap of the same family
+as the two recorded above, so it goes on the same list: **the boundary must be
+carried in local time for `operator.log` and in Zulu for `trace.jsonl`, and
+this item states its boundaries in local.**
+
+### Both instruments, and this time they reconcile ending-for-ending
+
+`operator.log`, exclusive of the boundary, through 2026-08-15 14:12 local
+(5.66 days):
+
+- **1 `copilot exited unexpectedly`** against **11 `restart signal detected!`**
+- **0 `Giving up`** and **0 `markers cannot be examined`** — both must be zero
+  for the rest of the count to mean anything, since either one is the
+  supervisor saying it could no longer classify an ending
+- 36 `adopting the running session`
+
+`trace.jsonl`, exclusive of `2026-08-10T05:31:20Z`:
+
+- **12 `session_exit`**: 11 with `restart=True`, 1 with `restart=False`
+- 36 `supervisor_start`
+
+Twelve endings against twelve records; eleven restarts on each side; one
+unexpected exit on each side. **This is the first window in this item's history
+in which the two instruments agree ending-for-ending with nothing
+unaccounted.** The 2026-08-05 window had 60 endings against zero records and
+the 2026-08-10 one needed the SESSION_NUM arithmetic to reconcile at all. Here
+there is no gap for a kill to sit in.
+
+### The single ending is not a kill, and for the first time the exit code says so
+
+`subtitle-localizer` session #1, 2026-08-10 01:28:18 local, up 23200s,
+`exit_code: 0`. Zero is Copilot terminating of its own accord: not
+`3221225477` (a fault in its own process), and not `null` (nobody watching).
+Its runner log agrees independently — `copilot exited rc=0` at 00:27:09.
+
+The gap between those two timestamps is 61 minutes, and it is the *old* defect
+rather than a new one: that runner was launched 2026-08-09 19:01:37, before
+9650435 moved the exit marker ahead of metrics capture, so it is the last
+measurement of the pre-fix ordering and not a recurrence of it. Every runner
+launched since takes its code from disk at launch, so unlike a supervisor a
+runner cannot stay stale for long — which is why this instrument, alone among
+the six, needed no deployment step.
+
+**No kill has been observed by either instrument in 5.66 days.**
+
+### What that is worth, which is much less than it looks
+
+Both detectors need endings, and endings have collapsed. Twelve in 5.66 days
+across nine instances, against **60 in 11.1 hours** at the 2026-08-05
+measurement — about one hundredth the rate. Four instances
+(`book-translator`, `finances`, `prism`, `scripts`) produced no ending at all
+in the window; their Copilot processes have been up since 2026-08-09.
+
+Checked before concluding anything, because *no endings* and *nothing can end*
+produce the identical count: all eight sessions are alive and working. Each
+instance's pinned Copilot debug log had been written within six minutes of the
+measurement (2026-08-15 14:07–14:12 local), at sizes from 5.6 MB to 207 MB.
+These are long-lived sessions, not stalled ones.
+
+So the verdict stands and its weight does not. **A 5.66-day window holding 12
+endings carries roughly what 80 minutes carried in the original regime**, and
+"no kills in 5.66 days" should be read as about as strong as "no kills in 80
+minutes" would have been then. Nothing here identifies the emitter. The fifth
+hypothesis for the original waves is still owed.
+
+### No event 21 in the window
+
+All 43 `TerminalServices-LocalSessionManager` events of Id 21 or 25 between the
+boundary and 2026-08-15 14:12 local are **Id 25 reconnections; there is no
+Id 21**. The 2026-08-09 logon replacement has not recurred — consistent with
+there being no wave for it to explain.
+
+### Nine supervisors restarted in 50 seconds, and it is not a wave
+
+Every `~/.operator/restart/*.loop.pid` was rewritten between 2026-08-13
+23:35:10 and 23:36:00 — nine instances inside 50 seconds, which is a tighter
+spread than the six-instance wave of 2026-08-09 — and `operator list` said
+nothing about any of it. That is precisely the shape the recipe above tells
+the next reader to treat as a broadcast, and this time it is not one:
+
+- every `*.loopcode.json` records `"adopted": true, "began_run": false`;
+- `operator.log` holds nine `adopting the running session` lines across those
+  50 seconds and no `copilot exited unexpectedly` anywhere near them.
+
+A fleet-wide `operator restart-loop` sweep, deploying current code. **This is
+the first live exercise of the `adopted` stamp added on 2026-08-09**, and it
+answered correctly — and correctly *silently*, which on this item is the
+answer that has to be checked rather than accepted, since a silent all-clear is
+how five earlier instruments failed. The positive control is the nine records
+themselves: they carry `adopted: true`, so the silence is a verdict that was
+computed and printed nothing, not one that was never reached. Their digest
+(`a61c296821330203`) matches the source on disk, so nothing is stale either.
+
+Three more sweeps sit in the same window (2026-08-10 02:33, 03:08 and 04:01,
+nine instances each), which is what the 36 adoptions and the 36
+`supervisor_start` events are — they match exactly.
+
+### The fourth instrument is sound; its instructions are not
+
+The recipe above introduces `markers.exit_code` and says:
+
+> **`null`** still means nobody observed the ending, which remains the
+> signature of the whole pane going
+
+**That is false for every record carrying `restart=True`, and false by design
+rather than by oversight.** `_record_session_exit` is called with
+`session_gone=False` on the handoff path, and its docstring gives the reason:
+the record is written while Copilot is still up, so no exit code can belong to
+it and none is read. `null` there means "recorded before the process ended",
+not "nobody saw it end".
+
+Eleven of the twelve records in this window are `restart=True, exit_code=null`.
+Across the 36 records since 2026-08-10, 35 are. A reader following the recipe
+as written finds 35 nulls and has been told each one is the signature of a pane
+being taken.
+
+The code does not make this mistake. `ending_was_observed` is consulted only in
+the `restart_probe is not True` branch, so the exit code is never asked to
+account for a handoff. Only the handover text does. That is a new position for
+this item's signature failure: eight times an instrument could not report what
+it was read as reporting, and this time the instrument reports correctly and
+**the instructions name the wrong field**. Writing the instrument was not the
+end of the job.
+
+The kill signature needs both fields together — `restart=False` **and**
+`exit_code=null`. Either one on its own is ordinary.
+
+### Re-measurement recipe, superseding the one above
+
+1. **Fix the boundary in both time zones before anything else.**
+   `operator.log` is local; `trace.jsonl` is UTC; this item quotes local.
+2. **`operator.log`, exclusive of the boundary.** Count `copilot exited
+   unexpectedly` against `restart signal detected!`, and count `Giving up` and
+   `markers cannot be examined` as well. If either of the latter two is
+   non-zero the supervisor stopped being able to classify endings and the rest
+   of the count is unsafe.
+3. **`trace.jsonl`, exclusive of the boundary in UTC. Reconcile before
+   reading any field.** Endings must equal records and `restart=True` must
+   equal the restart-signal count. If they do not, the population is censored
+   and nothing derived from it means anything — which is what went wrong in
+   three of the four measurements above.
+4. **Read `restart` and `exit_code` together. Never `exit_code` alone.**
+   - `restart=True`, `exit_code=null` — a handoff, recorded before the process
+     ended. **Not evidence of anything.** It is the overwhelming majority.
+   - `restart=False`, `exit_code=3221225477` — Copilot faulted in its own
+     process. Not a kill.
+   - `restart=False`, `exit_code=0` — Copilot ended cleanly on its own.
+   - `restart=False`, `exit_code=null` — nobody observed the ending. **This is
+     the kill signature, and it is the only one.**
+5. **Divide endings by days before believing a quiet window.** A detector that
+   only fires at an ending is blind in proportion to how few there are, and
+   this fleet's rate fell about a hundredfold between 2026-08-05 and
+   2026-08-15. When it is low, confirm the sessions are alive rather than
+   wedged — pinned Copilot log mtime per instance — because "no endings" and
+   "nothing can end" are the same number.
+6. **Consult the event log only once step 4 has found a kill.** Id 21 at its
+   timestamp is the 2026-08-09 cause; Id 25 is routine, frequent and harmless,
+   and treating it as suspicious buries the one that matters.
+7. **A fleet-wide `*.loop.pid` rewrite is not a wave by itself.** Read
+   `adopted` in `*.loopcode.json`: `true` is an `operator restart-loop` sweep.
+   A wave leaves supervisors that restarted without adopting anything.
