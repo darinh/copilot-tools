@@ -824,3 +824,402 @@ it go red.
 **For the next reader.** The instrument to distrust here is a test that asserts
 a call is *made*. Presence is not behaviour, and the gap between them is
 exactly wide enough to hold this item's entire history.
+
+## Re-measurement, 2026-08-15: no kills in 5.7 days, and the recipe reads the wrong field
+
+Run by the recipe above. Two findings: the fault is quiet again, on a window
+whose evidential power is a hundredth of what the previous ones had; and the
+fourth instrument the previous re-measurement introduced is described in a way
+that misreads 35 of the 36 records it applies to.
+
+### The boundary, in both time zones
+
+The window opens at the last ending the 2026-08-10 re-measurement recorded:
+**2026-08-09 22:31:20 local**, which is **2026-08-10T05:31:20Z**. That section
+states its five endings in local time and `trace.jsonl` stamps everything in
+UTC, and the first pass here compared the log's local stamps against
+`2026-08-10 22:31:20` — a day late — and reported a clean window that was
+really 152 log lines wide. It is the third arithmetic trap of the same family
+as the two recorded above, so it goes on the same list: **the boundary must be
+carried in local time for `operator.log` and in Zulu for `trace.jsonl`, and
+this item states its boundaries in local.**
+
+### Both instruments, and this time they reconcile ending-for-ending
+
+`operator.log`, exclusive of the boundary, through 2026-08-15 14:12 local
+(5.66 days):
+
+- **1 `copilot exited unexpectedly`** against **11 `restart signal detected!`**
+- **0 `Giving up`** and **0 `markers cannot be examined`** — both must be zero
+  for the rest of the count to mean anything, since either one is the
+  supervisor saying it could no longer classify an ending
+- 36 `adopting the running session`
+
+`trace.jsonl`, exclusive of `2026-08-10T05:31:20Z`:
+
+- **12 `session_exit`**: 11 with `restart=True`, 1 with `restart=False`
+- 36 `supervisor_start`
+
+Twelve endings against twelve records; eleven restarts on each side; one
+unexpected exit on each side. **This is the first window in this item's history
+in which the two instruments agree ending-for-ending with nothing
+unaccounted.** The 2026-08-05 window had 60 endings against zero records and
+the 2026-08-10 one needed the SESSION_NUM arithmetic to reconcile at all. Here
+there is no gap for a kill to sit in.
+
+### The single ending is not a kill, and for the first time the exit code says so
+
+`subtitle-localizer` session #1, 2026-08-10 01:28:18 local, up 23200s,
+`exit_code: 0`. Zero is Copilot terminating of its own accord: not
+`3221225477` (a fault in its own process), and not `null` (nobody watching).
+Its runner log agrees independently — `copilot exited rc=0` at 00:27:09.
+
+The gap between those two timestamps is 61 minutes, and it is the *old* defect
+rather than a new one: that runner was launched 2026-08-09 19:01:37, before
+9650435 moved the exit marker ahead of metrics capture, so it is the last
+measurement of the pre-fix ordering and not a recurrence of it. Every runner
+launched since takes its code from disk at launch, so unlike a supervisor a
+runner cannot stay stale for long — which is why this instrument, alone among
+the six, needed no deployment step.
+
+**No kill has been observed by either instrument in 5.66 days.**
+
+### What that is worth, which is much less than it looks
+
+Both detectors need endings, and endings have collapsed. Twelve in 5.66 days
+across nine instances, against **60 in 11.1 hours** at the 2026-08-05
+measurement — about one hundredth the rate. Four instances
+(`book-translator`, `finances`, `prism`, `scripts`) produced no ending at all
+in the window; their Copilot processes have been up since 2026-08-09.
+
+Checked before concluding anything, because *no endings* and *nothing can end*
+produce the identical count: all eight sessions are alive and working. Each
+instance's pinned Copilot debug log had been written within six minutes of the
+measurement (2026-08-15 14:07–14:12 local), at sizes from 5.6 MB to 207 MB.
+These are long-lived sessions, not stalled ones.
+
+So the verdict stands and its weight does not. **A 5.66-day window holding 12
+endings carries roughly what 80 minutes carried in the original regime**, and
+"no kills in 5.66 days" should be read as about as strong as "no kills in 80
+minutes" would have been then. Nothing here identifies the emitter. The fifth
+hypothesis for the original waves is still owed.
+
+### No event 21 in the window
+
+All 43 `TerminalServices-LocalSessionManager` events of Id 21 or 25 between the
+boundary and 2026-08-15 14:12 local are **Id 25 reconnections; there is no
+Id 21**. The 2026-08-09 logon replacement has not recurred — consistent with
+there being no wave for it to explain.
+
+### Nine supervisors restarted in 50 seconds, and it is not a wave
+
+Every `~/.operator/restart/*.loop.pid` was rewritten between 2026-08-13
+23:35:10 and 23:36:00 — nine instances inside 50 seconds, which is a tighter
+spread than the six-instance wave of 2026-08-09 — and `operator list` said
+nothing about any of it. That is precisely the shape the recipe above tells
+the next reader to treat as a broadcast, and this time it is not one:
+
+- every `*.loopcode.json` records `"adopted": true, "began_run": false`;
+- `operator.log` holds nine `adopting the running session` lines across those
+  50 seconds and no `copilot exited unexpectedly` anywhere near them.
+
+A fleet-wide `operator restart-loop` sweep, deploying current code. **This is
+the first live exercise of the `adopted` stamp added on 2026-08-09**, and it
+answered correctly — and correctly *silently*, which on this item is the
+answer that has to be checked rather than accepted, since a silent all-clear is
+how five earlier instruments failed. The positive control is the nine records
+themselves: they carry `adopted: true`, so the silence is a verdict that was
+computed and printed nothing, not one that was never reached. Their digest
+(`a61c296821330203`) matches the source on disk, so nothing is stale either.
+
+Three more sweeps sit in the same window (2026-08-10 02:33, 03:08 and 04:01,
+nine instances each), which is what the 36 adoptions and the 36
+`supervisor_start` events are — they match exactly.
+
+### The fourth instrument is sound; its instructions are not
+
+The recipe above introduces `markers.exit_code` and says:
+
+> **`null`** still means nobody observed the ending, which remains the
+> signature of the whole pane going
+
+**That is false for every record carrying `restart=True`, and false by design
+rather than by oversight.** `_record_session_exit` is called with
+`session_gone=False` on the handoff path, and its docstring gives the reason:
+the record is written while Copilot is still up, so no exit code can belong to
+it and none is read. `null` there means "recorded before the process ended",
+not "nobody saw it end".
+
+Eleven of the twelve records in this window are `restart=True, exit_code=null`.
+Across the 36 records since 2026-08-10, 35 are. A reader following the recipe
+as written finds 35 nulls and has been told each one is the signature of a pane
+being taken.
+
+The code does not make this mistake. `ending_was_observed` is consulted only in
+the `restart_probe is not True` branch, so the exit code is never asked to
+account for a handoff. Only the handover text does. That is a new position for
+this item's signature failure: eight times an instrument could not report what
+it was read as reporting, and this time the instrument reports correctly and
+**the instructions name the wrong field**. Writing the instrument was not the
+end of the job.
+
+The kill signature needs both fields together — `restart=False` **and**
+`exit_code=null`. Either one on its own is ordinary.
+
+### Re-measurement recipe, superseding the one above
+
+1. **Fix the boundary in both time zones before anything else.**
+   `operator.log` is local; `trace.jsonl` is UTC; this item quotes local.
+2. **`operator.log`, exclusive of the boundary.** Count `copilot exited
+   unexpectedly` against `restart signal detected!`, and count `Giving up` and
+   `markers cannot be examined` as well. If either of the latter two is
+   non-zero the supervisor stopped being able to classify endings and the rest
+   of the count is unsafe.
+3. **`trace.jsonl`, exclusive of the boundary in UTC. Reconcile before
+   reading any field.** Endings must equal records and `restart=True` must
+   equal the restart-signal count. If they do not, the population is censored
+   and nothing derived from it means anything — which is what went wrong in
+   three of the four measurements above.
+4. **Read `restart` and `exit_code` together. Never `exit_code` alone.**
+   - `restart=True`, `exit_code=null` — a handoff, recorded before the process
+     ended. **Not evidence of anything.** It is the overwhelming majority.
+   - `restart=False`, `exit_code=3221225477` — Copilot faulted in its own
+     process. Not a kill.
+   - `restart=False`, `exit_code=0` — Copilot ended cleanly on its own.
+   - `restart=False`, `exit_code=null` — nobody observed the ending. **This is
+     the kill signature, and it is the only one.**
+5. **Divide endings by days before believing a quiet window.** A detector that
+   only fires at an ending is blind in proportion to how few there are, and
+   this fleet's rate fell about sixtyfold between 2026-08-05 and 2026-08-15 —
+   12 endings in 5.66 days against 60 in 11.1 hours, which is 61x, not the
+   hundredfold stated in the section that introduced this step. When it is low, confirm the sessions are alive rather than
+   wedged, because "no endings" and "nothing can end" are the same number.
+   **Not by Copilot log mtime**, which cannot answer it — see the correction
+   below. Read the newest `Forwarding event for session` line in each pinned
+   log instead. Two things make that reading honest, and without them it
+   decays into the mtime check it replaced: confirm the marker occurs in that
+   file **at all** before believing its absence, and check it is current in a
+   session you know is working. **If the marker is missing from a whole log,
+   the answer is "cannot tell", not "idle"** — fall back to the instruments
+   that do not read the log: last commit in the instance's repository, and the
+   newest non-supervisor `operator` invocation from that repository in
+   `trace.jsonl`. Both are downstream of the agent completing a turn, so they
+   confirm inactivity without explaining it.
+6. **Consult the event log only once step 4 has found a kill.** Id 21 at its
+   timestamp is the 2026-08-09 cause; Id 25 is routine, frequent and harmless,
+   and treating it as suspicious buries the one that matters.
+7. **A fleet-wide `*.loop.pid` rewrite is not a wave by itself.** Read
+   `adopted` in `*.loopcode.json`: `true` is an `operator restart-loop` sweep.
+   A wave leaves supervisors that restarted without adopting anything.
+
+## Correction, 2026-08-15: the liveness check above is not one, and the fleet is inert
+
+Written hours after the section above, by the session that followed it. The
+counts it reports are reproduced exactly and nothing in them is withdrawn.
+What is withdrawn is the sentence that licensed reading them as reassuring:
+
+> Checked before concluding anything, because *no endings* and *nothing can
+> end* produce the identical count: all eight sessions are alive and working.
+> Each instance's pinned Copilot debug log had been written within six minutes
+> of the measurement [...] These are long-lived sessions, not stalled ones.
+
+**They were idle ones.** At the moment that was written, all eight had
+completed a turn, emitted `session.idle`, and done nothing since — for between
+2.8 and 5.9 days.
+
+### Why the log mtime could not answer it
+
+Copilot's process log is written by the runtime, not by the agent. ExP
+assignment polls, telemetry queue flushes and IDE lock-file scans continue on
+their own timers for as long as the process exists, so **the mtime measures
+that the process is running, which was never in doubt.** It is the ninth
+instrument in this item that could not report the thing it was read as
+reporting, and the first introduced by a re-measurement *of this item* and
+relied upon in the same session.
+
+Stated at the strength it was measured: what is established for all eight is
+the negative, and it is the only part the argument needs. **The region of every
+log written after the agent went quiet contains no agent event at all**, while
+the mtime advanced through the whole of it. Spot classification of that region
+finds rust-runtime records, ExP assignment polls and IDE lock scans; an
+independent reviewer tailing `69536` at measurement time saw the same, an ExP
+POST and a `cli.telemetry` flush timestamped 2026-08-15T22:06:56Z in a log
+whose agent had stopped on 2026-08-10. No exhaustive attribution of those bytes
+is claimed, and none is needed: whatever that traffic is, it is not the agent,
+and mtime cannot tell the difference.
+
+### The measurement it should have been
+
+`Forwarding event for session <uuid>` is written whenever the agent does
+anything — a tool call, a background-task change, a message turn. Measured
+2026-08-15T22:17Z over the whole of each pinned log:
+
+| pid | log size | mtime | newest `Forwarding event` |
+|---|---|---|---|
+| 69536 | 211.3 MB | 0.3 min | 2026-08-10T05:10:56Z — **137.1h** |
+| 52936 | 68.0 MB | 0.3 min | 2026-08-10T01:09:12Z — **141.1h** |
+| 36676 | 82.4 MB | 8.9 min | 2026-08-10T01:53:29Z — **140.4h** |
+| 13584 | 120.8 MB | 0.7 min | 2026-08-10T04:39:20Z — **137.6h** |
+| 37600 | 20.3 MB | 2.1 min | 2026-08-10T06:46:01Z — **135.5h** |
+| 12284 | 16.7 MB | 4.6 min | 2026-08-10T19:53:27Z — **122.4h** |
+| 66784 | 251.6 MB | 8.6 min | 2026-08-13T01:41:59Z — **68.6h** |
+| 54508 | 217.4 MB | 6.9 min | 2026-08-13T01:51:07Z — **68.4h** |
+| 57864 | 14.2 MB | 0.0 min | 2026-08-15T22:17:38Z — **0.0h** |
+
+The last row is the session that measured this, and it is the positive
+control: the marker is current in a session that is working, so its absence
+elsewhere is a reading rather than a broken probe. The second control is the
+marker count per file — 18,290 to 130,455 occurrences in the eight inert logs.
+**The marker is abundant in exactly the files where it has gone quiet**, which
+is what separates "this session stopped" from "this build stopped logging it".
+Check both before believing this measurement; a Copilot release that renames
+the string turns it silently into the mtime check it replaced.
+
+Between the newest marker and the end of file, those logs grew by 0.93 MB to
+1.93 MB apiece. That is what the mtime was reporting.
+
+### What state they are in, which is measured and not inferred
+
+The last forwarded event before each silence is the same in all eight, once the
+`session.background_tasks_changed` churn that continues afterwards is set
+aside:
+
+```
+assistant.turn_end → hook.start → hook.end → session.usage_checkpoint
+                   → assistant.idle (ephemeral) → session.idle (ephemeral)
+```
+
+Seven are exactly that. The eighth, `12284`, carries a `session.error` between
+`assistant.turn_end` and the idle pair. **Every one of these sessions completed
+a turn and went idle, and nothing issued another turn.** They are not wedged
+part-way through one.
+
+That is a state, not a cause. Why nothing continued — the harness not
+resuming, the agent ending its own loop, something upstream — is unmeasured
+here, and this item has been burned three times by an explanation that fitted.
+
+### Two instruments, independent in code and not in what they depend on
+
+Same measurement window, neither reading `~/.copilot/logs` at all:
+
+- **git.** Last commit in each instance's repository: 68.4h, 68.5h, 123.7h,
+  135.5h, 137.1h, 137.6h, 140.3h, 141.1h. Every working tree clean, so it is
+  not uncommitted work either.
+- **The last *agent* `operator` invocation per repository**, taken from
+  `trace.jsonl` with the supervisor's own `--_supervise` launches excluded.
+  These pair with the marker ages to within a fraction of an hour: `finances`
+  `backlog check` 141.4h against a 141.1h marker, `book-translator`
+  `backlog check` 140.7h against 140.4h, `prism` `backlog check` 137.4h
+  against 137.1h, `discord-invite-manager` `backlog ready` 135.8h against
+  135.5h, `snes-ghosts` `backlog list` 68.7h against 68.4h. **Two unrelated
+  files agree on when each agent stopped, instance by instance.**
+
+  The first draft of this bullet said the newest invocation from those
+  repositories was the supervisor launch at 2026-08-14T06:35Z. That is the
+  newest *row*, not the newest agent command, and reading it as the latter
+  clips the instrument to a 40-hour window — too short to say anything about a
+  2.8-to-5.9-day silence. The pairing above was in the same file all along.
+
+**Three claims withdrawn from the first draft of this section.** It listed four
+instruments and called them independent:
+
+- *Handoff files.* "No `next-session.md` written anywhere since 2026-08-07" is
+  **false twice over.** `next-session.md` is the legacy path; handoffs are
+  written per instance to `~/.operator/projects/{guid}/handoff/{instance}.md`,
+  and `copilot-tools.md` was written at 2026-08-15T22:07:56Z, ten minutes
+  before the measurement. Worse, the reader deletes the handoff at session
+  start — the 2026-08-05 correction in this file says exactly that about
+  exactly this instrument — so surviving files could not date the last write
+  even on the right path. It is the same instrument this item already
+  withdrew once, picked up again by someone who had read the withdrawal.
+- *`session_exit`.* It fires at an ending, so for these eight it dates the
+  *start* of the session still running, not the stop of the work. Kept below
+  as an ending record; it is not evidence of inactivity.
+- *Independence.* None of these is independent *evidence*: every one is
+  downstream of "the agent completed a turn", so a single cause accounts for
+  all of them at once. What they establish is that the inactivity is real
+  rather than an artifact of one reader — the failure this item keeps hitting.
+  They say nothing about why.
+
+For the record, since the first draft got the tally wrong: the last
+`session_exit` per instance is 2026-08-10 for **seven** of the nine,
+2026-08-13 for `snes-ghosts`, and 2026-08-15 for `copilot-tools` — 7 + 1 + 1,
+the whole fleet. The draft's "five, two, and copilot-tools" dropped an instance
+and is the fourth arithmetic trap of the family this file already lists three
+of.
+
+### What this does to the verdict above
+
+The section above is right that "no kills in 5.66 days" is worth far less than
+it looks, and right that the reason is the collapse in endings — a detector
+that only fires at an ending is blind in proportion to how few there are. What
+is withdrawn is its account of *why* the endings collapsed. They did not
+collapse because sessions got longer. They collapsed because most of the fleet
+stopped working and then held its processes open.
+
+That makes even the discounted figure generous. **Four of the eight had already
+gone idle before the window opened.** The window starts at 2026-08-10T05:31Z,
+and `52936`, `36676`, `13584` and `69536` emitted their last marker at 01:09Z,
+01:53Z, 04:39Z and 05:10Z that morning. Those four contributed no working time
+to the 5.66 days at all.
+
+**Every instrument this item owns fires at an ending.** `operator.log` counts
+exits; `trace.jsonl` records `session_exit`; the supervisor polls for a dead
+process. A session that stops working without exiting satisfies none of them,
+and `operator list` prints `looping · session #N` for it indefinitely — as it
+did for eight instances while this was measured.
+
+So the quiet window is evidence about a narrower thing than it reads as.
+**Eight live processes were exposed to a kill throughout it**, and an emitter
+that takes a pane does not care whether the agent inside it is mid-turn — the
+2026-08-09 logon replacement did not. Against *that* the window still counts:
+roughly 1,000 live process-hours passed without one. What it cannot weigh is
+the harm this item is named for, a session killed **mid-turn** with context
+unwritten, because for 2.8 to 5.9 days of those hours there were no turns in
+progress to interrupt. Nor can any of these instruments have noticed a session
+that stopped without ending, which is the state all eight were in.
+
+**The emitter is still unidentified and nothing here identifies it.** Nor does
+this name a cause for the inertia: the observable is that the agent stopped and
+the process did not, and this item has already been burned three times by an
+explanation that fitted. The mechanism is filed as its own item rather than
+guessed at here.
+
+### How long a silence this fleet has come back from
+
+A trailing silence only means *stopped* if it is longer than silences these
+sessions have recovered from, so that was measured rather than assumed. Every
+gap of an hour or more between consecutive markers, across all nine logs:
+
+- **Seven of the eight inert sessions have no internal gap of even one hour.**
+  Their whole log is continuous work followed by one silence — the trailing
+  one. The silence is not the largest of many; it is the only one.
+- The exception is `66784`, which **recovered from a 63.05h silence**
+  (2026-08-10T09:13Z to 2026-08-13T00:16Z), worked for about 90 minutes, and
+  has been silent again for 68.6h.
+
+So this fleet has come back from 2.6 days of silence once, and nothing recorded
+either the stop or the restart. **The claim here is that eight sessions have
+been silent for 2.8 to 5.9 days, not that they are dead.** The two shortest —
+68.4h and 68.6h — are only about a tenth longer than the silence `66784` came
+back from, and should be read as no more than "longer than anything this fleet
+has recovered from". The other six, at 122.4h to 141.1h, are twice that.
+
+For scale in the other direction: inside their own working periods these
+sessions emit the marker with a median gap of 0.0s and a maximum, across every
+log measured, of 38.6 minutes.
+
+**The marker under-reports liveness, and that direction matters.** It is
+written when the agent does something the session layer sees; an agent blocked
+for hours inside one long local command emits nothing meanwhile, so a silence
+is an upper bound on idleness rather than proof of it. The 38.6-minute figure
+is what bounds that empirically here — it is the longest any of these sessions
+has gone quiet while demonstrably still working — and it is two orders of
+magnitude below the silences being reported. A future reader on a fleet with
+much longer tool calls should re-derive it rather than reuse the number.
+
+### For the next reader
+
+Do step 5 before steps 2 to 4, not after. A quiet count is only evidence that
+the fault is quiet if something was running that the fault could have taken,
+and on 2026-08-15 that was true of one instance out of nine.
