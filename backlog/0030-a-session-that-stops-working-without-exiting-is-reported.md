@@ -156,3 +156,82 @@ fixed.
 **The eight sessions were left running.** They hold days of context that no
 handoff has been written for, and killing them would destroy the only copy.
 Whoever acts on this should decide that deliberately.
+
+## Re-measurement, 2026-08-16: all eight woke, and the wake was an inbound message
+
+Measured 2026-08-16T01:25Z, ten hours after the section above. **Every one of
+the eight recovered.** Eleven supervised `copilot` processes are live, none of
+them the pids tabulated above, and the marker is current in most:
+
+| pid | proc started (UTC) | MB | log mtime | markers in file | newest `Forwarding event` | age |
+|---|---|---|---|---|---|---|
+| 20076 | 00:10:06 | 49.5 | 4.5 min | 39,327 | 2026-08-16T00:36:16Z | 0.81h |
+| 24048 | 2026-08-15T22:57:07 | 119.6 | 7.5 min | 151,144 | 2026-08-15T23:57:30Z | 1.46h |
+| 42876 | 00:10:21 | 236.4 | 0.0 min | 160,700 | 2026-08-16T01:25:10Z | 0.00h |
+| 47944 | 00:09:57 | 26.9 | 4.7 min | 36,831 | 2026-08-16T00:37:53Z | 0.79h |
+| 73400 | 00:42:04 | 97.3 | 0.1 min | 76,277 | 2026-08-16T01:25:04Z | 0.00h |
+| 74612 | 00:12:39 | 93.2 | 2.0 min | 47,684 | 2026-08-16T01:20:51Z | 0.07h |
+| 75208 | 01:21:04 | 6.0 | 0.0 min | 4,734 | 2026-08-16T01:25:09Z | 0.00h |
+| 82116 | 00:14:32 | 54.4 | 0.1 min | 55,706 | 2026-08-16T01:22:13Z | 0.05h |
+| 86508 | 00:09:46 | 17.0 | 4.9 min | 28,481 | 2026-08-16T00:36:06Z | 0.82h |
+| 91392 | 00:09:47 | 169.0 | 0.1 min | 111,040 | 2026-08-16T01:25:06Z | 0.00h |
+| 91624 | 01:10:48 | 13.5 | 3.9 min | 6,028 | 2026-08-16T01:19:53Z | 0.09h |
+
+Same instrument, same two controls as above: `75208` is the session that took
+the measurement and is the positive control, and the marker count per file is
+in the tens of thousands throughout, so a quiet marker is a reading rather than
+a build that stopped emitting it.
+
+### What woke them, measured per instance rather than per cluster
+
+`trace.jsonl`, window 00:05Z–00:20Z. For each instance: the `operator send`
+addressed to it, its `operator reply`, and its `session_exit`.
+
+| instance | `send --to` | its `reply` | latency | `session_exit` | restart |
+|---|---|---|---|---|---|
+| subtitle-localizer | 00:06:25 | 00:06:38 | 13s | 00:09:17 | True |
+| ac-unreal | 00:08:11 | 00:08:21 | 10s | 00:09:51 | True |
+| book-translator | 00:08:12 | 00:08:23 | 11s | 00:09:36 | True |
+| discord-invite-manager | 00:08:12 | 00:08:22 | 10s | 00:09:27 | True |
+| finances | 00:08:13 | 00:08:24 | 11s | 00:09:17 | True |
+| prism | 00:08:14 | 00:08:26 | 12s | 00:12:09 | True |
+| scripts | 00:08:15 | 00:08:26 | 11s | 00:14:02 | True |
+| snes-ghosts | 00:08:16 | 00:08:34 | 18s | 00:09:51 | True |
+
+**Eight for eight, each reply following its own message by 10 to 18 seconds.**
+The pairing is what makes this causal rather than two clusters that happen to
+overlap: `subtitle-localizer` was sent to 106 seconds before the other seven
+and replied 106 seconds before them, so the offset instance is the control on
+the batch. Every one then ended `restart=True` — it wrote a handoff — and its
+supervisor relaunched it, which is where the eleven live pids above come from.
+
+The sends came from a supervised `copilot-tools` agent session (pid 2596 in the
+invocation ancestry), not from a human and not from the harness.
+
+### What that establishes, and what it does not
+
+- **The state is idle, not wedged.** A session silent for 2.8 to 5.9 days
+  answered in 10 to 18 seconds. Nothing that had hung, deadlocked or lost its
+  model connection does that. The section above declined to call it either way
+  and was right to; this settles it.
+- **The state is recoverable, and the recovery is a turn.** `operator send`
+  delivers into the running session, which is exactly the thing the supervisor
+  has no way to do. The note above records one spontaneous recovery with
+  neither transition observed; here are eight with both.
+- **Nothing in the harness could have done it.** The supervising loop advances
+  on exactly four conditions — the stop marker, the detach marker,
+  `is_copilot_running()` going false, and the restart marker
+  (`copilot_operator.py` 5640-5800). There is no liveness probe of a running
+  session and no nudge; `grep -i 'idle|nudge'` over `copilot_operator.py`
+  returns only the no-change progress breaker, which is itself driven by
+  endings. So an agent that finishes a turn without handing off parks its
+  instance until something outside sends it a message.
+- **Detection remains the whole gap.** Recovery took 18 seconds once triggered;
+  the trigger took between 2.8 and 5.9 days to arrive, and it arrived because
+  an agent read this backlog item, not because anything measured the fleet.
+
+**Not established: why they stopped.** Eight agents ending a turn without a
+handoff still has no measured cause, and the wake tells us nothing about it —
+being woken by a message says only that the session could still take a turn.
+This item has been burned three times by an explanation that fitted; that
+question is still open.

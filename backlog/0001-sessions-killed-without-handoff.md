@@ -1223,3 +1223,91 @@ much longer tool calls should re-derive it rather than reuse the number.
 Do step 5 before steps 2 to 4, not after. A quiet count is only evidence that
 the fault is quiet if something was running that the fault could have taken,
 and on 2026-08-15 that was true of one instance out of nine.
+
+## Re-measurement, 2026-08-16: the fleet is working again, and the endings sort into two shapes
+
+Measured 2026-08-16T01:25Z. The section above closed by saying a quiet
+ending-count is only evidence about kills if something was running that a kill
+could have taken, and that on 2026-08-15 that was true of one instance in nine.
+**That is no longer true**: all eleven supervised sessions are live and eight of
+them emitted the agent-activity marker within the last six minutes (the table
+is in item 0030). Exposure has resumed, so from 2026-08-16T00:09Z onward a
+quiet ending-count means something again. It did not before, and nothing below
+should be read backwards into the 5.66-day window.
+
+### Every ending recorded since the instruments were fixed
+
+The 2026-08-05 correction in this file establishes that records before that
+date cannot answer this question, so the population is every `session_exit`
+from 2026-08-05 on — 132 of them:
+
+| how it ended | count |
+|---|---|
+| by restart request (a handoff was written) | 76 |
+| unaccounted: no exit code, restart marker observed absent | 51 |
+| carrying an exit code | 5 |
+
+The five that carried an exit code, in full:
+
+```
+2026-08-08T23:22:03Z discord-invite-manager #230  rc=3221225477  uptime=77811s
+2026-08-10T01:46:33Z copilot-tools          #240  rc=3221225477  uptime=4794s
+2026-08-10T08:28:18Z subtitle-localizer     #1    rc=0           uptime=23200s
+2026-08-15T22:52:22Z tiktok-downloader      #1    rc=0           uptime=112s
+2026-08-16T00:09:00Z copilot-tools          #247  rc=3221225477  uptime=498s
+```
+
+`3221225477` is `0xC0000005`, an access violation. The original evidence at the
+top of this item found exactly one of those in 940 pre-fix records; there have
+been three in the 132 post-fix ones.
+
+### The 51 unaccounted endings are almost all bursts, and they stopped on 2026-08-10
+
+Grouped by when they landed:
+
+- **2026-08-05, five bursts** — 00:45:21–29, 00:48:36–43, 00:55:10–18,
+  00:57:05–15, 01:02:52–59. Eight, eight, eight, eight and seven instances,
+  each burst spanning 7 to 10 seconds end to end. 39 endings.
+- **2026-08-10T00:25:44–49** — seven instances in five seconds. 7 endings.
+- **Five singletons** — `scripts` #87 at 2026-08-08T04:54:48, then
+  `snes-ghosts` #236 05:19:19, `ac-unreal` #29 05:20:06 and #30 05:29:00, and
+  `copilot-tools` #242 05:31:20, all on 2026-08-10.
+
+46 of the 51 are therefore bursts of seven or eight instances inside ten
+seconds, which is the "one broadcast, not eight independent decisions" shape
+this item was opened on. **The last unaccounted ending of any kind is
+2026-08-10T05:31:20Z**, 5.8 days before this measurement.
+
+### The one fresh kill, and it is not a burst
+
+`copilot-tools` #247 ended at 2026-08-16T00:09:00Z with `rc=3221225477`,
+`uptime_s=498`, `restart=False`, `stop=False`, `detach=False`. It was working
+44 seconds earlier — its last `operator send` is timestamped 00:08:16 — so it
+was taken mid-turn with no handoff written, which is the harm this item is
+named for. Its successor ran `session start --instance copilot-tools` at
+00:09:15, fifteen seconds later.
+
+**It stands alone.** No other instance ended unaccounted anywhere near it; the
+eight endings that follow it between 00:09:17 and 00:14:02 all carry
+`restart=True` and are the handoffs of eight agents that had just been woken by
+a message (item 0030). A burst of `restart=True` endings and a burst of
+unaccounted ones are different events, and the timestamps alone do not separate
+them — the marker does.
+
+So on the post-fix record the two shapes are:
+
+- **bursts of unaccounted endings**, 46 of them, none since 2026-08-10T05:31Z;
+- **isolated access violations**, three since 2026-08-05, roughly one per 3.7
+  days, one of them 76 minutes before this measurement.
+
+Whether those are one emitter or two is not established here. What is new is
+that the second shape is still happening while the first has not recurred, and
+that the fleet is now exposed again, so the next burst — if the emitter is
+still there — will land on running sessions and be visible as one.
+
+### For the next reader
+
+The step-5-first instruction above still holds, and it now has a cheap answer:
+item 0030 carries a liveness table for 2026-08-16T01:25Z and the recipe that
+produced it. Re-run that first. A quiet ending-count measured while the fleet
+is idle is worth nothing, and this item has now made that mistake once.
