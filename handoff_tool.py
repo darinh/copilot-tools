@@ -427,7 +427,11 @@ def resolve_guid(project_root) -> str:
             f"name, such as a GUID. Fix the line to read:\n"
             f"  \"{resolved_str(project_root)}\",<guid>")
     die(f"No catalog entry for: {target}\n"
-        f"Add it with a line such as:\n  \"{resolved_str(project_root)}\",<guid>")
+        f"This project is not registered, so there is nowhere to write the "
+        f"handoff. Register it with:\n"
+        f"  operator projects\n"
+        f"or add a line to {CATALOG} such as:\n"
+        f"  \"{resolved_str(project_root)}\",<guid>")
 
 
 class StateUnreadable(Exception):
@@ -675,9 +679,42 @@ def scan_checkout(root) -> "list[str] | None":
             ignored.append(path)
         else:
             paths.append(path)
+    paths = [p for p in paths if not _in_worktrees(p)]
     if not ignored_known:
         return paths
     return paths + _empty_dir_strays(root, ignored)
+
+
+#: The directory the operator toolchain keeps linked worktrees in, relative to
+#: the checkout root.
+#:
+#: Duplicated from ``operator_worktree.WORKTREES_DIR`` rather than imported:
+#: this module is the handoff, and it is reached on the path where a session is
+#: already ending. Importing the worktree command would pull the work database
+#: and its dependencies in behind it, so a failure anywhere in that import
+#: chain would take the handoff with it -- trading the thing that preserves a
+#: session's context against a constant. ``test_handoff_checkout_guard.py``
+#: asserts the two spellings are equal, so the copy cannot drift silently.
+WORKTREES_DIR = ".worktrees"
+
+
+def _in_worktrees(rel: str) -> bool:
+    """Whether ``rel`` names the worktrees directory, or anything inside it.
+
+    Anchored at the checkout root, exactly like the ``/.worktrees/`` ignore
+    rule ``operator worktree new`` writes: a ``docs/.worktrees/`` that somebody
+    meant to track is still reported.
+
+    Separators are compared as ``/`` and never translated, because both callers
+    produce that spelling -- ``git status -z`` always does, and the walk below
+    builds its own paths with it -- while a backslash is an ordinary character
+    in a POSIX filename. Translating would let a file literally named
+    ``.worktrees\\x`` on Linux read as being inside this directory, which
+    suppresses a real finding. Under-refusing is the one direction this guard
+    cannot afford.
+    """
+    norm = rel.rstrip("/")
+    return norm == WORKTREES_DIR or norm.startswith(WORKTREES_DIR + "/")
 
 
 #: How many directories the candidate walk will visit before it gives up.
@@ -751,6 +788,21 @@ def _empty_dir_strays(root, ignored: "list[str]") -> "list[str]":
             except OSError:
                 continue
             child = f"{rel}/{entry.name}" if rel else entry.name
+            if _in_worktrees(child):
+                # Another checkout, not this one's content. `git worktree
+                # remove` never removes this parent, so it outlives the trees
+                # it held and -- in any repository whose `.gitignore` has not
+                # got the rule yet -- becomes an empty untracked directory that
+                # refuses every handoff from here on. It is created by this
+                # toolchain, so the refusal is self-inflicted, and the refusal
+                # text tells the agent to delete what it names.
+                #
+                # Descending is the worse half. A live worktree here belongs to
+                # a peer, and reporting a scratch directory inside it hands one
+                # agent another's tree as litter to remove -- against the one
+                # rule this project states about worktrees. Each checkout's own
+                # handoff sees its own contents, so nothing goes unwatched.
+                continue
             if child in prune:
                 continue
             if _is_junction(entry):

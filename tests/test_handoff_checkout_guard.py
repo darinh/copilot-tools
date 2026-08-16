@@ -760,3 +760,113 @@ def test_a_handoff_with_no_instance_and_no_way_to_infer_one_refuses(
                  "--project-root", str(wired["repo"])])
 
     assert "--instance" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# The worktrees directory is another checkout, not this one's content.
+
+
+def test_an_empty_worktrees_directory_does_not_refuse_the_handoff(repo):
+    """The regression this pair of tests exists for.
+
+    `git worktree remove` deletes the tree and never its parent, so
+    `.worktrees/` outlives the checkouts it held. Git cannot see an empty
+    directory, so in any repository whose `.gitignore` has not got the rule
+    yet it is invisible to `git status` and visible only to the walk -- which
+    reported it, refused the handoff, and told the agent to delete "what was
+    scratch". The toolchain creates this directory itself, so the refusal was
+    self-inflicted and permanent: nothing the agent could clean would clear
+    it.
+    """
+    (repo / ".worktrees").mkdir()
+
+    assert ho.scan_checkout(repo) == []
+
+
+def test_a_peer_worktree_is_never_reported_as_this_checkout_litter(repo):
+    """The worse half, and the reason the walk does not descend either.
+
+    A live worktree here belongs to another agent. Reporting its contents
+    hands one agent another's tree as litter to remove, against the one rule
+    this project states about worktrees -- and it arrives inside a refusal
+    whose remedy is deletion. Both halves are checked because they came from
+    different places: `git status` reports the nested checkout itself, and the
+    walk reaches the scratch directory inside it.
+    """
+    _git(repo, "worktree", "add", ".worktrees/feat-x", "-b", "feat/x")
+    (repo / ".worktrees" / "feat-x" / "tests" / "scratch").mkdir(parents=True)
+
+    assert ho.scan_checkout(repo) == []
+
+
+def test_a_worktrees_directory_below_the_root_is_still_reported(repo):
+    """Negative control: the exemption is anchored, and must stay that way.
+
+    `operator worktree new` writes `/.worktrees/` with a leading slash for
+    exactly this reason -- it names the directory at the repository root and
+    nothing else. An unanchored exemption would silence a `docs/.worktrees/`
+    that somebody meant to track, and an exemption wider than its reason is
+    the kind that gets noticed only when something is already lost.
+
+    `docs/` holds a file so that it is not itself the finding: the walk
+    reports only the outermost empty directory of a nest, so an empty `docs/`
+    would be named instead and this control would pass without ever reaching
+    the directory it is about.
+    """
+    (repo / "docs" / ".worktrees").mkdir(parents=True)
+    (repo / "docs" / "note.md").write_text("kept\n", encoding="utf-8")
+
+    assert sorted(ho.scan_checkout(repo)) == ["docs/.worktrees/",
+                                              "docs/note.md"]
+
+
+def test_a_directory_merely_starting_with_the_name_is_still_reported(repo):
+    """Negative control for the prefix test.
+
+    `.worktrees-old/` is not `.worktrees/`, and a `startswith` without the
+    separator would swallow it. That is the shape that turns one exemption
+    into a family of them.
+    """
+    (repo / ".worktrees-old").mkdir()
+
+    assert ho.scan_checkout(repo) == [".worktrees-old/"]
+
+
+@pytest.mark.parametrize("rel, inside", [
+    (".worktrees", True),
+    (".worktrees/", True),
+    (".worktrees/feat-x", True),
+    (".worktrees/feat-x/tests/", True),
+    ("docs/.worktrees", False),
+    ("docs/.worktrees/feat-x", False),
+    (".worktrees-old", False),
+    (".worktreesx", False),
+    ("worktrees", False),
+    (".worktrees\\x", False),
+])
+def test_in_worktrees_names_the_root_directory_and_nothing_adjacent(rel, inside):
+    """The last case is the one worth stating.
+
+    A backslash is an ordinary character in a POSIX filename, so
+    ``.worktrees\\x`` there is one file at the checkout root and not a path
+    inside anything. Both producers feeding this predicate emit `/` -- `git
+    status -z` always does, and the walk builds its own paths with it -- so
+    translating separators could only ever suppress a real finding. This
+    project has already shipped one bug of exactly that family by reaching for
+    `os.path` where the string named the other platform's syntax.
+    """
+    assert ho._in_worktrees(rel) is inside
+
+
+def test_the_guard_and_the_worktree_command_agree_on_the_directory_name():
+    """`handoff_tool` copies the constant rather than importing it.
+
+    That is deliberate -- see the comment there; the handoff must not acquire
+    the work database as an import-time dependency. A copy with nothing
+    binding it to its original is how two spellings drift apart silently, and
+    the failure would be a guard that quietly stops covering the directory it
+    was written for.
+    """
+    import operator_worktree
+
+    assert ho.WORKTREES_DIR == operator_worktree.WORKTREES_DIR
