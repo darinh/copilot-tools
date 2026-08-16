@@ -1410,10 +1410,37 @@ this item has been unable to say whether the kills stopped or the fleet did.
 part of that history and eleven for the rest, and nothing here should rest on
 which.
 
+**Its 13 endings are not the "12 endings in 5.66 days" quoted earlier in this
+file, and the difference is the boundary rather than a correction.** The
+population here is every `session_exit` strictly after 2026-08-10T05:31:20Z and
+before 2026-08-15T22:17Z, and it is listed in full so the next reader can check
+it: `discord-invite-manager` #238 and #239, `snes-ghosts` #237 and #238,
+`ac-unreal` #31 through #36, `copilot-tools` #243 and #244 — twelve
+`restart=True` — plus `subtitle-localizer` #1 at 08:28:18Z with `exit_code=0`,
+a clean self-terminated exit. Neither count contains an unaccounted ending, so
+nothing downstream of the difference changes.
+
 **One hour and fifty-one minutes of the restored fleet is worth more than half
 of the preceding five and a half days.** 12.48 active session-hours against
 23.25. That is the sentence every previous re-measurement of this item wanted
 and could not write.
+
+### Two things about this window that weaken it, stated before the result
+
+**The window was manufactured, and by an agent reading this backlog.** The
+fleet is working because eight inert sessions were sent a message at
+2026-08-16T00:08Z (item 0030), each replied within 10 to 18 seconds, handed off,
+and was relaunched by its supervisor. So this is not a sample of normal
+operation; it is a sample of the fleet in the two hours after a deliberate
+intervention. Whether kill exposure during a post-intervention burst resembles
+exposure during ordinary running is not known, and nothing here assumes it.
+
+**The measuring session is in the population it measures.** `copilot-tools` is
+one of the eleven instances, it accounts for 3 of the 18 endings, and one of
+those three is the access violation. It is not excluded, because excluding the
+one instance whose behaviour is best understood would bias the count in an
+unknown direction — but a reader weighing the 18 should know that a sixth of
+them belong to the instrument.
 
 ### The ending-count, read against it
 
@@ -1440,9 +1467,25 @@ the apparent change:
 So roughly 97% of the hundredfold swing in ending rate is exposure, not a
 change in how sessions end. An ending-count divided by days — step 5 of the
 recipe as written — would have reported a fleet behaving 102 times
-differently. It is behaving about 2.6 times differently, and even that gap is
-mostly session length: the quiet window's endings are sessions that had been
-up for 41 hours, the exposure window's for 30 to 100 minutes.
+differently. It is behaving about 2.6 times differently.
+
+**The residual 2.6x is not explained here, and one tempting explanation is
+wrong.** A first draft attributed it to session length, saying the quiet
+window's sessions had been up 41 hours against 30 to 100 minutes in the
+exposure window. The uptimes at ending say the opposite, and say it in both
+windows at once:
+
+| | n | median uptime | mean | shape |
+|---|---|---|---|---|
+| quiet | 13 | 1.35h | 9.29h | eleven under 6.5h, then 38.5h and 61.5h |
+| exposure | 18 | 1.78h | 19.12h | ten under 1.9h, then **eight at 41.6h** |
+
+The eight 41.6-hour endings are the woken sessions of item 0030 handing off
+together — they had been up since about 2026-08-14T06:36Z and ended within
+five minutes of each other. So the exposure window's sessions are the *older*
+group by mean, and its median is longer too. Session length does not account
+for the residual, and nothing measured here does; it is left open rather than
+furnished with a story that fits.
 
 ### What this is worth, stated at the strength it was measured
 
@@ -1458,6 +1501,18 @@ burst that survives provenance checking took seven instances inside five
 seconds. Absence across 12 active session-hours does not exclude a phenomenon
 whose observed inter-arrival is days, and nobody should read the zero as more
 than the ordinary accrual of evidence it is.
+
+**What the zero actually bounds, and why even that is generous.** Zero events
+in 12.48 active session-hours puts a 95% upper bound of about 0.24 unaccounted
+endings per active session-hour on the rate — the rule of three, 3/12.48 —
+against 0.129 from the quiet window's 23.25 hours, so the two together bound it
+near 0.084. Those numbers assume independent arrivals, **and the one burst this
+file can vouch for was seven instances in five seconds**, which is the exact
+opposite of independent. A bound derived from a Poisson assumption is therefore
+optimistic against an emitter that fires on many sessions at once: the fleet
+could sit clean for a week and then lose every session in one second, and
+nothing measured here would have moved beforehand. Read the bound as an upper
+limit on *background* rate, not on the wave.
 
 **The denominator is a lower bound, and knowing which way it errs matters.**
 The marker is silent while an agent waits inside one long tool call, so a
