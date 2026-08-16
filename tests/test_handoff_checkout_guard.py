@@ -835,8 +835,7 @@ def test_a_directory_merely_starting_with_the_name_is_still_reported(repo):
 @pytest.mark.parametrize("rel, inside", [
     (".worktrees", True),
     (".worktrees/", True),
-    (".worktrees/feat-x", True),
-    (".worktrees/feat-x/tests/", True),
+    (".worktrees/feat-x", False),
     ("docs/.worktrees", False),
     ("docs/.worktrees/feat-x", False),
     (".worktrees-old", False),
@@ -844,18 +843,35 @@ def test_a_directory_merely_starting_with_the_name_is_still_reported(repo):
     ("worktrees", False),
     (".worktrees\\x", False),
 ])
-def test_in_worktrees_names_the_root_directory_and_nothing_adjacent(rel, inside):
-    """The last case is the one worth stating.
+def test_in_worktrees_names_the_container_and_nothing_else(rel, inside):
+    """The container only. What is *inside* it is judged by identity.
 
-    A backslash is an ordinary character in a POSIX filename, so
-    ``.worktrees\\x`` there is one file at the checkout root and not a path
-    inside anything. Both producers feeding this predicate emit `/` -- `git
-    status -z` always does, and the walk builds its own paths with it -- so
-    translating separators could only ever suppress a real finding. This
-    project has already shipped one bug of exactly that family by reaching for
-    `os.path` where the string named the other platform's syntax.
+    ``.worktrees/feat-x`` answers False on purpose: whether it is exempt is a
+    question for ``git worktree list``, not for its name, because a name test
+    cannot tell a peer's checkout from a stray somebody left in the same
+    place. An earlier draft answered True here and hid both.
+
+    The backslash case is the other one worth stating. A backslash is an
+    ordinary character in a POSIX filename, so ``.worktrees\\x`` there is one
+    file at the checkout root and not a path inside anything. This project has
+    already shipped one bug of exactly that family by reaching for `os.path`
+    where the string named the other platform's syntax.
     """
     assert ho._in_worktrees(rel) is inside
+
+
+@pytest.mark.parametrize("rel, under", [
+    (".worktrees/feat-a", True),
+    (".worktrees/feat-a/tests/scratch", True),
+    (".worktrees/feat-a2", False),
+    (".worktrees/feat", False),
+    ("elsewhere", False),
+])
+def test_under_any_compares_whole_segments(rel, under):
+    """``startswith`` answers True for ``.worktrees/feat-a2`` under
+    ``.worktrees/feat-a``, which would exempt a directory that is nobody's
+    worktree -- the same trap ``operator_worktree._is_inside`` documents."""
+    assert ho._under_any(rel, {".worktrees/feat-a"}) is under
 
 
 def test_the_guard_and_the_worktree_command_agree_on_the_directory_name():
@@ -907,8 +923,68 @@ def test_a_junction_named_worktrees_is_reported_rather_than_exempted(repo):
     (target / "content.txt").write_text("not empty\n", encoding="utf-8")
     _junction(repo / ".worktrees", target)
 
-    assert sorted(ho.scan_checkout(repo)) == [".worktrees",
-                                              "elsewhere/content.txt"]
+    assert ".worktrees" in ho.scan_checkout(repo)
+
+
+def test_a_stray_file_inside_the_worktrees_directory_is_still_reported(repo):
+    """The container is exempt; its contents are not.
+
+    Found by adversarial review of the first fix, which exempted the whole
+    namespace by name and so reported a clean tree for a scratch file an agent
+    had left at `.worktrees/scratch.txt`. That is the direction this guard
+    cannot afford -- it reads exactly like success.
+    """
+    (repo / ".worktrees").mkdir()
+    (repo / ".worktrees" / "scratch.txt").write_text("x\n", encoding="utf-8")
+
+    assert ho.scan_checkout(repo) == [".worktrees/scratch.txt"]
+
+
+def test_an_empty_directory_inside_worktrees_that_is_no_worktree_is_reported(repo):
+    """Same rule for the invisible half.
+
+    `.worktrees/not-a-worktree/` is nobody's checkout -- `git worktree list`
+    does not know it -- so the walk must descend into the container and report
+    it, while still saying nothing about the container itself.
+    """
+    (repo / ".worktrees" / "not-a-worktree").mkdir(parents=True)
+
+    assert ho.scan_checkout(repo) == [".worktrees/not-a-worktree/"]
+
+
+def test_a_worktree_outside_the_convention_is_exempt_too(repo):
+    """Identity, not location.
+
+    `git worktree add <anywhere>` puts a checkout where the `.worktrees/`
+    convention does not reach. It is still a peer's tree and still not this
+    checkout's litter, and a name-based exemption could never see it. The JS
+    reference has covered this since it grew `nestedWorktreePrefixes`.
+    """
+    _git(repo, "worktree", "add", "sideways", "-b", "feat/sideways")
+    (repo / "sideways" / "tests" / "scratch").mkdir(parents=True)
+
+    assert ho.scan_checkout(repo) == []
+
+
+def test_a_git_that_cannot_list_worktrees_reports_no_information(repo, monkeypatch):
+    """None, never `[]`.
+
+    Without the list there is no way to tell a peer's checkout from a stray.
+    Guessing "none" reports a peer's tree as litter to delete; guessing
+    "everything" hides real artifacts. The caller already treats None as no
+    information rather than as a clean tree, so saying so is the only honest
+    answer -- and it is the rule the rest of this module already follows.
+    """
+    real = ho._git
+
+    def refuse(root, *args, **kw):
+        if args[:1] == ("worktree",):
+            return False, ""
+        return real(root, *args, **kw)
+
+    monkeypatch.setattr(ho, "_git", refuse)
+
+    assert ho.scan_checkout(repo) is None
 
 
 @pytest.mark.skipif(sys.platform != "win32",

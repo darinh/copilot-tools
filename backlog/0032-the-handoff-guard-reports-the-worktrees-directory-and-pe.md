@@ -64,3 +64,21 @@ was issuing the instruction the safety rules exist to prevent.
 ## Notes
 
 The JS reference implementation already had this right: INTRINSIC_EXCLUSIONS in `extensions/checkout-guard/guard.mjs` holds `.git` and `.worktrees`, on the stated grounds that both are 'checkouts or plumbing, never repository content'. The Python guard was the half that lagged, so closing this narrows a divergence rather than widening one. Backlog item 0020 tracks the rest of that divergence.
+
+**Remaining gap, measured while fixing this.** The fix exempts by *name*:
+paths whose first segment is the worktrees directory. The JS reference does
+something stronger -- `scanCheckoutTree` in
+`extensions/checkout-guard/guard.mjs` filters against
+`nestedWorktreePrefixes`, the actual registered list from `git worktree
+list --porcelain`, so it covers a worktree created *anywhere*, which
+`git worktree add <anywhere>` makes easy. Its own comment says why: the
+extension ships to projects that have no `.worktrees/` convention at all.
+
+So a peer worktree outside `.worktrees/` is still reported by the Python
+guard as this checkout's litter. This project's own convention puts every
+worktree under `.worktrees/`, which is why the name-based fix covers the
+fleet today, but the two implementations do not agree on the general case.
+Adopting the JS approach in Python means a `git worktree list` call on the
+handoff path and a decision about what an unanswerable call means -- the JS
+answer is null, "no information", which callers already treat as not-clean.
+That is the same territory as item 0020.
