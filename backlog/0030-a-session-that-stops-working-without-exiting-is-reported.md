@@ -177,10 +177,24 @@ them the pids tabulated above, and the marker is current in most:
 | 91392 | 00:09:47 | 169.0 | 0.1 min | 111,040 | 2026-08-16T01:25:06Z | 0.00h |
 | 91624 | 01:10:48 | 13.5 | 3.9 min | 6,028 | 2026-08-16T01:19:53Z | 0.09h |
 
-Same instrument, same two controls as above: `75208` is the session that took
-the measurement and is the positive control, and the marker count per file is
-in the tens of thousands throughout, so a quiet marker is a reading rather than
-a build that stopped emitting it.
+Same instrument as the table above, and the same positive control: `75208` is
+the session that took the measurement. The count column is the second control —
+the marker occurs thousands of times in every one of these files, so a quiet
+marker is a reading rather than a build that stopped emitting the string.
+
+**The count control is weaker than the section above claimed, and the age
+column carries less than it looks.** Two corrections to how this table should
+be read, both applying to the table above as well:
+
+- The marker fires on *any* forwarded event, including the
+  `session.background_tasks_changed` churn that the section above already had
+  to set aside. A recent marker therefore establishes that the session layer is
+  doing something, not that the agent is. Classify the event before concluding
+  (see the next subsection, which does).
+- Marker abundance shows the string was emitted in the past, which rules out a
+  build that never emits it. It does not rule out a build that stopped, and
+  the count for a young log — 4,734 and 6,028 here — is a fact about the log's
+  age rather than about the marker's health.
 
 ### What woke them, measured per instance rather than per cluster
 
@@ -218,14 +232,20 @@ invocation ancestry), not from a human and not from the harness.
   delivers into the running session, which is exactly the thing the supervisor
   has no way to do. The note above records one spontaneous recovery with
   neither transition observed; here are eight with both.
-- **Nothing in the harness could have done it.** The supervising loop advances
-  on exactly four conditions — the stop marker, the detach marker,
-  `is_copilot_running()` going false, and the restart marker
-  (`copilot_operator.py` 5640-5800). There is no liveness probe of a running
-  session and no nudge; `grep -i 'idle|nudge'` over `copilot_operator.py`
-  returns only the no-change progress breaker, which is itself driven by
-  endings. So an agent that finishes a turn without handing off parks its
-  instance until something outside sends it a message.
+- **No automatic path in the harness could have done it.** The supervising loop
+  advances on the stop marker, the detach marker, `is_copilot_running()` going
+  false, the restart marker, and its own shutdown signal
+  (`copilot_operator.py` 5640-5800). None of those is "a live session went
+  quiet": there is no liveness probe of a running session and no nudge, and
+  `grep -i 'idle|nudge'` over `copilot_operator.py` returns only the no-change
+  progress breaker, which is itself driven by endings. So an agent that
+  finishes a turn without handing off parks its instance until something sends
+  it a message.
+
+  `operator send` *is* harness code — it types into the target pane — so the
+  claim is not that the toolkit cannot deliver a turn. It is that nothing
+  decides to. Every wake in the table above was invoked by an agent that had
+  read this backlog item.
 - **Detection remains the whole gap.** Recovery took 18 seconds once triggered;
   the trigger took between 2.8 and 5.9 days to arrive, and it arrived because
   an agent read this backlog item, not because anything measured the fleet.
@@ -235,3 +255,42 @@ handoff still has no measured cause, and the wake tells us nothing about it —
 being woken by a message says only that the session could still take a turn.
 This item has been burned three times by an explanation that fitted; that
 question is still open.
+
+### The state came back within ninety minutes, and it is measurable live
+
+Measured 2026-08-16T01:39Z, fourteen minutes after the table above, this time
+classifying the newest forwarded event by type instead of counting markers.
+`session.background_tasks_changed` keeps firing after an agent goes quiet, so
+"newest event of any kind" and "newest event that is not background churn" are
+different questions and the first one flatters the fleet:
+
+| pid | newest event of any kind | newest non-background event |
+|---|---|---|
+| 20076 | 1.05h `session.background_tasks_changed` | 1.05h **`session.idle`** |
+| 24048 | 1.70h `session.background_tasks_changed` | 1.70h **`session.idle`** |
+| 29312 | 0.00h `assistant.tool_call_delta` | 0.00h `assistant.tool_call_delta` |
+| 47944 | 1.02h `session.background_tasks_changed` | 1.02h **`session.idle`** |
+| 58612 | 0.00h `model.call_start` | 0.00h `model.call_start` |
+| 74612 | 0.06h `session.background_tasks_changed` | 0.06h `hook.end` |
+| 75208 | 0.00h `session.background_tasks_changed` | 0.00h `hook.end` |
+| 82116 | 0.00h `model.call_start` | 0.00h `model.call_start` |
+| 86508 | 1.05h `session.background_tasks_changed` | 1.05h **`session.idle`** |
+| 91392 | 0.00h `assistant.reasoning_delta` | 0.00h `assistant.reasoning_delta` |
+| 91624 | 0.00h `assistant.streaming_delta` | 0.00h `assistant.streaming_delta` |
+
+**Four instances are already back in the state this item describes** — newest
+non-background event `session.idle`, between 1.0 and 1.7 hours ago, each with a
+live process and a supervisor reporting `looping`. Three of them started at
+00:09–00:10Z as replacements for the woken sessions, so they worked for roughly
+half an hour and stopped.
+
+Two things follow that the days-old measurement could not show:
+
+- **The wake is not a fix.** It bought about thirty minutes on those three. The
+  state recurs on the ordinary path, not as a rare accident, and the eight
+  sessions silent for days were an accumulation of it rather than one event.
+- **It does not need days to observe.** The signature is visible about an hour
+  in, from one file, on a machine anyone can run this on. Whatever detector is
+  eventually built has a same-day test rather than a week-long one — and this
+  table is what it must reproduce, including the four rows where the newest
+  event of *any* kind is fresh and the session is nevertheless idle.
