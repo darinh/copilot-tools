@@ -45,19 +45,27 @@ five hours.
 
 ## Why it matters
 
-Items 0001 and 0030 both rest entirely on these logs. 0030's liveness
-classification reads the newest `Forwarding event` marker per session; 0001's
-exposure denominator -- active session-hours -- is computed from every marker
-in every supervised log. Neither instrument has any other source.
+Items 0001 and 0030 both depend on these logs, though not equally, and the
+first draft of this section overstated it. 0030's liveness classification reads
+the newest `Forwarding event` marker per session and has no other source at
+all. 0001's kill *count* does not come from here — it comes from `session_exit`
+records in `~/.operator/trace.jsonl`, which is an append-only file and not a
+50-entry ring, so the count is durable. What the logs uniquely hold for 0001 is
+the exposure denominator and **the shape of an ending**.
 
-A 50-file ring that a working fleet cycles in about five hours means the
-evidence for both items expires faster than the phenomena they describe. The
-2026-08-10T00:25 burst is the concrete loss already taken: it is the one burst
-in 0001 that survives provenance filtering, and the logs of the seven sessions
-it took are gone. The oldest retained file was created 00:26:39Z, 55 seconds
-after the last of the seven endings, so what remains are the successor
-sessions. Nobody will ever be able to look at what those processes were doing
-when they died.
+That second one is the real loss, and it is the one this item is about. Every
+ending in 0001 that was ever diagnosed was diagnosed from a log: the original
+wave by seven extension hosts exiting `0xC000013A` with an orderly teardown
+following, and the 2026-08-16T00:09 access violation by its log stopping inside
+a token stream with no shutdown sequence at all. The trace records that both
+happened. Only the log distinguishes a kill from a crash.
+
+The 2026-08-10T00:25 burst is the concrete loss already taken: it is the one
+burst in 0001 that survives provenance filtering, and the logs of the seven
+sessions it took are gone. The oldest retained file was created 00:26:39Z, 55
+seconds after the last of the seven endings, so what remains are the successor
+sessions. That burst can now never be classified further than the trace already
+classifies it.
 
 The bias is the bad way round. An idle fleet writes almost no new logs, so
 history survives; a working fleet evicts it. So the retention is longest
@@ -77,12 +85,15 @@ Copilot setting that changes it. That is the first thing to check, because if
 one exists this item is a configuration change rather than a snapshot
 mechanism.
 
-**The remedy is probably a marker index, not a log copy.** The retained logs
-are 6.3 GB and copying them on a schedule is not reasonable. Everything both
-items need is the marker stream -- timestamp, session uuid, event type -- which
-for the current 45 supervised logs compresses to a few MB. A periodic
-extraction into a durable store would preserve the measurement while the logs
-themselves stay disposable.
+**The marker index is not a sufficient remedy, and calling it one would be the
+same error twice.** The retained logs are 6.3 GB and copying them on a schedule
+is not reasonable; a `{timestamp, session uuid, event type}` index of the same
+material is a few MB and would preserve 0030's liveness instrument and 0001's
+exposure denominator completely. It would **not** preserve the thing 0001 most
+needs: an extension host exiting `0xC000013A` with an orderly teardown, or a
+file stopping mid-token-stream, are not events in the marker stream. An index
+retires the cheap uses and silently drops the diagnostic one. Whatever is built
+here has to decide that deliberately.
 
 **Where it belongs is the owner's call.** This repository is frozen to safety
 fixes (`FROZEN.md`) and the supervision kernel lives in `../operator`, which is

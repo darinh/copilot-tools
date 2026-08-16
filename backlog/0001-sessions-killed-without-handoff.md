@@ -1420,10 +1420,12 @@ it: `discord-invite-manager` #238 and #239, `snes-ghosts` #237 and #238,
 a clean self-terminated exit. Neither count contains an unaccounted ending, so
 nothing downstream of the difference changes.
 
-**One hour and fifty-one minutes of the restored fleet is worth more than half
-of the preceding five and a half days.** 12.48 active session-hours against
-23.25. That is the sentence every previous re-measurement of this item wanted
-and could not write.
+**On the session-hours unit, one hour and fifty-one minutes of the restored
+fleet carries more than half the exposure of the preceding five and a half
+days** — 12.48 active session-hours against 23.25. Read that as a statement
+about an independent per-session process only; against a fleet-wide emitter
+concurrency counts once, and the section below sets out both denominators
+before drawing anything from either.
 
 ### Two things about this window that weaken it, stated before the result
 
@@ -1489,30 +1491,83 @@ furnished with a story that fits.
 
 ### What this is worth, stated at the strength it was measured
 
-**It is the first window in this file where the zero was purchased.** The
-5.70-day quiet window bought 23.25 active session-hours of evidence; this one
-added 12.48 in 111 minutes, so the standing evidence against a mid-turn kill
-grew by more than half in under two hours. Forward testing this item no longer
-takes a week.
+**There are two denominators here and they must never be added.** Which one
+applies depends on what is being looked for, and the first draft of this
+section led with the wrong one.
+
+- **Against a fleet-wide emitter** — the only burst this file can vouch for
+  took seven instances inside five seconds — concurrency buys nothing. Seven
+  sessions dying together is *one* draw, not seven, so the unit is wall-clock
+  time during which there were live panes to take. On that unit the quiet
+  window is 136.75 hours and this one is **1.85**. The new window is on the
+  order of a percent of the standing evidence against a wave, not half of it.
+- **Against an independent per-session process** — something that could take
+  one session mid-turn without touching its neighbours — active session-hours
+  is the right unit, and it is 12.48 against 23.25.
+
+The first draft said "111 minutes of the restored fleet is worth more than half
+of the preceding five and a half days". That is true only of the second
+estimand, and the wave is the first. **Item 0001 is named for the wave.**
+
+**The 2.6x is a handoff rate, and cannot be read as a kill rate.** Seventeen of
+the eighteen endings in the exposure window are `restart=True`, which step 4 of
+the recipe calls "not evidence of anything", and **eight of those seventeen
+were caused by the intervention that created the window** — the woken sessions
+handing off together. The table above is therefore worth keeping for exactly
+one purpose, which is to show that dividing endings by days rather than by
+exposure changes the answer forty-fold. It says nothing about kills. The kill
+rate is 0 in both windows and the ratio of two zeroes does not exist.
+
+**Who owns these hours, which is not the fleet in equal shares.** Attributing
+each active minute to its instance, through `session_pid` on the ending record:
+
+| window | total | largest contributor | the measuring instance |
+|---|---|---|---|
+| quiet | 23.25h | `ac-unreal` 12.18h (52.4%) | `copilot-tools` 5.48h (**23.6%**) |
+| inert | 1.82h | `copilot-tools` 1.82h (100%) | **all of it** |
+| exposure | 12.48h | `operator` 1.87h (15.0%) | `copilot-tools` 1.40h (11.2%) |
+
+Three things follow, and two of them are unflattering:
+
+- **The inert row is withdrawn as a statement about the fleet.** Every one of
+  its 109 active minutes, and both of its endings, are `copilot-tools` — the
+  session taking the measurement. It measures the instrument, and it is left in
+  the table only because deleting a row after reading it is worse.
+- **Nearly a quarter of the quiet window's evidence is the measurer**, and
+  another half is a single instance cycling handoffs on 2026-08-10, one of them
+  ten seconds long. Five instances contribute anything at all. A
+  "fleet-wide" figure it is not.
+- **The exposure window is the first one that is actually fleet-wide.** Ten
+  instances contribute, no instance exceeds 15%, and the measurer is 11.2%.
+  That is a real improvement in breadth, and it is the one respect in which
+  this window beats the quiet one on its merits rather than by choice of unit.
 
 **It is not evidence that the kills have stopped.** The newest unaccounted
-ending is 2026-08-10T05:31:20Z, 5.9 days before this measurement, and the one
-burst that survives provenance checking took seven instances inside five
-seconds. Absence across 12 active session-hours does not exclude a phenomenon
-whose observed inter-arrival is days, and nobody should read the zero as more
-than the ordinary accrual of evidence it is.
+ending is 2026-08-10T05:31:20Z, 5.9 days before this measurement. Absence
+across 12 active session-hours does not exclude a phenomenon whose observed
+inter-arrival is days, and nobody should read the zero as more than the
+ordinary accrual of evidence it is.
 
 **What the zero actually bounds, and why even that is generous.** Zero events
 in 12.48 active session-hours puts a 95% upper bound of about 0.24 unaccounted
 endings per active session-hour on the rate — the rule of three, 3/12.48 —
 against 0.129 from the quiet window's 23.25 hours, so the two together bound it
-near 0.084. Those numbers assume independent arrivals, **and the one burst this
-file can vouch for was seven instances in five seconds**, which is the exact
-opposite of independent. A bound derived from a Poisson assumption is therefore
-optimistic against an emitter that fires on many sessions at once: the fleet
-could sit clean for a week and then lose every session in one second, and
-nothing measured here would have moved beforehand. Read the bound as an upper
-limit on *background* rate, not on the wave.
+near 0.084. That still permits an unaccounted ending roughly every twelve
+working session-hours, which at this window's concurrency is several a day: it
+is a weak bound, not a clean bill. And it assumes independent arrivals, **while
+the one burst this file can vouch for was seven instances in five seconds**,
+which is the exact opposite. The fleet could sit clean for a week and then lose
+every session in one second, and nothing measured here would have moved
+beforehand. Read the bound as a loose upper limit on a *background* rate, and
+as no bound at all on the wave.
+
+**What did get faster, stated precisely.** The background-rate denominator
+accrues about seven times faster per wall-clock hour with the fleet working
+than with it parked — 6.75 concurrently active sessions against 0.17. That is
+worth having and it is why this measurement was possible at all in an evening.
+It is not a substitute for calendar time against a wave, and an earlier draft
+of this section said forward testing "no longer takes a week". Withdrawn: for
+the phenomenon this item was opened on, it still does.
 
 **The denominator is a lower bound, and knowing which way it errs matters.**
 The marker is silent while an agent waits inside one long tool call, so a
