@@ -1223,3 +1223,152 @@ much longer tool calls should re-derive it rather than reuse the number.
 Do step 5 before steps 2 to 4, not after. A quiet count is only evidence that
 the fault is quiet if something was running that the fault could have taken,
 and on 2026-08-15 that was true of one instance out of nine.
+
+## Re-measurement, 2026-08-16: the fleet is working again, and the endings sort into two shapes
+
+Measured 2026-08-16T01:25Z. The section above closed by saying a quiet
+ending-count is only evidence about kills if something was running that a kill
+could have taken, and that on 2026-08-15 that was true of one instance in nine.
+**Exposure has partly returned.** Eleven supervised sessions are live and seven
+of them emitted an agent-activity event within the last six minutes (the table
+is in item 0030), where a day earlier one of nine did.
+
+Keep the distinction that section drew, because the first draft of this one
+collapsed it. An idle session still holds a live process and a live pane, so
+the quiet window was always real evidence against anything that takes a *pane*
+— roughly 1,000 process-hours of it. What idleness removes is evidence about
+the harm this item is named for, a session interrupted **mid-turn** with
+context unwritten, because a session with no turn in progress cannot suffer it.
+From 2026-08-16T00:09Z there are turns in progress again, so the second kind of
+evidence has started accruing; it had not before, and nothing below should be
+read backwards into the 5.66-day window.
+
+### Every ending the trace can actually vouch for
+
+The 2026-08-05 correction in this file establishes that records written by a
+pre-fix supervisor cannot answer this question. **A calendar cutoff does not
+separate them**, and the first draft of this section used one. A supervisor
+imports its code once and keeps it for its whole run, so records written after
+the fix landed can still come from a supervisor that predates it — which is the
+same fact item 0011 is about, applied to this file's own arithmetic.
+
+The discriminator is in the record: `session_exit` carries a `code` fingerprint
+naming the supervisor code that wrote it, and a record without one was written
+by a supervisor old enough not to stamp it. Of the 132 records dated 2026-08-05
+or later, **39 carry no fingerprint, and all 39 fall in one 17-minute span** —
+2026-08-05T00:45:21Z to 01:02:59Z, the earliest window in the population. The
+oldest stamped record is 2026-08-05T16:12:22Z.
+
+Those 39 are exactly the artifact the correction above withdrew. An unfixed
+supervisor called `_record_session_exit` only from the branch that runs when no
+restart was requested, so **every record it ever wrote reads as unaccounted**,
+whatever actually happened. Counting them as endings-without-a-handoff is
+counting the instrument.
+
+So the population is the 93 stamped records:
+
+| how it ended | count |
+|---|---|
+| by restart request (a handoff was written) | 76 |
+| unaccounted: no exit code, restart marker observed absent | 12 |
+| carrying an exit code | 5 |
+
+with 39 further records that are dated inside the window and cannot be
+classified at all.
+
+The five that carried an exit code, in full:
+
+```
+2026-08-08T23:22:03Z discord-invite-manager #230  rc=3221225477  uptime=77811s
+2026-08-10T01:46:33Z copilot-tools          #240  rc=3221225477  uptime=4794s
+2026-08-10T08:28:18Z subtitle-localizer     #1    rc=0           uptime=23200s
+2026-08-15T22:52:22Z tiktok-downloader      #1    rc=0           uptime=112s
+2026-08-16T00:09:00Z copilot-tools          #247  rc=3221225477  uptime=498s
+```
+
+`3221225477` is `0xC0000005`, an access violation. The original evidence at the
+top of this item found exactly one of those in 940 pre-fix records; there have
+been three in the 132 post-fix ones.
+
+### One burst survives the provenance filter, and it is 2026-08-10
+
+Grouping the 12 unaccounted endings by arrival, treating any gap of 30 seconds
+or less as one burst:
+
+- **2026-08-10T00:25:44–49** — seven instances inside five seconds. The "one
+  broadcast, not seven independent decisions" shape this item was opened on.
+- **Five singletons** — `scripts` #87 at 2026-08-08T04:54:48, then
+  `snes-ghosts` #236 05:19:19, `ac-unreal` #29 05:20:06 and #30 05:29:00, and
+  `copilot-tools` #242 05:31:20, all on 2026-08-10.
+
+**The newest unaccounted ending of any kind is 2026-08-10T05:31:20Z**, 5.8 days
+before this measurement. That timestamp is the same under either population —
+it is the one number the provenance filter does not move, because everything it
+removes is older.
+
+Run over all 132 date-filtered records the same grouping gives 46 in six bursts
+and 5 singletons, and five of those six bursts are the unclassifiable 39. That
+tally is recorded here only so the next reader recognises it: it is the shape
+this section reported before the fingerprint was checked, and it overstates the
+evidence roughly four-fold.
+
+### One fresh access violation, which is a crash and not shown to be a kill
+
+`copilot-tools` #247 ended at 2026-08-16T00:09:00Z with `rc=3221225477`,
+`uptime_s=498`, `restart=False`, `stop=False`, `detach=False`.
+
+**It died mid-turn, and that part is directly observed rather than inferred.**
+Its process log, `process-1786838442435-2596.log`, ends at 00:08:44.916Z in the
+middle of a streamed model response:
+
+```
+00:08:44.916Z [DEBUG] Forwarding event ...: assistant.streaming_delta (ephemeral)
+00:08:44.916Z [DEBUG] Forwarding event ...: assistant.reasoning_delta (ephemeral)
+<end of file>
+```
+
+There is no shutdown sequence after it — no extension-host exits, no runtime
+teardown, the file simply stops inside a token stream. So no handoff was
+written and the turn's context went with the process, which is the harm this
+item is named for. Its successor ran `session start --instance copilot-tools`
+at 00:09:15.
+
+**It is not evidence that the emitter is back**, and the first draft of this
+section called it a kill, which overstates it twice over:
+
+- `0xC0000005` is an access violation — a fault taken *by* the process. The
+  wave signature described at the top of this item is the opposite: seven
+  extension hosts exiting with `0xC000013A` (`STATUS_CONTROL_C_EXIT`) and an
+  orderly shutdown following. This log has neither.
+- It stands alone. No other instance ended unaccounted anywhere near it, and
+  the eight endings between 00:09:17 and 00:14:02 all carry `restart=True` —
+  they are the handoffs of eight agents that had just been woken by a message
+  (item 0030). A burst of `restart=True` endings and a burst of unaccounted
+  ones look identical in a list of timestamps; only the marker separates them,
+  and reading the one as the other would manufacture a wave that did not
+  happen.
+
+On the stamped record the two shapes are therefore:
+
+- **bursts of unaccounted endings** — one that survives provenance checking,
+  seven instances on 2026-08-10T00:25, plus five singletons over the following
+  five hours, and nothing since;
+- **isolated access violations** — three since 2026-08-05, one of them 76
+  minutes before this measurement.
+
+Whether either shape has an emitter, and whether it is the same one, is not
+established here.
+
+### For the next reader
+
+The step-5-first instruction above still holds, and it now has a cheap answer:
+item 0030 carries a liveness table for 2026-08-16 and the recipe that produced
+it. Re-run that first, and read the ending-count against it rather than on its
+own — an ending-count measured over an idle fleet still bounds pane-level
+kills, but says nothing about mid-turn loss.
+
+And check the `code` fingerprint before counting anything. A calendar cutoff
+looks like a provenance filter and is not one, because a supervisor keeps its
+code for its whole run. Using one here inflated the unaccounted count from 12
+to 51 and the burst count from one to six, and every added record was the
+instrument this file had already withdrawn.
