@@ -1,0 +1,66 @@
+---
+id: 32
+title: The handoff guard reports the worktrees directory and peer worktrees as this checkout's litter
+status: proposed
+opened: 2026-08-15
+spec: none
+---
+
+## Evidence
+
+Measured 2026-08-15 in scratch repositories under `%TEMP%`.
+
+`git worktree remove` deletes the tree and never its parent:
+
+```
+$ git worktree add .worktrees/feat-x -b feat/x
+$ git worktree remove .worktrees/feat-x
+$ Test-Path .worktrees      -> True, holding 0 entries
+$ git status --porcelain -uall --ignored=matching -z   -> (no output)
+```
+
+Git reports nothing, because there is no blob in an empty directory. The
+handoff guard'"'"'s own walk was the only thing that saw it, and it reported it:
+
+```
+$ handoff --instance probe --status s --next n
+Error: The checkout is not clean, so this handoff was not written.
+
+    .worktrees/
+
+  ... Commit what belongs to the repository, delete what was scratch,
+  and run the same command again.
+```
+
+Second, worse half. With a *live* worktree present and `.worktrees/` not
+ignored, `scan_checkout` returned:
+
+```
+['.worktrees/feat-x/', '.worktrees/feat-x/tests/']
+```
+
+`.worktrees/feat-x/` is another agent'"'"'s working tree, reported by `git status`
+as untracked; `.worktrees/feat-x/tests/` is an empty directory inside it,
+found by the guard'"'"'s walk descending into that tree.
+
+This repository never saw either, because its own `.gitignore` carries
+`/.worktrees/`, so git prunes the whole subtree before the walk begins. It was
+reported by the `subtitle-localizer` instance, whose repository had no such
+rule, and reproduced here from that report.
+
+## Why it matters
+
+The handoff is what carries a session'"'"'s context across a restart, and this
+refused it permanently: the directory is created by this toolchain and
+recreated by the next `operator worktree new`, so nothing the agent cleaned
+could clear the complaint.
+
+The advice attached to the refusal made it worse than a stall. It names the
+paths and says to delete what was scratch -- so an agent following it deletes
+a peer'"'"'s live working tree, against the one rule this project states about
+worktrees ("Leave worktrees you did not create alone"). The safety mechanism
+was issuing the instruction the safety rules exist to prevent.
+
+## Notes
+
+The JS reference implementation already had this right: INTRINSIC_EXCLUSIONS in `extensions/checkout-guard/guard.mjs` holds `.git` and `.worktrees`, on the stated grounds that both are 'checkouts or plumbing, never repository content'. The Python guard was the half that lagged, so closing this narrows a divergence rather than widening one. Backlog item 0020 tracks the rest of that divergence.

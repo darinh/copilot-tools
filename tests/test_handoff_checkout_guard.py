@@ -870,3 +870,59 @@ def test_the_guard_and_the_worktree_command_agree_on_the_directory_name():
     import operator_worktree
 
     assert ho.WORKTREES_DIR == operator_worktree.WORKTREES_DIR
+
+
+def test_a_tracked_file_under_worktrees_is_still_reported_when_modified(repo):
+    """The exemption covers untracked peers, not the whole name.
+
+    Found by adversarial review and confirmed by measurement: filtering every
+    status code hid ` M .worktrees/owned.txt` -- tracked repository content,
+    modified, and then reported clean. A repository is free to track something
+    under this name, and a guard that goes silent about a modification is the
+    failure it exists to prevent. A linked worktree is untracked from the
+    parent's point of view, so `??` is the only code a peer can arrive under
+    and the only one exempted.
+    """
+    (repo / ".worktrees").mkdir()
+    (repo / ".worktrees" / "owned.txt").write_text("v1\n", encoding="utf-8")
+    _git(repo, "add", ".worktrees/owned.txt")
+    _git(repo, "commit", "-m", "track content under the name")
+    (repo / ".worktrees" / "owned.txt").write_text("v2\n", encoding="utf-8")
+
+    assert ho.scan_checkout(repo) == [".worktrees/owned.txt"]
+
+
+def test_a_junction_named_worktrees_is_reported_rather_than_exempted(repo):
+    """Order matters: junction first, exemption second.
+
+    `git worktree add` makes an ordinary directory, so a junction wearing this
+    name is not what the exemption is for -- and testing the name first would
+    let any junction be hidden from the guard by choosing what to call it,
+    which is a wider hole than the one the exemption closes.
+    """
+    if not _can_junction(repo):
+        pytest.skip("junctions need Windows")
+    target = repo / "elsewhere"
+    target.mkdir()
+    (target / "content.txt").write_text("not empty\n", encoding="utf-8")
+    _junction(repo / ".worktrees", target)
+
+    assert sorted(ho.scan_checkout(repo)) == [".worktrees",
+                                              "elsewhere/content.txt"]
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="one directory under two spellings needs Windows")
+def test_a_differently_cased_worktrees_directory_is_still_exempt(repo):
+    """`.WORKTREES` and `.worktrees` are one directory on Windows.
+
+    `git worktree add .worktrees/feat-x` populates an existing `.WORKTREES`
+    and git then reports the path in that spelling, so a case-sensitive
+    comparison put the guard straight back into the failure this predicate
+    exists to prevent: a live peer's worktree reported as litter to delete.
+    Measured before the fix returning `['.WORKTREES/feat-x/']`.
+    """
+    (repo / ".WORKTREES").mkdir()
+    _git(repo, "worktree", "add", ".worktrees/feat-x", "-b", "feat/x")
+
+    assert ho.scan_checkout(repo) == []

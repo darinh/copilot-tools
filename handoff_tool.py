@@ -428,10 +428,13 @@ def resolve_guid(project_root) -> str:
             f"  \"{resolved_str(project_root)}\",<guid>")
     die(f"No catalog entry for: {target}\n"
         f"This project is not registered, so there is nowhere to write the "
-        f"handoff. Register it with:\n"
-        f"  operator projects\n"
-        f"or add a line to {CATALOG} such as:\n"
-        f"  \"{resolved_str(project_root)}\",<guid>")
+        f"handoff. Register it by adding a line to\n"
+        f"  {CATALOG}\n"
+        f"such as:\n"
+        f"  \"{resolved_str(project_root)}\",<guid>\n"
+        f"The second column is the project directory name under "
+        f"{projects_root()}; nothing in this toolkit writes the catalog, so "
+        f"the line has to be added by hand.")
 
 
 class StateUnreadable(Exception):
@@ -677,9 +680,18 @@ def scan_checkout(root) -> "list[str] | None":
             skip_next = True
         if code == "!!":
             ignored.append(path)
+        elif code == "??" and _in_worktrees(path):
+            # A linked worktree is untracked from the parent's point of view,
+            # so `??` is the only code a peer's checkout can arrive under, and
+            # exempting just that one keeps the rest of the namespace visible.
+            # Filtering every code instead was measured hiding
+            # ` M .worktrees/owned.txt` -- tracked repository content, modified
+            # and then reported clean. A repository is free to track something
+            # under this name, and a guard that goes quiet about a modification
+            # is the failure it exists to prevent.
+            continue
         else:
             paths.append(path)
-    paths = [p for p in paths if not _in_worktrees(p)]
     if not ignored_known:
         return paths
     return paths + _empty_dir_strays(root, ignored)
@@ -705,16 +717,32 @@ def _in_worktrees(rel: str) -> bool:
     rule ``operator worktree new`` writes: a ``docs/.worktrees/`` that somebody
     meant to track is still reported.
 
-    Separators are compared as ``/`` and never translated, because both callers
-    produce that spelling -- ``git status -z`` always does, and the walk below
-    builds its own paths with it -- while a backslash is an ordinary character
-    in a POSIX filename. Translating would let a file literally named
-    ``.worktrees\\x`` on Linux read as being inside this directory, which
-    suppresses a real finding. Under-refusing is the one direction this guard
-    cannot afford.
+    Only the first path segment is examined, and it is compared as a whole
+    name. That is what keeps a separator out of the comparison, and the
+    separator is the trap here. Both producers emit ``/`` -- ``git status -z``
+    always does, and the walk below builds its own paths with it -- while
+    ``ntpath.normcase`` rewrites ``/`` to ``\\`` as well as lowering case, so a
+    prefix test written against ``.worktrees/`` and then normalised would stop
+    matching on Windows and silently exempt nothing. Splitting first means the
+    two concerns never meet.
+
+    Case is left to ``os.path.normcase``, which is the running platform's own
+    answer and the right one *here* because these paths came from the running
+    machine -- this module's own git call and its own ``scandir``, not a string
+    naming some other platform's syntax. On Windows ``.WORKTREES`` and
+    ``.worktrees`` are one directory, and ``git worktree add`` will populate a
+    differently-cased one that already exists; without this the guard reports a
+    live peer's worktree as litter, which is the failure this predicate exists
+    to prevent.
+
+    Known gap, stated rather than papered over: macOS is case-insensitive by
+    default and ``posixpath.normcase`` is the identity, so a ``.WORKTREES``
+    there still reads as a different directory. That errs towards *reporting*
+    a stray, which costs a false refusal and not a silent miss -- the only
+    direction this guard can afford to be wrong in.
     """
-    norm = rel.rstrip("/")
-    return norm == WORKTREES_DIR or norm.startswith(WORKTREES_DIR + "/")
+    head = rel.strip("/").split("/", 1)[0]
+    return os.path.normcase(head) == os.path.normcase(WORKTREES_DIR)
 
 
 #: How many directories the candidate walk will visit before it gives up.
@@ -788,6 +816,27 @@ def _empty_dir_strays(root, ignored: "list[str]") -> "list[str]":
             except OSError:
                 continue
             child = f"{rel}/{entry.name}" if rel else entry.name
+            if child in prune:
+                continue
+            if _is_junction(entry):
+                # Reported, never descended. Git cannot store a junction --
+                # there is no tree entry for one -- so a junction inside a
+                # checkout is always something a process left behind, and it
+                # is the one artifact git can be silent about while the
+                # filesystem still holds it. Descending it would also walk
+                # out of the checkout, or round a cycle if it points at an
+                # ancestor. A junction that is legitimate infrastructure
+                # (`node_modules` pointed at a shared cache) is in
+                # `.gitignore`, so `prune` above has already dropped it.
+                #
+                # Ordered before the worktrees exemption below, deliberately.
+                # `git worktree add` makes an ordinary directory, so a
+                # junction wearing that name is not the thing the exemption is
+                # for -- and exempting by name first would let any junction be
+                # hidden from this guard by choosing what to call it, a wider
+                # hole than the one the exemption closes.
+                links.append(child)
+                continue
             if _in_worktrees(child):
                 # Another checkout, not this one's content. `git worktree
                 # remove` never removes this parent, so it outlives the trees
@@ -802,20 +851,6 @@ def _empty_dir_strays(root, ignored: "list[str]") -> "list[str]":
                 # agent another's tree as litter to remove -- against the one
                 # rule this project states about worktrees. Each checkout's own
                 # handoff sees its own contents, so nothing goes unwatched.
-                continue
-            if child in prune:
-                continue
-            if _is_junction(entry):
-                # Reported, never descended. Git cannot store a junction --
-                # there is no tree entry for one -- so a junction inside a
-                # checkout is always something a process left behind, and it
-                # is the one artifact git can be silent about while the
-                # filesystem still holds it. Descending it would also walk
-                # out of the checkout, or round a cycle if it points at an
-                # ancestor. A junction that is legitimate infrastructure
-                # (`node_modules` pointed at a shared cache) is in
-                # `.gitignore`, so `prune` above has already dropped it.
-                links.append(child)
                 continue
             candidates.append(child)
             stack.append(child)

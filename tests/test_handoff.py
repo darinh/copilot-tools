@@ -263,6 +263,30 @@ def test_resolve_guid_keeps_the_actionable_message_for_a_missing_entry(env, caps
     assert str(env["project"].resolve()) in err
 
 
+def test_the_missing_entry_message_names_the_file_and_no_command_that_registers(
+        env, capsys):
+    """Which file, and no instruction that cannot work.
+
+    A fresh instance on an unregistered project meets this refusal on the path
+    where it has just been told to hand off, so what it says is the whole
+    remedy. It used to say "Add it with a line such as" without naming the file
+    to add the line to.
+
+    The second assertion is the one with history. The first fix here offered
+    `operator projects`, which browses configurations for projects that are
+    *already* catalogued and cannot create a row -- no code in this toolkit
+    writes the catalog at all, as `docs/operator.md` states. An instruction
+    delivered for the wrong situation is worse than none, which is what this
+    module's own docstring says about exactly this function.
+    """
+    env["catalog"].write_text('"/somewhere/else",zzz\n', encoding="utf-8")
+    with pytest.raises(SystemExit):
+        ho.resolve_guid(env["project"])
+    err = capsys.readouterr().err
+    assert str(ho.CATALOG) in err
+    assert "operator projects" not in err
+
+
 def test_blank_id_never_writes_to_the_shared_projects_root(env, monkeypatch):
     """The whole point of the guard: one project must not clobber all of them."""
     env["catalog"].write_text(

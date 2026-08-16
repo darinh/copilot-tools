@@ -429,6 +429,7 @@ copilot-tools/
 ├── backlog/                       # Open work, one file per item; see its README
 ├── .gitattributes                 # Shell scripts check out LF on every platform
 ├── .gitignore                     # Caches, packaging output, and /.worktrees/
+├── FROZEN.md                      # This repo takes safety fixes only; the kernel moved out
 ├── LICENSE                        # MIT
 ├── README.md                      # This file
 ├── pyproject.toml                 # Packaging and console scripts
