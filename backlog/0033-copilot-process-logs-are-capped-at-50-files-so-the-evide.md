@@ -31,12 +31,12 @@ Both windows are the *same* interval, 2026-08-10T05:32Z to 08-15T22:17Z. The
 measurement of a fixed past window returns a smaller answer every time it is
 run.**
 
-The eviction rule is not established, and the two obvious guesses are both
-refuted. The evicted file was created 2026-08-10T05:14:00Z and four retained
-files were created before it, so it is not oldest-by-creation; its mtime was
-newer than that of at least five retained files, so it is not
-least-recently-written either. This item deliberately does not propose a third
-rule that also fits.
+The eviction rule is not established, and the obvious guess is refuted. The
+evicted file was created 2026-08-10T05:14:00Z and five retained files were
+created before it (four of them supervised sessions), so it is not
+oldest-by-creation. Least-recently-written could not be tested: the file's
+mtime was never recorded before it was deleted, which is this item's own
+subject arriving one level up. No third rule is proposed here.
 
 Rate: the fleet produced 18 successor sessions in the 111 minutes from
 2026-08-16T00:09Z, about ten new logs an hour, against a 50-file ceiling.
@@ -53,10 +53,11 @@ in every supervised log. Neither instrument has any other source.
 A 50-file ring that a working fleet cycles in about five hours means the
 evidence for both items expires faster than the phenomena they describe. The
 2026-08-10T00:25 burst is the concrete loss already taken: it is the one burst
-in 0001 that survives provenance filtering, and the logs of the eight sessions
-it took are gone. The oldest retained file was created 00:26:39Z, thirteen
-minutes after the burst, so what remains are the successor sessions. Nobody
-will ever be able to look at what those processes were doing when they died.
+in 0001 that survives provenance filtering, and the logs of the seven sessions
+it took are gone. The oldest retained file was created 00:26:39Z, 55 seconds
+after the last of the seven endings, so what remains are the successor
+sessions. Nobody will ever be able to look at what those processes were doing
+when they died.
 
 The bias is the bad way round. An idle fleet writes almost no new logs, so
 history survives; a working fleet evicts it. So the retention is longest

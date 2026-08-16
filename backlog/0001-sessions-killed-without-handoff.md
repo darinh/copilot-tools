@@ -1490,7 +1490,7 @@ furnished with a story that fits.
 ### What this is worth, stated at the strength it was measured
 
 **It is the first window in this file where the zero was purchased.** The
-5.66-day quiet window bought 23.25 active session-hours of evidence; this one
+5.70-day quiet window bought 23.25 active session-hours of evidence; this one
 added 12.48 in 111 minutes, so the standing evidence against a mid-turn kill
 grew by more than half in under two hours. Forward testing this item no longer
 takes a week.
@@ -1539,13 +1539,14 @@ two runs of the same scan, 20 minutes apart, one file appeared and one
 previously-present file vanished: `process-1786338840160-82184.log`, confirmed
 absent from disk, 29 agent-minutes of a supervised session gone.
 
-**The eviction rule is not established, and the two obvious guesses are both
-wrong.** The evicted file was created 2026-08-10T05:14:00Z, and four retained
-files were created before it; its mtime was newer than that of at least five
-retained files. So it is neither oldest-by-creation nor least-recently-written,
-and this section deliberately stops there rather than proposing a third rule
-that also fits. What is measured is the cap and the eviction, and those are
-enough:
+**The eviction rule is not established, and the obvious guess is wrong.** The
+evicted file was created 2026-08-10T05:14:00Z, and five files created before it
+are still retained (four of them supervised sessions), so eviction is not
+oldest-by-creation. Least-recently-written could not be tested at all: **the
+file's mtime was never recorded before it was deleted**, which is the same
+lesson this section is about, arriving one level up. This section deliberately
+stops there rather than proposing a rule that also fits. What is measured is
+the cap and the eviction, and those are enough:
 
 - Every measurement of a past window from these logs is a lower bound that
   *shrinks over time*. The quiet window read 23.63 active session-hours at
@@ -1555,9 +1556,9 @@ enough:
   about ten new logs an hour, against a 50-file ceiling. **A working fleet
   turns over the entire retained history in something like five hours.**
 - The logs of the 2026-08-10T00:25 burst are already gone. The oldest file now
-  retained was created at 00:26:39Z, thirteen minutes after it — these are the
-  successor sessions, not the killed ones. No future reader will be able to
-  look at what those eight processes were doing when they died.
+  retained was created at 00:26:39Z, 55 seconds after the last of the seven
+  endings — it is a successor session, not a killed one. No future reader will
+  be able to look at what those seven processes were doing when they died.
 - The days-long silences item 0030 measured were only observable because an
   idle fleet writes no new logs. **The state is easiest to detect exactly when
   the evidence survives longest, and hardest when it does not.**

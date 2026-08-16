@@ -331,8 +331,9 @@ new instance to the state and neither takes one out of it.
 | 86508 | `session.idle` 2026-08-16T00:36:06.340Z | 1.05h | 1.31h | 1.40h | 28,481 | 28,481 |
 
 The other seven supervised sessions were working at both readings, newest
-marker 0.00–0.01h old, and three of them are pids that did not exist at
-01:39Z — the fleet churned around the four while the four did nothing.
+marker 0.00–0.01h old, and four of them are pids that did not exist at 01:39Z
+(2952, 24072, 43820, 58856, started 01:41:15Z to 01:52:21Z) — the fleet churned
+around the four while the four did nothing.
 
 **The count column is the stronger of the two, and it is the one to reach for
 next time.** An age is a difference between a log timestamp and the measuring
@@ -381,12 +382,21 @@ rather than there is that it fired in the measurement *this item* runs.
 
 ### Two live processes this instrument cannot classify, and the trace can
 
-Two live `copilot` processes have a pinned log of zero bytes and therefore zero
-markers: pid 61852 (running since 2026-08-11T17:45:33Z, log untouched for
-96.4h) and pid 75944 (since 2026-08-14T03:20:23Z, 29.3h). Per the rule this
-item states, zero occurrences is **cannot tell**, not idle — and a detector
-that has to emit "cannot tell" twice on every run will be silenced by whoever
-maintains it.
+Two live `copilot` processes have a pinned log containing **zero markers**: pid
+61852 (running since 2026-08-11T17:45:33Z, log 26,791 bytes, untouched for
+96.4h) and pid 75944 (since 2026-08-14T03:20:23Z, 30,223 bytes, 29.3h). The
+files are not empty — they hold the ordinary startup lines, shell completions,
+workspace initialisation, extension discovery — they simply contain no
+`Forwarding event for session` line at all, because no turn was ever run in
+them. A first draft of this section called them "zero bytes", having read
+`"mb": 0.0` out of the measuring script's rounded output; the byte counts above
+are from `stat` and the distinction matters, because a genuinely empty file
+would indicate a process that failed to start rather than one that started and
+was never asked to do anything.
+
+Per the rule this item states, zero occurrences is **cannot tell**, not idle —
+and a detector that has to emit "cannot tell" twice on every run will be
+silenced by whoever maintains it.
 
 It does not have to. Neither pid appears anywhere in `trace.jsonl` as a
 `session_pid`, and both have a `powershell.exe` parent rather than a
