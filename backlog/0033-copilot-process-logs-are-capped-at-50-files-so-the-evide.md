@@ -1,6 +1,6 @@
 ---
 id: 33
-title: Copilot process logs are capped at 50 files, so the evidence for items 0001 and 0030 expires in hours
+title: Copilot process logs are capped at 50 files and evict while sessions run, destroying evidence items 0001 and 0030 depend on
 status: proposed
 opened: 2026-08-15
 spec: specs/003-windows-native-operator/spec.md
@@ -8,28 +8,29 @@ spec: specs/003-windows-native-operator/spec.md
 
 ## Evidence
 
-Measured on this machine 2026-08-16T01:54Z-02:12Z, while re-measuring
+Measured on this machine 2026-08-16T01:54Z-02:03Z, while re-measuring
 backlog item 0001.
 
 `~/.copilot/logs` holds **exactly 50 `process-*.log` files**. It held exactly
-50 at three observations across 25 minutes, and files are evicted while
-sessions run: between two runs of the same scan, 20 minutes apart, one file
-appeared and `process-1786338840160-82184.log` vanished — confirmed absent
-from disk on re-test, 29 agent-active minutes of a supervised session with it.
+50 at every observation, and files are evicted while sessions run: between two
+runs of the same scan, one file appeared and
+`process-1786338840160-82184.log` vanished — confirmed absent from disk on
+re-test, 29 eventful minutes of a supervised session with it.
 
 The scan is a forward pass over every log counting
 `Forwarding event for session <uuid>: <type>` markers, restricted to logs
-whose pid the trace names as a session. Two runs:
+whose pid the trace names as a session. Two runs, timed by the mtime of the
+artefacts they wrote:
 
 ```
-scan A  2026-08-16T01:58Z  45 supervised logs  quiet-window exposure 23.63 active session-hours
-scan B  2026-08-16T02:12Z  45 supervised logs  quiet-window exposure 23.25 active session-hours
+scan A  finished 2026-08-16T01:59:15Z  45 supervised logs  quiet-window total 23.63 eventful log-hours
+scan B  finished 2026-08-16T02:03:12Z  45 supervised logs  quiet-window total 23.25 eventful log-hours
 ```
 
 Both windows are the *same* interval, 2026-08-10T05:32Z to 08-15T22:17Z. The
-0.38-hour difference is not a correction; it is a deleted file. **A
-measurement of a fixed past window returns a smaller answer every time it is
-run.**
+0.38-hour difference is not a correction; it is a deleted file. **A measurement
+of a fixed past window can return a smaller answer when it is re-run.** One
+eviction was observed, so nothing stronger than "can" is claimed.
 
 The eviction rule is not established, and the obvious guess is refuted. The
 evicted file was created 2026-08-10T05:14:00Z and five retained files were
@@ -39,9 +40,10 @@ mtime was never recorded before it was deleted, which is this item's own
 subject arriving one level up. No third rule is proposed here.
 
 Rate: the fleet produced 18 successor sessions in the 111 minutes from
-2026-08-16T00:09Z, about ten new logs an hour, against a 50-file ceiling.
-A working fleet therefore turns over the whole retained history in roughly
-five hours.
+2026-08-16T00:09Z, about ten new logs an hour, against a 50-file ceiling. That
+is eviction pressure equal to the size of the whole cache in about five hours.
+It is **not** a claim that every file now present will be gone in five hours —
+that needs the oldest-first rule the paragraph above refuses to assume.
 
 ## Why it matters
 
@@ -76,8 +78,9 @@ five days for.
 ## Notes
 
 **Not established: the eviction rule.** Measured is the cap (50) and that
-eviction happens during normal operation. Oldest-by-creation and
-least-recently-written are both refuted by the one eviction observed. One
+eviction happens during normal operation. Oldest-by-creation is refuted by the
+one eviction observed; least-recently-written could not be tested at all,
+because the evicted file's mtime was never recorded before it went. One
 eviction is a thin basis for any rule, which is why none is proposed here.
 
 **Not established: whether the cap is configurable.** No search was made for a

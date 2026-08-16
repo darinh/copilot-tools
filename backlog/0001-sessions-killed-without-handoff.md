@@ -1381,31 +1381,52 @@ thing without being able to put a number on it. **This one puts a number on
 it.** Exposure is measured here rather than asserted, from the same logs item
 0030 classifies, and the ending-count is then read against it.
 
-### Active session-hours, and why that is the denominator
+### Eventful log-minutes, and why that is the denominator
 
 For every supervised session log, count the distinct wall-clock minutes
 containing at least one agent event — a `Forwarding event for session` marker
 whose type is not `session.background_tasks_changed`. Summed over the fleet
-that is **active session-hours**: how much session-time was spent doing
-something a mid-turn kill could have interrupted.
+that is **eventful log-minutes**, reported below in hours: an index of how much
+session-time was spent doing something a mid-turn kill could have interrupted.
+
+**It is an index, not a duration, and the direction of its error is unknown.**
+A single marker credits a whole minute even if the activity lasted
+milliseconds, which overcounts; the marker is silent while an agent waits
+inside one long tool call, which undercounts; and a session that ends and
+restarts within one minute has both logs credited for it, which double-counts.
+A first draft called the figure a lower bound on exposure and reasoned that its
+error was conservative in the direction of the conclusion. That was not
+measured and is withdrawn — neither the size nor the sign of the net bias is
+known here.
 
 Background events are excluded because item 0030 measured them landing 13–50 ms
 after `session.idle`, as the trailing event of the same turn; counting them
 would credit the fleet with activity it did not have. Which logs belong to
-supervised sessions is decided from `trace.jsonl`, not from the log directory,
-for the reason item 0030 now records: two live `copilot` processes on this
-machine are nobody's session.
+supervised sessions is decided from `trace.jsonl` — the pids it names as
+sessions, plus live processes whose log creation time matches their process
+start — rather than from the log directory, for the reason item 0030 now
+records: two live `copilot` processes on this machine are nobody's session.
+Those two are in the scanned population and contribute zero minutes, having no
+markers at all, so they move no number here.
 
-| window | span | active session-hours | mean sessions working at once | endings | unaccounted |
+| window | span | eventful log-hours | mean sessions eventful at once | endings | unaccounted |
 |---|---|---|---|---|---|
 | quiet, 2026-08-10T05:32Z → 08-15T22:17Z | 136.75h | 23.25 | 0.17 | 13 | **0** |
 | inert, 2026-08-15T20:29Z → 22:17Z | 1.80h | 1.82 | 1.01 | 2 | **0** |
 | exposure, 2026-08-16T00:09Z → 02:00Z | 1.85h | 12.48 | 6.75 | 18 | **0** |
 
+**The quiet row is fragile in the one direction that flatters this
+measurement.** Log eviction removes old files only, so re-running the scan
+shrinks the quiet denominator while leaving the exposure one untouched: it read
+23.63 at 01:59Z and 23.25 four minutes later, and about 1.7 further missing
+hours would take the exposure window from "more than half" of it to less. The
+comparison below should be read with that sensitivity in mind, and item 0033
+is why it exists.
+
 The quiet window starts one minute after the newest unaccounted ending this
 file knows of (2026-08-10T05:31:20Z), so it is exactly the interval over which
 this item has been unable to say whether the kills stopped or the fleet did.
-"Mean sessions working at once" is active session-hours over span, deliberately
+"Mean sessions eventful at once" is eventful log-hours over span, deliberately
 *not* a duty cycle against an instance count: the fleet was nine instances for
 part of that history and eleven for the rest, and nothing here should rest on
 which.
@@ -1417,12 +1438,12 @@ before 2026-08-15T22:17Z, and it is listed in full so the next reader can check
 it: `discord-invite-manager` #238 and #239, `snes-ghosts` #237 and #238,
 `ac-unreal` #31 through #36, `copilot-tools` #243 and #244 — twelve
 `restart=True` — plus `subtitle-localizer` #1 at 08:28:18Z with `exit_code=0`,
-a clean self-terminated exit. Neither count contains an unaccounted ending, so
+a clean but unexplained exit. Neither count contains an unaccounted ending, so
 nothing downstream of the difference changes.
 
 **On the session-hours unit, one hour and fifty-one minutes of the restored
 fleet carries more than half the exposure of the preceding five and a half
-days** — 12.48 active session-hours against 23.25. Read that as a statement
+days** — 12.48 eventful log-hours against 23.25. Read that as a statement
 about an independent per-session process only; against a fleet-wide emitter
 concurrency counts once, and the section below sets out both denominators
 before drawing anything from either.
@@ -1430,12 +1451,13 @@ before drawing anything from either.
 ### Two things about this window that weaken it, stated before the result
 
 **The window was manufactured, and by an agent reading this backlog.** The
-fleet is working because eight inert sessions were sent a message at
-2026-08-16T00:08Z (item 0030), each replied within 10 to 18 seconds, handed off,
-and was relaunched by its supervisor. So this is not a sample of normal
-operation; it is a sample of the fleet in the two hours after a deliberate
-intervention. Whether kill exposure during a post-intervention burst resembles
-exposure during ordinary running is not known, and nothing here assumes it.
+fleet is working because eight inert sessions were sent a message — one at
+2026-08-16T00:06:25Z and the other seven between 00:08:11Z and 00:08:16Z (item
+0030) — each replied within 10 to 18 seconds, handed off, and was relaunched by
+its supervisor. So this is not a sample of normal operation; it is a sample of
+the fleet in the two hours after a deliberate intervention. Whether kill
+exposure during a post-intervention burst resembles exposure during ordinary
+running is not known, and nothing here assumes it.
 
 **The measuring session is in the population it measures.** `copilot-tools` is
 one of the eleven instances, it accounts for 3 of the 18 endings, and one of
@@ -1448,9 +1470,12 @@ them belong to the instrument.
 
 All 18 endings in the exposure window carry a `code` fingerprint, all of them
 the same one (`a61c29682133`), so none is the unclassifiable pre-fix artifact.
-`giving_up` is false on every record, so the supervisor never lost its ability
-to classify. Reconciled by class, reading `restart` and `exit_code` together
-per step 4 of the recipe:
+`giving_up` is false on every record, which means only that no supervisor
+reached its consecutive-failure limit (`operator_trace.py:662` defines it as
+`consecutive >= limit` and nothing else) — it is not, as a first draft had it,
+a statement that classification stayed healthy. What makes these records
+classifiable is that each carries the marker values step 4 needs. Reconciled by
+class, reading `restart` and `exit_code` together per that step:
 
 - **17 `restart=True`** — a handoff was written. Not evidence of anything.
 - **1 access violation** — `copilot-tools` #247 at 00:09:00Z, `rc=3221225477`,
@@ -1458,36 +1483,34 @@ per step 4 of the recipe:
 - **0 unaccounted.** The kill signature — `restart=False`, `exit_code=null` —
   did not occur once.
 
-Normalising the rate is what the denominator is for, and it dissolves most of
-the apparent change:
+Normalising by exposure rather than by days changes the aggregate ending-rate
+comparison by a factor of about forty:
 
 | | quiet | exposure | ratio |
 |---|---|---|---|
 | endings per wall-clock day | 2.3 | 233.5 | **102x** |
-| endings per active session-hour | 0.56 | 1.44 | **2.6x** |
+| endings per eventful log-hour | 0.56 | 1.44 | **2.6x** |
 
-So roughly 97% of the hundredfold swing in ending rate is exposure, not a
-change in how sessions end. An ending-count divided by days — step 5 of the
-recipe as written — would have reported a fleet behaving 102 times
-differently. It is behaving about 2.6 times differently.
+An ending-count divided by days — step 5 of the recipe as written — reports a
+fleet behaving 102 times differently; divided by exposure, 2.6 times. **Neither
+number measures kills**, and a first draft's claim that "97% of the swing is
+exposure" is withdrawn as well: that is an additive share read off a pair of
+multiplicative ratios, and it varies from 79% to 98% depending on how it is
+taken.
 
-**The residual 2.6x is not explained here, and one tempting explanation is
-wrong.** A first draft attributed it to session length, saying the quiet
-window's sessions had been up 41 hours against 30 to 100 minutes in the
-exposure window. The uptimes at ending say the opposite, and say it in both
-windows at once:
+**The residual 2.6x is not explained here, and the field that looked like the
+explanation does not mean what it says.** A first draft attributed it to
+session length, from `markers.uptime_s` on the ending records. That field is
+**the current supervisor's observation time, not the session's age**, and the
+difference is not small: the eight sessions it reports as 41.6 hours old have
+pinned logs created 2026-08-10T00:26Z, six days earlier. `uptime_s` restarts
+when a supervisor adopts a running session, so on this fleet — where every
+supervisor has been restarted at least once — it systematically understates
+age by however long ago the last adoption was.
 
-| | n | median uptime | mean | shape |
-|---|---|---|---|---|
-| quiet | 13 | 1.35h | 9.29h | eleven under 6.5h, then 38.5h and 61.5h |
-| exposure | 18 | 1.78h | 19.12h | ten under 1.9h, then **eight at 41.6h** |
-
-The eight 41.6-hour endings are the woken sessions of item 0030 handing off
-together — they had been up since about 2026-08-14T06:36Z and ended within
-five minutes of each other. So the exposure window's sessions are the *older*
-group by mean, and its median is longer too. Session length does not account
-for the residual, and nothing measured here does; it is left open rather than
-furnished with a story that fits.
+The whole uptime comparison is therefore withdrawn, not corrected: a session-age
+distribution was never computed, and nothing here explains the residual. It is
+left open rather than furnished with a story that fits.
 
 ### What this is worth, stated at the strength it was measured
 
@@ -1502,7 +1525,7 @@ section led with the wrong one.
   window is 136.75 hours and this one is **1.85**. The new window is on the
   order of a percent of the standing evidence against a wave, not half of it.
 - **Against an independent per-session process** — something that could take
-  one session mid-turn without touching its neighbours — active session-hours
+  one session mid-turn without touching its neighbours — eventful log-hours
   is the right unit, and it is 12.48 against 23.25.
 
 The first draft said "111 minutes of the restored fleet is worth more than half
@@ -1521,36 +1544,44 @@ rate is 0 in both windows and the ratio of two zeroes does not exist.
 **Who owns these hours, which is not the fleet in equal shares.** Attributing
 each active minute to its instance, through `session_pid` on the ending record:
 
-| window | total | largest contributor | the measuring instance |
-|---|---|---|---|
-| quiet | 23.25h | `ac-unreal` 12.18h (52.4%) | `copilot-tools` 5.48h (**23.6%**) |
-| inert | 1.82h | `copilot-tools` 1.82h (100%) | **all of it** |
-| exposure | 12.48h | `operator` 1.87h (15.0%) | `copilot-tools` 1.40h (11.2%) |
+| window | total | largest attributed contributor | the measuring instance | unattributed |
+|---|---|---|---|---|
+| quiet | 23.25h | `ac-unreal` 12.18h (52.4%) | `copilot-tools` 5.48h (**23.6%**) | 0 |
+| inert | 1.82h | `copilot-tools` 1.82h (100%) | **all of it** | 0 |
+| exposure | 12.48h | `operator` 1.87h (15.0%) | `copilot-tools` 1.40h (11.2%) | **3.22h (25.8%)** |
 
-Three things follow, and two of them are unflattering:
+The unattributed column is sessions that had not yet ended when this was
+measured, so no `session_exit` record names their instance. It matters that it
+is a quarter of the exposure window: **no claim can be made about the maximum
+share any instance holds there**, because a single unattributed owner could
+exceed every attributed one. A first draft said no instance exceeded 15%, which
+the data does not support.
+
+Three things do follow, and two of them are unflattering:
 
 - **The inert row is withdrawn as a statement about the fleet.** Every one of
-  its 109 active minutes, and both of its endings, are `copilot-tools` — the
+  its 109 eventful minutes, and both of its endings, are `copilot-tools` — the
   session taking the measurement. It measures the instrument, and it is left in
   the table only because deleting a row after reading it is worse.
 - **Nearly a quarter of the quiet window's evidence is the measurer**, and
   another half is a single instance cycling handoffs on 2026-08-10, one of them
   ten seconds long. Five instances contribute anything at all. A
   "fleet-wide" figure it is not.
-- **The exposure window is the first one that is actually fleet-wide.** Ten
-  instances contribute, no instance exceeds 15%, and the measurer is 11.2%.
-  That is a real improvement in breadth, and it is the one respect in which
-  this window beats the quiet one on its merits rather than by choice of unit.
+- **The exposure window is much better spread even so.** Ten instances
+  contribute among the 74.2% that can be attributed, the largest of them 15.0%,
+  and the measurer is 11.2% — against one instance holding 52.4% of the quiet
+  window. That breadth is the one respect in which this window beats the quiet
+  one on its merits rather than by choice of unit.
 
 **It is not evidence that the kills have stopped.** The newest unaccounted
 ending is 2026-08-10T05:31:20Z, 5.9 days before this measurement. Absence
-across 12 active session-hours does not exclude a phenomenon whose observed
+across 12 eventful log-hours does not exclude a phenomenon whose observed
 inter-arrival is days, and nobody should read the zero as more than the
 ordinary accrual of evidence it is.
 
 **What the zero actually bounds, and why even that is generous.** Zero events
-in 12.48 active session-hours puts a 95% upper bound of about 0.24 unaccounted
-endings per active session-hour on the rate — the rule of three, 3/12.48 —
+in 12.48 eventful log-hours puts a 95% upper bound of about 0.24 unaccounted
+endings per eventful log-hour on the rate — the rule of three, 3/12.48 —
 against 0.129 from the quiet window's 23.25 hours, so the two together bound it
 near 0.084. That still permits an unaccounted ending roughly every twelve
 working session-hours, which at this window's concurrency is several a day: it
@@ -1562,8 +1593,8 @@ beforehand. Read the bound as a loose upper limit on a *background* rate, and
 as no bound at all on the wave.
 
 **What did get faster, stated precisely.** The background-rate denominator
-accrues about seven times faster per wall-clock hour with the fleet working
-than with it parked — 6.75 concurrently active sessions against 0.17. That is
+accrues about forty times faster per wall-clock hour with the fleet working
+than with it parked — 6.75 eventful sessions at once against 0.17. That is
 worth having and it is why this measurement was possible at all in an evening.
 It is not a substitute for calendar time against a wave, and an earlier draft
 of this section said forward testing "no longer takes a week". Withdrawn: for
@@ -1589,10 +1620,10 @@ see. Read both spellings.
 ### The evidence is being deleted while this is written
 
 `~/.copilot/logs` holds **exactly 50 `process-*.log` files**, and it was
-holding exactly 50 at three separate observations across 25 minutes. Between
-two runs of the same scan, 20 minutes apart, one file appeared and one
-previously-present file vanished: `process-1786338840160-82184.log`, confirmed
-absent from disk, 29 agent-minutes of a supervised session gone.
+holding exactly 50 at every observation. Between two runs of the same scan,
+finishing 01:59:15Z and 02:03:12Z, one file appeared and one previously-present
+file vanished: `process-1786338840160-82184.log`, confirmed absent from disk,
+29 eventful minutes of a supervised session gone.
 
 **The eviction rule is not established, and the obvious guess is wrong.** The
 evicted file was created 2026-08-10T05:14:00Z, and five files created before it
@@ -1601,15 +1632,18 @@ oldest-by-creation. Least-recently-written could not be tested at all: **the
 file's mtime was never recorded before it was deleted**, which is the same
 lesson this section is about, arriving one level up. This section deliberately
 stops there rather than proposing a rule that also fits. What is measured is
-the cap and the eviction, and those are enough:
+the cap and one eviction, and those are enough:
 
-- Every measurement of a past window from these logs is a lower bound that
-  *shrinks over time*. The quiet window read 23.63 active session-hours at
-  01:58Z and 23.25 at 02:12Z, and the difference is a deleted file, not a
-  correction.
+- A measurement of a fixed past window **can shrink between runs** when a log
+  inside it is evicted. The quiet window read 23.63 eventful log-hours at
+  01:59Z and 23.25 at 02:03Z, and the difference is a deleted file, not a
+  correction. One eviction is not a rate, and nothing here claims every run
+  returns a smaller number.
 - The exposure window's fleet produced 18 successor sessions in 111 minutes,
-  about ten new logs an hour, against a 50-file ceiling. **A working fleet
-  turns over the entire retained history in something like five hours.**
+  about ten new logs an hour, against a 50-file ceiling. That is **eviction
+  pressure equal to the whole cache in about five hours** — not a demonstration
+  that every file now present will be gone by then, which needs the
+  oldest-first rule the paragraph above has just refused to assume.
 - The logs of the 2026-08-10T00:25 burst are already gone. The oldest file now
   retained was created at 00:26:39Z, 55 seconds after the last of the seven
   endings — it is a successor session, not a killed one. No future reader will
@@ -1624,7 +1658,7 @@ measurement time. Filed as item 0033.
 ### For the next reader
 
 Re-run item 0030's liveness classification first — that instruction has not
-changed — but then compute active session-hours before dividing anything by
+changed — but then compute eventful log-hours before dividing anything by
 days. An ending-count over an idle fleet is not a small measurement, it is a
 measurement of the fleet; and this file has now published a reassuring quiet
 window twice and withdrawn it twice for exactly that reason.
