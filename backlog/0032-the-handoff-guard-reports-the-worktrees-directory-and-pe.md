@@ -82,3 +82,22 @@ Adopting the JS approach in Python means a `git worktree list` call on the
 handoff path and a decision about what an unanswerable call means -- the JS
 answer is null, "no information", which callers already treat as not-clean.
 That is the same territory as item 0020.
+
+## Status
+
+**The fix is already landed on `work/1`** — commits fe1b1a9, e29b723,
+febd380 and b7d0d2d. This item is filed as the record of the defect and its
+measurements, and is left `proposed` because closing it needs the product
+owner's approval first (`operator backlog close 32` refuses without it, which
+is the gate working as intended).
+
+What landed: the guard exempts linked worktrees by *identity*, taken from
+`git worktree list --porcelain`, and exempts the `.worktrees/` container
+itself by name only when it is the container. Strays inside the container --
+`.worktrees/scratch.txt`, `.worktrees/not-a-worktree/` -- are still reported,
+and a modified tracked file under that path is still reported. A git that
+cannot list worktrees yields "no information" rather than a clean tree.
+
+Three review rounds across four models found four defects in the first two
+drafts; each is described in the commit messages, and each has a test with a
+positive and a negative control.
