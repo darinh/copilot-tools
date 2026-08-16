@@ -760,3 +760,245 @@ def test_a_handoff_with_no_instance_and_no_way_to_infer_one_refuses(
                  "--project-root", str(wired["repo"])])
 
     assert "--instance" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# The worktrees directory is another checkout, not this one's content.
+
+
+def test_an_empty_worktrees_directory_does_not_refuse_the_handoff(repo):
+    """The regression this pair of tests exists for.
+
+    `git worktree remove` deletes the tree and never its parent, so
+    `.worktrees/` outlives the checkouts it held. Git cannot see an empty
+    directory, so in any repository whose `.gitignore` has not got the rule
+    yet it is invisible to `git status` and visible only to the walk -- which
+    reported it, refused the handoff, and told the agent to delete "what was
+    scratch". The toolchain creates this directory itself, so the refusal was
+    self-inflicted and permanent: nothing the agent could clean would clear
+    it.
+    """
+    (repo / ".worktrees").mkdir()
+
+    assert ho.scan_checkout(repo) == []
+
+
+def test_a_peer_worktree_is_never_reported_as_this_checkout_litter(repo):
+    """The worse half, and the reason the walk does not descend either.
+
+    A live worktree here belongs to another agent. Reporting its contents
+    hands one agent another's tree as litter to remove, against the one rule
+    this project states about worktrees -- and it arrives inside a refusal
+    whose remedy is deletion. Both halves are checked because they came from
+    different places: `git status` reports the nested checkout itself, and the
+    walk reaches the scratch directory inside it.
+    """
+    _git(repo, "worktree", "add", ".worktrees/feat-x", "-b", "feat/x")
+    (repo / ".worktrees" / "feat-x" / "tests" / "scratch").mkdir(parents=True)
+
+    assert ho.scan_checkout(repo) == []
+
+
+def test_a_worktrees_directory_below_the_root_is_still_reported(repo):
+    """Negative control: the exemption is anchored, and must stay that way.
+
+    `operator worktree new` writes `/.worktrees/` with a leading slash for
+    exactly this reason -- it names the directory at the repository root and
+    nothing else. An unanchored exemption would silence a `docs/.worktrees/`
+    that somebody meant to track, and an exemption wider than its reason is
+    the kind that gets noticed only when something is already lost.
+
+    `docs/` holds a file so that it is not itself the finding: the walk
+    reports only the outermost empty directory of a nest, so an empty `docs/`
+    would be named instead and this control would pass without ever reaching
+    the directory it is about.
+    """
+    (repo / "docs" / ".worktrees").mkdir(parents=True)
+    (repo / "docs" / "note.md").write_text("kept\n", encoding="utf-8")
+
+    assert sorted(ho.scan_checkout(repo)) == ["docs/.worktrees/",
+                                              "docs/note.md"]
+
+
+def test_a_directory_merely_starting_with_the_name_is_still_reported(repo):
+    """Negative control for the prefix test.
+
+    `.worktrees-old/` is not `.worktrees/`, and a `startswith` without the
+    separator would swallow it. That is the shape that turns one exemption
+    into a family of them.
+    """
+    (repo / ".worktrees-old").mkdir()
+
+    assert ho.scan_checkout(repo) == [".worktrees-old/"]
+
+
+@pytest.mark.parametrize("rel, inside", [
+    (".worktrees", True),
+    (".worktrees/", True),
+    (".worktrees/feat-x", False),
+    ("docs/.worktrees", False),
+    ("docs/.worktrees/feat-x", False),
+    (".worktrees-old", False),
+    (".worktreesx", False),
+    ("worktrees", False),
+    (".worktrees\\x", False),
+])
+def test_in_worktrees_names_the_container_and_nothing_else(rel, inside):
+    """The container only. What is *inside* it is judged by identity.
+
+    ``.worktrees/feat-x`` answers False on purpose: whether it is exempt is a
+    question for ``git worktree list``, not for its name, because a name test
+    cannot tell a peer's checkout from a stray somebody left in the same
+    place. An earlier draft answered True here and hid both.
+
+    The backslash case is the other one worth stating. A backslash is an
+    ordinary character in a POSIX filename, so ``.worktrees\\x`` there is one
+    file at the checkout root and not a path inside anything. This project has
+    already shipped one bug of exactly that family by reaching for `os.path`
+    where the string named the other platform's syntax.
+    """
+    assert ho._in_worktrees(rel) is inside
+
+
+@pytest.mark.parametrize("rel, under", [
+    (".worktrees/feat-a", True),
+    (".worktrees/feat-a/tests/scratch", True),
+    (".worktrees/feat-a2", False),
+    (".worktrees/feat", False),
+    ("elsewhere", False),
+])
+def test_under_any_compares_whole_segments(rel, under):
+    """``startswith`` answers True for ``.worktrees/feat-a2`` under
+    ``.worktrees/feat-a``, which would exempt a directory that is nobody's
+    worktree -- the same trap ``operator_worktree._is_inside`` documents."""
+    assert ho._under_any(rel, {".worktrees/feat-a"}) is under
+
+
+def test_the_guard_and_the_worktree_command_agree_on_the_directory_name():
+    """`handoff_tool` copies the constant rather than importing it.
+
+    That is deliberate -- see the comment there; the handoff must not acquire
+    the work database as an import-time dependency. A copy with nothing
+    binding it to its original is how two spellings drift apart silently, and
+    the failure would be a guard that quietly stops covering the directory it
+    was written for.
+    """
+    import operator_worktree
+
+    assert ho.WORKTREES_DIR == operator_worktree.WORKTREES_DIR
+
+
+def test_a_tracked_file_under_worktrees_is_still_reported_when_modified(repo):
+    """The exemption covers untracked peers, not the whole name.
+
+    Found by adversarial review and confirmed by measurement: filtering every
+    status code hid ` M .worktrees/owned.txt` -- tracked repository content,
+    modified, and then reported clean. A repository is free to track something
+    under this name, and a guard that goes silent about a modification is the
+    failure it exists to prevent. A linked worktree is untracked from the
+    parent's point of view, so `??` is the only code a peer can arrive under
+    and the only one exempted.
+    """
+    (repo / ".worktrees").mkdir()
+    (repo / ".worktrees" / "owned.txt").write_text("v1\n", encoding="utf-8")
+    _git(repo, "add", ".worktrees/owned.txt")
+    _git(repo, "commit", "-m", "track content under the name")
+    (repo / ".worktrees" / "owned.txt").write_text("v2\n", encoding="utf-8")
+
+    assert ho.scan_checkout(repo) == [".worktrees/owned.txt"]
+
+
+def test_a_junction_named_worktrees_is_reported_rather_than_exempted(repo):
+    """Order matters: junction first, exemption second.
+
+    `git worktree add` makes an ordinary directory, so a junction wearing this
+    name is not what the exemption is for -- and testing the name first would
+    let any junction be hidden from the guard by choosing what to call it,
+    which is a wider hole than the one the exemption closes.
+    """
+    if not _can_junction(repo):
+        pytest.skip("junctions need Windows")
+    target = repo / "elsewhere"
+    target.mkdir()
+    (target / "content.txt").write_text("not empty\n", encoding="utf-8")
+    _junction(repo / ".worktrees", target)
+
+    assert ".worktrees" in ho.scan_checkout(repo)
+
+
+def test_a_stray_file_inside_the_worktrees_directory_is_still_reported(repo):
+    """The container is exempt; its contents are not.
+
+    Found by adversarial review of the first fix, which exempted the whole
+    namespace by name and so reported a clean tree for a scratch file an agent
+    had left at `.worktrees/scratch.txt`. That is the direction this guard
+    cannot afford -- it reads exactly like success.
+    """
+    (repo / ".worktrees").mkdir()
+    (repo / ".worktrees" / "scratch.txt").write_text("x\n", encoding="utf-8")
+
+    assert ho.scan_checkout(repo) == [".worktrees/scratch.txt"]
+
+
+def test_an_empty_directory_inside_worktrees_that_is_no_worktree_is_reported(repo):
+    """Same rule for the invisible half.
+
+    `.worktrees/not-a-worktree/` is nobody's checkout -- `git worktree list`
+    does not know it -- so the walk must descend into the container and report
+    it, while still saying nothing about the container itself.
+    """
+    (repo / ".worktrees" / "not-a-worktree").mkdir(parents=True)
+
+    assert ho.scan_checkout(repo) == [".worktrees/not-a-worktree/"]
+
+
+def test_a_worktree_outside_the_convention_is_exempt_too(repo):
+    """Identity, not location.
+
+    `git worktree add <anywhere>` puts a checkout where the `.worktrees/`
+    convention does not reach. It is still a peer's tree and still not this
+    checkout's litter, and a name-based exemption could never see it. The JS
+    reference has covered this since it grew `nestedWorktreePrefixes`.
+    """
+    _git(repo, "worktree", "add", "sideways", "-b", "feat/sideways")
+    (repo / "sideways" / "tests" / "scratch").mkdir(parents=True)
+
+    assert ho.scan_checkout(repo) == []
+
+
+def test_a_git_that_cannot_list_worktrees_reports_no_information(repo, monkeypatch):
+    """None, never `[]`.
+
+    Without the list there is no way to tell a peer's checkout from a stray.
+    Guessing "none" reports a peer's tree as litter to delete; guessing
+    "everything" hides real artifacts. The caller already treats None as no
+    information rather than as a clean tree, so saying so is the only honest
+    answer -- and it is the rule the rest of this module already follows.
+    """
+    real = ho._git
+
+    def refuse(root, *args, **kw):
+        if args[:1] == ("worktree",):
+            return False, ""
+        return real(root, *args, **kw)
+
+    monkeypatch.setattr(ho, "_git", refuse)
+
+    assert ho.scan_checkout(repo) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="one directory under two spellings needs Windows")
+def test_a_differently_cased_worktrees_directory_is_still_exempt(repo):
+    """`.WORKTREES` and `.worktrees` are one directory on Windows.
+
+    `git worktree add .worktrees/feat-x` populates an existing `.WORKTREES`
+    and git then reports the path in that spelling, so a case-sensitive
+    comparison put the guard straight back into the failure this predicate
+    exists to prevent: a live peer's worktree reported as litter to delete.
+    Measured before the fix returning `['.WORKTREES/feat-x/']`.
+    """
+    (repo / ".WORKTREES").mkdir()
+    _git(repo, "worktree", "add", ".worktrees/feat-x", "-b", "feat/x")
+
+    assert ho.scan_checkout(repo) == []

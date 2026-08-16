@@ -427,7 +427,14 @@ def resolve_guid(project_root) -> str:
             f"name, such as a GUID. Fix the line to read:\n"
             f"  \"{resolved_str(project_root)}\",<guid>")
     die(f"No catalog entry for: {target}\n"
-        f"Add it with a line such as:\n  \"{resolved_str(project_root)}\",<guid>")
+        f"This project is not registered, so there is nowhere to write the "
+        f"handoff. Register it by adding a line to\n"
+        f"  {CATALOG}\n"
+        f"such as:\n"
+        f"  \"{resolved_str(project_root)}\",<guid>\n"
+        f"The second column is the project directory name under "
+        f"{projects_root()}; nothing in this toolkit writes the catalog, so "
+        f"the line has to be added by hand.")
 
 
 class StateUnreadable(Exception):
@@ -646,6 +653,14 @@ def scan_checkout(root) -> "list[str] | None":
     if not answered:
         return None
     records = [r for r in out.split("\0") if r]
+    trees = _linked_worktrees(root)
+    if trees is None:
+        # An unanswered question is not an answer of "none". Without the list
+        # there is no way to tell a peer's checkout from a stray, and guessing
+        # either way is worse than saying so: guessing "none" reports a peer's
+        # tree as litter to delete, and guessing "everything" hides real
+        # artifacts. The caller already treats None as "no information".
+        return None
     paths: "list[str]" = []
     ignored: "list[str]" = []
     skip_next = False
@@ -673,11 +688,131 @@ def scan_checkout(root) -> "list[str] | None":
             skip_next = True
         if code == "!!":
             ignored.append(path)
+        elif code == "??" and _under_any(path, trees):
+            # A linked worktree is untracked from the parent's point of view,
+            # so `??` is the only code a peer's checkout can arrive under, and
+            # exempting just that one keeps the rest of the namespace visible.
+            # Filtering every code instead was measured hiding
+            # ` M .worktrees/owned.txt` -- tracked repository content, modified
+            # and then reported clean. A repository is free to track something
+            # under this name, and a guard that goes quiet about a modification
+            # is the failure it exists to prevent.
+            continue
         else:
             paths.append(path)
     if not ignored_known:
         return paths
-    return paths + _empty_dir_strays(root, ignored)
+    return paths + _empty_dir_strays(root, ignored, trees)
+
+
+#: The directory the operator toolchain keeps linked worktrees in, relative to
+#: the checkout root.
+#:
+#: Duplicated from ``operator_worktree.WORKTREES_DIR`` rather than imported:
+#: this module is the handoff, and it is reached on the path where a session is
+#: already ending. Importing the worktree command would pull the work database
+#: and its dependencies in behind it, so a failure anywhere in that import
+#: chain would take the handoff with it -- trading the thing that preserves a
+#: session's context against a constant. ``test_handoff_checkout_guard.py``
+#: asserts the two spellings are equal, so the copy cannot drift silently.
+WORKTREES_DIR = ".worktrees"
+
+
+def _in_worktrees(rel: str) -> bool:
+    """Whether ``rel`` names the worktrees directory itself.
+
+    Anchored at the checkout root, exactly like the ``/.worktrees/`` ignore
+    rule ``operator worktree new`` writes: a ``docs/.worktrees/`` that somebody
+    meant to track is a different directory and is still reported.
+
+    This answers for the *container* only, and nothing inside it. Everything
+    inside is judged by :func:`_linked_worktrees`, which asks git which paths
+    are really checkouts -- so a stray an agent leaves at
+    ``.worktrees/scratch.txt``, or an empty ``.worktrees/not-a-worktree/``, is
+    still reported. An earlier draft exempted the whole namespace by name and
+    hid exactly those, which is the direction this guard cannot afford: it
+    reads as a clean tree.
+
+    Only a path with no separator in it can be the container, so the check
+    rejects those first and ``normcase`` never sees a separator. That matters
+    because ``ntpath.normcase`` rewrites ``/`` to ``\\`` as well as lowering
+    case, and a comparison that let the two concerns meet would answer wrongly
+    on exactly one platform.
+
+    Case is left to ``os.path.normcase`` -- the running platform's own answer,
+    and the right one here because this string came from this machine's own
+    ``scandir``, not from a record naming some other platform's syntax.
+    """
+    norm = rel.strip("/")
+    if "/" in norm:
+        return False
+    return os.path.normcase(norm) == os.path.normcase(WORKTREES_DIR)
+
+
+def _linked_worktrees(root) -> "set[str] | None":
+    """Every linked worktree registered inside ``root``, relative to it.
+
+    ``None`` means git could not answer, which a caller must treat as "no
+    information" rather than "there are none" -- the same rule the rest of
+    this module follows. Spending an unanswered question as an empty set here
+    would report a peer's checkout as litter on every command afterwards,
+    which is the failure this function exists to prevent.
+
+    Identity, not name. The reason is that a name test cannot tell a checkout
+    from an ordinary directory that happens to sit in the same place, so it
+    exempts strays as readily as peers; git knows which paths are actually
+    worktrees and is the only thing that does. It also removes any dependence
+    on how the path is spelled or cased, and covers a worktree created
+    somewhere the convention does not reach -- ``git worktree add <anywhere>``
+    makes that easy, and this is what
+    ``extensions/checkout-guard/guard.mjs`` (``nestedWorktreePrefixes``)
+    already did on the JS side.
+
+    The primary checkout is the first record and is dropped: it is ``root``
+    itself, and keeping it would exempt the entire tree.
+    """
+    answered, out = _git(root, "worktree", "list", "--porcelain")
+    if not answered:
+        return None
+    try:
+        root = Path(root).resolve()
+    except (OSError, RuntimeError, ValueError):
+        # Every relative path below is computed against this one, so a root
+        # that cannot be resolved is not a shorter answer -- it is no answer.
+        # None rather than an empty set, for the reason in the docstring.
+        return None
+    found: "set[str]" = set()
+    for line in out.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        try:
+            tree = Path(line[len("worktree "):].strip()).resolve()
+            rel = tree.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            # `relative_to` raises `ValueError` for a worktree outside this
+            # checkout, which is not an error: it is simply not ours to
+            # exempt. `resolve` adds `OSError` on a denial and `RuntimeError`
+            # on a symlink loop -- all three mean this record cannot be placed,
+            # and an unplaceable record is one this checkout does not own.
+            continue
+        if not rel.parts:
+            continue                      # the primary checkout, i.e. `root`
+        found.add("/".join(rel.parts))
+    return found
+
+
+def _under_any(rel: str, prefixes: "set[str]") -> bool:
+    """Whether ``rel`` is one of ``prefixes`` or sits inside one.
+
+    Compared segment-wise rather than with ``startswith`` so that
+    ``.worktrees/feat-a2`` is not read as living under ``.worktrees/feat-a``.
+    """
+    parts = tuple(p for p in rel.strip("/").split("/") if p)
+    for prefix in prefixes:
+        pp = tuple(p for p in prefix.split("/") if p)
+        if parts[:len(pp)] == pp:
+            return True
+    return False
 
 
 #: How many directories the candidate walk will visit before it gives up.
@@ -708,13 +843,18 @@ def _is_junction(entry) -> bool:
     return tag == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", object())
 
 
-def _empty_dir_strays(root, ignored: "list[str]") -> "list[str]":
+def _empty_dir_strays(root, ignored: "list[str]",
+                      trees: "set[str]") -> "list[str]":
     """Untracked directories holding no files, which git never reports.
 
     ``ignored`` is git's own collapsed answer (``!! node_modules/``), used to
     prune. An unfiltered walk is not a rougher answer -- it is every ignored
     build directory in the project, handed to an agent as litter, plus the
     time to walk `node_modules`.
+
+    ``trees`` is the registered linked worktrees, which are neither reported
+    nor descended: they are other checkouts, and each one's own handoff sees
+    its own contents.
 
     Only the *outermost* empty directory is reported. Naming ``a/``, ``a/b/``
     and ``a/b/c/`` for one stray describes one mistake three times, and the
@@ -763,7 +903,36 @@ def _empty_dir_strays(root, ignored: "list[str]") -> "list[str]":
                 # ancestor. A junction that is legitimate infrastructure
                 # (`node_modules` pointed at a shared cache) is in
                 # `.gitignore`, so `prune` above has already dropped it.
+                #
+                # Ordered before the worktrees exemption below, deliberately.
+                # `git worktree add` makes an ordinary directory, so a
+                # junction wearing that name is not the thing the exemption is
+                # for -- and exempting by name first would let any junction be
+                # hidden from this guard by choosing what to call it, a wider
+                # hole than the one the exemption closes.
                 links.append(child)
+                continue
+            if _in_worktrees(child):
+                # The container itself, and only the container. `git worktree
+                # remove` never removes this parent, so it outlives the trees
+                # it held and -- in any repository whose `.gitignore` has not
+                # got the rule yet -- becomes an empty untracked directory
+                # that refuses every handoff from here on. It is created by
+                # this toolchain, so the refusal is self-inflicted, and the
+                # refusal text tells the agent to delete what it names.
+                #
+                # The walk still descends: anything inside that is not a
+                # registered worktree is an ordinary stray and is reported as
+                # one, so `.worktrees/not-a-worktree/` is still found.
+                stack.append(child)
+                continue
+            if _under_any(child, trees):
+                # A live worktree belongs to a peer. Reporting a scratch
+                # directory inside it hands one agent another's tree as litter
+                # to remove -- against the one rule this project states about
+                # worktrees -- inside a refusal whose stated remedy is
+                # deletion. Each checkout's own handoff sees its own contents,
+                # so nothing goes unwatched.
                 continue
             candidates.append(child)
             stack.append(child)
