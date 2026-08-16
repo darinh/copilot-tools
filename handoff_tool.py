@@ -774,7 +774,13 @@ def _linked_worktrees(root) -> "set[str] | None":
     answered, out = _git(root, "worktree", "list", "--porcelain")
     if not answered:
         return None
-    root = Path(root).resolve()
+    try:
+        root = Path(root).resolve()
+    except (OSError, RuntimeError, ValueError):
+        # Every relative path below is computed against this one, so a root
+        # that cannot be resolved is not a shorter answer -- it is no answer.
+        # None rather than an empty set, for the reason in the docstring.
+        return None
     found: "set[str]" = set()
     for line in out.splitlines():
         if not line.startswith("worktree "):
@@ -782,10 +788,12 @@ def _linked_worktrees(root) -> "set[str] | None":
         try:
             tree = Path(line[len("worktree "):].strip()).resolve()
             rel = tree.relative_to(root)
-        except (OSError, ValueError):
-            # `relative_to` raises for a worktree outside this checkout, which
-            # is not an error: it is simply not ours to exempt. `resolve` can
-            # raise on a path the filesystem will not answer for.
+        except (OSError, RuntimeError, ValueError):
+            # `relative_to` raises `ValueError` for a worktree outside this
+            # checkout, which is not an error: it is simply not ours to
+            # exempt. `resolve` adds `OSError` on a denial and `RuntimeError`
+            # on a symlink loop -- all three mean this record cannot be placed,
+            # and an unplaceable record is one this checkout does not own.
             continue
         if not rel.parts:
             continue                      # the primary checkout, i.e. `root`
