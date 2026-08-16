@@ -314,3 +314,92 @@ and `tool.execution_complete` occur in equal numbers in each of their logs
 safely past the 38.6-minute ceiling this item measured for a silence with the
 agent demonstrably still working, though that ceiling is empirical and a fleet
 with longer tool calls should re-derive it.
+
+## Re-measurement, 2026-08-16T02:00Z: the same four, and two defects in the instrument
+
+Two further readings, at 01:54:35Z and 02:00:01Z, taken with a script rather
+than by hand so that the two readings are the same measurement. Neither adds a
+new instance to the state and neither takes one out of it.
+
+### The four have not moved, and the marker *count* says so without arithmetic
+
+| pid | newest non-background event | 01:39Z | 01:54Z | 02:00Z | markers 01:54Z | markers 02:00Z |
+|---|---|---|---|---|---|---|
+| 20076 | `session.idle` 2026-08-16T00:36:16.470Z | 1.05h | 1.31h | 1.40h | 39,327 | 39,327 |
+| 24048 | `session.idle` 2026-08-15T23:57:30.826Z | 1.70h | 1.95h | 2.04h | 151,144 | 151,144 |
+| 47944 | `session.idle` 2026-08-16T00:37:53.050Z | 1.02h | 1.28h | 1.37h | 36,831 | 36,831 |
+| 86508 | `session.idle` 2026-08-16T00:36:06.340Z | 1.05h | 1.31h | 1.40h | 28,481 | 28,481 |
+
+The other seven supervised sessions were working at both readings, newest
+marker 0.00–0.01h old, and three of them are pids that did not exist at
+01:39Z — the fleet churned around the four while the four did nothing.
+
+**The count column is the stronger of the two, and it is the one to reach for
+next time.** An age is a difference between a log timestamp and the measuring
+clock, so reading one requires trusting both; a count is an integer the
+instrument produces on its own. These four counts are *identical* across two
+readings 5.4 minutes apart, which establishes that not one forwarded event of
+any kind occurred in between — no timestamp parsing, no clock, no timezone.
+The section above had to argue that background churn was not flattering the
+fleet; a repeated count settles the same question by construction. Note the
+weakness this shares with everything else here: it is a *differential*
+instrument, so it says nothing from a single reading, which is exactly when
+the age is all you have.
+
+### A pid is not a session, and this measurement was one line away from saying it was
+
+A pinned log is `process-<epoch_ms>-<pid>.log`, so the obvious way to find a
+live session's log is to match the pid. **That is wrong, and on this machine it
+is wrong right now.** At 01:54Z:
+
+```
+pid 52712  live process started      2026-08-16T01:51:41Z
+           log process-1786339891484-52712.log, 1036.3 MB
+           log's embedded creation    2026-08-10T05:31:31Z
+           disagreement               505,210 s  (5.85 days)
+```
+
+Matching on the pid alone hands a 1 GB log belonging to a session that died
+5.8 days ago to a process three minutes old. The reading it produces is not
+even "idle": the log's newest marker is hours stale, its mtime is 4.8 hours
+old, and the process it has been attributed to is alive and busy — so the
+detector reports a working session as dead.
+
+It is worse than a coincidence of numbers, because the live 52712 is not a
+session at all. Its parent is pid 24072, `copilot.EXE --yolo --autopilot ...`,
+so it is one of the eight worker processes every Copilot lead spawns. A
+detector matching pids would have to reject it for a second, independent
+reason. The trace agrees it is not the owner: pid 52712 appears as
+`session_pid` 131 times, all of them the dead session.
+
+The guard is cheap and belongs in anything built on these logs: the log name
+carries the creating process's epoch-ms, so **require it to agree with the
+running process's start time** — 90 seconds of tolerance is ample, the
+agreeing rows here differ by 0.6 to 0.8 s. This is item 0029's recycled-pid
+hazard arriving in a different instrument, and the reason it is recorded here
+rather than there is that it fired in the measurement *this item* runs.
+
+### Two live processes this instrument cannot classify, and the trace can
+
+Two live `copilot` processes have a pinned log of zero bytes and therefore zero
+markers: pid 61852 (running since 2026-08-11T17:45:33Z, log untouched for
+96.4h) and pid 75944 (since 2026-08-14T03:20:23Z, 29.3h). Per the rule this
+item states, zero occurrences is **cannot tell**, not idle — and a detector
+that has to emit "cannot tell" twice on every run will be silenced by whoever
+maintains it.
+
+It does not have to. Neither pid appears anywhere in `trace.jsonl` as a
+`session_pid`, and both have a `powershell.exe` parent rather than a
+supervisor, so **they are not supervised sessions** — they are stray CLI
+processes, and the correct verdict is *out of scope* rather than *unknown*.
+That is the shape of the answer for any detector built here: the log says what
+a session is doing, and the trace says which processes are sessions. Reading
+only the log conflates "an agent that stopped" with "a process nobody
+supervises", and those need opposite responses.
+
+Both facts about the previous tables in this item follow, and neither changes
+a conclusion: they listed eleven processes because they were assembled from the
+supervised set by hand, so they silently excluded these two rather than
+mis-reporting them, and no live supervised session was ever attributed to the
+wrong log.
+
