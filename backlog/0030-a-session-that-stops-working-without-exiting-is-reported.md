@@ -259,10 +259,9 @@ question is still open.
 ### The state came back within ninety minutes, and it is measurable live
 
 Measured 2026-08-16T01:39Z, fourteen minutes after the table above, this time
-classifying the newest forwarded event by type instead of counting markers.
-`session.background_tasks_changed` keeps firing after an agent goes quiet, so
-"newest event of any kind" and "newest event that is not background churn" are
-different questions and the first one flatters the fleet:
+classifying the newest forwarded event by *type* rather than only dating it.
+The type is what names the state: an age says a session has been quiet, and
+`session.idle` says it finished a turn and stopped.
 
 | pid | newest event of any kind | newest non-background event |
 |---|---|---|
@@ -278,6 +277,17 @@ different questions and the first one flatters the fleet:
 | 91392 | 0.00h `assistant.reasoning_delta` | 0.00h `assistant.reasoning_delta` |
 | 91624 | 0.00h `assistant.streaming_delta` | 0.00h `assistant.streaming_delta` |
 
+**Read the two columns as agreeing, because they do.** A first draft of this
+section presented the split as though background churn went on flattering the
+fleet after the agent stopped, and it does not: in all four quiet logs the last
+`session.background_tasks_changed` lands 13 to 50 ms after `session.idle` — it
+is the trailing event of the same turn, not activity during the silence. `20076`
+emitted `session.idle` at 00:36:16.470Z and its last background event at
+00:36:16.498Z, and nothing follows in either column. The instrument that does
+keep advancing through the silence is the log's mtime, which the section above
+already disposes of. **Do not read "the two columns differ" as the detector's
+signal here; there is no row in which they differ.**
+
 **Four instances are already back in the state this item describes** — newest
 non-background event `session.idle`, between 1.0 and 1.7 hours ago, each with a
 live process and a supervisor reporting `looping`. Three of them started at
@@ -292,5 +302,15 @@ Two things follow that the days-old measurement could not show:
 - **It does not need days to observe.** The signature is visible about an hour
   in, from one file, on a machine anyone can run this on. Whatever detector is
   eventually built has a same-day test rather than a week-long one — and this
-  table is what it must reproduce, including the four rows where the newest
-  event of *any* kind is fresh and the session is nevertheless idle.
+  table is what it must reproduce: four sessions whose newest forwarded event
+  of any kind is over an hour old and is `session.idle`, while their processes
+  are up, their logs' mtimes are minutes old, and `operator list` calls all
+  eleven `looping`.
+
+Two things this table does **not** show, against the reviewer's checks rather
+than by assumption. None of the four is mid-tool-call: `tool.execution_start`
+and `tool.execution_complete` occur in equal numbers in each of their logs
+(166/166, 500/500, 151/151, 85/85), so nothing was still running. And 1.02h is
+safely past the 38.6-minute ceiling this item measured for a silence with the
+agent demonstrably still working, though that ceiling is empirical and a fleet
+with longer tool calls should re-derive it.
