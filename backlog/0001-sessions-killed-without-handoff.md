@@ -1542,7 +1542,8 @@ exposure changes the answer forty-fold. It says nothing about kills. The kill
 rate is 0 in both windows and the ratio of two zeroes does not exist.
 
 **Who owns these hours, which is not the fleet in equal shares.** Attributing
-each active minute to its instance, through `session_pid` on the ending record:
+each eventful minute to its instance, through `session_pid` on the ending
+record:
 
 | window | total | largest attributed contributor | the measuring instance | unattributed |
 |---|---|---|---|---|
