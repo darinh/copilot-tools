@@ -8,6 +8,11 @@ spec: none
 
 ## Evidence
 
+A design proposal now exists and is the place to argue with this item:
+`~/repos/operator/docs/seat-identity.md` (commit 0a6ba8e). It is a proposal
+only — nothing is built, and it records the objection that may kill the idea
+alongside the case for it.
+
 The request, in the user's words (2026-08-17):
 
 > "What I'm really interested in is being able to use agents that have
