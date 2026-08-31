@@ -1668,3 +1668,158 @@ And do it promptly. The logs this rests on have a retention measured in hours
 once the fleet is working, so a window you did not measure today is a window
 you cannot measure.
 
+
+## Re-measurement, 2026-08-31: the signature recurred once, in a fleet that was working
+
+The window is 2026-08-16T02:00:00Z (where the section above stops) to
+2026-08-31T23:25Z — **15.89 days**, the longest gap this file has had between
+measurements. Local boundary 2026-08-15 19:00:00 at UTC-7, derived from the
+machine's own offset rather than assumed (step 1).
+
+**Result: one unaccounted ending, and it is the first in any window this file
+has measured.** The three windows in the section above hold zero between them.
+
+### The instrument was wrong first, and would have doubled the count
+
+Step 4 says to read `restart` and `exit_code` together. It does not say where
+`exit_code` lives, and the first pass of this measurement read it at the top
+level of the `session_exit` record. **It is not there — it is inside
+`markers`.** Read from the top level it is `None` on every record ever written,
+so every `restart=False` ending classified as the kill signature, and the first
+run of this scan reported **2 kills instead of 1**.
+
+That is the fourth instrument artifact in this file and it has the same shape as
+the other three: a field that could not carry the value being read out of it,
+producing a confident number. It was caught by dumping the raw records before
+believing the classification, which is now the first step below.
+
+    markers.exit_code   the process exit code, tri-state (null = unobserved)
+    markers.restart     the restart marker, tri-state
+    code                NOT an exit code. A fingerprint of the supervisor's
+                        own source, present on 134 of 1,113 records (12%)
+
+Anyone re-running this should print one record and look at it before writing a
+classifier over the population.
+
+### Steps 2 and 3: reconciled, and safe to read
+
+| check | value |
+|---|---|
+| `operator.log` lines after the boundary | 1,697 |
+| `copilot exited unexpectedly` | 2 |
+| `restart signal detected!` | 35 |
+| `Giving up` | **0** |
+| `markers cannot be examined` | **0** |
+| `trace.jsonl` `session_exit` records | 37 |
+| of those, `restart=True` | 35 |
+
+`restart=True` equals the restart-signal count exactly, and 35 + 1 + 1 = 37
+accounts for every record. The population is not censored, and neither
+classification-failure counter fired, so step 4 is safe to read here — which is
+the check three of the four earlier measurements in this file failed.
+
+### Step 4: the classification
+
+- **35 `restart=True`** — a handoff was written. Not evidence of anything.
+- **1 `restart=False`, `exit_code=0`** — `operator` #4 at 2026-08-17T18:44:46Z.
+  Copilot ended cleanly on its own without a handoff. Not a kill.
+- **1 `restart=False`, `exit_code=null`** — `discord-invite-manager` #241 at
+  2026-08-20T08:28:32Z, `session_pid=47944`. **The kill signature.**
+
+### The one kill is a different shape from the 2026-08-04 wave
+
+The root-cause note at the top of this file describes a broadcast: "All eight
+project instances are hit within roughly 70ms, repeatedly — one broadcast, not
+eight independent decisions." This one is not that.
+
+| endings within | distinct instances |
+|---|---|
+| ±1s | 1 |
+| ±60s | 1 |
+| ±300s | 1 |
+| ±3600s | **1** |
+
+`discord-invite-manager` is the only instance to end within a full hour either
+side. And the recovery was immediate: a replacement session was started 38
+seconds later (`session start --instance discord-invite-manager` at
+08:29:10Z), worked normally for 28 minutes — `backlog ready`, `work list`,
+`backlog new`, `worktree new --help` — and ended at 08:56:54Z with
+`restart=True`, a proper handoff.
+
+**So a lone unexplained ending, promptly replaced, is what this window
+contains.** Whether it shares a cause with the 2026-08-04 wave is not
+established here and should not be assumed; the only thing measured is that its
+neighbourhood is empty where the wave's was crowded. Per this file's own
+standing instruction: an explanation that fits is not the explanation.
+
+### Step 5: the exposure denominator, and why the count is not a quiet-window count
+
+The reason the previous section built this denominator is that "no kills" and
+"nothing running" are the same number. They are not the same here.
+
+| window | span | eventful log-hours | mean eventful at once | endings | unaccounted |
+|---|---|---|---|---|---|
+| quiet, 08-10→08-15 | 136.75h | 23.25 | 0.17 | 13 | 0 |
+| inert, 08-15 | 1.80h | 1.82 | 1.01 | 2 | 0 |
+| exposure, 08-16 00:09→02:00 | 1.85h | 12.48 | 6.75 | 18 | 0 |
+| **this one, 08-16→08-31** | **381.43h** | **242.27** | **0.635** | **37** | **1** |
+
+**This window carries ten times the eventful log-hours of the five-and-a-half
+day quiet window** (242.27 against 23.25), so the single kill is not the blind
+detector of a stopped fleet. Normalised:
+
+- 0.153 endings per eventful log-hour (quiet: 0.56, exposure burst: 1.44)
+- **0.0041 kills per eventful log-hour** — the first non-zero value this file
+  has been able to put on that line.
+
+The fleet is alive at the time of writing, checked per step 5 by the newest
+`Forwarding event for session` marker rather than by mtime: eight logs carry
+markers within the last minute.
+
+### Four things wrong with that denominator, stated before it is used again
+
+**Attribution failed completely.** The recipe says to decide which logs are
+supervised sessions from the pids `trace.jsonl` names. The pid in a log
+filename (`process-<epoch_ms>-<pid>.log`) matched **0 of the 1,070**
+`session_pid` values in the trace. They are different pids — the log name
+carries the `copilot.EXE` pid, and all nine live ones are current sessions —
+so the supervised-session filter could not be applied at all and the figure
+above is over *every* copilot process. The previous window's figure was
+filtered. **The two rows are therefore not strictly comparable**, and the
+direction of that difference is not known.
+
+**Logs are missing from the window.** 21 remain on disk; at least 37 sessions
+ended inside it, so the logs of at least sixteen are gone. Exposure is
+undercounted by an unknown amount, which pushes the kill *rate* up. Item 0033
+is the reason.
+
+**92% of the exposure is one session.** `process-1786909174577-54460.log`
+contributes 13,431 of the 14,536 eventful minutes, from a single session uuid
+(`cfabc021-…`) spanning 2026-08-16T19:39Z to 2026-08-28T03:03Z. It is real work
+— sampled, 88% of its events are `assistant.streaming_delta` and
+`assistant.tool_call_delta`, and the content is an agent reasoning about
+equivalent mutants — so the exposure is genuine rather than an artifact. But a
+denominator that is one session wearing the fleet's clothes should be read as
+such, and a mid-turn kill of *that* session would have been one ending against
+224 hours.
+
+**The index caveat from the previous section still applies unchanged**: a
+single marker credits a whole minute, the marker is silent inside one long tool
+call, and neither the size nor the sign of the net bias is known.
+
+### This seat is in the population, and its own record is odd
+
+`operator` — the instance that took this measurement — accounts for 2 of the 37
+endings, and one of them is the `exit_code=0` above. Worth two notes for
+whoever reads this next:
+
+- **Session #5 has no `session_exit` record at all.** It ran on 2026-08-17,
+  and the trace goes from #4 (08-17T18:44:46Z) straight to nothing; the seat is
+  now on #6. An ending that was never recorded is not an unaccounted ending —
+  it is invisible to every count in this file, including this one — and it is a
+  different failure from the one this item tracks. Not investigated here.
+- **The stale handoff is explained.** #4 ended `exit_code=0` with no handoff, so
+  the file session #3 wrote on 08-15 was still on disk sixteen days later, and
+  #6 was told to read it. A handoff nobody deletes and nobody supersedes is
+  read as current by the next session that starts.
+
