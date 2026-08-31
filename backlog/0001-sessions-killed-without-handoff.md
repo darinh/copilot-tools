@@ -1823,3 +1823,45 @@ whoever reads this next:
   #6 was told to read it. A handoff nobody deletes and nobody supersedes is
   read as current by the next session that starts.
 
+
+### Step 5's attribution can be done, just not by pid
+
+Recorded because the failure above is a defect in the recipe rather than in the
+fleet, and the next person to run this should not lose an hour to it.
+
+**By pid it cannot be done.** A log is named `process-<epoch_ms>-<pid>.log` and
+that pid is the `copilot.EXE` process; the trace's `session_pid` is a different
+number. The two sets intersect in **0 of 1,070** values. All nine live
+`copilot.EXE` pids appear in log names, so the log name is not wrong — it is
+simply not the identifier the trace records.
+
+**By session uuid it can.** Both sides carry it: every log line reads
+`Forwarding event for session <uuid>`, and `~/.operator/restart/` holds
+`<instance>.state`, `<instance>.session` and `<instance>.launch.json`, each
+naming the session id of that instance. Joining on it resolved **20 of 21 logs**
+to an owning instance, covering 16.8 GiB of the 16.8 GiB on disk.
+
+    ac-unreal              12,624.8 MB      repos                  74.1 MB
+    repos                   2,953.3 MB      prism                  44.4 MB
+    snes-ghosts               242.9 MB      scripts                37.0 MB
+    operator                  229.1 MB      book-translator        23.9 MB
+    copilot-tools             214.3 MB      discord-invite-manager 23.6 MB
+    prism                     184.4 MB      subtitle-localizer     20.7 MB
+    scripts                   143.3 MB      ...
+
+**The limitation, stated so it is not discovered later:** those files hold the
+*current* session, so this resolves logs whose session is live or was live when
+the instance last wrote state. A log whose session has been superseded resolves
+to nothing, and **"unresolved" must not be read as "not a supervised session"** —
+it is the same "cannot tell" that step 5 already insists on elsewhere. One log
+here is unresolved because it contains no `Forwarding` marker at all.
+
+Applied to the exposure figure above, this says the denominator is dominated by
+`ac-unreal`: the 12.6 GB log holding 92% of the eventful minutes is one
+`ac-unreal` session running 2026-08-16T19:39Z to 2026-08-28T03:03Z. `ac-unreal`
+also accounts for 10 of the window's 37 endings, and it is **no longer in
+`operator list`** at the time of writing. So the largest single contributor to
+this window's exposure belongs to an instance that has since left the fleet,
+and a reader comparing this row to a later one should know that before drawing
+a trend through the two.
+

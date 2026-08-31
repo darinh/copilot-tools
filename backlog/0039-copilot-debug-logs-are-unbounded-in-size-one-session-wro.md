@@ -56,3 +56,37 @@ The retention item 0033 caps the log directory at 50 FILES and says nothing abou
 ## Notes
 
 Distinct from 0033, which is about eviction destroying evidence by count - this is unbounded growth of a single file, and the two interact badly: a size-based sweep that evicts the big file destroys exactly the log 0001 most wants, while a count-based cap leaves it. Whatever is done should keep 0001 and 0030 able to read what they need. Note also that the log filename pid (process-<epoch_ms>-<pid>.log) is the copilot.EXE pid and matched 0 of 1,070 session_pid values in trace.jsonl, so nothing currently maps a log to the instance that owns it - worth fixing alongside, because it is what stopped 0001 filtering exposure to supervised sessions on 2026-08-31.
+
+## Ownership, added 2026-08-31: the two large logs belong to ac-unreal and repos
+
+Resolved by joining the session uuid in each log against the one named in
+`~/.operator/restart/<instance>.state`, which works where the pid in the log
+filename does not (that is the `copilot.EXE` pid and matches nothing the trace
+records). 20 of 21 logs resolved.
+
+| owner | log | size |
+|---|---|---|
+| **ac-unreal** | `process-1786909174577-54460.log` | **12,624.8 MB** |
+| **repos** | `process-1786834628244-24048.log` | 2,953.3 MB |
+| snes-ghosts | `process-1786848399237-50656.log` | 242.9 MB |
+| operator | `process-1786992294116-70072.log` | 229.1 MB |
+| copilot-tools | `process-1786845076616-58856.log` | 214.3 MB |
+
+Every other log is under 200 MB. So this is not a fleet-wide accumulation to be
+managed in aggregate — **two instances hold 93% of the bytes**, and `ac-unreal`
+alone holds 73%.
+
+`ac-unreal`'s session ran 2026-08-16T19:39Z to 2026-08-28T03:03Z, 11.3 days
+without ending, and `ac-unreal` is no longer in `operator list`. `repos` is
+still running. Whether an 11-day session is itself the thing to fix is a
+separate question from the logging volume and is not asserted here.
+
+**Correction to a figure this item nearly carried.** A first pass reported the
+directory growing from 16.69 GB to 18.06 GB during one session, which would
+have been about 80 GB/day extrapolated. It is not growing: the two numbers are
+the same quantity in binary and decimal units (18.06e9 bytes = 16.82 GiB). Two
+readings 120 seconds apart showed **0 MB of growth**. The rate at which this
+accumulates is therefore still unmeasured — the 1 GB/day/busy-session figure in
+the evidence above is derived from one file's size over its own lifetime, not
+observed live.
+
