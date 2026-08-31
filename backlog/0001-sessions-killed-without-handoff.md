@@ -987,7 +987,18 @@ The kill signature needs both fields together — `restart=False` **and**
      process. Not a kill.
    - `restart=False`, `exit_code=0` — Copilot ended cleanly on its own.
    - `restart=False`, `exit_code=null` — nobody observed the ending. **This is
-     the kill signature, and it is the only one.**
+     the kill signature among endings that were recorded.** It is *not* the
+     only kill shape: a supervisor that dies together with its session writes
+     no record at all, so those endings are missing from the population rather
+     than present and unaccounted. **Run the completeness check in step 4a
+     before reading any count from this classifier** — see the 2026-08-31
+     correction, which measured eleven such endings in one window.
+4a. **Count what is missing before classifying what is present.** For every
+   instance with state, compare the session number in its last `session_exit`
+   against the one in its newest `supervisor_start`. Any gap is that many
+   endings the trace never recorded, and the ending-count is short by at least
+   that much. A gap means the supervisor died with its session — look for the
+   cause in step 6, not in this classifier.
 5. **Divide endings by days before believing a quiet window.** A detector that
    only fires at an ending is blind in proportion to how few there are, and
    this fleet's rate fell about sixtyfold between 2026-08-05 and 2026-08-15 —
@@ -1005,9 +1016,15 @@ The kill signature needs both fields together — `restart=False` **and**
    newest non-supervisor `operator` invocation from that repository in
    `trace.jsonl`. Both are downstream of the agent completing a turn, so they
    confirm inactivity without explaining it.
-6. **Consult the event log only once step 4 has found a kill.** Id 21 at its
-   timestamp is the 2026-08-09 cause; Id 25 is routine, frequent and harmless,
-   and treating it as suspicious buries the one that matters.
+6. **Consult the event log whenever step 4a is non-zero — not only once step 4
+   has found a kill.** The original ordering was wrong and is withdrawn: a
+   supervisor that dies with its session produces no step-4 row at all, so
+   gating this behind step 4 guarantees the one wave this item has actually
+   explained would never be looked for. Id 21 at its timestamp is the
+   2026-08-09 cause (a logon-session replacement, with `LastBootUpTime`
+   unchanged); System 1074/6005/6006/41 is a reboot, which is the 2026-08-28
+   cause. Id 25 is routine, frequent and harmless, and treating it as
+   suspicious buries the one that matters.
 7. **A fleet-wide `*.loop.pid` rewrite is not a wave by itself.** Read
    `adopted` in `*.loopcode.json`: `true` is an `operator restart-loop` sweep.
    A wave leaves supervisors that restarted without adopting anything.
@@ -1672,7 +1689,9 @@ you cannot measure.
 
 Measured 2026-08-31T23:2xZ, fifteen days after the section above, which is the
 forward test that section asked for. It returns a result about kills, and it
-also **withdraws the sentence in the recipe that says what a kill looks like.**
+also **withdraws the word "only" from step 4 of the recipe** — the signature
+that step names is right, but it is not the only shape a kill takes, and the
+other shape leaves nothing for step 4 to classify.
 
 ### What the ending-count says on its own
 
@@ -1747,7 +1766,7 @@ long it lasted:
 **Nothing between those lines. Fifteen days and twenty-two hours of a
 supervisor that reported `looping` throughout.**
 
-### What ended them, which is measured and not inferred
+### What ended them: a reboot, and which sessions that statement covers
 
 The machine rebooted. From the Windows event log and `LastBootUpTime`:
 
@@ -1757,15 +1776,46 @@ The machine rebooted. From the Windows event log and `LastBootUpTime`:
 2026-08-28T03:04:33Z  evt 6005  system up      (LastBootUpTime)
 ```
 
-Four sessions were still working 42 seconds into that shutdown. Newest
-forwarded event in each surviving pinned log, by type rather than age:
+**Two different populations are in play here and an earlier draft of this
+section merged them.** The gap census above is computed from `operator list`,
+so it sees only instances a human restarted on 08-31; the surviving Copilot
+logs see whatever escaped the ring. They overlap in two instances, not nine.
+Set out separately, with the newest non-background event in each pre-reboot
+log:
 
-| pid | instance | log size | newest event | at |
-|---|---|---|---|---|
-| 54460 | ac-unreal | **12.33 GB** | **`tool.execution_start`** | 03:03:09.856Z |
-| 70072 | operator | 229.1 MB | `session.tools_updated` | 03:03:09.759Z |
-| 97616 | finances | 91.6 MB | `session.tools_updated` | 03:03:10.377Z |
-| 34096 | discord-invite-manager | 4.5 MB | `session.tools_updated` | 03:03:09.064Z |
+| instance | pre-reboot session | last agent event | state at the reboot |
+|---|---|---|---|
+| ac-unreal | 54460 | **`tool.execution_start`** 03:03:09.856Z | **working** |
+| finances | 97616 | `session.tools_updated` 03:03:10.377Z | **working** |
+| operator | 70072 | `session.tools_updated` 03:03:09.759Z | **working** |
+| discord-invite-manager | 34096 | `session.tools_updated` 03:03:09.064Z | **working** |
+| repos | 24048 | `session.idle` 08-21T06:27Z | idle 6.9 d |
+| book-translator | 20076 | `session.idle` 08-17T18:58Z | idle 10.3 d |
+| scripts | 14184 | `session.idle` 08-17T05:10Z | idle 10.9 d |
+| copilot-tools | 58856 | `session.idle` 08-16T18:12Z | idle 11.4 d |
+| snes-ghosts | 50656 | `session.idle` 08-16T03:40Z | idle 12.0 d |
+| prism | 24072 | `session.idle` 08-16T03:11Z | idle 12.0 d |
+| subtitle-localizer | 86508 | `session.idle` 08-16T00:36Z | idle 12.1 d |
+
+**Eleven sessions were alive when the machine went down; four were working and
+seven were idle.** Only the four are *observed* dying — their logs stop within
+1.5 seconds of each other, 42 seconds after the shutdown was initiated. The
+seven idle ones cannot be observed dying, because an idle session emits nothing
+and item 0030 is precisely the finding that its process stays up regardless; a
+log whose last event is 08-16 is silent about 08-28 either way.
+
+So the claim is made at two strengths. **Four sessions, directly observed,
+killed while working.** Seven more that had gone idle and whose processes are
+inferred to have been taken by the same reboot — inferred from the session-number
+gap, which says their endings were never recorded, and from there being no
+other event between their last activity and the relaunch. That inference is
+good but it is an inference.
+
+Note which instances the two methods miss. **`ac-unreal` and `finances` are
+absent from the gap census entirely**, because nobody restarted them on 08-31
+— and `ac-unreal` is the largest loss on this list. A census taken from
+`operator list` is conditioned on what a human chose to bring back, which makes
+nine a **lower bound on unrecorded endings, biased by that choice**.
 
 `54460`'s last act was to **start a tool call**. That is the harm this item is
 named for, observed directly rather than inferred: a session interrupted
@@ -1806,22 +1856,47 @@ within half a minute, and then never recorded anything again.
 zero.** The largest loss of agent context this file has ever documented
 contributed **nothing** to the ending-count above.
 
-### The correction, which is to step 4 of the recipe
+**A reboot is not the only thing that does this, and this file already contains
+another.** What produces an unrecorded ending is the supervisor and its session
+dying *together*, whatever kills them. The 2026-08-09 wave in this item was a
+logon-session replacement with `LastBootUpTime` unchanged — the same co-death
+with a different cause. A logoff, a console teardown or a fast-startup hybrid
+shutdown would do it too. Reboot is the instance measured here, not the class.
+
+### The correction, which is to step 4's *exclusivity*
 
 Step 4 says, of `restart=False` with `exit_code=null`:
 
 > **This is the kill signature, and it is the only one.**
 
-**It is not the only one.** That signature is what a *surviving* supervisor
-writes about a session it watched die. A reboot takes the supervisor and the
-session in the same instant, so there is no survivor to write anything, and the
-ending is not recorded as unaccounted — **it is not recorded at all.**
+**The signature is right; "the only one" is false.** Step 4 is a classifier of
+rows that exist, and on those rows it reads correctly — that is what a
+surviving supervisor writes about a session it watched die. What it cannot do
+is see a session whose supervisor died in the same instant, because that
+ending produces **no row at all**. This is a census gap, not a misread field,
+and the 2026-08-05 correction in this file is the precedent: handoffs were
+invisible then because they produced no record, not because a field lied.
 
 The two failure modes are opposite in the worst possible way. An unaccounted
-ending *raises* the count that step 4 reads. A reboot *lowers* it, because the
-sessions that would have ended are gone before they can end. A window
-containing a reboot therefore reads quieter than a window without one, and
-every quiet window in this file was read as evidence that kills had stopped.
+ending *raises* the count step 4 reads. A co-death *lowers* it — not because
+the sessions failed to end, they very much ended, but because **the ending is
+never written down.**
+
+Be precise about what that does to a window, because "reads quieter" bundles
+two different things and only one of them is a defect:
+
+- **The reboot deaths are the defect.** Eleven endings occurred and contributed
+  zero to the numerator. That is the instrument failing.
+- **The 3.85 days of downtime afterwards are not.** No sessions existed, so no
+  endings occurred, and a count of zero is the correct answer. Item 0030's
+  lesson applies unchanged.
+- **The calendar denominator is a third thing.** Dividing by 15.89 days spreads
+  a real 12-day window over a span that includes four days of an empty machine,
+  which is why the exposure table below is cut at the boot instant.
+
+Only the first is the instrument reading backwards, and it is enough on its
+own: a window containing a co-death reads *quieter than the truth*, and every
+quiet window in this file has been read as evidence that kills had stopped.
 
 This is the eleventh instrument defect recorded in this item — the ninth is
 the log mtime, the tenth was in a reader rather than a writer — and it is the
@@ -1830,11 +1905,13 @@ Step 4 reads `session_exit` correctly. There is simply an ending it never
 gets to read.
 
 Note what this does **not** say. The 2026-08-09 wave was explicitly checked
-against this and cleared — the section above records "No reboot:
+against a reboot and cleared — the section above records "No reboot:
 `LastBootUpTime` is 2026-08-04 10:02:54 and unchanged". That check was right
-and stands. What is new is that a reboot leaves *no* record, so it must be
-excluded by reading `LastBootUpTime`, and can never be excluded by finding the
-ending-count quiet.
+and stands, and that wave turned out to be a logon-session replacement, which
+is a co-death of the same class arriving by a different route. What is new is
+that co-death leaves *no* record, so it has to be excluded by looking for the
+event that caused it, and can never be excluded by finding the ending-count
+quiet.
 
 ### The exposure, which is one session wearing the fleet's clothes
 
@@ -1850,8 +1927,9 @@ the definition the section above settled on:
 
 240.82 eventful log-hours is an order of magnitude more exposure than any
 window previously measured here — and **93.0% of it is the single ac-unreal
-session**, 223.85 hours of it. Every other instance on the machine contributed
-an hour or less across twelve days:
+session**, 223.85 hours of it. One other instance, `repos`, contributed 10.40
+hours; the remaining eight contributed under two hours *each* across twelve
+days:
 
 ```
 pid 54460  223.85 h  93.0%      pid 58856    0.93 h   0.4%
@@ -1865,37 +1943,64 @@ A mean of 0.83 sessions working at once, across a fleet of nine to eleven, is
 item 0030's inertia at full scale: seven of the surviving logs end in
 `session.idle` between 2026-08-16 and 2026-08-21 and never resume. **The fleet
 did not work for two weeks; one runaway session did, and the aggregate wore its
-result.** Any exposure figure quoted from this window without that breakdown
-overstates fleet-wide exposure roughly fourteen-fold.
+result.** Everything except that one session totals 16.97 hours, so quoting the
+240.82 aggregate as fleet-wide exposure overstates the rest of the fleet
+about fourteen-fold.
 
 These figures are also a lower bound that is still falling, per item 0033: they
 are computed from 21 surviving logs, and the ring held 50 a fortnight ago.
+Eviction removes the *oldest* logs first, so what it takes is exposure from the
+early part of the window — the bound understates, and understates the past more
+than the present.
 
 ### What this window is worth
 
-- **On the wave**, nothing. Zero bursts, and the only unaccounted ending is a
-  singleton. Against an emitter that fires on many sessions at once, this is
-  one draw.
-- **On a background per-session rate**, one unaccounted ending in 240.82
-  eventful log-hours, of which 93% is one session — so it is close to a
-  measurement of *that session's* luck, not the fleet's. The rule-of-three
-  bound of 3/240.82 assumes independent trials and this window does not supply
-  them.
-- **On the instrument**, decisively. The ending-count cannot see a reboot, and
-  a reboot is now a documented cause of exactly the harm this item exists to
-  count.
+- **On the wave**, nothing. Zero bursts, and the only recorded unaccounted
+  ending is a singleton. Against an emitter that fires on many sessions at
+  once, this is one draw.
+- **On a background per-session rate, no figure should be quoted at all**, and
+  an earlier draft of this section quoted one. Dividing the single unaccounted
+  ending by 240.82 eventful log-hours puts a numerator and a denominator
+  belonging to *different sessions* over one another: the ending is
+  `discord-invite-manager` #241, while 93% of the hours are ac-unreal, which
+  recorded no unaccounted ending at all. The trials are not merely
+  non-independent, they are **not the same kind of trial** — and seven of the
+  eleven sessions alive in this window were idle, so they could not have
+  suffered the mid-turn harm this item names whatever the rate was. What the
+  window supports is a list, not a rate: one recorded singleton on a
+  short-lived instance, ~224 eventful hours on one session that recorded
+  nothing, eleven endings the count never saw, and an idle remainder that was
+  never exposed.
+- **On the instrument**, decisively. The ending-count cannot see a co-death,
+  and a co-death is now a documented cause of exactly the harm this item
+  exists to count.
 
 ### For the next reader
 
-Before reading any ending-count, run **three** checks, not two:
+The two-step instruction above is not enough. Before reading any ending-count,
+run **four** checks, and note that the last two are new:
 
 1. Item 0030's liveness classification, to see whether sessions were running.
 2. Eventful log-hours **with the per-log breakdown**, because one runaway
    session can supply nearly all of it.
-3. **`LastBootUpTime`, and the System log for events 1074, 6006, 6005 and 41.**
-   A reboot inside the window removes sessions from the count silently. If one
-   is present, every session that was running at that instant ended without a
-   record, and the count is short by that many — a number the trace cannot give
-   you and the Copilot logs can.
+3. **A completeness check on the count itself.** For every instance that has
+   state — not only the ones currently looping — compare its last
+   `session_exit` session number against the session number in the newest
+   `supervisor_start`. Any gap is that many endings the trace never recorded,
+   and the count is short by at least that much. This is computed from the
+   trace and instance state, and it is the only check here that gives a
+   *number*.
+4. **If step 3 is non-zero, find what killed the supervisors**, because step 3
+   says how many were lost and nothing about why. `LastBootUpTime` and System
+   events 1074/6005/6006/41/6008 catch a reboot; **TerminalServices event 21
+   catches a logon-session replacement, which is what the 2026-08-09 wave in
+   this file turned out to be and which leaves `LastBootUpTime` untouched.** A
+   logoff or a fast-startup hybrid shutdown is the same class again.
+
+Step 6 of the recipe above — "consult the event log only once step 4 has found
+a kill" — is therefore **withdrawn as an ordering rule.** A co-death produces
+no step-4 row, so gating the event log behind step 4 guarantees the one wave
+this item has actually explained would never be looked for. Consult it whenever
+step 3 is non-zero.
 
 

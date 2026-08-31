@@ -30,17 +30,17 @@ instance's own directory:
 23:18:59Z  argv=--loop --name copilot-tools            cwd=~\repos\copilot-tools
 23:19:00Z  argv=--loop --name discord-invite-manager   cwd=~\repos\discord-invite-manager
 23:19:00Z  argv=--loop --name operator                 cwd=~\repos\operator
-23:19:00Z  argv=--loop --name prism                    cwd=~\repos
+23:19:00Z  argv=--loop --name prism                    cwd=~\repos\prism
 ...
 ```
 
 Every one succeeded and launched a fresh session, which is itself evidence
 that nothing was running: `restart_loop` refuses an instance with no live
 session, and a second supervisor for a live instance is refused too. All nine
-Copilot leads on the machine now have a start time of 2026-08-31 16:19:01-04
-local.
+Copilot leads on the machine now have a start time of 2026-08-31 16:19:01
+local (UTC-07:00).
 
-**There is no mechanism that would have done this.** Checked directly:
+**Nothing this toolkit installs survives a reboot.** Checked directly:
 
 * `Get-ScheduledTask` — no task whose name or action mentions `operator` or
   `copilot`.
@@ -49,8 +49,12 @@ local.
 * `HKCU` and `HKLM` `...\CurrentVersion\Run` — fourteen entries, all
   third-party (Steam, OneDrive, Plex, Teams, ...). None is operator.
 
-So the toolkit installs nothing that survives a reboot, and this is not a
-setting that was switched off.
+That is a search of the three places this toolkit could plausibly have
+installed something, and it is not an exhaustive enumeration of every
+auto-start facility Windows has — services, unnamed scheduled tasks, logon
+scripts and Group Policy were not swept. The claim it supports is the one
+that matters: **the toolkit installs nothing that survives a reboot**, so this
+is not a setting somebody switched off.
 
 Nothing announced the state either. The instruments that exist report on
 instances that are running; with no supervisors alive there is nothing for
@@ -58,10 +62,14 @@ them to be silent *about*, so `operator list` prints an empty fleet, which is
 the same thing it prints on a machine where the fleet was never started. The
 gap was closed by a human noticing.
 
-Cost, measured rather than asserted: 3.85 days multiplied by nine instances is
-about 832 instance-hours of loop time that did not happen. For comparison, the
-twelve days *before* the reboot produced 240.82 eventful log-hours of agent
-activity across the whole fleet (backlog 0001, 2026-08-31 section).
+Cost: 3.85 days across nine instances is about 832 instance-hours during which
+no loop was running. **Do not read that as 832 hours of lost work.** The twelve
+days before the reboot produced 240.82 eventful log-hours in total, 93% of it
+from one session on an instance that was not among the nine restored, and a
+fleet mean of 0.83 sessions actually doing anything at once (backlog 0001,
+2026-08-31 section). The honest statement is that the fleet's *availability*
+was zero for 3.85 days; what it would have produced is not measurable from
+here.
 
 ## Why it matters
 
@@ -112,16 +120,26 @@ instances had no catalogue row, so it is not currently a complete one. A
 recorded "these instances were up when the machine went down" would be enough
 and needs no catalogue at all.
 
-**A boot-time marker would also date the loss for item 0001.** If the toolkit
-recorded a `machine_boot` event in the trace, every reader of that file could
-subtract the sessions a reboot removed instead of measuring `LastBootUpTime`
-separately and hoping to remember. That is a small addition to
-`operator_trace.py` and would have prevented this item's discovery being
-accidental.
+**A boot marker cannot be written at boot, which is the point of this item.**
+An earlier draft proposed that `operator_trace.py` record a `machine_boot`
+event so readers of item 0001 could subtract the sessions a reboot removed.
+Nothing in this toolkit is alive at boot — that is the defect being filed — so
+such a marker could only be written by the *next* `operator` process to run,
+which here was the human's relaunch 3.85 days later. That is a convenience
+over reading `LastBootUpTime`, not a detector, and it announces nothing while
+the fleet is down. Writing it *at* boot requires a boot-time task, which is the
+auto-start half deferred above. Withdrawn as a remedy for this item; if it is
+wanted at all it belongs in item 0001's re-measurement recipe, which now tells
+the reader to check `LastBootUpTime` and the event log directly.
 
 **Where the remedy belongs is the owner's call.** FROZEN.md limits this
 repository to fixes for defects affecting running sessions, and the
-supervision kernel is now ../operator. Auto-start is new behaviour and
-probably belongs there; the trace marker is arguably a safety fix here,
-because without it every future reading of 0001 is wrong in the same
-direction.
+supervision kernel is now ../operator. Both halves — auto-start and the
+announcement — are new behaviour rather than repairs to something that
+misbehaves while sessions run, so on the plain reading of the freeze both
+belong in the kernel. An earlier draft argued the trace marker was "arguably a
+safety fix here, because without it every future reading of 0001 is wrong in
+the same direction"; that is withdrawn. 0001 being misread is a measurement
+problem, not a running-session defect, and the correction for it has landed
+where it belongs — in 0001's own recipe, which now carries a completeness
+check that needs no new code at all.
