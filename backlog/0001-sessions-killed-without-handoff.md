@@ -1698,7 +1698,7 @@ within hours of it, so it has none of the seven-in-five-seconds shape of the
 this file.
 
 **Read on its own, this window is reassuring, and reading it on its own would
-be the tenth instrument error in this file.**
+be the eleventh instrument error in this file.**
 
 ### Nine sessions ended and the trace recorded none of them
 
@@ -1726,6 +1726,13 @@ session's number. Only a launch moves to the next one." The supervisor writing
 this session's record logged `Continuing from session #251` and launched 48
 seconds later, so it took the `+1` branch from a stored `SESSION_NUM` of 250.
 **Session #250 is a session that ran and ended, and no record of it exists.**
+
+**Disclosure, because it is not incidental: this section is written by session
+#251, and the unrecorded #250 is its own immediate predecessor.** The author is
+the successor of one of the nine sessions it counts as lost, and can testify to
+one thing no instrument here shows — the handoff file that #251 read at startup
+still contained #249's text, so #250 wrote nothing before it went. That is a
+sample of one, and it is the sample this section is standing in.
 
 `operator.log` says the same thing in the supervisor's own voice, and says how
 long it lasted:
@@ -1762,12 +1769,25 @@ forwarded event in each surviving pinned log, by type rather than age:
 
 `54460`'s last act was to **start a tool call**. That is the harm this item is
 named for, observed directly rather than inferred: a session interrupted
-mid-turn with its context unwritten. Seek-sampling that file at forty offsets
-returns monotonically increasing timestamps from 2026-08-16T19:39:34Z to
-2026-08-27T18:54:20Z and exactly **one** session uuid
-(`cfabc021-bedf-49b6-a787-56d87c8d5d0e`), so it is one session that ran for
-**11.3 days** and 16.6 million forwarded events. No handoff was written: the
-newest handoff file on the machine is `discord-invite-manager`, 2026-08-20.
+mid-turn with its context unwritten. The final lines of that file are a model
+finishing a message and then dispatching a tool —
+
+```
+03:03:09.854Z  assistant.message
+03:03:09.856Z  tool.execution_start     <- last line of a 12.33 GB file
+```
+
+— with **no `tool.execution_complete` after it**, and the file simply stops.
+The check matters because an unmatched start is the whole claim: in the last
+4 MB alone there are 22 starts and 24 completes, so completions do normally
+follow, and this one did not.
+
+Seek-sampling that file at forty offsets returns monotonically increasing
+timestamps from 2026-08-16T19:39:34Z to 2026-08-27T18:54:20Z and exactly
+**one** session uuid (`cfabc021-bedf-49b6-a787-56d87c8d5d0e`), so it is one
+session that ran for **11.3 days** and 16.6 million forwarded events. No
+handoff was written: the newest handoff file on the machine is
+`discord-invite-manager`, 2026-08-20.
 
 Each of the four is the successor of its instance's last recorded ending, and
 the arithmetic is tight enough to leave no room for another reading:
@@ -1803,8 +1823,11 @@ sessions that would have ended are gone before they can end. A window
 containing a reboot therefore reads quieter than a window without one, and
 every quiet window in this file was read as evidence that kills had stopped.
 
-This is the ninth instrument in this item that could not report what it was
-read as reporting, and the first where the defect is in the *primary* one.
+This is the eleventh instrument defect recorded in this item — the ninth is
+the log mtime, the tenth was in a reader rather than a writer — and it is the
+first that is a gap in the *taxonomy* rather than a misreading of a signal.
+Step 4 reads `session_exit` correctly. There is simply an ending it never
+gets to read.
 
 Note what this does **not** say. The 2026-08-09 wave was explicitly checked
 against this and cleared — the section above records "No reboot:
