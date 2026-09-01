@@ -31,6 +31,69 @@ def section(title):
     print(f"\n=== {title} ===")
 
 
+def wait_until(predicate, timeout=30.0, poll=0.5):
+    """Poll ``predicate`` until it holds or ``timeout`` elapses.
+
+    Returns whether it held, so a caller can tell "became true" from "ran out
+    of time" -- though every caller here re-asks the real question afterwards
+    and lets `check` report it, so a timeout costs a failure and never a hang.
+
+    Bounded on a monotonic clock rather than ``time.time``: a wall-clock step
+    (NTP correcting a CI runner, which is a fresh VM and often does) can move
+    a deadline backwards and end a wait early, which is exactly the bug this
+    helper exists to remove.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
+
+
+def metrics_recorded(db_path, session_num):
+    """Whether the runner's metrics row is *committed*, not merely started.
+
+    The distinction is the whole point. `operator_ingest.connect` opens the
+    database with ``sqlite3.connect``, which creates the file the moment
+    ingestion begins -- before the schema is applied, before the log is
+    parsed, and before a git subprocess that carries a five-second timeout of
+    its own. So the file appearing says only "a capture started". Waiting on
+    it and then querying leaves a window in which the harness reads an empty
+    -- or schemaless -- database and reports a working runner as broken,
+    which is a narrower version of the very race this wait was added to fix.
+
+    Every not-yet state answers False rather than raising: the file absent,
+    the table not created yet, the row not inserted yet. Found by adversarial
+    review of the first fix, which waited on the file.
+
+    Imported inside the function to match this file's deliberate lazy style:
+    the module-level import list is itself one of the things `main` checks.
+    """
+    import sqlite3
+
+    import operator_ingest
+
+    path = Path(db_path)
+    # probe-ok: a wrong False costs one more poll and never a wrong verdict.
+    # An occupied-but-unexaminable path reads as "not recorded yet", the wait
+    # continues, and if it never becomes readable the `check` below reports
+    # the failure on the real question. The guard is kept rather than left to
+    # the `except` because `sqlite3.connect` *creates* a missing file, so
+    # probing by connecting would have this predicate manufacture the very
+    # database it is asking about.
+    if not path.exists():
+        return False
+    try:
+        with operator_ingest.connect(path) as conn:
+            rows = conn.execute(
+                "SELECT session_num FROM sessions WHERE no_op = 0").fetchall()
+    except (sqlite3.Error, OSError):
+        return False
+    return any(row["session_num"] == session_num for row in rows)
+
+
 def make_log(path, cwd="/tmp/project"):
     path.write_text(
         '2026-07-27T10:00:00.000Z [info] start\n'
@@ -198,17 +261,35 @@ def main():
         try:
             mux.new_session(rname, str(rdir),
                             [sys.executable, str(runner), str(spec)])
-            deadline = time.time() + 60
             # probe-ok: this harness is the assertion — a wrong False times
             # out and the `check` on the next line reports it to the human
             # who is watching the run, and a raise ends the harness with a
             # traceback in front of that same human. Both are loud, which is
             # the only property a diagnostic needs here.
-            while time.time() < deadline and not (rdir / "verify.exit").exists():
-                time.sleep(0.5)
+            wait_until(lambda: (rdir / "verify.exit").exists(), timeout=60)
             # probe-ok: the probe *is* the check; a wrong False fails it and a
             # raise aborts the harness in front of the human running it.
             check("runner recorded exit", (rdir / "verify.exit").exists())
+            # The exit marker does *not* mean the metrics are in. The runner
+            # publishes it deliberately early -- before the log parse, and
+            # before a two-second wait for Copilot to flush its shutdown
+            # telemetry -- because an exit code is recoverable from nothing
+            # once the process is gone, while a cut-short capture can be
+            # picked up later by `operator ingest`. See the ordering comment
+            # in `operator_runner`.
+            #
+            # This harness kept waiting on the marker after that reorder, so
+            # it asked about the database roughly two seconds before the
+            # runner had any reason to have written one, and reported "no
+            # database created" -- a real-looking failure with nothing behind
+            # it. Measured at 2.11s between the two instants on Windows.
+            #
+            # Waited on the committed row rather than the file: the file is
+            # created by `connect` as ingestion *begins*, so waiting for it
+            # would leave the same race in miniature. `metrics_recorded` says
+            # what this check is about to assert, and a timeout leaves that
+            # assertion to fail normally below.
+            wait_until(lambda: metrics_recorded(rdb, 9), timeout=30)
             # probe-ok: a wrong False skips the metrics comparison below, and
             # the check above has already failed by then; a raise stops the
             # harness loudly, which is an acceptable outcome for a diagnostic.
