@@ -63,38 +63,29 @@ was issuing the instruction the safety rules exist to prevent.
 
 ## Done when
 
-The built half is done; what remains is a close and a decision about the residue.
+The work is done. What remains is a close.
 
-- `backlog close 32` records the commit that finished the work. The last of the
-  four is `b7d0d2d88b821772dcd2ff6b9df8e35cbd48edaf`, "fix(handoff): guard every
+- `backlog close 32` records the commit that finished it. The last of the four is
+  `b7d0d2d88b821772dcd2ff6b9df8e35cbd48edaf`, "fix(handoff): guard every
   exception Path.resolve can raise", 2026-08-15 18:08 -0700.
-- The residual general-case gap -- a linked worktree created *outside*
-  `.worktrees/` is still reported as this checkout's litter -- has a home: either
-  folded into item 0020, which already owns the Python/JS guard divergence, or
-  filed as its own item. It must not be closed silently with this one.
 
 ## Not in scope
 
-- The general case above, under this id.
 - `handoff.sh`, which has no guard at all. That is item 0020.
 
 ## Risk
 
-🟢 nothing left to build for the landed half. The residue is 🟡: adopting the JS
-approach means calling `git worktree list` on the handoff path and deciding what
-an unanswerable call means -- the JS answer is null, "no information", which
-callers already treat as not-clean.
+🟢 nothing left to build.
 
 ## Needs a decision before this can be worked
 
 - **Approval to close**, which is the only thing standing between this item and
   `closed`. `operator backlog close 32` refuses without it, which is the gate
   working as intended rather than an obstacle to route around.
-- **Where the residual gap goes** -- 0020, or its own item.
 
-## Verified 2026-08-31: the fix is on `main`, not only on `work/1`
+## Verified 2026-08-31: the fix is on `main`, and the residual gap below was closed with it
 
-The Status section below says the fix landed on `work/1`. It has since merged:
+The Status section says the fix landed on `work/1`. It has since merged:
 
 ```
 $ git branch --contains fe1b1a9      $ git branch --contains b7d0d2d
@@ -107,6 +98,23 @@ All four commits are ancestors of `main`. So this is an item whose work is
 shipped and merged, and which reads as `proposed` -- the queue's most misleading
 state, because `backlog ready --explain` reports it as awaiting approval to be
 *worked* when what it awaits is approval to be *closed*.
+
+**The "Remaining gap" paragraph in the Notes below is superseded and should not
+be worked.** It describes the *name-based* draft, and says a peer worktree
+outside `.worktrees/` is still reported as this checkout's litter. The Status
+section, written later, records that the landed guard exempts linked worktrees by
+identity from `git worktree list --porcelain`. Checked rather than inferred:
+
+    handoff_tool.py:752   def _linked_worktrees(root) -> "set[str] | None"
+    handoff_tool.py:656   trees = _linked_worktrees(root)
+    tests/test_handoff_checkout_guard.py:955
+        test_a_worktree_outside_the_convention_is_exempt_too   -> 1 passed
+
+So the general case the JS reference handles is handled here too, and the
+divergence that paragraph describes no longer exists. It is left in place because
+this project does not edit an item's older text to make it right -- being wrong
+is data -- but nothing should be filed or scoped against it. This correction was
+found by an adversarial reviewer who read the code rather than the paragraph.
 
 ## Notes
 

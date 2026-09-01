@@ -119,7 +119,7 @@ nothing watching for it.
 - The same statement reaches the agent in its preamble.
 - A session whose work dir *is* a repository prints neither -- the control, as in
   item 0034.
-- The loop still starts.
+- The state is announced whether or not the launch proceeds.
 - The launch record makes the configuration visible after the fact, not only at
   the moment it scrolls past. Nineteen hours of commits to `tiktok-offline` were
   attributed to nothing; a reader coming to `operator.log` afterwards should be
@@ -127,8 +127,10 @@ nothing watching for it.
 
 ## Not in scope
 
-- Refusing the launch. Same argument as item 0034: costing an agent a session is
-  worse than costing it a hint.
+- Deciding whether to refuse the launch. The same argument as item 0034 applies
+  and is equally unsettled: the item records refusal as "not established", and a
+  refinement that ruled it out would be answering the decision below rather than
+  recording it.
 - **A repository-oriented view** -- answering "what loop, if any, is working in
   this repository", which is the question the user actually asked. That is the
   other half of this and is genuinely separate: it also covers the sub-agent and
@@ -141,8 +143,9 @@ nothing watching for it.
 ## Risk
 
 🟢 the launch path's reporting and one preamble clause. Same kernel-budget
-constraint as item 0034 if the clause lands in `operator_kernel/preamble.py`
-(item 0038: 11 total lines of headroom).
+constraint as item 0034 if the clause lands in `operator_kernel/preamble.py`:
+item 0038 measures 11 total lines of headroom against a `<=` ceiling, so measure
+the clause's net cost rather than assuming it fits or does not.
 
 ## Needs a decision before this can be worked
 

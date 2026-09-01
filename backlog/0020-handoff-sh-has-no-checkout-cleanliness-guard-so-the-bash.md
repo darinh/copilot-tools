@@ -47,10 +47,11 @@ Whichever of the three options below is chosen, all of these hold:
 
 ## Not in scope
 
-- The general-case worktree question -- exempting a linked worktree created
-  outside `.worktrees/` -- which item 0032 records as a measured, still-open
-  divergence between the Python and JS guards.
-- Any change to `handoff_tool.py`'s own scan.
+- `handoff_tool.py`'s own scan, which has the guard this item is about the
+  absence of. Note that the "remaining gap" item 0032's Notes describe -- a
+  worktree outside `.worktrees/` -- was closed by the identity-based fix that
+  landed with it, verified 2026-08-31, so there is no Python-side worktree
+  divergence left for this item to inherit.
 
 ## Risk
 

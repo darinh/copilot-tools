@@ -33,8 +33,10 @@ The sentence converts an agent's preference into an owner's instruction, and it 
 - The operational constraint is still stated plainly, because it is true and a
   session needs it: nobody is reading this session while it runs, so a question
   addressed to the user is not answered and the seat idles.
-- `git log -S "blanket human approval"` finds no occurrence in the working tree
-  of `copilot_operator.py`.
+- No occurrence of the phrase survives in the working tree of
+  `copilot_operator.py`. Check it with a working-tree search -- `rg -F "blanket
+  human approval" copilot_operator.py` -- not with `git log -S`, which searches
+  history and will keep finding 7ce67b8 and 9854ff3 forever.
 - A test fails if the authorisation claim returns. Assert against the *text a
   session receives*, not against a constant the same module defines, or the test
   passes for any wording.
@@ -82,12 +84,12 @@ copilot_operator.py:2194:  "Key facts: (1) You have blanket human approval f..."
 
 So the item is not "unfixed" and not "fixed" -- it is fixed in the copy nothing
 runs, which is the same shape as the skills in item 0015 and the seat journal in
-item 0037. **The remaining work is therefore smaller than the item above
-suggests and better specified than it was**: the wording question is answered by
-`operator_kernel/preamble.py`, and what is left is porting that split to
-`copilot_operator.py` and bringing `tests/test_preamble_authority.py`'s
-equivalent with it. Whether the owner accepts the kernel's wording as his own is
-still the owner's to say -- an agent wrote that one too.
+item 0037. **What this changes is that a worked example of the replacement now
+exists**, which is different from that example having been chosen. An agent wrote
+the kernel's wording too. If the owner accepts it, the remaining work is porting
+the mechanism/authority split to `copilot_operator.py` and bringing the
+equivalent of `tests/test_preamble_authority.py` with it; if he does not, the
+wording question above is exactly as open as it was when this item was filed.
 
 ## Notes
 

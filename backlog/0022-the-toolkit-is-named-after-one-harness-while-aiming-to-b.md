@@ -56,8 +56,6 @@ own change, on a quiet branch, with the suite as the only thing moving.
 
 - Moving state out of `~/.operator`. Declined already and recorded as D1/D2 in
   `specs/004-operator-session/spec.md`; reopening it is a separate argument.
-- Renaming the GitHub repository, which only the owner can do and which is not
-  required for any of the above to be true.
 
 ## Risk
 
@@ -71,6 +69,7 @@ fails on the next machine to run `setup`.
 - **Whether to do it at all, and what the new name is.** Both are the owner's:
   the first is a judgement about whether the stated direction is still the
   direction, and the second is naming.
-- **Whether the repository itself is renamed in the same pass or left for
-  later.** These can be separated, and separating them keeps the code change
-  reviewable.
+- **Whether the repository itself is renamed, and if so whether in this pass.**
+  Named in the evidence as one of the affected identifiers, and only the owner
+  can do it. The code change is reviewable without it, so the two can be
+  separated -- but that is a choice, not a fact, and it is his.

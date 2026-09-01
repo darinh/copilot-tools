@@ -53,10 +53,13 @@ that simply never handed off.
   watches, or does not claim to have handed off. Telling an agent it handed off
   when no marker was raised is silent context loss, which is worse than the loud
   refusal that ships today.
-- Two agents starting in one repository at the same moment produce one project
-  row, not two. Keying on `git rev-parse --show-toplevel`, normalised the way
+- **If, and only if, the answer to the decision below is self-registration:** two
+  agents starting in one repository at the same moment produce one project row,
+  not two. Keying on `git rev-parse --show-toplevel`, normalised the way
   `project_paths` already normalises, is what makes a double registration
-  collapse instead of fork.
+  collapse instead of fork. Under the other two candidates -- persist on refusal,
+  or discovery through the session store -- no row is written and this criterion
+  does not apply.
 - A `cwd` that is not a git repository at all has a stated, tested behaviour --
   whichever behaviour the decision below chooses.
 - The number this item ends on is known: how many of the fleet's projects are

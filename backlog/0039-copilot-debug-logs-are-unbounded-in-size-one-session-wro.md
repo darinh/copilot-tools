@@ -102,18 +102,24 @@ a truncated log looks like a session that stopped.
     process-1786909174577-54460.log  13,238.0 MB  last write 2026-08-28T03:03Z
     process-1786834628244-24048.log   3,096.8 MB  last write 2026-08-28T02:58Z
 
-The two large files are unchanged in size and neither has been written to since
-2026-08-28 -- both owning sessions have ended. The directory total moved only by
-the addition of new small logs, one of which is this session's.
+The two large files were unchanged in size and neither had been written to since
+2026-08-28. The directory total moves between readings because live sessions are
+still writing small logs and starting new ones -- three readings within the hour
+gave 22 files / 18.17 GB, 22 / 18.351 GB and 23 / 18.353 GB -- so any total here
+is a snapshot and not a level. This is the same trap as the units correction
+below: quote a reading, not a trend, unless the trend was measured.
 
-So the two files at the centre of this item are **inert**: they are 15.6 GB of
-disk that nothing is adding to and nothing is reading. That makes this less
-urgent than "unbounded growth" sounds and does not make it less real -- the
-mechanism that produced a 12 GB file is untouched, and the next long-running
-session does it again.
+**What the timestamps do and do not establish.** They establish that those two
+files stopped growing. They do not establish that the sessions writing them
+ended: item 0030 exists precisely because a session can fall silent for days with
+its process alive, and a stale mtime is the signature of both. Nor is "nothing is
+reading them" a measurement -- items 0001 and 0030 read these logs by design, and
+file metadata says nothing about readers.
 
-Consistent with the correction below, the count moved 21 -> 22 and the byte
-total moved with it; no growth rate is claimed from two readings on the same day.
+What can be said is narrower and still worth saying: the 15.6 GB at the centre of
+this item is not currently growing, so the disk pressure is not accelerating
+today. The mechanism that produced a 12 GB file is untouched, so it **can** recur
+whenever a session runs that long again. Whether it will is not predicted here.
 
 ## Notes
 

@@ -35,15 +35,18 @@ It also guarantees item 31 for that session: an instance in this state cannot ha
 - A session in a registered project prints neither. That is the control: a
   message that appears in both cases carries no information, which is the defect
   being fixed.
-- The loop still starts. Refusing is ruled out below.
+- The state is announced whether or not the launch proceeds. Announcing is the
+  whole of this item; whether operator should also *refuse* is argued below and
+  is not settled here.
 - "not registered" and "nothing to do" are distinguishable from the output alone,
   by someone who does not already know which one they are looking at.
 
 ## Not in scope
 
-- Refusing to launch. `work_seam._loop_work_db` is deliberate that a missing
-  store costs the agent a hint and never a session, and the same argument applies
-  here.
+- Deciding whether to refuse the launch. The item argues refusing is probably
+  wrong -- `work_seam._loop_work_db` is deliberate that a missing store costs the
+  agent a hint and never a session -- and "probably" is an argument to be had,
+  not a decision to inherit from a refinement.
 - Registering the project. Item 0031 owns enrollment; this item must not grow a
   second mechanism for it.
 
@@ -53,9 +56,10 @@ It also guarantees item 31 for that session: an instance in this state cannot ha
 
 One constraint if the preamble clause lands in `operator_kernel/preamble.py`
 rather than `copilot_operator.py`: item 0038 measures the kernel at 11 total
-lines below its ceiling, so a clause of any size fails
-`test_the_kernel_as_a_whole_stays_under_its_total_ceiling`. Sequence behind 0038
-or write it in the supervisor.
+lines below its ceiling. The boundary test asserts `total <= 9000`, so a clause
+whose net cost is 11 lines or fewer still passes and anything larger does not --
+measure the delta rather than assuming either way. Sequencing behind 0038 removes
+the constraint entirely.
 
 ## Needs a decision before this can be worked
 

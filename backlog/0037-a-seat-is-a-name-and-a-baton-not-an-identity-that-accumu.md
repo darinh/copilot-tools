@@ -151,12 +151,19 @@ same shape as item 0013 (fixed in the kernel, live in the supervisor) and item
 0015 (skills correct in the repository, absent from the machine), and it is now
 the third instance of it.
 
-**What this does to the item.** The substrate question is largely answered; the
-remaining work is smaller and differently shaped than the item above describes:
-wire the advertisement into the supervisor that runs the fleet, and answer the
-four open questions -- which the built substrate has *not* answered, it has only
-made concrete. `detect_repo`, the hook whose answers would reach a preamble, still
-has no call site.
+**What this does to the item.** It makes the four open questions concrete rather
+than answering them: there is now a working substrate to argue about, and
+arguing about a built thing is easier than arguing about a proposal. It does not
+make wiring that substrate into the live supervisor the remaining work.
+Advertising the agent-authored journal to every session *is* an answer to what is
+written and who writes it, and those are two of the four questions. If the owner
+chooses this design, the wiring is small and well understood; if he prefers
+derived facts, supervisor-authored state, or the objection in
+`docs/seat-identity.md` that may kill the idea, the built substrate is a
+prototype rather than a decision. `detect_repo`, the hook whose answers would
+reach a preamble, still has no call site
+(`docs/extensions.md:414`: "**no call site** -- nothing composes its answer into
+a preamble").
 
 ## Notes
 

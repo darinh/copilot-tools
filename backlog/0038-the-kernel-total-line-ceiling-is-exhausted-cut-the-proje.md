@@ -101,8 +101,10 @@ Unchanged to the line from the 2026-08-17 measurement, and
 `python -m pytest tests/test_kernel_boundary.py -q` reports `57 passed`. The
 ceiling has not been breached because **nothing has been added to the kernel
 since** -- which is the item's point arriving as evidence rather than as
-prediction. Items 0034 and 0035 both want one preamble clause, and neither can
-have it.
+prediction. The assertions are `total <= MAX_KERNEL_TOTAL_LINES`
+(`tests/test_kernel_boundary.py:882`), so eleven net total lines still fit; items
+0034 and 0035 each want one preamble clause and would have to be measured against
+that, which is a worse position to design from than having room.
 
 ## Notes
 

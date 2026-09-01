@@ -71,7 +71,7 @@ is the substance of this item.
 
 The item is two-staged and the first stage can close it.
 
-**Stage 1 -- the measurement, which is the whole of the approved work:**
+**Stage 1 -- the measurement, and on its own a sufficient end for this item:**
 
 - The number is known: how many of the 2,720 `agent-<uuid>` events correspond to
   rows in `turns`, by the session-id-and-exact-content join whose mapping was

@@ -47,15 +47,22 @@ the terminal.
 
 ## Done when
 
-- `operator setup` does not start a session. The same holds for the other words
-  measured as passing through: `install`, `start`, `run`, `update`, `init`,
-  `config`, `doctor`, `stat`.
+Stated as invariants, because *how* the tie is broken is the open decision below
+and a criterion naming one mechanism would settle it by the back door.
+
+- A word typed in the belief that it is a subcommand does not silently become an
+  autopilot prompt. `setup` is the measured case; `install`, `start`, `run`,
+  `update`, `init`, `config`, `doctor` and `stat` behave the same way today and
+  must end up wherever `setup` ends up.
+- Whatever happens to such a word, the user can get out of it without closing the
+  terminal.
 - The documented shape still works. Every input pinned by
   `test_a_word_that_resembles_no_subcommand_is_left_alone` -- `operator implement
-  the login fix` and its siblings -- still launches a session, and that test is
-  amended rather than deleted if the tie-break changes what it asserts.
-- Whatever is refused is refused with a message on stderr and a non-zero exit,
-  not by attaching the terminal to anything.
+  the login fix` and its siblings -- still reaches a session, and that test is
+  amended deliberately rather than deleted if the chosen tie-break changes what
+  it asserts.
+- The outcome is distinguishable from a hang: whatever is declined is declined
+  visibly, rather than by attaching the terminal to something.
 
 ## Not in scope
 
