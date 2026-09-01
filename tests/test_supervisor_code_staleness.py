@@ -65,20 +65,33 @@ def _unreadable(monkeypatch, target: Path):
     the file never reaches -- so it would deny nothing here and the test would
     pass without exercising the branch it names.
 
-    Both `builtins.open` and `io.open` are patched, and the second is not
-    redundant. They are the *same function object* but two separate names, so
-    rebinding one leaves the other pointing at the original -- and
-    `Path.read_text` goes through `io.open`, not through the builtins global.
-    Patching only builtins denied `_digest_file`, which calls `open()`
-    directly, while silently failing to deny every reader that went through
-    `pathlib`. `test_an_unreadable_record_is_unknown_not_unrecorded` was one
-    of those: measured with a probe, its `read_text` succeeded, and the record
-    it wrote (`{}`) has no `files` key, so `CODE_UNKNOWN` came back for a
-    reason that had nothing to do with a denied read. It asserted the right
-    answer and proved nothing, which is why that test now writes a record
-    that would read as `CODE_CURRENT` if this helper ever stopped biting.
+    Three names are patched, and none of them is redundant, because this
+    helper has now failed twice by denying *some* readers and not others.
+
+    `builtins.open` and `io.open` are the same function object under two
+    separate names, so rebinding one leaves the other pointing at the
+    original. Patching only builtins denied `_digest_file`, which calls
+    `open()` directly, while silently failing to deny every reader that went
+    through `pathlib`.
+
+    `Path.open` is the third, and it is what CI found. On Python 3.10
+    `pathlib` resolves opens through `self._accessor.open`, a reference to
+    `io.open` captured at *import* time, so rebinding `io.open` afterwards
+    never reaches `Path.read_text` at all. 3.11 dropped the accessor and calls
+    `io.open` dynamically -- which is why every developer machine on 3.11+
+    passed while all three 3.10 legs failed, on Linux, macOS *and* Windows.
+    Patching the method itself is the one spelling that does not depend on
+    which interpreter is reading, and `read_text`/`read_bytes` funnel through
+    it on every supported version.
+
+    `test_the_denial_helper_denies_every_reader` below is the guard: it fails
+    on any interpreter where a reader slips past, rather than leaving the
+    tests that *depend* on the denial to fail somewhere far from the cause.
+    Those tests write a record that would read as `CODE_CURRENT` if this
+    helper ever stopped biting, so they cannot pass for the wrong reason.
     """
     real_open = builtins.open
+    real_path_open = Path.open
 
     def guard(file, *args, **kwargs):
         try:
@@ -89,8 +102,79 @@ def _unreadable(monkeypatch, target: Path):
             raise PermissionError(13, "Permission denied")
         return real_open(file, *args, **kwargs)
 
+    def path_guard(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError(13, "Permission denied")
+        return real_path_open(self, *args, **kwargs)
+
     monkeypatch.setattr(builtins, "open", guard)
     monkeypatch.setattr(io, "open", guard)
+    monkeypatch.setattr(Path, "open", path_guard)
+
+
+def test_the_denial_helper_denies_every_reader(tmp_path, monkeypatch):
+    """The helper's own regression test, and the reason it has three patches.
+
+    Every assertion below corresponds to a reader that reached the file after
+    a previous version of `_unreadable` claimed to have revoked it: `open()`
+    for `_digest_file`, `io.open` for the direct callers, and
+    `Path.read_text` -- the one `_read_loop_record` actually uses -- which
+    escaped through 3.10's pre-bound accessor and turned two tests red on CI
+    for a month while passing locally.
+
+    The final assertion is the control. A helper that denied *everything*
+    would satisfy the four above and make every test using it vacuous, since
+    the code under test reads other files too.
+    """
+    target = tmp_path / "record.json"
+    target.write_text("{}", encoding="utf-8")
+    neighbour = tmp_path / "other.json"
+    neighbour.write_text("still readable", encoding="utf-8")
+
+    _unreadable(monkeypatch, target)
+
+    with pytest.raises(PermissionError):
+        target.read_text(encoding="utf-8")
+    with pytest.raises(PermissionError):
+        target.read_bytes()
+    with pytest.raises(PermissionError):
+        open(target, "rb")
+    with pytest.raises(PermissionError):
+        io.open(target, "rb")
+
+    assert neighbour.read_text(encoding="utf-8") == "still readable"
+
+
+def test_the_denial_helper_denies_through_pathlib_alone(tmp_path, monkeypatch):
+    """The half of the helper that only a 3.10 interpreter could otherwise prove.
+
+    `test_the_denial_helper_denies_every_reader` above passes on 3.11+ even
+    with the `Path.open` patch deleted, and correctly so: there
+    `Path.read_text` resolves `io.open` dynamically, so the `io.open` patch
+    alone really does deny every reader and the helper's claim holds. The
+    consequence is the trap, though. On a developer's 3.11 machine that test
+    cannot fail for the reason it exists, so removing the pathlib patch looks
+    green locally and goes red only on CI's three 3.10 legs -- which is
+    precisely how the original miss survived unnoticed.
+
+    Restoring the real `open` underneath the helper isolates the pathlib
+    patch and removes the interpreter from the question: if `Path.open` is
+    not denied in its own right, `read_text` reaches the file and this fails
+    on every version, 3.10 and 3.14 alike.
+    """
+    target = tmp_path / "record.json"
+    target.write_text("{}", encoding="utf-8")
+    real_open = builtins.open
+
+    _unreadable(monkeypatch, target)
+    # Undo the two function-level patches, leaving `Path.open` as the only
+    # thing that can still refuse. `monkeypatch` restores both at teardown
+    # regardless of this second setattr.
+    monkeypatch.setattr(builtins, "open", real_open)
+    monkeypatch.setattr(io, "open", real_open)
+
+    with pytest.raises(PermissionError):
+        target.read_text(encoding="utf-8")
 
 
 class _RaisingRecord:

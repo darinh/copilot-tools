@@ -64,9 +64,41 @@ def only_git_subprocess(monkeypatch):
     unknown path and the loop's behaviour under test is unchanged.
 
     What the test actually claims survives intact: nothing reached a real
-    multiplexer. Anything that is neither git nor a multiplexer still raises,
-    so a future spawn cannot be added silently.
+    multiplexer. Anything that is not one of the probes named below still
+    raises, so a future spawn cannot be added silently.
+
+    `ps` and `sysctl` joined git for the same reason and by the same
+    measurement, and they are macOS's alone. Writing the pid file calls
+    `operator_liveness.process_start_token` -- ``ps -p <pid> -o lstart=`` --
+    and then `boot_identity`, which falls through to
+    ``sysctl -n kern.boottime`` once ``/proc`` has failed to answer. Linux
+    reads ``/proc`` for both and Windows asks ctypes, so macOS is the only leg
+    that spawns anything here. Nobody works on macOS interactively, so the
+    omission was invisible until CI said so, and it failed *both* macOS legs
+    on a supervisor behaving exactly as designed. The canned non-zero result
+    is right for both: each reads a non-zero return as "the probe could not
+    answer", and `_loop_pid_stamp` documents a pid file missing either stamp
+    as a supported shape.
+
+    Matched on the whole argument vector rather than the program name.
+    ``ps`` and ``sysctl`` are general-purpose tools, and an allowance spelled
+    as "any ps" would let an unrelated future spawn through the guard this
+    file exists to be -- which is the same mistake as the blanket delegation
+    rejected above, one command narrower.
     """
+    def answered_without_spawning(parts: "list[str]") -> bool:
+        program = os.path.basename(parts[0]).lower() if parts else ""
+        if program.endswith(".exe"):
+            program = program[:-4]
+        if program == "git":
+            # The progress breaker's probes, whose arguments vary by design.
+            return True
+        if program == "ps":
+            return parts[1:2] == ["-p"] and parts[3:5] == ["-o", "lstart="]
+        if program == "sysctl":
+            return parts[1:] == ["-n", "kern.boottime"]
+        return False
+
     spawned: list[list[str]] = []
 
     def guarded(*args, **kwargs):
@@ -74,15 +106,14 @@ def only_git_subprocess(monkeypatch):
         parts = ([str(a) for a in argv] if isinstance(argv, (list, tuple))
                  else [str(argv)])
         spawned.append(parts)
-        program = os.path.basename(parts[0]).lower() if parts else ""
-        if program.endswith(".exe"):
-            program = program[:-4]
-        if program != "git":
+        if not answered_without_spawning(parts):
             raise AssertionError(
-                f"a real process was spawned: {parts!r}. Only git is "
+                f"a real process was spawned: {parts!r}. Only git, "
+                "`ps -p <pid> -o lstart=` and `sysctl -n kern.boottime` are "
                 "expected from the supervisor (the progress breaker's "
-                "read-only probes); a multiplexer spawn here is the flake "
-                "this file exists to prevent."
+                "read-only probes, and the macOS start-token and boot-identity "
+                "probes); a multiplexer spawn here is the flake this file "
+                "exists to prevent."
             )
         return subprocess.CompletedProcess(parts, 1, "", "")
 

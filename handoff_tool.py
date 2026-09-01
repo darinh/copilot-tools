@@ -821,6 +821,19 @@ def _under_any(rel: str, prefixes: "set[str]") -> bool:
 WALK_BUDGET = 4096
 
 
+#: Windows' junction reparse tag, spelled out rather than read from ``stat``
+#: alone. ``stat.IO_REPARSE_TAG_MOUNT_POINT`` exists only on Windows, so a
+#: ``getattr`` default of ``object()`` made the comparison below unequal to
+#: everything on POSIX -- not because the entry was not a junction, but
+#: because the constant was absent. That is a *different rule on each leg*,
+#: and it kept `test_only_the_mount_point_tag_counts_as_a_junction` red on
+#: every Linux and macOS run while passing on Windows: the test exists
+#: precisely to exercise this comparison where no real junction can be made.
+#: The value is fixed in the Windows ABI and cannot drift.
+IO_REPARSE_TAG_MOUNT_POINT = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT",
+                                     0xA0000003)
+
+
 def _is_junction(entry) -> bool:
     """Whether a directory entry is a Windows junction.
 
@@ -840,7 +853,7 @@ def _is_junction(entry) -> bool:
         tag = entry.stat(follow_symlinks=False).st_reparse_tag
     except (OSError, AttributeError, ValueError):
         return False
-    return tag == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", object())
+    return tag == IO_REPARSE_TAG_MOUNT_POINT
 
 
 def _empty_dir_strays(root, ignored: "list[str]",
