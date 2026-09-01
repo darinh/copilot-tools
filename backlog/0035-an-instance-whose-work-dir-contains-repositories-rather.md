@@ -127,10 +127,6 @@ nothing watching for it.
 
 ## Not in scope
 
-- Deciding whether to refuse the launch. The same argument as item 0034 applies
-  and is equally unsettled: the item records refusal as "not established", and a
-  refinement that ruled it out would be answering the decision below rather than
-  recording it.
 - **A repository-oriented view** -- answering "what loop, if any, is working in
   this repository", which is the question the user actually asked. That is the
   other half of this and is genuinely separate: it also covers the sub-agent and
@@ -149,6 +145,10 @@ the clause's net cost rather than assuming it fits or does not.
 
 ## Needs a decision before this can be worked
 
+- **Whether operator should also refuse to launch with a container work dir.**
+  The item records refusal as "not established" and argues, as item 0034 does,
+  that costing an agent a session is worse than costing it a hint. Unsettled, and
+  not settled here. It does not block the announcement above.
 - **Whether a container work dir is a supported configuration.** It may be that
   a roving instance with the whole `~/repos` tree in scope is wanted, which is a
   legitimate thing to want. If it is supported, this item is a warning; if it is

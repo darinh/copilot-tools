@@ -45,11 +45,22 @@ spelling was avoided, which is a tax on every traversal written from now on.
   produces one. This is the negative control and it is the whole difficulty: the
   receiver is an `ast.Name` in both cases, so a fix that only widens the gate
   retires the check it is meant to preserve.
-- `handoff_tool.py` can be written in the obvious spelling with no suppression
-  comment and no explanatory paragraph.
+- `handoff_tool.py` can be written in the obvious spelling without an
+  explanatory paragraph per site. Whether it also needs no marking at all
+  depends on which of the two options in the Notes is taken -- the second ends
+  with a new annotation at the site, distinct from `# floor-ok:`, and that is a
+  legitimate answer rather than a failure to meet this criterion.
 - Both cases above are pinned by tests in
   `tests/test_python_floor_conformance.py`, and the second one is observed
   failing against the fixed scanner before it is relied on.
+
+## The choice in the Notes is real and is not made here
+
+Recognising `os.scandir` loop targets, or accepting a new annotation meaning
+"not the type you think", are both live. They are costed differently and the
+item does not choose between them. An implementer may; a refinement should not,
+and the "no suppression comment" phrasing this section originally carried would
+have ruled out the second option without saying so.
 
 ## Not in scope
 

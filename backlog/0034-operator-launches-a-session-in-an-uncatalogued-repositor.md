@@ -43,10 +43,6 @@ It also guarantees item 31 for that session: an instance in this state cannot ha
 
 ## Not in scope
 
-- Deciding whether to refuse the launch. The item argues refusing is probably
-  wrong -- `work_seam._loop_work_db` is deliberate that a missing store costs the
-  agent a hint and never a session -- and "probably" is an argument to be had,
-  not a decision to inherit from a refinement.
 - Registering the project. Item 0031 owns enrollment; this item must not grow a
   second mechanism for it.
 
@@ -63,6 +59,13 @@ the constraint entirely.
 
 ## Needs a decision before this can be worked
 
+- **Whether operator should also refuse to launch into an uncatalogued
+  repository.** The item says refusing is "probably the wrong fix and should be
+  argued before it is built", and that argument has not been had.
+  `work_seam._loop_work_db` is deliberate that a missing store costs the agent a
+  hint and never a session, which is the case against. This does **not** block
+  the announcement above -- that is wanted under either answer -- but it must not
+  be settled by a refinement's silence either.
 - **What a `cwd` that is not a git repository at all should do.** Shared with
   item 0031 and with item 0035, and it should be answered once for all three
   rather than three times. `tiktok-downloader` had no readable git state, so it
