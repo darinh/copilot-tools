@@ -45,6 +45,50 @@ standing in and attached to their terminal. Here that was HOME, which is the cas
 operator menu already warns about in its own banner, and the only escape was closing
 the terminal.
 
+## Done when
+
+Stated as invariants, because *how* the tie is broken is the open decision below
+and a criterion naming one mechanism would settle it by the back door.
+
+- A word typed in the belief that it is a subcommand does not silently become an
+  autopilot prompt. `setup` is the measured case; `install`, `start`, `run`,
+  `update`, `init`, `config`, `doctor` and `stat` behave the same way today and
+  must end up wherever `setup` ends up.
+- Whatever happens to such a word, the user can get out of it without closing the
+  terminal.
+- The documented shape still works. Every input pinned by
+  `test_a_word_that_resembles_no_subcommand_is_left_alone` -- `operator implement
+  the login fix` and its siblings -- still reaches a session, and that test is
+  amended deliberately rather than deleted if the chosen tie-break changes what
+  it asserts.
+- The outcome is distinguishable from a hang: whatever is declined is declined
+  visibly, rather than by attaching the terminal to something.
+
+## Not in scope
+
+- Redesigning the typo guard's suggestion logic. The item's finding is that the
+  guard is working correctly and is not the thing that must change.
+- The separate HOME/non-repository question below, unless the owner folds it in.
+
+## Risk
+
+🟡 `copilot_operator.py::_dispatch_command` / `run_dispatch`, and
+`tests/test_operator.py`. The blast radius is every invocation of the CLI. The
+failure mode of a wrong rule is refusing a legitimate prompt, which is loud; the
+failure mode of no rule is the one already reported, which is a terminal the user
+has to close.
+
+## Needs a decision before this can be worked
+
+- **How to break the tie between a one-word prompt and a mistyped subcommand.**
+  The item names one candidate (a bare single word is refused; a multi-word
+  prompt is not) and that candidate is cheap, but choosing it is a product
+  decision about what `operator <prompt>` means.
+- **Separately: whether launching in HOME, or in any directory that is not a git
+  repository, should require confirmation however it was reached.** This is
+  answerable independently and overlaps items 0034 and 0035, which both argue
+  that costing an agent a session is worse than costing it a hint.
+
 ## Notes
 
 This is not an untested path, which is the part worth keeping.

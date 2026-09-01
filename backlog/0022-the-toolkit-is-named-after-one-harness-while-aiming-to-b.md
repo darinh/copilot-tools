@@ -37,3 +37,39 @@ module, the console scripts, the install manifest, the env var (which needs a
 deprecation path, not a rename), and the repo name. Bundled with functional work
 it would hide any bug in it inside a diff nobody can review. It wants to be its
 own change, on a quiet branch, with the suite as the only thing moving.
+
+## Done when
+
+- None of the identifiers listed in the evidence names a single harness, except
+  where an external contract requires it -- `~/.copilot/` is the Copilot CLI's
+  own directory and stays spelled that way.
+- `COPILOT_OPERATOR_HOME` keeps working. A machine that sets it today is not
+  broken by the rename; it is warned, on a path someone will see, and the
+  replacement is documented.
+- The diff contains no functional change. The suite is the only thing moving,
+  and it is green before and after on the same commit range.
+- An installed machine survives the change: `setup.ps1`/`setup.sh` from the
+  renamed tree over an old install produces working console scripts, and the
+  install manifest names the new ones.
+
+## Not in scope
+
+- Moving state out of `~/.operator`. Declined already and recorded as D1/D2 in
+  `specs/004-operator-session/spec.md`; reopening it is a separate argument.
+
+## Risk
+
+🔴 whole tree. `copilot_operator.py` is loaded by every entry point, the console
+script names are what `setup` installs onto a PATH, and the env var is live
+configuration on at least one machine. A missed rename does not fail here; it
+fails on the next machine to run `setup`.
+
+## Needs a decision before this can be worked
+
+- **Whether to do it at all, and what the new name is.** Both are the owner's:
+  the first is a judgement about whether the stated direction is still the
+  direction, and the second is naming.
+- **Whether the repository itself is renamed, and if so whether in this pass.**
+  Named in the evidence as one of the affected identifiers, and only the owner
+  can do it. The code change is reviewable without it, so the two can be
+  separated -- but that is a choice, not a fact, and it is his.

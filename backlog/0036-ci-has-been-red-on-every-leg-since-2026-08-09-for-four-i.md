@@ -137,6 +137,91 @@ was silent about it on stderr. The fleet runs on Windows today, so nothing is
 being lost right now; a second machine on Linux or macOS would lose it silently
 and the guard would report success.
 
+## Done when
+
+- Cause 1 is fixed and the fix is proven by a test that fails without it. The
+  comparison must be meaningful on a leg with no `stat.IO_REPARSE_TAG_MOUNT_POINT`,
+  which is the condition the current `object()` sentinel makes unsatisfiable.
+- Cause 2 is fixed, and `_unreadable()` **asserts that it actually bit** before
+  the test proceeds. That assertion is worth more than the fix: a denial helper
+  that silently fails to deny turns two tests into assertions that pass for the
+  wrong reason.
+- Cause 3 is diagnosed, or the item records why it could not be. It fails on
+  macos 3.12 where neither other cause applies, so it is independent and must not
+  be guessed at -- but it is one of the four this item is titled for, and
+  dropping it silently would let the item close with a quarter of its subject
+  untouched. If it is to be split out, that is the decision below and it needs a
+  replacement item filed before this one closes.
+- A CI run is green on all eight legs, or every remaining red leg has an item of
+  its own with its own evidence. "Green except for the known ones" without those
+  items is how a red CI becomes permanent.
+- The count is checked, not just the colour. windows-latest 3.12 is reported as a
+  failed job and contributes no FAILED test line, so something outside the test
+  run fails there -- possibly the stdlib-only smoke step at `ci.yml:75`. That is
+  a fifth thing and is undiagnosed.
+
+## Not in scope
+
+- **Fixing** cause 3 without a macOS leg to reproduce it on. Diagnosing it is in
+  scope; guessing at it is not.
+- Any change beyond the four causes. A red CI is a tempting place to land
+  unrelated work and a terrible one to review it in.
+
+## Risk
+
+🟡 `handoff_tool.py:843` (`_is_junction`) and
+`tests/test_supervisor_code_staleness.py`'s `_unreadable()` helper.
+
+Cause 1 is also a live correctness defect, not only a red light: `_is_junction`
+answers False for every input on POSIX, so on a non-Windows checkout the handoff
+guard walks into the junction-like reparse points it was written to refuse. The
+fleet runs on Windows, so nothing is being lost today; a second machine on Linux
+or macOS would lose it silently and the guard would report success.
+
+## Needs a decision before this can be worked
+
+- **Whether the freeze permits landing causes 1 and 2.** `FROZEN.md` admits
+  "fixes for defects that affect running sessions. Nothing else", and no failing
+  combination is Windows-3.11, which is what this fleet runs. The argument for
+  landing them anyway -- that a red CI disarms the freeze's own safety net -- is
+  exactly the reasoning that erodes a freeze, and the item is explicit that this
+  is the owner's judgement rather than an agent's.
+
+- **Whether cause 3 stays in this item or is split into its own.** It needs a
+  macOS leg nobody here has. Splitting it lets the rest close; not splitting it
+  keeps the four-cause diagnosis together. Either is defensible and neither is an
+  agent's to choose, because it decides what "this item is finished" means.
+
+## Re-checked 2026-08-31: CI has not run in fifteen days, because nothing has been pushed
+
+    $ gh run list --limit 4 --json workflowName,conclusion,createdAt
+    CI               failure  2026-08-16T17:48:59Z
+    Commit identity  success  2026-08-16T17:48:59Z
+    CI               failure  2026-08-09T22:44:12Z
+    Commit identity  success  2026-08-09T22:44:12Z
+
+    $ git log --oneline origin/main..main | wc -l
+    9
+    $ git log --oneline -1 origin/main
+    a61e628 backlog(0034): launching into an uncatalogued repository says nothing
+
+The newest run is still `a61e628`, the run this item was filed from. `main` is
+**nine commits ahead of `origin/main`**, so the failure count has not grown --
+and the sample has not grown either. Those nine commits have **no recorded
+GitHub Actions coverage at all**, and the only test evidence recorded for them
+anywhere is a local run on Windows 3.11. Whether anyone ran anything else on
+them is not knowable from here, which is itself the complaint.
+
+This is worse than the item as filed, and in a way the item could not see. Ten
+red runs is an instrument reporting failure. Zero runs is no instrument: nothing
+is red, nothing is green, and `gh run list` looks superficially unchanged. **Push
+before drawing any conclusion about CI's colour** -- the four causes above may
+have been joined by others in those nine commits, and no evidence exists either
+way.
+
+(The second workflow, "Commit identity", passes on every run and is not part of
+this item.)
+
 ## Notes
 
 **This is filed rather than fixed, deliberately.** FROZEN.md admits "fixes for

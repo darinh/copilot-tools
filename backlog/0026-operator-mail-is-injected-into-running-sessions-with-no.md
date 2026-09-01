@@ -71,6 +71,55 @@ This is the same shape this repository keeps finding: a mechanism that returns
 a confident answer nobody can check. `delivery: "live"` and `read_at` both
 read as proof of something they do not prove.
 
+## Done when
+
+The item names three directions and only the second is finishable on its own.
+Split accordingly.
+
+**The half that can ship alone (acknowledgement):**
+
+- The mail record distinguishes *injected* from *acknowledged by the receiving
+  agent*. `delivery: "live"` and `read_at` no longer assert readership that
+  nothing observed.
+- The 286 existing mail files still read after the change. Whatever the old
+  fields meant, they are not silently reinterpreted as the new stronger claim --
+  that would relabel 284 unproven deliveries as proven ones in a single commit.
+- A message that is injected and never acted on is distinguishable, after the
+  fact, from one that was read.
+
+**The rest (readiness, queue-on-busy):** not finishable until designed, and the
+design question below is unanswered. Do not approve those halves as one item.
+
+## Not in scope
+
+- Item 0025's affiliation and labelling work, which is finishable and should not
+  be reopened here.
+- Gating live delivery on whether the mail is cross-project. The 0025 council
+  considered and rejected that axis explicitly.
+
+## Risk
+
+🟡 `copilot_operator.py::send_message` / `record_delivered` /
+`_can_receive_live`, `operator_mux.py:344`. The acknowledgement half changes the
+meaning of a recorded field, so existing records need a stated interpretation
+rather than a migration that guesses. 98.6% of all mail is live-injected, so
+anything that changes delivery affects effectively all of it.
+
+## Needs a decision before this can be worked
+
+- **Whether a busy agent is interruptible at all for urgent mail, and who
+  decides which mail is urgent.** The item names this as unanswered, and it is
+  load-bearing: a readiness gate with no override converts one failure mode into
+  another, and an override with no rule is the current behaviour with extra
+  steps.
+
+## Open and unexplained
+
+One message reached its recipient days late, found "sitting in the textbox" and
+submitted by hand. `enter=True` is sent, so the simple explanation is refuted and
+no other has been established. A readiness design that assumes injection works
+except when the recipient is busy would be assuming away this observation.
+
 ## Notes
 
 Filed out of the 0025 council, deliberately as a separate item rather than

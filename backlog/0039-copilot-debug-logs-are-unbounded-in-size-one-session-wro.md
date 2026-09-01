@@ -53,6 +53,74 @@ failure mode when a machine fills is not a clean one.
 
 The retention item 0033 caps the log directory at 50 FILES and says nothing about bytes, so a single long-running session can grow one file without limit and the cap never fires. Two files now hold 15.6 GB. The cost is not only disk: item 0001 reads these logs to measure exposure, and a 12 GB file takes minutes per scan, so the instrument that item depends on gets slower as the fault gets worse. A machine that fills up loses the sessions, the logs and the evidence together.
 
+## Done when
+
+- No single Copilot debug log can grow without bound. Either the streaming
+  deltas that make up 88% of the volume stop reaching disk at DEBUG, or a size
+  bound exists that fires before a file reaches gigabytes.
+- The accumulation rate is **observed**, not derived. The 1 GB/day/busy-session
+  figure comes from one file's size over its own lifetime; two readings 120
+  seconds apart showed zero growth. A remedy sized against a derived rate is
+  sized against nothing.
+- Items 0001 and 0030 can still read what they need afterwards: 0030's newest
+  marker per running session, and 0001's ability to tell a kill from a crash by
+  the *shape* of a log's ending.
+- Whoever closes this states which of the two it is: a configuration change in
+  the Copilot CLI, or a fleet-side sweep. See the decision below -- they are not
+  the same item and one of them may not be this project's to make.
+
+## Not in scope
+
+- A size-based sweep that evicts the largest file. That destroys exactly the log
+  item 0001 most wants, and it is the obvious remedy, which is why it is ruled
+  out here in writing.
+- Whether an 11-day session is itself a defect. Named and explicitly not asserted
+  by this item.
+- Item 0033's count-based eviction. Distinct fault, and the two interact badly:
+  a count cap never fires on one 12 GB file, and a size sweep evicts what the
+  count cap correctly kept.
+
+## Risk
+
+🔴 by consequence. Every remedy here either deletes evidence or changes what gets
+written, and two live items read these files. There is no rollback for a deleted
+log. Anything that truncates a file *in place* is worse than deleting it, because
+a truncated log looks like a session that stopped.
+
+## Needs a decision before this can be worked
+
+- **Whether this is ours to fix at all.** `~/.copilot/logs` is written by the
+  Copilot CLI, not by this toolkit. If the log level or a size cap is
+  configurable, this is a settings change and a line of documentation. If it is
+  not, the only lever this project has is deletion -- which is the lever the
+  scope section above rules out. **Check for the setting first**; it is the same
+  unanswered prior question item 0033 has, and one search answers both.
+
+## Re-measured 2026-08-31T23:45Z, later the same day
+
+    22 files, 18.17 GB (decimal) = 16.92 GiB
+    process-1786909174577-54460.log  13,238.0 MB  last write 2026-08-28T03:03Z
+    process-1786834628244-24048.log   3,096.8 MB  last write 2026-08-28T02:58Z
+
+The two large files were unchanged in size and neither had been written to since
+2026-08-28. The directory total moves between readings because live sessions are
+still writing small logs and starting new ones -- three readings within the hour
+gave 22 files / 18.17 GB, 22 / 18.351 GB and 23 / 18.353 GB -- so any total here
+is a snapshot and not a level. This is the same trap as the units correction
+below: quote a reading, not a trend, unless the trend was measured.
+
+**What the timestamps do and do not establish.** They establish that those two
+files stopped growing. They do not establish that the sessions writing them
+ended: item 0030 exists precisely because a session can fall silent for days with
+its process alive, and a stale mtime is the signature of both. Nor is "nothing is
+reading them" a measurement -- items 0001 and 0030 read these logs by design, and
+file metadata says nothing about readers.
+
+What can be said is narrower and still worth saying: the 15.6 GB at the centre of
+this item is not currently growing, so the disk pressure is not accelerating
+today. The mechanism that produced a 12 GB file is untouched, so it **can** recur
+whenever a session runs that long again. Whether it will is not predicted here.
+
 ## Notes
 
 Distinct from 0033, which is about eviction destroying evidence by count - this is unbounded growth of a single file, and the two interact badly: a size-based sweep that evicts the big file destroys exactly the log 0001 most wants, while a count-based cap leaves it. Whatever is done should keep 0001 and 0030 able to read what they need. Note also that the log filename pid (process-<epoch_ms>-<pid>.log) is the copilot.EXE pid and matched 0 of 1,070 session_pid values in trace.jsonl, so nothing currently maps a log to the instance that owns it - worth fixing alongside, because it is what stopped 0001 filtering exposure to supervised sessions on 2026-08-31.

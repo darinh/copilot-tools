@@ -61,6 +61,61 @@ a peer'"'"'s live working tree, against the one rule this project states about
 worktrees ("Leave worktrees you did not create alone"). The safety mechanism
 was issuing the instruction the safety rules exist to prevent.
 
+## Done when
+
+The work is done. What remains is a close.
+
+- `backlog close 32` records the commit that finished it. The last of the four is
+  `b7d0d2d88b821772dcd2ff6b9df8e35cbd48edaf`, "fix(handoff): guard every
+  exception Path.resolve can raise", 2026-08-15 18:08 -0700.
+
+## Not in scope
+
+- `handoff.sh`, which has no guard at all. That is item 0020.
+
+## Risk
+
+🟢 nothing left to build.
+
+## Needs a decision before this can be worked
+
+- **Approval to close**, which is the only thing standing between this item and
+  `closed`. `operator backlog close 32` refuses without it, which is the gate
+  working as intended rather than an obstacle to route around.
+
+## Verified 2026-08-31: the fix is on `main`, and the residual gap below was closed with it
+
+The Status section says the fix landed on `work/1`. It has since merged:
+
+```
+$ git branch --contains fe1b1a9      $ git branch --contains b7d0d2d
+  docs/reboot-kill-shape               docs/reboot-kill-shape
+* main                               * main
+  work/1                               work/1
+```
+
+All four commits are ancestors of `main`. So this is an item whose work is
+shipped and merged, and which reads as `proposed` -- the queue's most misleading
+state, because `backlog ready --explain` reports it as awaiting approval to be
+*worked* when what it awaits is approval to be *closed*.
+
+**The "Remaining gap" paragraph in the Notes below is superseded and should not
+be worked.** It describes the *name-based* draft, and says a peer worktree
+outside `.worktrees/` is still reported as this checkout's litter. The Status
+section, written later, records that the landed guard exempts linked worktrees by
+identity from `git worktree list --porcelain`. Checked rather than inferred:
+
+    handoff_tool.py:752   def _linked_worktrees(root) -> "set[str] | None"
+    handoff_tool.py:656   trees = _linked_worktrees(root)
+    tests/test_handoff_checkout_guard.py:955
+        test_a_worktree_outside_the_convention_is_exempt_too   -> 1 passed
+
+So the general case the JS reference handles is handled here too, and the
+divergence that paragraph describes no longer exists. It is left in place because
+this project does not edit an item's older text to make it right -- being wrong
+is data -- but nothing should be filed or scoped against it. This correction was
+found by an adversarial reviewer who read the code rather than the paragraph.
+
 ## Notes
 
 The JS reference implementation already had this right: INTRINSIC_EXCLUSIONS in `extensions/checkout-guard/guard.mjs` holds `.git` and `.worktrees`, on the stated grounds that both are 'checkouts or plumbing, never repository content'. The Python guard was the half that lagged, so closing this narrows a divergence rather than widening one. Backlog item 0020 tracks the rest of that divergence.

@@ -43,6 +43,57 @@ The failure is silent from the fleet'"'"'s point of view: nothing records that a
 handoff was attempted and refused, so an instance in this state looks like one
 that simply never handed off.
 
+## Done when
+
+- On a repository with no catalog row, `handoff --instance X --status s --next n`
+  leaves the composed text somewhere a *successor can actually find*, and says
+  where. That invariant is the item's, and it is what rules out the withdrawn
+  "write it anywhere and exit 0".
+- Whatever path is taken raises the restart marker in the place the supervisor
+  watches, or does not claim to have handed off. Telling an agent it handed off
+  when no marker was raised is silent context loss, which is worse than the loud
+  refusal that ships today.
+- **If, and only if, the answer to the decision below is self-registration:** two
+  agents starting in one repository at the same moment produce one project row,
+  not two. Keying on `git rev-parse --show-toplevel`, normalised the way
+  `project_paths` already normalises, is what makes a double registration
+  collapse instead of fork. Under the other two candidates -- persist on refusal,
+  or discovery through the session store -- no row is written and this criterion
+  does not apply.
+- A `cwd` that is not a git repository at all has a stated, tested behaviour --
+  whichever behaviour the decision below chooses.
+- The number this item ends on is known: how many of the fleet's projects are
+  uncatalogued. Item 0034 answers part of it already (1 of 11 live instances on
+  2026-08-16), and that answer belongs here.
+
+## Not in scope
+
+- Making the toolkit the general manager of `catalog.csv` -- editing, pruning or
+  reconciling rows. Only the creation path is in question.
+- Item 0034's announcement half. Same root cause, different victim; if this item
+  is approved, 0034 becomes the announcement half of it and should not grow a
+  second enrollment mechanism.
+
+## Risk
+
+🔴 `~/.operator/projects/catalog.csv` and `handoff_tool.py::resolve_guid`. The
+catalog maps a directory to a project id, and a wrong write costs a project its
+identity -- the same file item 0022 calls "the one file whose loss costs every
+project its id". Anything writing it needs an idempotency key and an
+append-only discipline, and a backup before the first write is cheap insurance.
+
+## Needs a decision before this can be worked
+
+- **Whether the toolkit may write the catalog at all.** This is not a design
+  detail: `docs/operator.md:1038` states outright that no code here writes it,
+  and `tests/test_enrollment_conformance.py` holds that as an invariant. Self-
+  registration means deliberately repealing a documented invariant and changing
+  the test that guards it. An agent doing that quietly would be removing a
+  control while implementing a convenience.
+- **What a non-git `cwd` does.** Minting a project per arbitrary directory is
+  probably not wanted, but "probably" is not a specification, and the answer
+  decides whether the fallback in the Notes is ever reached.
+
 ## Notes
 
 The refusal message was improved on `work/1` (commit fe1b1a9 and its

@@ -36,6 +36,48 @@ scan switched off rather than fixed -- named in that file's own docstring.
 The workaround costs a comment paragraph per site explaining why the obvious
 spelling was avoided, which is a tax on every traversal written from now on.
 
+## Done when
+
+- A file containing the standard symlink-safe traversal -- `for entry in
+  os.scandir(p): ... entry.is_dir(follow_symlinks=False)` -- produces no floor
+  violation.
+- A file containing `p = Path(x); p.is_dir(follow_symlinks=False)` still
+  produces one. This is the negative control and it is the whole difficulty: the
+  receiver is an `ast.Name` in both cases, so a fix that only widens the gate
+  retires the check it is meant to preserve.
+- `handoff_tool.py` can be written in the obvious spelling without an
+  explanatory paragraph per site. Whether it also needs no marking at all
+  depends on which of the two options in the Notes is taken -- the second ends
+  with a new annotation at the site, distinct from `# floor-ok:`, and that is a
+  legitimate answer rather than a failure to meet this criterion.
+- Both cases above are pinned by tests in
+  `tests/test_python_floor_conformance.py`, and the second one is observed
+  failing against the fixed scanner before it is relied on.
+
+## The choice in the Notes is real and is not made here
+
+Recognising `os.scandir` loop targets, or accepting a new annotation meaning
+"not the type you think", are both live. They are costed differently and the
+item does not choose between them. An implementer may; a refinement should not,
+and the "no suppression comment" phrasing this section originally carried would
+have ruled out the second option without saying so.
+
+## Not in scope
+
+- Other floor rules. Only the keyword-gated path for `is_dir` is in question.
+- Rewriting `handoff_tool.py`'s traversal back to the keyword spelling. It uses
+  `entry.is_symlink() or not entry.is_dir()` today, which is exactly equivalent
+  on every input; changing it back is optional and proves nothing on its own.
+- Reusing the existing `# floor-ok:` annotation. It claims the line is
+  unreachable on the floor, which would be a false claim here, and a false
+  suppression is worse than the false positive it silences.
+
+## Risk
+
+🟡 `tests/test_python_floor_conformance.py`. No shipped behaviour changes, but
+this is a guard: a fix that is too permissive silently retires real coverage,
+and a retired guard reads exactly like a passing one.
+
 ## Notes
 
 Deliberately NOT fixed alongside the guard. Narrowing the keyword-gated path
