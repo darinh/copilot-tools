@@ -8,7 +8,7 @@ spec: none
 
 ## Evidence
 
-Measured 2026-08-31T23:2xZ on this machine.
+Measured 2026-08-31T23:21Z-23:30Z on this machine.
 
 The machine rebooted on 2026-08-28. From the Windows System log and
 `LastBootUpTime`:
@@ -21,18 +21,26 @@ The machine rebooted on 2026-08-28. From the Windows System log and
 
 That ended every supervisor and every session on the machine. **Nothing
 started them again for 3.85 days.** The fleet was restored at
-2026-08-31T23:18:52-23:19:01Z by nine hand-typed commands, which the trace
-records as `kind=user` invocations, one per instance, each from that
-instance's own directory:
+2026-08-31T23:18:52-23:19:01Z by a burst of user-originated invocations, which
+the trace records as `kind=user` — a bare `operator` at 23:18:52 followed
+seven seconds later by nine `--loop` launches within two seconds of each
+other, each from its instance's own directory:
 
 ```
+23:18:52Z  argv=(bare operator)                        cwd=~
 23:18:59Z  argv=--loop --name book-translator          cwd=~\repos\book-translator
 23:18:59Z  argv=--loop --name copilot-tools            cwd=~\repos\copilot-tools
 23:19:00Z  argv=--loop --name discord-invite-manager   cwd=~\repos\discord-invite-manager
 23:19:00Z  argv=--loop --name operator                 cwd=~\repos\operator
 23:19:00Z  argv=--loop --name prism                    cwd=~\repos\prism
+23:19:01Z  argv=--loop --name repos                    cwd=~\repos
 ...
 ```
+
+Nine launches in two seconds is not nine things typed by hand, and this item
+does not claim it was. It is consistent with `operator restore --all`, which
+is exactly the documented recovery path (below); what the trace establishes is
+only that a human initiated it, not that they typed each line.
 
 Every one succeeded and launched a fresh session, which is itself evidence
 that nothing was running: `restart_loop` refuses an instance with no live
@@ -40,7 +48,23 @@ session, and a second supervisor for a live instance is refused too. All nine
 Copilot leads on the machine now have a start time of 2026-08-31 16:19:01
 local (UTC-07:00).
 
-**Nothing this toolkit installs survives a reboot.** Checked directly:
+**The recovery mechanism exists; the trigger does not.** An earlier draft of
+this item missed this and was wrong to. `operator restore` replays
+`~/.operator/tabs.json`, is offered in the bare-`operator` menu, and is
+documented for precisely this case (`copilot_operator.py:1398` `restore_tabs`,
+`docs/operator.md:134-139`):
+
+```
+operator restore              # pick which tracked tab(s) to reopen
+operator restore --all        # reopen every tracked tab, resuming sessions
+```
+
+`tabs.json` is therefore also the recorded "these instances were up" list — a
+later note in this item proposed inventing one, and it already exists. So the
+defect is **not** that recovery is impossible or unrecorded. It is that
+nothing *fires* the recovery and nothing *says* it is needed.
+
+**Nothing this toolkit installs runs at boot.** Checked directly:
 
 * `Get-ScheduledTask` — no task whose name or action mentions `operator` or
   `copilot`.
@@ -49,27 +73,30 @@ local (UTC-07:00).
 * `HKCU` and `HKLM` `...\CurrentVersion\Run` — fourteen entries, all
   third-party (Steam, OneDrive, Plex, Teams, ...). None is operator.
 
-That is a search of the three places this toolkit could plausibly have
-installed something, and it is not an exhaustive enumeration of every
-auto-start facility Windows has — services, unnamed scheduled tasks, logon
-scripts and Group Policy were not swept. The claim it supports is the one
-that matters: **the toolkit installs nothing that survives a reboot**, so this
-is not a setting somebody switched off.
+Those are three persistence surfaces, not all of them: Windows services,
+unnamed scheduled tasks, logon scripts, Group Policy and the alternate
+registry views were not swept. The claim they support is bounded accordingly —
+**no direct operator reference exists on the three surfaces checked**, so the
+absence of boot recovery is not a setting somebody switched off on one of
+them.
 
 Nothing announced the state either. The instruments that exist report on
 instances that are running; with no supervisors alive there is nothing for
 them to be silent *about*, so `operator list` prints an empty fleet, which is
-the same thing it prints on a machine where the fleet was never started. The
-gap was closed by a human noticing.
+the same thing it prints on a machine where the fleet was never started —
+even though `tabs.json` on that same machine still lists what ought to be up.
+The gap was closed by a human noticing.
 
-Cost: 3.85 days across nine instances is about 832 instance-hours during which
-no loop was running. **Do not read that as 832 hours of lost work.** The twelve
-days before the reboot produced 240.82 eventful log-hours in total, 93% of it
-from one session on an instance that was not among the nine restored, and a
-fleet mean of 0.83 sessions actually doing anything at once (backlog 0001,
-2026-08-31 section). The honest statement is that the fleet's *availability*
-was zero for 3.85 days; what it would have produced is not measurable from
-here.
+Cost: 3.85 days across the nine instances that were later restored is about
+832 instance-hours during which no loop ran. **That is nine restored instances,
+not a measured fleet total** — eleven sessions were alive before the reboot,
+and the nine is what somebody chose to bring back. **Nor is it 832 hours of
+lost work.** The twelve days before the reboot produced 240.82 eventful
+log-hours in total, 93% of it from one session on an instance that was *not*
+among the nine restored, at a fleet mean of 0.83 sessions active at once
+(backlog 0001, 2026-08-31 section). The honest statement is that fleet
+availability was zero for 3.85 days; what it would have produced is not
+measurable from here.
 
 ## Why it matters
 
@@ -93,10 +120,10 @@ session in the same instant, so no record is written at all -- not even the
 `restart=False, exit_code=null` that step 4 of its recipe calls "the kill
 signature, and it is the only one". The window containing this reboot
 therefore reads QUIETER than a window without it, while being the window in
-which the most context was actually lost: four sessions were killed mid-work,
-one of them mid-tool-call with 12.33 GB of log and 11.3 days of context, and
-none of the four appears in any count. A defect that makes the fleet's own
-loss-measuring instrument read backwards is worth more than the downtime.
+which the most context was actually lost: eleven sessions ended without a
+record, one of them mid-tool-call after 11.3 days, and none of the eleven
+appears in any count. A defect that makes the fleet's own loss-measuring
+instrument read short is worth more than the downtime.
 
 ## Notes
 
@@ -113,12 +140,16 @@ repositories whose state nobody has looked at since the machine went down.
 The safe half of this item is the announcement, not the auto-start, and they
 should be considered separately.
 
-**The cheap half is to say it.** Something that knows the fleet's intended
-membership can compare it against what is running. The project catalogue is
-that list for registered projects, though item 0034 measures that 1 of 11 live
-instances had no catalogue row, so it is not currently a complete one. A
-recorded "these instances were up when the machine went down" would be enough
-and needs no catalogue at all.
+**The cheap half is to say it, and most of the parts already exist.**
+Something that knows the fleet's intended membership can compare it against
+what is running, and `~/.operator/tabs.json` is already that list — it is what
+`operator restore` replays, and it survived the reboot intact. An earlier
+draft of this note proposed recording "these instances were up when the
+machine went down" as though it had to be invented; it does not. What is
+missing is something that performs the comparison and says the answer out
+loud. The project catalogue is a second candidate list, though item 0034
+measures that 1 of 11 live instances had no catalogue row, so it is not
+currently complete; `tabs.json` needs no catalogue at all.
 
 **A boot marker cannot be written at boot, which is the point of this item.**
 An earlier draft proposed that `operator_trace.py` record a `machine_boot`
