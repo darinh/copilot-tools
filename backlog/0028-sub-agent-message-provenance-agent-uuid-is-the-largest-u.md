@@ -67,6 +67,48 @@ store has no name for -- `agent-agent` currently means peer instances
 exchanging mail, not a parent delegating to a child. Deciding that vocabulary
 is the substance of this item.
 
+## Done when
+
+The item is two-staged and the first stage can close it.
+
+**Stage 1 -- the measurement, which is the whole of the approved work:**
+
+- The number is known: how many of the 2,720 `agent-<uuid>` events correspond to
+  rows in `turns`, by the session-id-and-exact-content join whose mapping was
+  verified 194/194 in a17c3e4.
+- If that number is near zero, this item closes as `rejected` **with the number
+  recorded**. The events exist and never reach the store; nothing needs building
+  and the next agent to notice the family does not pay for the measurement again.
+
+**Stage 2 -- only if the number is non-zero:**
+
+- What the uuid names is established, not assumed. `sessions.id` is the cheap
+  candidate and either resolves or does not.
+- Whether it names the sending or the receiving agent is established.
+- A channel vocabulary is chosen and applied, and `specs/005-conversation-log/spec.md`
+  is updated in the same commit that applies it.
+- The control this feature has needed every previous time holds: a real human
+  message is not reclassified. Without that control the change is unfalsifiable
+  by its input.
+
+## Not in scope
+
+- The three source families already handled (`instruction-discovery`,
+  `thinking-exhausted-continuation`, `skill-*`).
+- Redefining `agent-agent`, which today means peer instances exchanging mail,
+  unless stage 2's vocabulary decision explicitly does so.
+
+## Risk
+
+🟡 `conversation_log.py`. Misclassification rewrites what the log says was said
+and by whom, and nothing downstream can detect it -- which is why the human-message
+control is not optional.
+
+## Needs a decision before this can be worked
+
+None yet. Stage 1 is a query, and the vocabulary question in stage 2 should not
+be answered before stage 1 says whether it matters.
+
 ## Notes
 
 Sequenced deliberately after a17c3e4 rather than folded into it. That change

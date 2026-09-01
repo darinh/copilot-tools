@@ -45,6 +45,43 @@ standing in and attached to their terminal. Here that was HOME, which is the cas
 operator menu already warns about in its own banner, and the only escape was closing
 the terminal.
 
+## Done when
+
+- `operator setup` does not start a session. The same holds for the other words
+  measured as passing through: `install`, `start`, `run`, `update`, `init`,
+  `config`, `doctor`, `stat`.
+- The documented shape still works. Every input pinned by
+  `test_a_word_that_resembles_no_subcommand_is_left_alone` -- `operator implement
+  the login fix` and its siblings -- still launches a session, and that test is
+  amended rather than deleted if the tie-break changes what it asserts.
+- Whatever is refused is refused with a message on stderr and a non-zero exit,
+  not by attaching the terminal to anything.
+
+## Not in scope
+
+- Redesigning the typo guard's suggestion logic. The item's finding is that the
+  guard is working correctly and is not the thing that must change.
+- The separate HOME/non-repository question below, unless the owner folds it in.
+
+## Risk
+
+🟡 `copilot_operator.py::_dispatch_command` / `run_dispatch`, and
+`tests/test_operator.py`. The blast radius is every invocation of the CLI. The
+failure mode of a wrong rule is refusing a legitimate prompt, which is loud; the
+failure mode of no rule is the one already reported, which is a terminal the user
+has to close.
+
+## Needs a decision before this can be worked
+
+- **How to break the tie between a one-word prompt and a mistyped subcommand.**
+  The item names one candidate (a bare single word is refused; a multi-word
+  prompt is not) and that candidate is cheap, but choosing it is a product
+  decision about what `operator <prompt>` means.
+- **Separately: whether launching in HOME, or in any directory that is not a git
+  repository, should require confirmation however it was reached.** This is
+  answerable independently and overlaps items 0034 and 0035, which both argue
+  that costing an agent a session is worse than costing it a hint.
+
 ## Notes
 
 This is not an untested path, which is the part worth keeping.

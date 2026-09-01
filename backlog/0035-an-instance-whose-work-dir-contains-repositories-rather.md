@@ -111,6 +111,48 @@ is still session #1 after 19 hours - so the entire day of context is held in a
 process that item 0030 has just measured as idle, with no handoff written and
 nothing watching for it.
 
+## Done when
+
+- Launching with a work dir that is not a git repository prints one line naming
+  it as such and listing what that disables: the progress breaker, ownership
+  enforcement, and repository naming in every operator surface.
+- The same statement reaches the agent in its preamble.
+- A session whose work dir *is* a repository prints neither -- the control, as in
+  item 0034.
+- The loop still starts.
+- The launch record makes the configuration visible after the fact, not only at
+  the moment it scrolls past. Nineteen hours of commits to `tiktok-offline` were
+  attributed to nothing; a reader coming to `operator.log` afterwards should be
+  able to see why.
+
+## Not in scope
+
+- Refusing the launch. Same argument as item 0034: costing an agent a session is
+  worse than costing it a hint.
+- **A repository-oriented view** -- answering "what loop, if any, is working in
+  this repository", which is the question the user actually asked. That is the
+  other half of this and is genuinely separate: it also covers the sub-agent and
+  worktree cases where one instance legitimately touches several repositories.
+  If it is wanted, it wants its own item; it is not a bigger version of the
+  launch warning.
+- Re-enabling the progress breaker for a container work dir. Whether that is even
+  meaningful depends on the decision below.
+
+## Risk
+
+🟢 the launch path's reporting and one preamble clause. Same kernel-budget
+constraint as item 0034 if the clause lands in `operator_kernel/preamble.py`
+(item 0038: 11 total lines of headroom).
+
+## Needs a decision before this can be worked
+
+- **Whether a container work dir is a supported configuration.** It may be that
+  a roving instance with the whole `~/repos` tree in scope is wanted, which is a
+  legitimate thing to want. If it is supported, this item is a warning; if it is
+  not, the remedy is different and larger. The item is explicit that the defect
+  is not the choice but that the choice is unannounced -- and that framing
+  depends on the choice being allowed.
+
 ## Notes
 
 **Not established: whether the container work dir was deliberate.** It may be

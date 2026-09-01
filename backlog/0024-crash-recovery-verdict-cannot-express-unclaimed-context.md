@@ -46,6 +46,40 @@ belongs with `operator session start` (Phase D of specs/004-operator-session),
 which is the seam that decides what a session is told at launch. Tweaking the
 boolean now would ship a third wrong answer and make the real fix harder.
 
+## Done when
+
+- A session that launches with no handoff addressed to it, while unclaimed
+  context for the project exists, is told so and told *where* -- by path.
+- A real crash is still reported as one.
+- An unattributed legacy handoff is still not reported as a crash.
+  `test_an_unmigrated_handoff_is_not_reported_as_a_crash` stays green, and it is
+  the control that the third state was added rather than the second answer
+  swapped for the first.
+- The suppression is bounded. Today's `next-session.md` fallback is
+  unconditional in time, so a stale legacy file can mask a real crash
+  indefinitely; whatever ships must not preserve that.
+
+## Not in scope
+
+- Improving the boolean in place. The item's argument is that a better boolean
+  is a third wrong answer.
+- Adding `migrate_project_handoff` to the launch path. Measured, and it makes
+  the unattributed case report a crash that did not happen.
+
+## Risk
+
+🟡 `copilot_operator.py::crash_recovery_verdict` (~L2041) and whatever composes
+the launch preamble. The failure mode is a false crash report, which costs a
+session its first minutes and its trust in the readout, not data.
+
+## Sequencing
+
+Blocked on `operator session start` -- Phase D of
+`specs/004-operator-session/spec.md` -- which is the seam that decides what a
+session is told at launch. This item does not need its own design; it needs that
+seam to exist and then to carry one more state. Approving it before Phase D
+lands would put it in the queue with nothing to attach to.
+
 ## Notes
 
 Found by adversarial review of the handoff re-key (Phase B). Do not fix by adding migrate_project_handoff to the launch path -- measured, it makes the unattributed case report a crash that did not happen.

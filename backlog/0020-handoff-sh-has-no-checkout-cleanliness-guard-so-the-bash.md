@@ -32,6 +32,41 @@ The exposure is narrow -- rollback and stale installs -- but "narrow" is what
 the empty-directory blind spot looked like before it cost three agents an
 evening.
 
+## Done when
+
+Whichever of the three options below is chosen, all of these hold:
+
+- No path spelled `handoff` on a machine carrying this toolkit writes a handoff
+  while the checkout is unclean. "Unclean" means what `handoff_tool.py` means by
+  it today, including the empty-directory case that git itself cannot see.
+- `docs/operator.md:63` no longer documents symlinking `handoff.sh` onto
+  `~/.local/bin/handoff` as an install route, whatever else it says.
+- The bash tests either cover the guard or are removed with the file they cover.
+  Tests left behind asserting the old behaviour are the failure this item is
+  about, one layer up.
+
+## Not in scope
+
+- The general-case worktree question -- exempting a linked worktree created
+  outside `.worktrees/` -- which item 0032 records as a measured, still-open
+  divergence between the Python and JS guards.
+- Any change to `handoff_tool.py`'s own scan.
+
+## Risk
+
+🟡 `handoff.sh`, `docs/operator.md`. Under option 1 the constraint is bash 3.2
+(`.github/copilot-instructions.md`): no associative arrays, `${a[@]+"${a[@]}"}`
+throughout, and `git status --porcelain -uall -z` parsed by hand. Under option 3
+the risk is that the rollback story loses its subject.
+
+## Needs a decision before this can be worked
+
+- **Which of the three options.** The item argues option 2 -- refuse outright
+  when the Python tool is available -- is cheapest and probably right, and says
+  in the same breath that it changes what "rollback" means, which is the human's
+  call. An agent picking one here would be choosing what the project's fallback
+  is, not how to implement it.
+
 ## Notes
 
 Three options, unpriced:

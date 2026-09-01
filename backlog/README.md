@@ -103,6 +103,35 @@ cost is that a `# open | closed | rejected` left in a copied template fails
 loudly instead of parsing as `open` -- which is the better failure, and why
 the vocabulary is documented here rather than in a comment.
 
+## Refinement sections
+
+`## Evidence`, `## Why it matters` and `## Notes` say what was measured and why
+someone should care. They do not say what *done* looks like, and an item nobody
+can finish is a rumour with better sourcing. Three optional sections carry that,
+and a refined item has all three:
+
+| Section | Answers |
+|---|---|
+| `## Done when` | What is observably true when this is finished that is not true now. Outcomes, not designs. Include the control where an assertion could otherwise pass for the wrong reason. |
+| `## Not in scope` | The edges. An item with no stated boundary grows one at implementation time, chosen by whoever is holding it. |
+| `## Risk` | Which files, and how dangerous: 🟢 additive, 🟡 existing behaviour, 🔴 auth, data loss, identity, schema, concurrency. |
+
+A fourth, `## Needs a decision before this can be worked`, is how an item records
+an ambiguity **without resolving it**. A guess written into an item is
+indistinguishable from a decision, and the next agent has no way to tell it was
+invented. Listing the question is cheap; each entry should be phrased so that
+either answer changes what gets built.
+
+None of these is validated by `backlog check`. The body is prose and a checker
+that demanded a heading would get a heading. They are a convention for making an
+item consumable, and the test of one is whether an agent with no memory of the
+conversation that filed it could finish it and know that it had.
+
+Later additions are appended as their own dated section -- `## Re-measured
+2026-08-31: ...` -- rather than edited into the original text. Being wrong is
+data, and an item silently corrected loses the record of what was believed and
+when.
+
 ## The approval gate
 
 `proposed` means *filed, not approved*. It is the status every item an agent

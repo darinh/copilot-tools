@@ -64,6 +64,48 @@ the reply is always the same wrong number.
 The docstring on `copilot_tools_version.py` states the intended invariant in
 so many words: one place the version is written down. There are two.
 
+## Done when
+
+- `operator --version` prints the version of the toolkit that is installed. On
+  this machine today that is `1.4.0`, not `1.0.0`.
+- The test compares the printed output against `copilot_tools_version.__version__`
+  -- a constant the printing code does not define -- and a control proves the
+  assertion goes red when the two differ. The present test scores the output
+  against the same literal the code printed, so it passes for any value; a fix
+  that leaves that shape in place has fixed the number and not the defect.
+- Either there is one version literal in the tree, or there are two and each is
+  documented as to what it versions and printed where it belongs.
+
+## Not in scope
+
+- Changing the version number itself, the release process, or how `setup`
+  records the manifest.
+
+## Risk
+
+🟢 `copilot_operator.py:88` and its `--version` handler, plus the test at
+`tests/test_operator.py:976`. Nothing downstream reads
+`copilot_operator.__version__`; `TOOLKIT_VERSION` is already what the manifest,
+the generated project instructions and the manifest read-back use.
+
+## Needs a decision before this can be worked
+
+- **Is `copilot_operator.__version__` meant to be a CLI-interface version
+  distinct from the toolkit release?** If yes, it is not stale and the defect is
+  that `--version` prints the wrong one of two things nothing distinguishes. If
+  no -- which `copilot_tools_version.py`'s own "the one place the toolkit's
+  version is written down" suggests -- the literal is deleted and
+  `TOOLKIT_VERSION` re-exported. The two answers produce different diffs.
+
+## Still true on 2026-08-31
+
+    PS> operator --version
+    operator 1.0.0
+
+The literal has moved one line, to `copilot_operator.py:88`, and is otherwise
+untouched. Three weeks and no release has changed it, which is the point: it
+cannot change, because nothing that ships a version reads it.
+
 ## Notes
 
 Not fixed on discovery because the fix has a decision in it that should be

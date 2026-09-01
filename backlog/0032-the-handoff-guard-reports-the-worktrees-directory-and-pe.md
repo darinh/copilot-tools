@@ -61,6 +61,53 @@ a peer'"'"'s live working tree, against the one rule this project states about
 worktrees ("Leave worktrees you did not create alone"). The safety mechanism
 was issuing the instruction the safety rules exist to prevent.
 
+## Done when
+
+The built half is done; what remains is a close and a decision about the residue.
+
+- `backlog close 32` records the commit that finished the work. The last of the
+  four is `b7d0d2d88b821772dcd2ff6b9df8e35cbd48edaf`, "fix(handoff): guard every
+  exception Path.resolve can raise", 2026-08-15 18:08 -0700.
+- The residual general-case gap -- a linked worktree created *outside*
+  `.worktrees/` is still reported as this checkout's litter -- has a home: either
+  folded into item 0020, which already owns the Python/JS guard divergence, or
+  filed as its own item. It must not be closed silently with this one.
+
+## Not in scope
+
+- The general case above, under this id.
+- `handoff.sh`, which has no guard at all. That is item 0020.
+
+## Risk
+
+🟢 nothing left to build for the landed half. The residue is 🟡: adopting the JS
+approach means calling `git worktree list` on the handoff path and deciding what
+an unanswerable call means -- the JS answer is null, "no information", which
+callers already treat as not-clean.
+
+## Needs a decision before this can be worked
+
+- **Approval to close**, which is the only thing standing between this item and
+  `closed`. `operator backlog close 32` refuses without it, which is the gate
+  working as intended rather than an obstacle to route around.
+- **Where the residual gap goes** -- 0020, or its own item.
+
+## Verified 2026-08-31: the fix is on `main`, not only on `work/1`
+
+The Status section below says the fix landed on `work/1`. It has since merged:
+
+```
+$ git branch --contains fe1b1a9      $ git branch --contains b7d0d2d
+  docs/reboot-kill-shape               docs/reboot-kill-shape
+* main                               * main
+  work/1                               work/1
+```
+
+All four commits are ancestors of `main`. So this is an item whose work is
+shipped and merged, and which reads as `proposed` -- the queue's most misleading
+state, because `backlog ready --explain` reports it as awaiting approval to be
+*worked* when what it awaits is approval to be *closed*.
+
 ## Notes
 
 The JS reference implementation already had this right: INTRINSIC_EXCLUSIONS in `extensions/checkout-guard/guard.mjs` holds `.git` and `.worktrees`, on the stated grounds that both are 'checkouts or plumbing, never repository content'. The Python guard was the half that lagged, so closing this narrows a divergence rather than widening one. Backlog item 0020 tracks the rest of that divergence.

@@ -104,6 +104,58 @@ about kills if something was running that a kill could have taken, and on
 2026-08-15 that was true of one instance out of nine. No sharpening of those
 instruments can fix this, because the population they sample has gone.
 
+## Done when
+
+- The supervisor can distinguish "process alive and working" from "process alive
+  and stopped" without waiting for an ending, and reports the second as something
+  other than `looping`.
+- The signal fails loudly when it cannot answer. A log with zero occurrences of
+  the marker means *cannot tell*, not *idle*, and the positive control -- the
+  marker occurs 18,290 to 130,455 times in the very logs where it has gone quiet
+  -- belongs in the code, not only in this item.
+- The event is classified before a conclusion is drawn.
+  `session.background_tasks_changed` churn keeps the marker current in a session
+  whose agent has stopped, and the 2026-08-16 re-measurement records that
+  correction against this item's own first table.
+- The threshold is derived from the fleet, not assumed. The longest silence
+  observed while a session was demonstrably working is 38.6 minutes, against
+  reported silences of 68.4 to 141.1 hours -- that gap is what makes a threshold
+  possible, and it is a measurement that will need retaking.
+- A session in the measured state is *surfaced*, not acted on. See scope.
+
+## Not in scope
+
+- Killing, restarting or otherwise acting on a session detected as stopped. The
+  eight measured sessions held days of context with no handoff written, and
+  killing one destroys the only copy. Detection first; the response is a separate
+  decision with a separate blast radius.
+- Diagnosing *why* a session stops. Unmeasured, deliberately not guessed at, and
+  a detector does not need the answer.
+- Building on log mtime. Measured to report eight inert sessions as working,
+  because the Copilot runtime keeps writing telemetry for as long as the process
+  exists.
+
+## Risk
+
+🔴 whatever gains the ability to declare a live session dead. A false positive
+here does not misreport a number, it invites the destruction of unwritten
+context. The detector must be readable and non-acting before anything reads it
+to decide.
+
+Also 🟡 by dependency: the instrument reads `~/.copilot/logs`, which item 0033
+shows is capped and evicts during normal operation, and item 0039 shows contains
+single files of 12 GB. A detector that must scan those files is slow exactly when
+the fleet is busy.
+
+## Needs a decision before this can be worked
+
+- **Where the remedy lives.** This repository is frozen to safety fixes
+  (`FROZEN.md`) and the supervision kernel now lives in `../operator`. A session
+  a supervisor cannot tell has stopped is arguably a defect affecting running
+  sessions, but the remedy is new detection rather than a repair. The item names
+  this as the owner's call and it is still open. Item 0038 is relevant: the
+  kernel has 11 total lines of headroom, so "put it in the kernel" is not free.
+
 ## Notes
 
 **The mechanism is not established and is deliberately not guessed at here.**

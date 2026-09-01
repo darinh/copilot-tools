@@ -24,6 +24,46 @@ A session launched in an uncatalogued repository has no project directory, and t
 
 It also guarantees item 31 for that session: an instance in this state cannot hand off, so when its context fills, the context dies with the process. The user in the report above spent the discovery cost themselves, concluded the toolkit was broken, and was looking for what regressed - which is the cost of a state the system knows about and does not mention.
 
+## Done when
+
+- Launching in a repository with no catalog row prints one line, beside the
+  existing "Progress breaker: inactive" line, naming
+  `~/.operator/projects/catalog.csv` and stating that nothing in this toolkit
+  writes it.
+- The same statement reaches the agent, in the preamble it reads, so the agent
+  knows its own status rather than inferring it from an empty queue.
+- A session in a registered project prints neither. That is the control: a
+  message that appears in both cases carries no information, which is the defect
+  being fixed.
+- The loop still starts. Refusing is ruled out below.
+- "not registered" and "nothing to do" are distinguishable from the output alone,
+  by someone who does not already know which one they are looking at.
+
+## Not in scope
+
+- Refusing to launch. `work_seam._loop_work_db` is deliberate that a missing
+  store costs the agent a hint and never a session, and the same argument applies
+  here.
+- Registering the project. Item 0031 owns enrollment; this item must not grow a
+  second mechanism for it.
+
+## Risk
+
+🟢 the launch path's reporting and one preamble clause. No behaviour changes.
+
+One constraint if the preamble clause lands in `operator_kernel/preamble.py`
+rather than `copilot_operator.py`: item 0038 measures the kernel at 11 total
+lines below its ceiling, so a clause of any size fails
+`test_the_kernel_as_a_whole_stays_under_its_total_ceiling`. Sequence behind 0038
+or write it in the supervisor.
+
+## Needs a decision before this can be worked
+
+- **What a `cwd` that is not a git repository at all should do.** Shared with
+  item 0031 and with item 0035, and it should be answered once for all three
+  rather than three times. `tiktok-downloader` had no readable git state, so it
+  was not merely uncatalogued -- it could not have been catalogued meaningfully.
+
 ## Notes
 
 Refusing to launch is probably the wrong fix and should be argued before it is built: work_seam._loop_work_db is deliberate that a missing store must cost the agent a hint and never a session, and the loop is supposed to run whether or not the project is registered.

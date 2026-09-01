@@ -75,6 +75,74 @@ exactly when there is nothing to see, and shortest during the windows that
 carry evidence -- which is precisely the exposure window 0001 has been waiting
 five days for.
 
+## Done when
+
+- The eviction rule is established, or shown to be unestablishable from outside
+  the Copilot CLI and recorded as such. Everything else here is a guess without
+  it.
+- The prior question is answered: **is the cap configurable?** No search has been
+  made for a Copilot setting that changes it, and if one exists this item is a
+  configuration change rather than a mechanism to build.
+- Whatever retention ships keeps item 0001 able to distinguish a kill from a
+  crash. That means whole logs for the endings it cares about -- an extension
+  host exiting `0xC000013A` with an orderly teardown, or a file stopping
+  mid-token-stream, are not events in the marker stream and no index preserves
+  them.
+- Item 0030's liveness instrument still has logs to read for currently running
+  sessions.
+- Any retention added is bounded in bytes as well as files, or item 0039 defeats
+  it: one session there wrote a single 12 GB file, and a file-count cap never
+  fires on it.
+
+## Not in scope
+
+- A marker index *as the whole remedy*. It retires the cheap uses -- 0030's
+  liveness, 0001's exposure denominator -- and silently drops the diagnostic one.
+  It may be part of an answer; it is not the answer.
+- Copying the retained logs on a schedule. They are 6.3 GB and this is not
+  reasonable.
+- A size-based sweep that evicts the largest file, which destroys exactly the log
+  item 0001 most wants. See 0039.
+
+## Risk
+
+🔴 by consequence rather than by code. Every candidate remedy here either deletes
+evidence or decides which evidence to keep, and two live items depend on what
+survives. There is no rollback for a deleted log.
+
+## Needs a decision before this can be worked
+
+- **Where it belongs.** This repository is frozen to safety fixes (`FROZEN.md`)
+  and the supervision kernel lives in `../operator`. The item records this as the
+  owner's call, and it is the same disposition item 0030 has.
+
+## Re-measured 2026-08-31: the directory now holds 22 files, not 50
+
+    PS> (Get-ChildItem ~/.copilot/logs -Filter "process-*.log").Count
+    22
+    oldest by CreationTime: process-1786834628244-24048.log  2026-08-15T22:57:08Z
+    newest by CreationTime: process-1788219794530-55012.log  2026-08-31T23:43:14Z
+
+On 2026-08-16 this directory held **exactly 50** files at every observation, with
+the oldest retained created 2026-08-10T00:26:39Z. Fifteen days later it holds 22,
+and nothing older than 2026-08-15T22:57Z survives. That oldest survivor is the
+`repos` instance's session -- the same log item 0039 attributes to `repos` and the
+same pid 24048 whose start item 0030 records at 2026-08-15T22:57:07Z, so three
+independent readings agree on it.
+
+**A count-cap-with-eviction model does not explain a count of 22.** A 50-file cap
+that evicts on overflow has no mechanism for falling to 22 and staying there. At
+least one of these is true and none is established here: the retention has an age
+or lifetime component as well as a count, the cap is not 50, or something outside
+the CLI deleted files in the interval. Manual deletion cannot be ruled out on a
+machine a human uses.
+
+What this does *not* change: the loss is real and has already been taken. The
+2026-08-10T00:25 burst's logs were gone on 08-16 and are still gone, and the five
+days between 08-10 and 08-15 have gone with them since. Nor does it soften the
+item -- a rule nobody can state is not a retention policy anyone can rely on,
+which is the point.
+
 ## Notes
 
 **Not established: the eviction rule.** Measured is the cap (50) and that

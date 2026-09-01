@@ -36,6 +36,37 @@ scan switched off rather than fixed -- named in that file's own docstring.
 The workaround costs a comment paragraph per site explaining why the obvious
 spelling was avoided, which is a tax on every traversal written from now on.
 
+## Done when
+
+- A file containing the standard symlink-safe traversal -- `for entry in
+  os.scandir(p): ... entry.is_dir(follow_symlinks=False)` -- produces no floor
+  violation.
+- A file containing `p = Path(x); p.is_dir(follow_symlinks=False)` still
+  produces one. This is the negative control and it is the whole difficulty: the
+  receiver is an `ast.Name` in both cases, so a fix that only widens the gate
+  retires the check it is meant to preserve.
+- `handoff_tool.py` can be written in the obvious spelling with no suppression
+  comment and no explanatory paragraph.
+- Both cases above are pinned by tests in
+  `tests/test_python_floor_conformance.py`, and the second one is observed
+  failing against the fixed scanner before it is relied on.
+
+## Not in scope
+
+- Other floor rules. Only the keyword-gated path for `is_dir` is in question.
+- Rewriting `handoff_tool.py`'s traversal back to the keyword spelling. It uses
+  `entry.is_symlink() or not entry.is_dir()` today, which is exactly equivalent
+  on every input; changing it back is optional and proves nothing on its own.
+- Reusing the existing `# floor-ok:` annotation. It claims the line is
+  unreachable on the floor, which would be a false claim here, and a false
+  suppression is worse than the false positive it silences.
+
+## Risk
+
+🟡 `tests/test_python_floor_conformance.py`. No shipped behaviour changes, but
+this is a guard: a fix that is too permissive silently retires real coverage,
+and a retired guard reads exactly like a passing one.
+
 ## Notes
 
 Deliberately NOT fixed alongside the guard. Narrowing the keyword-gated path
