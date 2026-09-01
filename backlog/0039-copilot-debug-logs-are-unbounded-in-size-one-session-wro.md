@@ -110,11 +110,21 @@ is a snapshot and not a level. This is the same trap as the units correction
 below: quote a reading, not a trend, unless the trend was measured.
 
 **What the timestamps do and do not establish.** They establish that those two
-files stopped growing. They do not establish that the sessions writing them
-ended: item 0030 exists precisely because a session can fall silent for days with
-its process alive, and a stale mtime is the signature of both. Nor is "nothing is
-reading them" a measurement -- items 0001 and 0030 read these logs by design, and
-file metadata says nothing about readers.
+files stopped growing. On their own they do not establish that the sessions
+writing them ended: item 0030 exists precisely because a session can fall silent
+for days with its process alive, and a stale mtime is the signature of both.
+Nor is "nothing is reading them" a measurement -- items 0001 and 0030 read these
+logs by design, and file metadata says nothing about readers.
+
+**What does establish it is item 0040, filed the same day from independent
+evidence.** The machine rebooted at 2026-08-28T03:02:28Z-03:04:33Z, from the
+Windows System log (events 1074, 6006, 6005), and that ended every supervisor
+and every session on the machine. The last write to both large logs is
+2026-08-28T03:03Z, inside that window. So the sessions did end, and the reason
+is a reboot rather than anything about logging -- but the evidence for it is an
+event log, not an mtime. Worth keeping as a worked example: the first reading
+here inferred "both owning sessions have ended" from the timestamps alone, and
+happened to be right for a reason it had not measured.
 
 What can be said is narrower and still worth saying: the 15.6 GB at the centre of
 this item is not currently growing, so the disk pressure is not accelerating
