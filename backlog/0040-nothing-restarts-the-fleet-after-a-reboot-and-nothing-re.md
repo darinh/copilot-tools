@@ -125,6 +125,65 @@ record, one of them mid-tool-call after 11.3 days, and none of the eleven
 appears in any count. A defect that makes the fleet's own loss-measuring
 instrument read short is worth more than the downtime.
 
+## Done when
+
+The two halves are separable and only the first is uncontroversial.
+
+**The announcement half:**
+
+- Something compares the fleet's intended membership against what is running and
+  says the answer out loud. `~/.operator/tabs.json` is already the intended
+  list -- it is what `operator restore` replays and it survived the reboot
+  intact -- so nothing needs inventing to hold it.
+- An empty fleet on a machine whose supervisors died is distinguishable, from the
+  output alone, from an empty fleet on a machine where nobody started anything.
+  That is the whole defect; a change that does not produce this distinction has
+  not addressed it.
+- The comparison is available without a human thinking to ask. A report only
+  emitted by a command nobody runs while the fleet is down repeats the failure
+  one level up.
+
+**The auto-start half, if it is wanted at all:** something fires the recovery
+that already exists, and the fact that it fired is recorded.
+
+## Not in scope
+
+- Determining why the machine rebooted. Event 1074 shows an orderly,
+  process-initiated shutdown, and the item is explicit that the remedy does not
+  depend on the cause -- a fleet that cannot survive a planned reboot cannot
+  survive an unplanned one.
+- Building a recovery mechanism. `operator restore --all` exists, is documented
+  at `docs/operator.md:134-139`, and worked. The trigger is missing, not the
+  mechanism.
+- A `machine_boot` trace marker. Withdrawn in the Notes with the reasoning
+  intact: nothing in this toolkit is alive at boot, so such a marker could only
+  be written by the next `operator` process to run, which is a convenience over
+  `LastBootUpTime` rather than a detector.
+- Sweeping the remaining Windows persistence surfaces. Three were checked and the
+  claim is bounded to those three; a fuller sweep would strengthen the evidence
+  but changes nothing about the remedy.
+
+## Risk
+
+🟢 for the announcement half: a comparison and a message.
+
+🔴 for the auto-start half, and the item says why: nine autonomous agents
+resuming unattended with `--yolo` and blanket authority, into repositories whose
+state nobody has looked at since the machine went down. Note that the authority
+clause they would resume under is itself backlog item 0013, which is unresolved
+in the supervisor that would launch them.
+
+## Needs a decision before this can be worked
+
+- **Whether unattended restart after a reboot is wanted at all.** The item is
+  explicit that this is a decision with real consequences and that the safe half
+  is the announcement. Answering it decides whether the auto-start half exists.
+- **Where the remedy belongs.** `FROZEN.md` limits this repository to fixes for
+  defects affecting running sessions, and both halves are new behaviour rather
+  than repairs, so on the plain reading of the freeze both belong in
+  `../operator`. Same disposition as items 0030 and 0033, and it should be
+  answered once for all three rather than three times.
+
 ## Notes
 
 **Not established: why the machine rebooted.** Event 1074 names a process as

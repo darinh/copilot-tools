@@ -137,6 +137,14 @@ or lifetime component as well as a count, the cap is not 50, or something outsid
 the CLI deleted files in the interval. Manual deletion cannot be ruled out on a
 machine a human uses.
 
+**Item 0040 constrains it slightly, and does not settle it.** The machine
+rebooted at 2026-08-28T03:03Z and nothing restarted the fleet for 3.85 days, so
+for that entire stretch the fleet created no new logs. The count nonetheless
+fell. Files therefore leave this directory while nothing is arriving, which is
+consistent with an age or lifetime component and hard to reconcile with eviction
+driven purely by a count. It is not proof: a human deleting files during those
+same days would look identical from here.
+
 What this does *not* change: the loss is real and has already been taken. The
 2026-08-10T00:25 burst's logs were gone on 08-16 and are still gone, and the five
 days between 08-10 and 08-15 have gone with them since. Nor does it soften the
